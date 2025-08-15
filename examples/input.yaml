@@ -1,0 +1,63 @@
+# ============================================================================
+# Custom MD Simulation Configuration File
+# Simple Lennard-Jones System (32,000 particles)
+# ============================================================================
+
+# Basic simulation parameters (required)
+coordinate_file: "coordinates.xyz"
+topology_file: "topology.top"
+target_temperature: 300.0
+timestep: 0.001
+total_steps: 100
+
+# Simulation box parameters
+box_x: 80.0                          # Box length in x direction (Angstrom)
+box_y: 80.0                          # Box length in y direction (Angstrom)
+box_z: 80.0                          # Box length in z direction (Angstrom)
+periodic_x: true                     # Periodic boundary conditions in x
+periodic_y: true                     # Periodic boundary conditions in y
+periodic_z: true                     # Periodic boundary conditions in z
+
+# Output configuration
+output_prefix: "simulation"
+trajectory_output_freq: 100           # or 50 (Output trajectory every 50 steps)
+output_freq: 10                       # Output frequency for step info
+output_info: "STEP, T, KE, PE"  # Available: STEP, T, KE, PE, AVG_SPD, MAX_SPD, MAX_FORCE, SAMPLE_POS, STEP_TIME, PARTICLES
+# Debug level 2 automatically adds timing info to the above output
+
+# Force calculation parameters
+cutoff_distance: 12                  # or "cutoff: 8.5" (Alternative cutoff specification)
+
+# Neighbor list configuration
+neighbor_list_type: "cell_list"       # or "morton_hilbert" (Morton/Hilbert, CUDA only)
+neighbor_list_tile_size: 32
+neighbor_list_update_freq: 10
+
+# Integration method
+integrator: "velocity_verlet"         # or "verlet" (Basic Verlet), "leapfrog" (Leapfrog)
+
+# Thermostat (disabled for NVE simulation)
+# thermostat: "none"                  # or "langevin", "nose_hoover", "andersen"
+# tau_t: 1.0                          # Thermostat coupling constant
+
+# Barostat (disabled for NVE simulation)  
+# barostat: "none"                    # or "andersen", "parrinello_rahman"
+# target_pressure: 1.0                # Target pressure (atm)
+# tau_p: 5.0                          # Barostat coupling constant
+
+# Force calculation section
+force_calculation:
+  neighbor_list: "cell_list"         # or "morton_hilbert" (Morton/Hilbert, CUDA only)
+  update_frequency: 10
+  mode: "builtin"                     # or "python" (Python interface for custom forces)
+
+# Built-in force field parameters (when mode: "builtin")
+builtin_enable_lennard_jones: "true"   # Enable LJ potential
+builtin_enable_coulomb: "false"        # Enable Coulomb electrostatics  
+builtin_enable_bonds: "false"          # Enable bond forces
+builtin_enable_angles: "false"         # Enable angle forces
+builtin_enable_dihedrals: "false"      # Enable dihedral forces
+
+# Python force interface (disabled)
+# python_force_enabled: false        # or true (Enable Python forces)
+# python_force_path: "python_force/" # or "custom_forces/" (Path to Python modules)

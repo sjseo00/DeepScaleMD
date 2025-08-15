@@ -1,0 +1,110 @@
+# Makefile for Custom MD simulation
+
+# Compiler settings
+CXX = mpicxx
+NVCC = nvcc
+SYCL_CXX = icpx -fsycl
+
+# Build type
+BUILD_TYPE ?= cpu
+
+# Directories
+SRC_DIR = src
+INCLUDE_DIR = include
+OBJ_DIR = obj
+BIN_DIR = bin
+
+# Common source files
+COMMON_SOURCES = $(SRC_DIR)/md_system.cpp \
+                 $(SRC_DIR)/integrator.cpp \
+                 $(SRC_DIR)/thermostat.cpp \
+                 $(SRC_DIR)/barostat.cpp \
+                 $(SRC_DIR)/neighbor_list.cpp \
+                 $(SRC_DIR)/md_simulation.cpp \
+                 $(SRC_DIR)/python_interface.cpp \
+                 $(SRC_DIR)/main.cpp
+
+# Conditional sources and settings
+ifeq ($(BUILD_TYPE),cuda)
+    SOURCES = $(COMMON_SOURCES) $(SRC_DIR)/force_calculator_cuda.cpp $(SRC_DIR)/kernels_cuda.cu
+    CXXFLAGS_EXTRA = -DUSE_CUDA
+    LIBS_EXTRA = -lcudart -lcublas
+    TARGET_SUFFIX = _cuda
+else ifeq ($(BUILD_TYPE),sycl)
+    SOURCES = $(COMMON_SOURCES) $(SRC_DIR)/force_calculator_sycl.cpp
+    CXXFLAGS_EXTRA = -DUSE_SYCL
+    LIBS_EXTRA = 
+    TARGET_SUFFIX = _sycl
+    CXX = $(SYCL_CXX)
+else
+    SOURCES = $(COMMON_SOURCES)
+    CXXFLAGS_EXTRA = 
+    LIBS_EXTRA = 
+    TARGET_SUFFIX = _cpu
+endif
+
+# Object files
+OBJECTS = $(SOURCES:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
+OBJECTS := $(OBJECTS:$(SRC_DIR)/%.cu=$(OBJ_DIR)/%.o)
+
+# Compiler flags
+CXXFLAGS = -std=c++17 -O3 -Wall -I$(INCLUDE_DIR) $(CXXFLAGS_EXTRA)
+NVCC_FLAGS = -std=c++17 -O3 -I$(INCLUDE_DIR) $(CXXFLAGS_EXTRA)
+
+# Library flags - simplified approach
+PYTHON_FLAGS = $(shell python3-config --cflags)
+PYTHON_LIBS = $(shell python3-config --ldflags --embed)
+LIBS = -lm $(PYTHON_LIBS) $(LIBS_EXTRA)
+
+# Target
+TARGET = md_simulation$(TARGET_SUFFIX)
+
+.PHONY: all cpu cuda sycl clean help
+
+# Default target
+all: cpu
+
+# Build targets
+cpu:
+	$(MAKE) BUILD_TYPE=cpu build
+
+cuda:
+	$(MAKE) BUILD_TYPE=cuda build
+
+sycl:
+	$(MAKE) BUILD_TYPE=sycl build
+
+# Main build rule
+build: $(BIN_DIR)/$(TARGET)
+
+$(BIN_DIR)/$(TARGET): $(OBJECTS) | $(BIN_DIR)
+	$(CXX) $(OBJECTS) -o $@ $(LIBS)
+
+# Object file rules
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) $(PYTHON_FLAGS) -c $< -o $@
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu | $(OBJ_DIR)
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+# Directory creation
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
+
+# Clean
+clean:
+	rm -rf $(OBJ_DIR) $(BIN_DIR)
+
+# Help
+help:
+	@echo "Custom MD Simulation Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  cpu    - Build CPU version (default)"
+	@echo "  cuda   - Build CUDA version"
+	@echo "  sycl   - Build SYCL version" 
+	@echo "  clean  - Clean build files"
+	@echo "  help   - Show this help"

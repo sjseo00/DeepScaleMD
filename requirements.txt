@@ -1,0 +1,10 @@
+# Python requirements for Custom MD simulation
+numpy>=1.19.0
+scipy>=1.6.0
+
+# Optional ML dependencies
+torch>=1.9.0
+tensorflow>=2.6.0
+
+# Optional visualization
+matplotlib>=3.3.0

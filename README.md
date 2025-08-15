@@ -1,0 +1,441 @@
+# Custom MD Simulation
+
+A high-performance molecular dynamics simulation code designed for supercomputer-scale calculations with support for up to 10+ billion particles. The code features MPI parallelization with GPU acceleration through either CUDA or SYCL for maximum hardware compatibility.
+
+## Features
+
+### Core Capabilities
+- **Massive Scale**: Designed for 10+ billion particle simulations on supercomputers
+- **MPI Parallelization**: Domain decomposition for distributed memory systems
+- **GPU Acceleration**: Support for both CUDA and SYCL backends
+- **Structure of Arrays (SoA)**: GPU-optimized memory layout
+- **Python Integration**: Flexible force field calculations via Python interface
+
+### Integrators
+- Verlet
+- Velocity-Verlet  
+- Leapfrog
+- r-RESPA (multiple time-step)
+
+### Thermostats
+- Nosé-Hoover
+- Langevin
+- Andersen
+
+### Barostats
+- Parrinello-Rahman
+- Andersen
+
+### Force Fields
+- **Bonded Terms**: Bonds, angles, dihedrals (via Python interface)
+- **Non-bonded**: Lennard-Jones, Electrostatic interactions
+- **Machine Learning**: PyTorch and TensorFlow force field support
+- **Advanced Neighbor Lists**: Multiple algorithms including traditional cell-based and modern Morton/Hilbert CSR approaches
+
+### Input/Output
+- **YAML Configuration**: Human-readable input format
+- **XYZ Coordinates**: Standard coordinate file format
+- **Topology Files**: Bond connectivity and parameters
+- **Trajectory Output**: Standard format trajectories
+
+## Directory Structure
+
+```
+Custom_MD/
+├── src/                    # Source code
+│   ├── main.cpp           # Main program
+│   ├── md_system.cpp      # System management
+│   ├── md_simulation.cpp  # Simulation driver
+│   ├── integrator.cpp     # Time integration schemes
+│   ├── thermostat.cpp     # Temperature control
+│   ├── barostat.cpp       # Pressure control
+│   ├── neighbor_list.cpp  # Neighbor list construction
+│   ├── python_interface.cpp # Python force interface
+│   ├── force_calculator_cuda.cpp # CUDA force calculations
+│   ├── force_calculator_sycl.cpp # SYCL force calculations
+│   └── kernels_cuda.cu    # CUDA kernels
+├── include/               # Header files
+├── python_force/          # Python force implementations
+│   ├── bond_forces.py     # Bonded force calculations
+│   ├── angle_forces.py    # Angle force calculations
+│   ├── dihedral_forces.py # Dihedral force calculations
+│   ├── lj_forces.py       # Lennard-Jones forces
+│   ├── electrostatic_forces.py # Coulomb forces
+│   └── ml_forces.py       # ML force field interface
+├── docs/                  # Documentation
+├── examples/              # Example input files and systems
+│   ├── input.yaml         # Example configuration
+│   ├── coordinates.xyz    # Example coordinates
+│   └── generate_lj_system.py # LJ system generator
+└── Makefile              # Build system
+```
+
+## Requirements
+
+### Essential Dependencies
+- **MPI**: OpenMPI 4.0+ or MPICH 3.0+
+- **C++17 Compatible Compiler**: GCC 8+, Clang 10+, or Intel C++
+- **Python 3.7+**: With development headers
+- **NumPy**: For Python force calculations
+
+### Optional Dependencies
+- **CUDA Toolkit 11.0+**: For GPU acceleration with NVIDIA GPUs
+- **Intel oneAPI DPC++**: For SYCL-based multi-vendor GPU support
+- **PyTorch**: For ML force field support
+- **TensorFlow 2.x**: Alternative ML framework
+- **YAML-CPP**: For enhanced YAML parsing (fallback parser included)
+
+## Building
+
+### CPU-Only Build (Default)
+```bash
+make cpu
+```
+
+### CUDA Build (NVIDIA GPUs)
+```bash
+make cuda
+```
+
+### SYCL Build (Multi-vendor GPU support)
+```bash
+make sycl
+```
+
+### Clean Build
+```bash
+make clean
+```
+
+### Installation
+```bash
+# Install CPU version
+sudo make install-cpu
+
+# Install CUDA version  
+sudo make install-cuda
+
+# Install SYCL version
+sudo make install-sycl
+```
+
+## Usage
+
+### Basic Simulation
+```bash
+# Single node
+./bin/md_simulation_cpu input.yaml
+
+# Multi-node MPI
+mpirun -np 32 ./bin/md_simulation_cuda input.yaml
+
+# Large scale (example for 1000+ nodes)
+mpirun -np 4096 ./bin/md_simulation_cuda input.yaml
+```
+
+### Generating Test Systems
+```bash
+cd examples/
+python3 generate_lj_system.py
+```
+
+This generates a 32,000 particle Lennard-Jones system suitable for testing.
+
+## Configuration File Format
+
+The simulation uses YAML configuration files. Example `input.yaml`:
+
+```yaml
+# Simulation parameters
+timestep: 0.001                    # fs
+total_steps: 100000                
+output_frequency: 100              
+
+# System box
+box_x: 100.0                       # Angstrom
+box_y: 100.0                       
+box_z: 100.0                       
+periodic_x: true
+periodic_y: true
+periodic_z: true
+
+# GPU settings
+use_gpu: true
+
+# Files
+coordinate_file: "coordinates.xyz"
+topology_file: "topology.top"
+
+# Force field
+cutoff: 12.0                       # Angstrom
+lj_epsilon: [0.2339, 0.1094]      # kcal/mol
+lj_sigma: [3.4, 2.85]             # Angstrom
+
+# Integrator Options
+integrator: "velocity_verlet"     # Available options:
+                                  # - "verlet": Basic Verlet algorithm
+                                  # - "velocity_verlet": Velocity-Verlet (default)
+                                  # - "leapfrog": Leapfrog integration
+                                  # - "r_respa": r-RESPA multiple timestep
+                                  # - "velocity_verlet_cuda": CUDA-accelerated Velocity-Verlet
+                                  # - "velocity_verlet_sycl": SYCL-accelerated Velocity-Verlet
+
+# Thermostat Options
+thermostat: "langevin"           # Available options:
+                                 # - "none": No temperature control
+                                 # - "nose_hoover": Nose-Hoover deterministic thermostat
+                                 # - "langevin": Langevin stochastic thermostat
+                                 # - "andersen": Andersen stochastic thermostat
+                                 # - "langevin_cuda": CUDA-accelerated Langevin
+                                 # - "langevin_sycl": SYCL-accelerated Langevin
+target_temperature: 300.0        # K
+tau_t: 0.1                       # ps - thermostat coupling time constant
+
+# Barostat Options
+barostat: "none"                 # Available options:
+                                 # - "none": No pressure control (NVT ensemble)
+                                 # - "parrinello_rahman": Anisotropic pressure coupling
+                                 # - "andersen": Isotropic pressure coupling
+                                 # - "andersen_cuda": CUDA-accelerated Andersen
+                                 # - "andersen_sycl": SYCL-accelerated Andersen
+target_pressure: 1.0             # bar
+tau_p: 1.0                       # ps - barostat coupling time constant
+friction_coefficient: 1.0         
+
+# ML Force Field (optional)
+use_ml_forcefield: false
+ml_model_path: "model.pt"
+ml_framework: "pytorch"
+```
+
+## Python Force Interface
+
+The code supports custom force calculations through Python modules. Forces are computed in Python and integrated into the main simulation loop.
+
+### Supported Force Types
+1. **Bonded Forces**: Harmonic bonds, angles, dihedrals
+2. **Lennard-Jones**: With mixing rules
+3. **Electrostatic**: Coulomb interactions with optional Ewald summation
+4. **Machine Learning**: PyTorch/TensorFlow models
+
+### Adding Custom Forces
+Create a Python module in `python_force/` with the required interface:
+
+```python
+def c_compute_custom_forces(pos_ptr, n_atoms, forces_ptr):
+    # Your custom force calculation here
+    pass
+```
+
+## Performance Optimization
+
+### For Large Scale Runs
+
+1. **Domain Decomposition**: The code automatically distributes particles across MPI ranks
+2. **GPU Memory Management**: Efficient data transfer between CPU and GPU
+3. **Advanced Neighbor Lists**: Choose between traditional cell-based or Morton/Hilbert CSR algorithms based on system size and hardware
+4. **Load Balancing**: Particles distributed evenly across processes
+
+### Recommended Settings for 10B+ Particles
+
+```bash
+# Use large number of MPI processes (1000+ nodes)
+mpirun -np 4096 --bind-to socket --map-by socket \
+  ./bin/md_simulation_cuda input.yaml
+
+# Optimize GPU memory usage
+export CUDA_VISIBLE_DEVICES=0,1,2,3  # Use all available GPUs
+```
+
+### Memory Requirements
+
+For 10 billion particles:
+- **CPU Memory**: ~800 GB total (distributed across nodes)
+- **GPU Memory**: ~32 GB per GPU (for domain decomposition)
+- **Network**: High-bandwidth interconnect recommended (InfiniBand)
+
+## Validation and Testing
+
+### Test Systems Included
+1. **32K Lennard-Jones System**: Basic validation
+2. **Argon Liquid**: Thermodynamic properties validation
+3. **Water Box**: Hydrogen bonding validation
+
+### Performance Benchmarks
+Run the included benchmark scripts to validate performance:
+
+```bash
+cd examples/
+./run_benchmarks.sh
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **CUDA not found**: Ensure CUDA toolkit is properly installed and `nvcc` is in PATH
+2. **MPI errors**: Check MPI installation and network configuration
+3. **Python interface fails**: Verify Python development headers are installed
+4. **Memory issues**: Increase swap space or reduce particle count for testing
+
+### Performance Issues
+
+1. **Slow neighbor list updates**: Increase update frequency
+2. **GPU underutilization**: Ensure sufficient work per GPU
+3. **MPI communication overhead**: Optimize domain decomposition
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Add tests for new functionality
+4. Ensure all tests pass
+5. Submit a pull request
+
+## License
+
+This project is licensed under the MIT License. See LICENSE file for details.
+
+## Citation
+
+If you use this code in research, please cite:
+
+```
+@software{custom_md_2024,
+  title = {Custom MD: Scalable Molecular Dynamics with GPU Acceleration},
+  author = {Your Name},
+  year = {2024},
+  url = {https://github.com/yourusername/Custom_MD}
+}
+```
+
+## Contact
+
+1. 전체 실행 흐름 (공통)
+main.cpp
+
+main() → MDSimulation simulation;
+simulation.initialize(config_file);
+simulation.run();
+simulation.finalize();
+md_simulation.cpp
+
+initialize()에서 시스템, 입자, 토폴로지, 속도, 도메인 분해, force calculator, neighbor list 등 초기화
+run()에서 반복적으로 single_step() 호출
+2. Force Calculator 선택 및 함수 순서
+2.1. CPU 빌드 (기본)
+#else 또는 CUDA/SYCL 미지원 시
+순서:
+force_calc = std::make_unique<ForceCalculatorCPU>()
+force_calc->initialize()
+force_calc->compute_forces(*system) (single_step에서 반복 호출)
+내부적으로 BuiltinForceCalculator::compute_forces() → compute_bond_forces, compute_angle_forces, compute_dihedral_forces, compute_lj_forces 등
+2.2. CUDA 빌드
+#ifdef USE_CUDA
+순서:
+force_calc = std::make_unique<ForceCalculatorCUDA>()
+force_calc->initialize() (CUDA 디바이스, 스트림 등 초기화)
+force_calc->compute_forces(*system) (single_step에서 반복 호출)
+내부적으로 CUDA 커널 호출 (launch_lj_kernel 등), GPU 메모리에서 직접 계산
+2.3. SYCL 빌드
+#elif defined(USE_SYCL)
+순서:
+force_calc = std::make_unique<ForceCalculatorSYCL>()
+force_calc->initialize() (SYCL 디바이스, 큐 등 초기화)
+force_calc->compute_forces(*system) (single_step에서 반복 호출)
+내부적으로 SYCL 커널 호출
+3. 함수 호출 구조 요약
+4. 핵심 분기점
+컴파일 플래그와 런타임 디바이스 체크로 백엔드 결정
+각 백엔드별로 ForceCalculator 객체와 내부 함수가 다르게 동작
+나머지 시뮬레이션 로직(입자 이동, neighbor list, 적분 등)은 공통
+요약
+CPU: BuiltinForceCalculator의 C++ 함수들로 힘 계산
+CUDA: ForceCalculatorCUDA에서 CUDA 커널로 힘 계산
+SYCL: ForceCalculatorSYCL에서 SYCL 커널로 힘 계산
+ForceCalculator 선택 이후의 시뮬레이션 흐름은 거의 동일하며, compute_forces에서 백엔드별로 분기됨
+
+## Configuration System
+
+The MD simulation now uses a simplified YAML-based configuration system with automatic backend selection based on build flags.
+
+### Automatic Backend Selection
+
+Simply specify the algorithm name in your configuration. The build system automatically selects the appropriate backend:
+
+- **CPU-only build**: `make` - uses CPU implementations
+- **CUDA build**: `make USE_CUDA=ON` - uses CUDA implementations when available  
+- **SYCL build**: `make USE_SYCL=ON` - uses SYCL implementations when available
+
+### Supported Components
+
+**Integrators:**
+- `velocity_verlet`: Velocity-Verlet integration (default)
+- `verlet`: Classical Verlet integration  
+- `leapfrog`: Leapfrog integration
+- `r_respa`: Reversible reference system propagator algorithm
+
+**Thermostats:**
+- `none`: No temperature coupling (default)
+- `langevin`: Langevin thermostat
+- `nose_hoover`: Nosé-Hoover thermostat
+- `andersen`: Andersen thermostat
+
+**Barostats:**
+- `none`: No pressure coupling (default)
+- `andersen`: Andersen barostat
+- `parrinello_rahman`: Parrinello-Rahman barostat
+
+### Example Configuration
+
+```yaml
+simulation:
+  steps: 1000
+  output_frequency: 100
+  trajectory_file: "trajectory.xyz"
+
+integrator:
+  type: "velocity_verlet"  # Backend automatically selected based on build flags
+  timestep: 0.001
+
+thermostat:
+  type: "langevin"
+  target_temperature: 300.0
+  coupling_strength: 1.0
+
+barostat:
+  type: "none"
+
+force_calculation:
+  neighbor_list: "cell_list"
+  skin_distance: 0.3
+  update_frequency: 10      # Update neighbor list every N steps (default: 10)
+
+system:
+  temperature: 300.0
+  box_size: [10.0, 10.0, 10.0]
+  cutoff: 2.5
+
+topology:
+  file: "topology.top"
+  coordinates: "coordinates.xyz"
+```
+
+### Build Examples
+
+```bash
+# CPU-only version
+make clean
+make
+
+# CUDA version  
+make clean
+make USE_CUDA=ON
+
+# SYCL version
+make clean  
+make USE_SYCL=ON
+
+# Run with MPI (auto-detected)
+mpirun -np 4 ./bin/md_simulation_cpu examples/simple_config.yaml
+```
