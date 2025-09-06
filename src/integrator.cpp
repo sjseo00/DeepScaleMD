@@ -873,7 +873,9 @@ void RRESPAIntegratorSYCL::integrate(ParticleData& particles, Real dt, size_t lo
                 });
             }).wait();
             
-            // Force calculation would go here (not implemented in this simplified version)
+            // Note: Force calculation should be performed here by the force manager
+            // For r-RESPA, forces are typically split into fast/slow components
+            // This implementation assumes forces are already calculated and stored in fx, fy, fz
             
             // Second half of velocity update
             queue.submit([&](sycl::handler& cgh) {
@@ -1029,6 +1031,22 @@ void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, Real dt, s
         dev_x[i] += dev_vx[i] * dt;
         dev_y[i] += dev_vy[i] * dt;
         dev_z[i] += dev_vz[i] * dt;
+    });
+    
+    queue.wait();
+    
+    // Note: Force calculation should be performed here by the force manager
+    // This implementation assumes forces are recalculated after position update
+    
+    // Second half of velocity update
+    queue.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
+        int i = idx[0];
+        Real inv_mass = 1.0 / dev_mass[i];
+        
+        // Complete velocity update with new forces
+        dev_vx[i] += 0.5 * dev_fx[i] * inv_mass * dt;
+        dev_vy[i] += 0.5 * dev_fy[i] * inv_mass * dt;
+        dev_vz[i] += 0.5 * dev_fz[i] * inv_mass * dt;
     });
     
     queue.wait();

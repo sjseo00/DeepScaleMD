@@ -81,10 +81,10 @@ void MDSystem::load_config(const std::string& config_file) {
         std::string value = line.substr(colon_pos + 1);
         
         // Trim whitespace
-        key.erase(0, key.find_first_not_of(" \t"));
-        key.erase(key.find_last_not_of(" \t") + 1);
-        value.erase(0, value.find_first_not_of(" \t"));
-        value.erase(value.find_last_not_of(" \t") + 1);
+        key.erase(0, key.find_first_not_of(" \t\r\n"));
+        key.erase(key.find_last_not_of(" \t\r\n") + 1);
+        value.erase(0, value.find_first_not_of(" \t\r\n"));
+        value.erase(value.find_last_not_of(" \t\r\n") + 1);
         
         // Remove quotes if present
         if (!value.empty() && value.front() == '"' && value.back() == '"') {
@@ -117,7 +117,6 @@ void MDSystem::load_config(const std::string& config_file) {
         else if (key == "periodic_x") box.periodic_x = (value == "true");
         else if (key == "periodic_y") box.periodic_y = (value == "true");
         else if (key == "periodic_z") box.periodic_z = (value == "true");
-        // use_gpu flag is ignored - backend is determined by compilation flags
     }
     
     // Initialize force manager with parsed configuration
@@ -184,9 +183,9 @@ void MDSystem::initialize_velocities(Real temperature) {
     }
     
     // Target kinetic energy: KE = (3/2) * N * kB * T
-    // Use same conversion as temperature calculation: 2*KE/(3*N) * 120.272 = T
-    // Therefore: KE = 3*N*T / (2*120.272)
-    Real target_ke = 3.0 * particles.num_particles * temperature / (2.0 * 120.272);
+    // kB = 0.0019872041 kcal/(mol·K) for units real
+    Real kB = 0.0019872041; // kcal/(mol·K)
+    Real target_ke = 1.5 * particles.num_particles * kB * temperature;
     
     Real scale_factor = std::sqrt(target_ke / current_ke);
     
@@ -433,8 +432,8 @@ void MDSystem::setup_force_field_params() {
                 std::cerr << "Using default LJ parameters" << std::endl;
             }
             // Use default Argon parameters
-            ff_params.epsilon[i] = 0.997; // kJ/mol
-            ff_params.sigma[i] = 3.405;   // Å
+            ff_params.epsilon[i] = 0.238; // kcal/mol
+            ff_params.sigma[i] = 3.4;     // Å
         }
     }
     
@@ -442,7 +441,7 @@ void MDSystem::setup_force_field_params() {
         std::cout << "Force field setup: " << ff_params.epsilon.size() << " particles" << std::endl;
         if (debug_level(3) && !ff_params.epsilon.empty()) {
             std::cout << "Sample LJ parameters: epsilon=" << ff_params.epsilon[0] 
-                      << " kJ/mol, sigma=" << ff_params.sigma[0] << " Å" << std::endl;
+                      << " kcal/mol, sigma=" << ff_params.sigma[0] << " Å" << std::endl;
         }
     }
 }

@@ -5,6 +5,7 @@
 #include <iostream>
 #include <cmath>
 #include <mpi.h>
+#include <iomanip>
 
 // Helper function to check if this is rank 0
 static bool is_rank_zero() {
@@ -40,11 +41,12 @@ void ForceCalculatorCPU::compute_forces(MDSystem& system) {
     // If not, we'll use default settings for now
     
     // Compute different force contributions based on configuration
-    compute_bond_forces(system);         // Always compute - function will check if bonds exist
-    compute_angle_forces(system);        // Always compute - function will check if angles exist  
-    compute_dihedral_forces(system);     // Always compute - function will check if dihedrals exist
+    // sjseo : should be corrected
+    //compute_bond_forces(system);         // Always compute - function will check if bonds exist
+    //compute_angle_forces(system);        // Always compute - function will check if angles exist  
+    //compute_dihedral_forces(system);     // Always compute - function will check if dihedrals exist
     compute_lj_forces(system);           // Always compute - most common force
-    compute_electrostatic_forces(system); // Always compute - function will check if charges exist
+    //compute_electrostatic_forces(system); // Always compute - function will check if charges exist
     
     // Calculate kinetic energy will be done after integration
     // calculate_kinetic_energy(system);
@@ -59,23 +61,19 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
     size_t total_particles = system.get_num_particles();
     
-    static int debug_count = 0;
-    if (debug_count < 2 && is_rank_zero()) {
-        std::cout << "CPU LJ Force calculation: " << total_particles << " total particles, " 
-                  << local_particles << " local particles" << std::endl;
-        std::cout << "Cutoff: " << nlist.cutoff << " Å" << std::endl;
-        std::cout << "Using neighbor list with " << nlist.neighbors.size() << " pairs" << std::endl;
-        debug_count++;
-    }
     
     Real cutoff_sq = nlist.cutoff * nlist.cutoff;
     
     // Use neighbor list for efficient force calculation (O(N) instead of O(N²))
     for (size_t i = 0; i < local_particles; i++) {
+       
         // Get neighbor list for particle i
-        size_t neighbor_start = (i > 0) ? nlist.num_neighbors[i-1] : 0;
-        size_t neighbor_end = nlist.num_neighbors[i];
-        
+        size_t neighbor_start = 0;
+        for(int ii = 0; ii < i; ii++) neighbor_start += nlist.num_neighbors[ii];
+
+        size_t neighbor_end = neighbor_start + nlist.num_neighbors[i];
+
+        //for (size_t n_idx = neighbor_start; n_idx < neighbor_end; n_idx++) {
         for (size_t n_idx = neighbor_start; n_idx < neighbor_end; n_idx++) {
             if (n_idx >= nlist.neighbors.size()) break;
             
@@ -105,11 +103,9 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
             
             if (r2 < cutoff_sq && r2 > 0.01) { // Avoid very close contacts
                 // Lennard-Jones parameters
-                Real eps = (i < params.epsilon.size() && j < params.epsilon.size()) ? 
-                          std::sqrt(params.epsilon[i] * params.epsilon[j]) : 1.0;
-                Real sig = (i < params.sigma.size() && j < params.sigma.size()) ?
-                          0.5 * (params.sigma[i] + params.sigma[j]) : 3.4;
-                
+                Real eps = std::sqrt(params.epsilon[i] * params.epsilon[j]);
+                Real sig = 0.5 * (params.sigma[i] + params.sigma[j]);
+
                 Real sig2 = sig * sig;
                 Real sig6 = sig2 * sig2 * sig2;
                 Real sig12 = sig6 * sig6;
@@ -120,11 +116,19 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
                 
                 // LJ force magnitude: F = 24*eps/r * (2*(sig/r)^12 - (sig/r)^6)
                 Real force_mag = 24.0 * eps * r2inv * (2.0 * sig12 * r12inv - sig6 * r6inv);
-                
+
+                if(abs(force_mag) > 0.001)
+                {
+                    std::cout << std::fixed << std::setprecision(8);
+                    std::cout << "Force on particle " << i << " due to " << j << ": " << force_mag << std::endl;
+                    std::cin.get();
+                }
+
                 // LJ potential energy: V = 4*eps*((sig/r)^12 - (sig/r)^6)
                 Real pe_pair = 4.0 * eps * (sig12 * r12inv - sig6 * r6inv);
+
                 last_potential_energy += pe_pair;
-                
+
                 Real fx = force_mag * dx;
                 Real fy = force_mag * dy;
                 Real fz = force_mag * dz;
@@ -134,23 +138,24 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
                 particles.fz[i] += fz;
                 
                 // Newton's third law - but only if j is also local
-                if (j < local_particles) {
-                    particles.fx[j] -= fx;
-                    particles.fy[j] -= fy;
-                    particles.fz[j] -= fz;
-                }
+                // sjseo : looks wrong....
+
+                // particles.fx[j] -= fx;
+                // particles.fy[j] -= fy;
+                // particles.fz[j] -= fz;
             }
         }
     }
-    
+    //std::cout << std::fixed << std::setprecision(8);
+    //std::cout << "LJ energy : " << last_potential_energy / 2 << std::endl;
+    //std::cin.get();
     // Communicate forces with neighbors using MPI (if needed)
     // The halo exchange and force reduction is typically handled by the MD system
     // For a complete implementation, we would need:
     // 1. Halo particle exchange before force calculation
     // 2. Force reduction after calculation
     // This depends on the specific MPI system being used
-    
-    debug_count++;
+ 
 }
 
 void ForceCalculatorCPU::compute_electrostatic_forces(MDSystem& system) {

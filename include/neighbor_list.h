@@ -7,6 +7,10 @@
 #include <vector>
 #include <cstdint>
 
+#ifdef USE_SYCL
+#include <sycl/sycl.hpp>
+#endif
+
 enum class NeighborListType {
     CELL_LIST,
     MORTON_HILBERT_CSR,
@@ -72,6 +76,17 @@ private:
     std::vector<int> inverse_reorder;   // Mapping from reordered to original indices
     CSRNeighborList csr_nlist;
     TileStaging tile_staging;
+    
+    // GPU-related variables
+    bool gpu_available = false;
+    bool gpu_memory_allocated = false;
+    void* d_neighbor_list = nullptr;
+    void* d_tile_data = nullptr;
+    int gpu_device_id = 0;
+    
+#ifdef USE_SYCL
+    sycl::queue sycl_queue;
+#endif
     
     // Morton curve functions
     uint64_t morton_encode_3d(uint32_t x, uint32_t y, uint32_t z);

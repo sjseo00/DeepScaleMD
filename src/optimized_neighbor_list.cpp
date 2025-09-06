@@ -178,7 +178,7 @@ void OptimizedCellListNeighborBuilder::build_interior_neighbors(ParticleData& pa
     // These particles don't need halo exchange data
     
     Real cutoff_sq = cell_size * cell_size;
-    
+
     for (int i : interior_particles) {
         nlist.neighbor_offset[i] = nlist.neighbors.size();
         
@@ -202,7 +202,7 @@ void OptimizedCellListNeighborBuilder::build_interior_neighbors(ParticleData& pa
                     int neighbor_ix = ix + dx;
                     int neighbor_iy = iy + dy;
                     int neighbor_iz = iz + dz;
-                    
+
                     // Handle boundary conditions
                     if (box.periodic_x) {
                         neighbor_ix = (neighbor_ix + nx) % nx;
@@ -244,13 +244,21 @@ void OptimizedCellListNeighborBuilder::build_interior_neighbors(ParticleData& pa
                             if (dz_ij > box.lz * 0.5) dz_ij -= box.lz;
                             else if (dz_ij < -box.lz * 0.5) dz_ij += box.lz;
                         }
-                        
+
                         Real r2 = dx_ij * dx_ij + dy_ij * dy_ij + dz_ij * dz_ij;
                         
                         if (r2 < cutoff_sq) {
                             nlist.neighbors.push_back(j);
                             nlist.num_neighbors[i]++;
-                            
+                            /* sjseo
+                            std::cout << i << " : " << particles.x[i] << " " << particles.y[i] << " " << particles.z[i] << std::endl;
+                            std::cout << j << " : " << particles.x[j] << " " << particles.y[j] << " " << particles.z[j] << std::endl;
+
+                            std::cout << "Adding neighbor " << j << " for particle " << i 
+                                      << " with distance squared: " << r2 << std::endl;
+                            std::cin.get();
+                            */
+
                             // Limit neighbors to avoid memory issues
                             if (nlist.num_neighbors[i] >= 300) {
                                 break;
@@ -264,6 +272,13 @@ void OptimizedCellListNeighborBuilder::build_interior_neighbors(ParticleData& pa
             }
             if (nlist.num_neighbors[i] >= 300) break;
         }
+     
+        // sjseo : debug
+        /*
+        std::cout << "Particle " << i << " has " << nlist.num_neighbors[i] 
+                  << " neighbors in interior cell list." << std::endl;
+        std::cin.get();
+        */
     }
 }
 
@@ -372,14 +387,17 @@ void OptimizedCellListNeighborBuilder::build(ParticleData& particles, Simulation
     classify_particles(particles, box);
     
     // Step 2: Set up cell grid
+    // Use proper cell size calculation for optimal performance
     Real effective_cutoff = cell_size;
-    if (particles.num_particles > 10000) {
-        effective_cutoff = std::min(cell_size, 10.0); // Slightly larger for better accuracy
-    }
+
+    nx = static_cast<int>(std::ceil(box.lx / effective_cutoff));
+    ny = static_cast<int>(std::ceil(box.ly / effective_cutoff));
+    nz = static_cast<int>(std::ceil(box.lz / effective_cutoff));
     
-    nx = static_cast<int>(box.lx / effective_cutoff) + 1;
-    ny = static_cast<int>(box.ly / effective_cutoff) + 1;
-    nz = static_cast<int>(box.lz / effective_cutoff) + 1;
+    // Ensure minimum number of cells
+    nx = std::max(nx, 1);
+    ny = std::max(ny, 1);
+    nz = std::max(nz, 1);
     
     int total_cells = nx * ny * nz;
     cells.clear();
@@ -424,7 +442,7 @@ void OptimizedCellListNeighborBuilder::build(ParticleData& particles, Simulation
     build_boundary_neighbors(particles, box, nlist);
     
     // Print classification statistics
-    // print_classification_stats();
+    //print_classification_stats();
     
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
@@ -469,43 +487,138 @@ void TiledNeighborListBuilder::build_tile(int tile_start, int tile_end,
                                          NeighborList& nlist) {
     Real cutoff_sq = cutoff * cutoff;
     
+    // Create local cell grid for this tile
+    Real cell_size = cutoff;
+    int local_nx = static_cast<int>(std::ceil(box.lx / cell_size));
+    int local_ny = static_cast<int>(std::ceil(box.ly / cell_size));
+    int local_nz = static_cast<int>(std::ceil(box.lz / cell_size));
+    
+    // Ensure minimum number of cells
+    local_nx = std::max(local_nx, 1);
+    local_ny = std::max(local_ny, 1);
+    local_nz = std::max(local_nz, 1);
+    
+    int total_cells = local_nx * local_ny * local_nz;
+    std::vector<std::vector<int>> local_cells(total_cells);
+    
+    // Assign all particles to local cells
+    for (size_t i = 0; i < particles.num_particles; i++) {
+        int ix = static_cast<int>(particles.x[i] / cell_size);
+        int iy = static_cast<int>(particles.y[i] / cell_size);
+        int iz = static_cast<int>(particles.z[i] / cell_size);
+        
+        // Apply boundary conditions
+        if (box.periodic_x) {
+            ix = (ix + local_nx) % local_nx;
+        } else {
+            ix = std::max(0, std::min(ix, local_nx - 1));
+        }
+        if (box.periodic_y) {
+            iy = (iy + local_ny) % local_ny;
+        } else {
+            iy = std::max(0, std::min(iy, local_ny - 1));
+        }
+        if (box.periodic_z) {
+            iz = (iz + local_nz) % local_nz;
+        } else {
+            iz = std::max(0, std::min(iz, local_nz - 1));
+        }
+        
+        int cell_id = iz * local_nx * local_ny + iy * local_nx + ix;
+        if (cell_id >= 0 && cell_id < total_cells) {
+            local_cells[cell_id].push_back(i);
+        }
+    }
+    
+    // Process particles in the tile using cell-based neighbor search
     for (int i = tile_start; i < tile_end && i < static_cast<int>(particles.num_particles); i++) {
         nlist.neighbor_offset[i] = nlist.neighbors.size();
         
-        // Simple brute force within tile for now
-        // In practice, you would use cell-based approach within each tile
-        for (size_t j = 0; j < particles.num_particles; j++) {
-            if (static_cast<int>(j) == i) continue;
-            
-            Real dx = particles.x[i] - particles.x[j];
-            Real dy = particles.y[i] - particles.y[j];
-            Real dz = particles.z[i] - particles.z[j];
-            
-            // Apply minimum image convention
-            if (box.periodic_x) {
-                if (dx > box.lx * 0.5) dx -= box.lx;
-                else if (dx < -box.lx * 0.5) dx += box.lx;
-            }
-            if (box.periodic_y) {
-                if (dy > box.ly * 0.5) dy -= box.ly;
-                else if (dy < -box.ly * 0.5) dy += box.ly;
-            }
-            if (box.periodic_z) {
-                if (dz > box.lz * 0.5) dz -= box.lz;
-                else if (dz < -box.lz * 0.5) dz += box.lz;
-            }
-            
-            Real r2 = dx * dx + dy * dy + dz * dz;
-            
-            if (r2 < cutoff_sq) {
-                nlist.neighbors.push_back(j);
-                nlist.num_neighbors[i]++;
-                
-                // Limit neighbors
-                if (nlist.num_neighbors[i] >= 200) {
-                    break;
+        // Find cell for this particle
+        int ix = static_cast<int>(particles.x[i] / cell_size);
+        int iy = static_cast<int>(particles.y[i] / cell_size);
+        int iz = static_cast<int>(particles.z[i] / cell_size);
+        
+        // Apply boundary conditions
+        if (box.periodic_x) ix = (ix + local_nx) % local_nx;
+        else ix = std::max(0, std::min(ix, local_nx - 1));
+        if (box.periodic_y) iy = (iy + local_ny) % local_ny;
+        else iy = std::max(0, std::min(iy, local_ny - 1));
+        if (box.periodic_z) iz = (iz + local_nz) % local_nz;
+        else iz = std::max(0, std::min(iz, local_nz - 1));
+        
+        // Search neighboring cells
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int neighbor_ix = ix + dx;
+                    int neighbor_iy = iy + dy;
+                    int neighbor_iz = iz + dz;
+                    
+                    // Handle boundary conditions
+                    if (box.periodic_x) {
+                        neighbor_ix = (neighbor_ix + local_nx) % local_nx;
+                    } else if (neighbor_ix < 0 || neighbor_ix >= local_nx) {
+                        continue;
+                    }
+                    if (box.periodic_y) {
+                        neighbor_iy = (neighbor_iy + local_ny) % local_ny;
+                    } else if (neighbor_iy < 0 || neighbor_iy >= local_ny) {
+                        continue;
+                    }
+                    if (box.periodic_z) {
+                        neighbor_iz = (neighbor_iz + local_nz) % local_nz;
+                    } else if (neighbor_iz < 0 || neighbor_iz >= local_nz) {
+                        continue;
+                    }
+                    
+                    int neighbor_cell = neighbor_iz * local_nx * local_ny + neighbor_iy * local_nx + neighbor_ix;
+                    if (neighbor_cell < 0 || neighbor_cell >= total_cells) continue;
+                    
+                    // Check all particles in neighboring cell
+                    for (int j : local_cells[neighbor_cell]) {
+                        if (i == j) continue;
+                        
+                        Real dx_ij = particles.x[i] - particles.x[j];
+                        Real dy_ij = particles.y[i] - particles.y[j];
+                        Real dz_ij = particles.z[i] - particles.z[j];
+                        
+                        // Apply minimum image convention
+                        if (box.periodic_x) {
+                            if (dx_ij > box.lx * 0.5) dx_ij -= box.lx;
+                            else if (dx_ij < -box.lx * 0.5) dx_ij += box.lx;
+                        }
+                        if (box.periodic_y) {
+                            if (dy_ij > box.ly * 0.5) dy_ij -= box.ly;
+                            else if (dy_ij < -box.ly * 0.5) dy_ij += box.ly;
+                        }
+                        if (box.periodic_z) {
+                            if (dz_ij > box.lz * 0.5) dz_ij -= box.lz;
+                            else if (dz_ij < -box.lz * 0.5) dz_ij += box.lz;
+                        }
+                        
+                        Real r2 = dx_ij * dx_ij + dy_ij * dy_ij + dz_ij * dz_ij;
+                        
+                        if (r2 < cutoff_sq) {
+                            if (debug_level(3)) {
+                                std::cout << "Adding neighbor " << j << " for particle " << i 
+                                          << " with distance squared: " << r2 << std::endl;
+                            }
+                            nlist.neighbors.push_back(j);
+                            nlist.num_neighbors[i]++;
+                            
+                            // Limit neighbors to avoid memory issues
+                            if (nlist.num_neighbors[i] >= 200) {
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (nlist.num_neighbors[i] >= 200) break;
                 }
+                if (nlist.num_neighbors[i] >= 200) break;
             }
+            if (nlist.num_neighbors[i] >= 200) break;
         }
     }
 }

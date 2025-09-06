@@ -31,7 +31,8 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
                                int* neighbor_offset,
                                Real* epsilon, Real* sigma,
                                int num_particles, Real cutoff,
-                               int max_neighbors_total) {
+                               int max_neighbors_total,
+                               Real box_x, Real box_y, Real box_z) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_particles) return;
     
@@ -54,6 +55,15 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
         Real dx = xi - x[j];
         Real dy = yi - y[j];
         Real dz = zi - z[j];
+        
+        // Apply periodic boundary conditions
+        if (dx > box_x * 0.5) dx -= box_x;
+        else if (dx < -box_x * 0.5) dx += box_x;
+        if (dy > box_y * 0.5) dy -= box_y;
+        else if (dy < -box_y * 0.5) dy += box_y;
+        if (dz > box_z * 0.5) dz -= box_z;
+        else if (dz < -box_z * 0.5) dz += box_z;
+        
         Real r2 = dx*dx + dy*dy + dz*dz;
         
         if (r2 < cutoff*cutoff && r2 > 0.0) {
@@ -87,7 +97,8 @@ __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
                                     Real* charge, int* neighbors, int* num_neighbors,
                                     int* neighbor_offset,
                                     int num_particles, Real cutoff,
-                                    int max_neighbors_total) {
+                                    int max_neighbors_total,
+                                    Real box_x, Real box_y, Real box_z) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_particles) return;
     
@@ -113,6 +124,15 @@ __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
         Real dx = xi - x[j];
         Real dy = yi - y[j];
         Real dz = zi - z[j];
+        
+        // Apply periodic boundary conditions
+        if (dx > box_x * 0.5) dx -= box_x;
+        else if (dx < -box_x * 0.5) dx += box_x;
+        if (dy > box_y * 0.5) dy -= box_y;
+        else if (dy < -box_y * 0.5) dy += box_y;
+        if (dz > box_z * 0.5) dz -= box_z;
+        else if (dz < -box_z * 0.5) dz += box_z;
+        
         Real r2 = dx*dx + dy*dy + dz*dz;
         
         if (r2 < cutoff*cutoff && r2 > 0.0) {
@@ -140,14 +160,16 @@ void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
                                  Real* d_epsilon, Real* d_sigma,
                                  int num_particles, Real cutoff,
                                  int max_neighbors_total,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream,
+                                 Real box_x, Real box_y, Real box_z) {
     int blockSize = 256;
     int gridSize = (num_particles + blockSize - 1) / blockSize;
     
     lj_force_kernel<<<gridSize, blockSize, 0, stream>>>(
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
         d_neighbors, d_num_neighbors, d_neighbor_offset,
-        d_epsilon, d_sigma, num_particles, cutoff, max_neighbors_total
+        d_epsilon, d_sigma, num_particles, cutoff, max_neighbors_total,
+        box_x, box_y, box_z
     );
 }
 
@@ -157,14 +179,16 @@ void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                                       int* d_neighbor_offset,
                                       int num_particles, Real cutoff,
                                       int max_neighbors_total,
-                                      cudaStream_t stream) {
+                                      cudaStream_t stream,
+                                      Real box_x, Real box_y, Real box_z) {
     int blockSize = 256;
     int gridSize = (num_particles + blockSize - 1) / blockSize;
     
     coulomb_force_kernel<<<gridSize, blockSize, 0, stream>>>(
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
         d_charge, d_neighbors, d_num_neighbors, d_neighbor_offset,
-        num_particles, cutoff, max_neighbors_total
+        num_particles, cutoff, max_neighbors_total,
+        box_x, box_y, box_z
     );
 }
 

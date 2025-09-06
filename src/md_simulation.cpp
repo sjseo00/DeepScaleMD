@@ -164,7 +164,7 @@ void MDSimulation::initialize(const std::string& config_file) {
     } else if (neighbor_list_type_str == "cell_list") {
         nlist_type = NeighborListType::OPTIMIZED_CELL_LIST;
         if (system->get_rank() == 0 && debug_level(1)) {
-            std::cout << "Using traditional cell list neighbor list" << std::endl;
+            std::cout << "Using optimized cell list neighbor list" << std::endl;
         }
     } else if (neighbor_list_type_str == "tiled") {
         nlist_type = NeighborListType::TILED_CELL_LIST;
@@ -245,9 +245,6 @@ void MDSimulation::single_step() {
     
     // Update kinetic energy after velocity update and thermostat application
     if (force_calc) {
-        if (system->get_rank() == 0 && current_step % 10 == 0) {
-            std::cout << "Updating KE after integration at step " << current_step << std::endl;
-        }
         force_calc->calculate_kinetic_energy(*system);
     }
     
@@ -355,6 +352,7 @@ void MDSimulation::output_results(int step, double step_time_ms) {
         ParticleData& particles = system->get_particles();
         
         // Calculate speed-related values and get energies
+        /* Sj debug : comment out
         for (size_t i = 0; i < particles.num_particles; i++) {
             Real v2 = particles.vx[i] * particles.vx[i] + 
                       particles.vy[i] * particles.vy[i] + 
@@ -363,7 +361,7 @@ void MDSimulation::output_results(int step, double step_time_ms) {
             total_speed += speed;
             if (speed > max_speed) max_speed = speed;
         }
-        
+        */
         if (force_calc) {
             total_ke = force_calc->get_kinetic_energy();
             total_pe = force_calc->get_potential_energy();
@@ -379,38 +377,27 @@ void MDSimulation::output_results(int step, double step_time_ms) {
         }
         
         // Calculate max force
+        /* Sj debug : comment out
         for (size_t i = 0; i < std::min(particles.num_particles, size_t(100)); i++) {
             Real f2 = particles.fx[i]*particles.fx[i] + particles.fy[i]*particles.fy[i] + particles.fz[i]*particles.fz[i];
             Real f_mag = std::sqrt(f2);
             if (f_mag > max_force) max_force = f_mag;
         }
-        
+        */
+
         Real avg_speed = total_speed / particles.num_particles;
         Real temperature = 0.0;
         if (particles.num_particles > 0) {
-            // Simple temperature calculation for MD units (amu, Å/ps, K)
-            // T = 2*KE / (3*N*kB) where KE is in amu·(Å/ps)²
-            // Use standard MD conversion factor
-            temperature = 2.0 * total_ke / (3.0 * particles.num_particles) * 120.272; // MD unit conversion
+                // Temperature calculation for 'real' units (kcal/mol, LAMMPS convention)
+                // T = (2 * KE) / (3 * N * kB), KE in kcal/mol, kB = 0.0019872041 kcal/(mol·K)
+                constexpr double kB_kcal = 0.0019872041; // Boltzmann constant in kcal/(mol·K)
+                temperature = (2.0 * total_ke) / (3.0 * particles.num_particles * kB_kcal);
         }
         
         // Determine when to output based on debug level and frequency
         bool should_output = false;
         bool include_timing = false;
-        
-        if (debug_level(2)) {
-            // Debug level 2: based on output_freq, include timing info
-            should_output = (step % output_freq == 0);
-            include_timing = true;
-        } else if (debug_level(1)) {
-            // Debug level 1: only step 0, basic info only
-            should_output = (step == 0);
-            include_timing = false;
-        } else {
-            // Non-debug mode: based on output_freq
-            should_output = (step % output_freq == 0);
-            include_timing = false;
-        }
+        should_output = (step % output_freq == 0);
         
         if (should_output) {
             // Parse output_info and build output string
@@ -420,9 +407,18 @@ void MDSimulation::output_results(int step, double step_time_ms) {
             bool first = true;
             
             while (std::getline(ss, item, ',')) {
-                // Trim whitespace
-                item.erase(0, item.find_first_not_of(" \t"));
-                item.erase(item.find_last_not_of(" \t") + 1);
+                // Trim all whitespace (space, tab, newline, carriage return) from both ends
+                auto trim = [](std::string& s) {
+                    const char* ws = " \t\n\r";
+                    size_t start = s.find_first_not_of(ws);
+                    if (start == std::string::npos) {
+                        s.clear();
+                        return;
+                    }
+                    size_t end = s.find_last_not_of(ws);
+                    s = s.substr(start, end - start + 1);
+                };
+                trim(item);
                 
                 if (!first) output << ", ";
                 first = false;
@@ -432,9 +428,9 @@ void MDSimulation::output_results(int step, double step_time_ms) {
                 } else if (item == "T") {
                     output << "T = " << std::fixed << std::setprecision(3) << temperature << " K";
                 } else if (item == "KE") {
-                    output << "KE = " << std::setprecision(3) << total_ke;
+                    output << "KE = " << std::setprecision(8) << total_ke;
                 } else if (item == "PE") {
-                    output << "PE = " << std::setprecision(3) << total_pe;
+                    output << "PE = " << std::setprecision(8) << total_pe;
                 } else if (item == "AVG_SPD") {
                     output << "Avg Speed = " << std::setprecision(3) << avg_speed;
                 } else if (item == "MAX_SPD") {
@@ -455,6 +451,7 @@ void MDSimulation::output_results(int step, double step_time_ms) {
         }
         
         // Write trajectory (simplified)
+        /* SJ: implement later....
         if (step % 1000 == 0) {
             std::string filename = "trajectory_" + std::to_string(step) + ".xyz";
             std::ofstream traj_file(filename);
@@ -465,6 +462,7 @@ void MDSimulation::output_results(int step, double step_time_ms) {
                 traj_file << "C " << particles.x[i] << " " << particles.y[i] << " " << particles.z[i] << "\n";
             }
         }
+        */
     }
 }
 
@@ -503,6 +501,7 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     std::string line;
     std::string current_section = "";
     
+
     while (std::getline(file, line)) {
         // Remove inline comments (everything after # character)
         size_t comment_pos = line.find('#');

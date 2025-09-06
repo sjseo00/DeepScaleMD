@@ -1,0 +1,13 @@
+# LAMMPS input for LJ 32,000 particles (CHARMM style)
+units           real
+atom_style      atomic
+boundary        p p p
+read_data       coordinates.xyz
+pair_style      lj/charmm/coul/long 10.0 12.0
+pair_coeff      * * 0.238 3.4
+kspace_style    pppm 1.0e-4
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes
+thermo          100
+thermo_style    custom step temp etotal press
+# Ensemble 설정은 in.nve, in.nvt, in.npt 파일에서 fix 명령으로 지정

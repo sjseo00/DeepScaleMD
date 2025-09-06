@@ -1,0 +1,68 @@
+# ============================================================================
+# Custom MD Simulation Configuration File
+# Simple Lennard-Jones System (32,000 particles)
+# ============================================================================
+
+
+# Basic simulation parameters (required)
+coordinate_file: "coordinates.xyz"
+topology_file: "topology.top"
+target_temperature: 300.0
+timestep: 1.0      # 1 fs (LAMMPS units real)
+total_steps: 100  # LAMMPS run 10000
+
+
+# Simulation box parameters
+box_x: 320.0
+box_y: 320.0
+box_z: 320.0
+periodic_x: true
+periodic_y: true
+periodic_z: true
+
+
+# Output configuration
+output_prefix: "simulation"
+trajectory_output_freq: 100
+output_freq: 1
+output_info: STEP, T, KE, PE
+
+
+# Force calculation parameters
+cutoff_distance: 12.0
+
+# Neighbor list configuration
+neighbor_list_type: "cell_list"       # or "morton_hilbert" (Morton/Hilbert, CUDA only)
+neighbor_list_tile_size: 32
+neighbor_list_update_freq: 10
+
+
+# Integration method
+integrator: "velocity_verlet"
+
+
+# Thermostat (disabled for NVE simulation)
+thermostat: "none"
+
+
+# Barostat (disabled for NVE simulation)
+barostat: "none"
+
+
+# Force calculation section
+force_calculation:
+  neighbor_list: "cell_list"
+  update_frequency: 10
+  mode: "builtin"
+
+
+# Built-in force field parameters (when mode: "builtin")
+builtin_enable_lennard_jones: "true"
+builtin_enable_coulomb: "false"
+builtin_enable_bonds: "false"
+builtin_enable_angles: "false"
+builtin_enable_dihedrals: "false"
+
+# Python force interface (disabled)
+# python_force_enabled: false        # or true (Enable Python forces)
+# python_force_path: "python_force/" # or "custom_forces/" (Path to Python modules)
