@@ -40,8 +40,7 @@ extern "C" {
 
 // Note: CUDA kernels are defined in barostat_kernels.cu
 #endif
-
-const Real kb = 1.380649e-23; // Boltzmann constant
+const Real kb = 0.0019872041; // kcal/(mol·K)
 
 // Parrinello-Rahman Barostat
 ParrinelloRahmanBarostat::ParrinelloRahmanBarostat(Real press, Real mass) 

@@ -4,6 +4,7 @@
 #include "../include/topology.h"
 #include <iostream>
 #include <cmath>
+#include <chrono>
 #include <mpi.h>
 #include <iomanip>
 
@@ -45,19 +46,19 @@ void ForceCalculatorCPU::compute_forces(MDSystem& system) {
     
     // Compute different force contributions based on configuration
     if (force_config.enable_bonds) {
-        compute_bond_forces(system);         // Bonded interactions
+            compute_bond_forces(system);         // Bonded interactions
     }
     if (force_config.enable_angles) {
         compute_angle_forces(system);        // Angle bending forces  
     }
     if (force_config.enable_dihedrals) {
-        compute_dihedral_forces(system);     // Torsional forces
+            compute_dihedral_forces(system);     // Torsional forces
     }
     if (force_config.enable_lennard_jones) {
-        compute_lj_forces(system);           // Van der Waals forces
+            compute_lj_forces(system);           // Van der Waals forces
     }
     if (force_config.enable_coulomb) {
-        compute_electrostatic_forces(system); // Coulomb electrostatic forces
+            compute_electrostatic_forces(system); // Coulomb electrostatic forces
     }
     
     // Sum total potential energy across all MPI ranks
@@ -152,7 +153,7 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
     
     // Debug helper (half-list: energy already single-counted)
     // std::cout << std::fixed << std::setprecision(8) << "LJ energy : " << last_potential_energy << std::endl;
-    
+                    
     // Communicate forces with neighbors using MPI (if needed)
     // The halo exchange and force reduction is typically handled by the MD system
     // For a complete implementation, we would need:

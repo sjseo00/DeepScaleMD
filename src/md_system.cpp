@@ -486,3 +486,256 @@ void MDSystem::compute_forces() {
     
     force_manager->compute_forces(*this);
 }
+
+// ============================================================================
+// Halo Exchange Implementation
+// ============================================================================
+
+void MDSystem::setup_neighbor_ranks() {
+#ifdef USE_MPI
+    // Create a 3D Cartesian topology for the MPI processes
+    int dims[3] = {0, 0, 0};
+    int periods[3] = {box.periodic_x ? 1 : 0, box.periodic_y ? 1 : 0, box.periodic_z ? 1 : 0};
+    
+    // Let MPI decide the optimal grid dimensions
+    MPI_Dims_create(size, 3, dims);
+    
+    MPI_Comm cart_comm;
+    MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, 1, &cart_comm);
+    
+    // Get the coordinates of this rank in the Cartesian grid
+    int coords[3];
+    MPI_Cart_coords(cart_comm, rank, 3, coords);
+    
+    // Calculate local domain boundaries
+    domain_min[0] = coords[0] * box.lx / dims[0];
+    domain_min[1] = coords[1] * box.ly / dims[1];
+    domain_min[2] = coords[2] * box.lz / dims[2];
+    
+    domain_max[0] = (coords[0] + 1) * box.lx / dims[0];
+    domain_max[1] = (coords[1] + 1) * box.ly / dims[1];
+    domain_max[2] = (coords[2] + 1) * box.lz / dims[2];
+    
+    // Identify neighbor ranks in all 26 directions
+    num_neighbors = 0;
+    for (int i = -1; i <= 1; i++) {
+        for (int j = -1; j <= 1; j++) {
+            for (int k = -1; k <= 1; k++) {
+                if (i == 0 && j == 0 && k == 0) continue; // Skip self
+                
+                int neighbor_coords[3] = {coords[0] + i, coords[1] + j, coords[2] + k};
+                int neighbor_rank;
+                
+                // MPI_Cart_rank returns MPI_PROC_NULL for out-of-bounds non-periodic
+                MPI_Cart_rank(cart_comm, neighbor_coords, &neighbor_rank);
+                
+                if (neighbor_rank != MPI_PROC_NULL) {
+                    neighbor_ranks[num_neighbors] = neighbor_rank;
+                    num_neighbors++;
+                }
+            }
+        }
+    }
+    
+    // Free the Cartesian communicator
+    MPI_Comm_free(&cart_comm);
+    
+#else
+    num_neighbors = 0;
+#endif
+}
+
+void MDSystem::identify_halo_particles() {
+#ifdef USE_MPI
+    halo_particles.clear();
+    
+    // Halo width = cutoff + verlet skin (if using Verlet list)
+    Real halo_width = physical_cutoff + 2.0; // Add 2.0 Å as default skin
+    
+    // Identify particles near domain boundaries that need to be sent
+    for (size_t i = 0; i < particles.num_particles; i++) {
+        Real x = particles.x[i];
+        Real y = particles.y[i];
+        Real z = particles.z[i];
+        
+        // Check if particle is within halo width of any boundary
+        bool in_halo = false;
+        
+        if (x < domain_min[0] + halo_width || x > domain_max[0] - halo_width) in_halo = true;
+        if (y < domain_min[1] + halo_width || y > domain_max[1] - halo_width) in_halo = true;
+        if (z < domain_min[2] + halo_width || z > domain_max[2] - halo_width) in_halo = true;
+        
+        if (in_halo) {
+            halo_particles.push_back(i);
+        }
+    }
+#endif
+}
+
+void MDSystem::exchange_halo_particles() {
+#ifdef USE_MPI
+    if (num_neighbors == 0) {
+        return;  // No neighbors, nothing to exchange
+    }
+    
+    // Resize neighbor_halos to store data from all neighbors
+    neighbor_halos.resize(num_neighbors);
+    
+    std::vector<MPI_Request> send_count_requests(num_neighbors);
+    std::vector<MPI_Request> recv_count_requests(num_neighbors);
+    std::vector<MPI_Request> send_data_requests;
+    std::vector<MPI_Request> recv_data_requests;
+    
+    std::vector<std::vector<Real>> send_buffers(num_neighbors);
+    std::vector<std::vector<Real>> recv_buffers(num_neighbors);
+    std::vector<int> send_counts(num_neighbors, 0);
+    std::vector<int> recv_counts(num_neighbors, 0);  // Persistent storage for recv counts
+    
+    // Step 1: Pack data for all neighbors
+    for (int n = 0; n < num_neighbors; n++) {
+        pack_halo_data(neighbor_ranks[n], send_buffers[n]);
+        send_counts[n] = send_buffers[n].size();
+    }
+    
+    // Step 2: Exchange counts using non-blocking communication
+    for (int n = 0; n < num_neighbors; n++) {
+        // Post non-blocking receive for count
+        MPI_Irecv(&recv_counts[n], 1, MPI_INT, neighbor_ranks[n], 
+                  rank * 1000 + 0, MPI_COMM_WORLD, &recv_count_requests[n]);
+        
+        // Post non-blocking send for count
+        MPI_Isend(&send_counts[n], 1, MPI_INT, neighbor_ranks[n], 
+                  neighbor_ranks[n] * 1000 + 0, MPI_COMM_WORLD, &send_count_requests[n]);
+    }
+    
+    // Step 3: Wait for count exchanges to complete
+    if (num_neighbors > 0) {
+        MPI_Waitall(num_neighbors, send_count_requests.data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(num_neighbors, recv_count_requests.data(), MPI_STATUSES_IGNORE);
+    }
+    
+    // Step 4: Post receives for actual data
+    for (int n = 0; n < num_neighbors; n++) {
+        if (recv_counts[n] > 0) {
+            recv_buffers[n].resize(recv_counts[n]);
+            MPI_Request req;
+            MPI_Irecv(recv_buffers[n].data(), recv_counts[n], MPI_DOUBLE, 
+                     neighbor_ranks[n], rank * 1000 + 1, MPI_COMM_WORLD, &req);
+            recv_data_requests.push_back(req);
+        }
+    }
+    
+    // Step 5: Send actual data
+    for (int n = 0; n < num_neighbors; n++) {
+        if (send_counts[n] > 0) {
+            MPI_Request req;
+            MPI_Isend(send_buffers[n].data(), send_counts[n], MPI_DOUBLE, 
+                     neighbor_ranks[n], neighbor_ranks[n] * 1000 + 1, 
+                     MPI_COMM_WORLD, &req);
+            send_data_requests.push_back(req);
+        }
+    }
+    
+    // Step 6: Wait for all data exchanges to complete
+    if (!recv_data_requests.empty()) {
+        MPI_Waitall(recv_data_requests.size(), recv_data_requests.data(), MPI_STATUSES_IGNORE);
+    }
+    if (!send_data_requests.empty()) {
+        MPI_Waitall(send_data_requests.size(), send_data_requests.data(), MPI_STATUSES_IGNORE);
+    }
+    
+    // Step 7: Unpack received data
+    for (int n = 0; n < num_neighbors; n++) {
+        if (recv_counts[n] > 0) {
+            unpack_halo_data(neighbor_ranks[n], recv_buffers[n]);
+        }
+    }
+    
+    if (debug_level(3)) {
+        std::cout << "Rank " << rank << ": Halo exchange completed" << std::endl;
+    }
+#endif
+}
+
+void MDSystem::pack_halo_data(int neighbor_rank, std::vector<Real>& buffer) {
+#ifdef USE_MPI
+    buffer.clear();
+    
+    // Calculate which particles to send to this specific neighbor
+    // For simplicity, we'll send all halo particles to all neighbors
+    // (more sophisticated implementation would check spatial locality)
+    
+    int num_to_send = halo_particles.size();
+    
+    // Buffer format: [num_particles, x1, y1, z1, vx1, vy1, vz1, mass1, charge1, type1, x2, ...]
+    // 9 values per particle (x, y, z, vx, vy, vz, mass, charge, type)
+    buffer.resize(1 + num_to_send * 9);
+    
+    buffer[0] = static_cast<Real>(num_to_send);
+    
+    for (int i = 0; i < num_to_send; i++) {
+        int idx = halo_particles[i];
+        int offset = 1 + i * 9;
+        
+        buffer[offset + 0] = particles.x[idx];
+        buffer[offset + 1] = particles.y[idx];
+        buffer[offset + 2] = particles.z[idx];
+        buffer[offset + 3] = particles.vx[idx];
+        buffer[offset + 4] = particles.vy[idx];
+        buffer[offset + 5] = particles.vz[idx];
+        buffer[offset + 6] = particles.mass[idx];
+        buffer[offset + 7] = particles.charge[idx];
+        buffer[offset + 8] = static_cast<Real>(particles.type[idx]);
+    }
+    
+#endif
+}
+
+void MDSystem::unpack_halo_data(int neighbor_rank, const std::vector<Real>& buffer) {
+#ifdef USE_MPI
+    if (buffer.empty()) return;
+    
+    int num_received = static_cast<int>(buffer[0]);
+    
+    // Find the neighbor index
+    int neighbor_idx = -1;
+    for (int n = 0; n < num_neighbors; n++) {
+        if (neighbor_ranks[n] == neighbor_rank) {
+            neighbor_idx = n;
+            break;
+        }
+    }
+    
+    if (neighbor_idx < 0) return;
+    
+    // Resize the neighbor halo data structure
+    neighbor_halos[neighbor_idx].resize(num_received);
+    
+    // Unpack particle data
+    for (int i = 0; i < num_received; i++) {
+        int offset = 1 + i * 9;
+        
+        neighbor_halos[neighbor_idx].x[i] = buffer[offset + 0];
+        neighbor_halos[neighbor_idx].y[i] = buffer[offset + 1];
+        neighbor_halos[neighbor_idx].z[i] = buffer[offset + 2];
+        neighbor_halos[neighbor_idx].vx[i] = buffer[offset + 3];
+        neighbor_halos[neighbor_idx].vy[i] = buffer[offset + 4];
+        neighbor_halos[neighbor_idx].vz[i] = buffer[offset + 5];
+        neighbor_halos[neighbor_idx].mass[i] = buffer[offset + 6];
+        neighbor_halos[neighbor_idx].charge[i] = buffer[offset + 7];
+        neighbor_halos[neighbor_idx].type[i] = static_cast<int>(buffer[offset + 8]);
+    }
+    
+#endif
+}
+
+void MDSystem::update_ghost_positions() {
+#ifdef USE_MPI
+    // This function would update only positions of ghost particles
+    // (used during MD integration when we don't need to re-exchange everything)
+    
+    // For now, this is a placeholder - typically called every timestep
+    // while full exchange_halo_particles() is called less frequently
+    
+#endif
+}

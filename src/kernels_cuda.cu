@@ -32,7 +32,8 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
                                Real* epsilon, Real* sigma,
                                int num_particles, Real cutoff,
                                int max_neighbors_total,
-                               Real box_x, Real box_y, Real box_z) {
+                               Real box_x, Real box_y, Real box_z,
+                               int num_local_particles) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_particles) return;
     
@@ -83,6 +84,14 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
             fxi += force_mag * dx;
             fyi += force_mag * dy;
             fzi += force_mag * dz;
+            
+            // Apply Newton's third law only for local-local pairs to avoid double counting
+            // In MPI mode, only apply if j is also a local particle
+            if (j < num_local_particles) {
+                atomicAdd(&fx[j], -force_mag * dx);
+                atomicAdd(&fy[j], -force_mag * dy);
+                atomicAdd(&fz[j], -force_mag * dz);
+            }
         }
         }
     }
@@ -98,7 +107,8 @@ __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
                                     int* neighbor_offset,
                                     int num_particles, Real cutoff,
                                     int max_neighbors_total,
-                                    Real box_x, Real box_y, Real box_z) {
+                                    Real box_x, Real box_y, Real box_z,
+                                    int num_local_particles) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_particles) return;
     
@@ -144,6 +154,14 @@ __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
             fxi += force_mag * dx;
             fyi += force_mag * dy;
             fzi += force_mag * dz;
+            
+            // Apply Newton's third law only for local-local pairs to avoid double counting
+            // In MPI mode, only apply if j is also a local particle
+            if (j < num_local_particles) {
+                atomicAdd(&fx[j], -force_mag * dx);
+                atomicAdd(&fy[j], -force_mag * dy);
+                atomicAdd(&fz[j], -force_mag * dz);
+            }
         }
         }
     }
@@ -161,7 +179,8 @@ void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
                                  int num_particles, Real cutoff,
                                  int max_neighbors_total,
                                  cudaStream_t stream,
-                                 Real box_x, Real box_y, Real box_z) {
+                                 Real box_x, Real box_y, Real box_z,
+                                 int num_local_particles) {
     int blockSize = 256;
     int gridSize = (num_particles + blockSize - 1) / blockSize;
     
@@ -169,7 +188,7 @@ void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
         d_neighbors, d_num_neighbors, d_neighbor_offset,
         d_epsilon, d_sigma, num_particles, cutoff, max_neighbors_total,
-        box_x, box_y, box_z
+        box_x, box_y, box_z, num_local_particles
     );
 }
 
@@ -180,7 +199,8 @@ void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                                       int num_particles, Real cutoff,
                                       int max_neighbors_total,
                                       cudaStream_t stream,
-                                      Real box_x, Real box_y, Real box_z) {
+                                      Real box_x, Real box_y, Real box_z,
+                                      int num_local_particles) {
     int blockSize = 256;
     int gridSize = (num_particles + blockSize - 1) / blockSize;
     
@@ -188,7 +208,7 @@ void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
         d_charge, d_neighbors, d_num_neighbors, d_neighbor_offset,
         num_particles, cutoff, max_neighbors_total,
-        box_x, box_y, box_z
+        box_x, box_y, box_z, num_local_particles
     );
 }
 

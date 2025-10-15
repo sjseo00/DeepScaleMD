@@ -68,9 +68,10 @@ void MDSimulation::initialize(const std::string& config_file) {
     // Set up domain decomposition after particles are loaded
     system->setup_domain_decomposition();
     
-    if (system->get_rank() == 0 && debug_level(2)) {
-        std::cout << "Domain decomposition completed" << std::endl;
-    }
+    // Set up neighbor ranks for halo exchange (MPI only)
+#ifdef USE_MPI
+    system->setup_neighbor_ranks();
+#endif
     
     // Load topology file from configuration and assign properties to particles
     if (!topology_file.empty()) {
@@ -193,13 +194,19 @@ void MDSimulation::initialize(const std::string& config_file) {
 }
 
 void MDSimulation::single_step() {
-    // Build neighbor list (periodically)
+    // Exchange halo particles more frequently than neighbor list rebuild
+    // This ensures ghost particles are up-to-date for force calculations
+#ifdef USE_MPI
+    // Exchange halo particles every few steps (at least every neighbor_list_update_freq/2 steps)
+    int halo_exchange_freq = std::max(1, neighbor_list_update_freq / 2);
+    if (current_step % halo_exchange_freq == 0) {
+        system->identify_halo_particles();
+        system->exchange_halo_particles();
+    }
+#endif
+    
+    // Build neighbor list less frequently
     if (current_step % neighbor_list_update_freq == 0) {
-        /*
-        if (system->get_rank() == 0) {
-            std::cout << "Building neighbor list at step " << current_step << std::endl;
-        }
-        */
         neighbor_builder->build(system->get_particles(), system->get_box(), 
                                system->get_neighbor_list());
     }
@@ -289,21 +296,36 @@ void MDSimulation::single_step() {
 }
 
 void MDSimulation::calculate_potential_energy() {
-    cached_potential_energy = 0.0;
+    Real local_pe = 0.0;
     const NeighborList& nlist = system->get_neighbor_list();
     const ForceFieldParams& ff_params = system->get_ff_params();
     const SimulationBox& box = system->get_box();
     ParticleData& particles = system->get_particles();
     
+#ifdef USE_MPI
+    // In MPI mode, only calculate PE for local particles to avoid double counting
+    size_t num_local = system->get_local_particles();
+#else
+    // In serial mode, calculate for all particles
+    size_t num_local = particles.num_particles;
+#endif
+    
     // Simple LJ potential energy calculation with PBC
     if (!ff_params.epsilon.empty() && !ff_params.sigma.empty()) {
-        for (size_t i = 0; i < nlist.num_neighbors.size(); i++) {
+        for (size_t i = 0; i < num_local; i++) {
             size_t start = (i == 0) ? 0 : nlist.num_neighbors[i-1];
             size_t end = nlist.num_neighbors[i];
             
             for (size_t idx = start; idx < end; idx++) {
                 size_t j = nlist.neighbors[idx];
-                if (i >= j) continue; // Avoid double counting
+                
+                // In MPI mode: only count pairs where i is local
+                // Count each pair only once (i < j for local-local, all for local-ghost)
+#ifdef USE_MPI
+                if (j < num_local && i >= j) continue; // Skip local-local pairs to avoid double counting
+#else
+                if (i >= j) continue; // In serial mode, avoid double counting
+#endif
                 
                 Real dx = particles.x[i] - particles.x[j];
                 Real dy = particles.y[i] - particles.y[j];
@@ -331,11 +353,18 @@ void MDSimulation::calculate_potential_energy() {
                     Real sr = sigma / r;
                     Real sr6 = sr * sr * sr * sr * sr * sr;
                     Real sr12 = sr6 * sr6;
-                    cached_potential_energy += 4.0 * epsilon * (sr12 - sr6);
+                    local_pe += 4.0 * epsilon * (sr12 - sr6);
                 }
             }
         }
     }
+    
+#ifdef USE_MPI
+    // Sum potential energy across all ranks
+    MPI_Allreduce(&local_pe, &cached_potential_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#else
+    cached_potential_energy = local_pe;
+#endif
 }
 
 void MDSimulation::run() {

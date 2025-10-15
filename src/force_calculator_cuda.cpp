@@ -258,6 +258,7 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
 
 void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
+    size_t total_particles = system.get_num_particles();
     NeighborList& nlist = system.get_neighbor_list();
     SimulationBox& box = system.get_box();
     
@@ -266,11 +267,12 @@ void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
     }
     
     // Use CUDA kernel for LJ force calculation
+    // Pass num_local_particles to kernel to prevent double counting in MPI mode
     launch_lj_kernel(d_x, d_y, d_z, d_fx, d_fy, d_fz,
                      d_neighbors, d_num_neighbors, d_neighbor_offset,
                      d_epsilon, d_sigma, local_particles, nlist.cutoff,
                      max_neighbors_allocated, stream,
-                     box.lx, box.ly, box.lz);
+                     box.lx, box.ly, box.lz, local_particles);
     
     // Check for CUDA errors
     cudaError_t err = cudaGetLastError();
@@ -320,11 +322,12 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_cuda(MDSystem& system) {
     
     // Launch Coulomb kernel with domain decomposition support
     // The kernel should only process local_particles, not total_particles
+    // Pass num_local_particles to kernel to prevent double counting in MPI mode
     SimulationBox& box = system.get_box();
     launch_coulomb_kernel(d_x, d_y, d_z, d_fx, d_fy, d_fz,
                          d_charge, d_neighbors, d_num_neighbors, d_neighbor_offset,
                          local_particles, nlist.cutoff, max_neighbors_allocated, stream,
-                         box.lx, box.ly, box.lz);
+                         box.lx, box.ly, box.lz, local_particles);
 }
 
 // Complete implementations for bond, angle, and dihedral forces

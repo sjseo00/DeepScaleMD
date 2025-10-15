@@ -51,8 +51,8 @@ extern "C" {
 
 // Note: CUDA kernels are defined in thermostat_kernels.cu
 #endif
-
-const Real kb = 1.380649e-23; // Boltzmann constant
+// kB = 0.0019872041 kcal/(mol·K) for units real
+const Real kB = 0.0019872041; // kcal/(mol·K)
 
 // Nose-Hoover Thermostat
 NoseHooverThermostat::NoseHooverThermostat(Real temp, Real mass) 

@@ -4,34 +4,39 @@
 #include <cuda_runtime.h>
 
 // GPU kernels for packing/unpacking particle data for MPI communication
-__global__ void pack_particles_kernel(Real* positions, Real* velocities, Real* masses,
+__global__ void pack_particles_kernel(Real* x, Real* y, Real* z, 
+                                     Real* vx, Real* vy, Real* vz,
+                                     Real* mass, Real* charge,
                                      int* indices, Real* buffer, int count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
     
     int particle_id = indices[idx];
-    buffer[idx * 7 + 0] = positions[particle_id * 3 + 0]; // x
-    buffer[idx * 7 + 1] = positions[particle_id * 3 + 1]; // y
-    buffer[idx * 7 + 2] = positions[particle_id * 3 + 2]; // z
-    buffer[idx * 7 + 3] = velocities[particle_id * 3 + 0]; // vx
-    buffer[idx * 7 + 4] = velocities[particle_id * 3 + 1]; // vy
-    buffer[idx * 7 + 5] = velocities[particle_id * 3 + 2]; // vz
-    buffer[idx * 7 + 6] = masses[particle_id]; // mass
+    buffer[idx * 8 + 0] = x[particle_id];
+    buffer[idx * 8 + 1] = y[particle_id]; 
+    buffer[idx * 8 + 2] = z[particle_id];
+    buffer[idx * 8 + 3] = vx[particle_id];
+    buffer[idx * 8 + 4] = vy[particle_id];
+    buffer[idx * 8 + 5] = vz[particle_id];
+    buffer[idx * 8 + 6] = mass[particle_id];
+    buffer[idx * 8 + 7] = charge[particle_id];
 }
 
-__global__ void unpack_particles_kernel(Real* positions, Real* velocities, Real* masses,
-                                       int* indices, Real* buffer, int count) {
+__global__ void unpack_particles_kernel(Real* x, Real* y, Real* z,
+                                       Real* vx, Real* vy, Real* vz,
+                                       Real* mass, Real* charge,
+                                       Real* buffer, int count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
     
-    int particle_id = indices[idx];
-    positions[particle_id * 3 + 0] = buffer[idx * 7 + 0]; // x
-    positions[particle_id * 3 + 1] = buffer[idx * 7 + 1]; // y
-    positions[particle_id * 3 + 2] = buffer[idx * 7 + 2]; // z
-    velocities[particle_id * 3 + 0] = buffer[idx * 7 + 3]; // vx
-    velocities[particle_id * 3 + 1] = buffer[idx * 7 + 4]; // vy
-    velocities[particle_id * 3 + 2] = buffer[idx * 7 + 5]; // vz
-    masses[particle_id] = buffer[idx * 7 + 6]; // mass
+    x[idx] = buffer[idx * 8 + 0];
+    y[idx] = buffer[idx * 8 + 1];
+    z[idx] = buffer[idx * 8 + 2];
+    vx[idx] = buffer[idx * 8 + 3];
+    vy[idx] = buffer[idx * 8 + 4];
+    vz[idx] = buffer[idx * 8 + 5];
+    mass[idx] = buffer[idx * 8 + 6];
+    charge[idx] = buffer[idx * 8 + 7];
 }
 
 __global__ void allreduce_forces_kernel(Real* local_forces, Real* global_forces, int num_particles) {
@@ -42,20 +47,24 @@ __global__ void allreduce_forces_kernel(Real* local_forces, Real* global_forces,
 }
 
 // Host wrapper functions to call kernels
-void launch_pack_particles_kernel(Real* positions, Real* velocities, Real* masses,
+void launch_pack_particles_kernel(Real* x, Real* y, Real* z,
+                                 Real* vx, Real* vy, Real* vz,
+                                 Real* mass, Real* charge,
                                  int* indices, Real* buffer, int count, cudaStream_t stream) {
     int blockSize = 256;
     int gridSize = (count + blockSize - 1) / blockSize;
     pack_particles_kernel<<<gridSize, blockSize, 0, stream>>>(
-        positions, velocities, masses, indices, buffer, count);
+        x, y, z, vx, vy, vz, mass, charge, indices, buffer, count);
 }
 
-void launch_unpack_particles_kernel(Real* positions, Real* velocities, Real* masses,
-                                   int* indices, Real* buffer, int count, cudaStream_t stream) {
+void launch_unpack_particles_kernel(Real* x, Real* y, Real* z,
+                                   Real* vx, Real* vy, Real* vz,
+                                   Real* mass, Real* charge,
+                                   Real* buffer, int count, cudaStream_t stream) {
     int blockSize = 256;
     int gridSize = (count + blockSize - 1) / blockSize;
     unpack_particles_kernel<<<gridSize, blockSize, 0, stream>>>(
-        positions, velocities, masses, indices, buffer, count);
+        x, y, z, vx, vy, vz, mass, charge, buffer, count);
 }
 
 void launch_allreduce_forces_kernel(Real* local_forces, Real* global_forces, 

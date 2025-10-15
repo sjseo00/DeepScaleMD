@@ -100,14 +100,81 @@ void CUDAMPISystem::free_halo_buffers() {
 
 void CUDAMPISystem::exchange_particles_gpu_direct() {
     if (!cuda_aware_mpi_available) {
-        // Fallback to CPU-based exchange - simplified version
-        std::cout << "CUDA-aware MPI not available, skipping GPU direct exchange" << std::endl;
+        // Fallback to CPU-based exchange using parent class implementation
+        if (is_rank_zero() && get_rank() == 0) {
+            std::cout << "CUDA-aware MPI not available, using CPU-based halo exchange" << std::endl;
+        }
+        exchange_halo_particles();  // Call parent class method
         return;
     }
     
-    // For now, simplified implementation - would need proper neighbor rank tracking
-    std::cout << "GPU direct particle exchange not yet fully implemented" << std::endl;
-    std::cout << "Would need to implement proper domain decomposition and neighbor tracking" << std::endl;
+    // GPU-direct exchange using CUDA-aware MPI
+    // First, identify halo particles (can use parent class method)
+    identify_halo_particles();
+    
+    const auto& halo_list = get_halo_particles();
+    int num_halo = halo_list.size();
+    
+    if (num_halo == 0) return;
+    
+    // Get particle data reference
+    ParticleData& particles = get_particles();
+    const int* neighbor_ranks_ptr = get_neighbor_ranks();
+    
+    // For CUDA-aware MPI, we would:
+    // 1. Copy halo particle data to GPU send buffer
+    // 2. Use MPI_Isend/Irecv directly on GPU pointers
+    // 3. Unpack received data on GPU
+    
+    // Simplified implementation: use CPU for now, GPU optimization can be added later
+    std::vector<MPI_Request> send_requests(get_num_neighbors());
+    std::vector<MPI_Request> recv_requests(get_num_neighbors());
+    std::vector<std::vector<Real>> send_buffers(get_num_neighbors());
+    std::vector<std::vector<Real>> recv_buffers(get_num_neighbors());
+    
+    // Post receives
+    for (int n = 0; n < get_num_neighbors(); n++) {
+        int recv_count;
+        MPI_Irecv(&recv_count, 1, MPI_INT, neighbor_ranks_ptr[n], 0, 
+                  MPI_COMM_WORLD, &recv_requests[n]);
+    }
+    
+    // Pack and send
+    std::vector<int> send_counts(get_num_neighbors(), 0);
+    for (int n = 0; n < get_num_neighbors(); n++) {
+        pack_halo_data(neighbor_ranks_ptr[n], send_buffers[n]);
+        send_counts[n] = send_buffers[n].size();
+        
+        MPI_Send(&send_counts[n], 1, MPI_INT, neighbor_ranks_ptr[n], 0, MPI_COMM_WORLD);
+        
+        if (send_counts[n] > 0) {
+            MPI_Isend(send_buffers[n].data(), send_counts[n], MPI_DOUBLE, 
+                     neighbor_ranks_ptr[n], 1, MPI_COMM_WORLD, &send_requests[n]);
+        }
+    }
+    
+    // Receive and unpack
+    for (int n = 0; n < get_num_neighbors(); n++) {
+        int recv_count;
+        MPI_Status status;
+        MPI_Wait(&recv_requests[n], &status);
+        MPI_Get_count(&status, MPI_INT, &recv_count);
+        
+        if (recv_count > 0) {
+            recv_buffers[n].resize(recv_count);
+            MPI_Recv(recv_buffers[n].data(), recv_count, MPI_DOUBLE, 
+                    neighbor_ranks_ptr[n], 1, MPI_COMM_WORLD, &status);
+            
+            unpack_halo_data(neighbor_ranks_ptr[n], recv_buffers[n]);
+        }
+    }
+    
+    // Wait for sends
+    for (int n = 0; n < get_num_neighbors(); n++) {
+        if (send_counts[n] > 0) {
+            MPI_Wait(&send_requests[n], MPI_STATUS_IGNORE);
+        }
+    }
 }
 
 void CUDAMPISystem::exchange_halo_async() {
@@ -160,7 +227,7 @@ void CUDAMPISystem::unpack_halo_particles_gpu(int neighbor_rank) {
     // Launch GPU kernel to unpack particles  
     // Implementation would depend on specific halo management logic
     std::cout << "Unpacking halo particles from rank " << neighbor_rank << " on GPU" << std::endl;
-    
+        
     // Example usage of kernel wrapper (when particle indices are available):
     // launch_unpack_particles_kernel(d_positions, d_velocities, d_masses,
     //                                d_halo_indices, d_recv_buffer, halo_count);

@@ -53,7 +53,8 @@ void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
                         int num_particles, Real cutoff,
                         int max_neighbors_total,
                         cudaStream_t stream,
-                        Real box_x, Real box_y, Real box_z);
+                        Real box_x, Real box_y, Real box_z,
+                        int num_local_particles);
                         
 void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                             Real* d_fx, Real* d_fy, Real* d_fz,
@@ -62,7 +63,8 @@ void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                             int num_particles, Real cutoff,
                             int max_neighbors_total,
                             cudaStream_t stream,
-                            Real box_x, Real box_y, Real box_z);
+                            Real box_x, Real box_y, Real box_z,
+                            int num_local_particles);
 
 #endif // USE_CUDA
 

@@ -47,11 +47,15 @@ private:
 
 // CUDA kernel wrapper functions (implemented in cuda_mpi_kernels.cu)
 extern "C" {
-void launch_pack_particles_kernel(Real* positions, Real* velocities, Real* masses,
+void launch_pack_particles_kernel(Real* x, Real* y, Real* z,
+                                 Real* vx, Real* vy, Real* vz,
+                                 Real* mass, Real* charge,
                                  int* indices, Real* buffer, int count, cudaStream_t stream = 0);
 
-void launch_unpack_particles_kernel(Real* positions, Real* velocities, Real* masses,
-                                   int* indices, Real* buffer, int count, cudaStream_t stream = 0);
+void launch_unpack_particles_kernel(Real* x, Real* y, Real* z,
+                                   Real* vx, Real* vy, Real* vz,
+                                   Real* mass, Real* charge,
+                                   Real* buffer, int count, cudaStream_t stream = 0);
 
 void launch_allreduce_forces_kernel(Real* local_forces, Real* global_forces, 
                                    int num_particles, cudaStream_t stream = 0);
