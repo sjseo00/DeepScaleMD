@@ -13,12 +13,6 @@
 #include <sstream>
 #include <cmath>
 
-// Helper function to check if this is rank 0
-static bool is_rank_zero() {
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    return rank == 0;
-}
 
 MDSimulation::MDSimulation() : 
     coordinate_file(""),
@@ -31,6 +25,7 @@ MDSimulation::MDSimulation() :
     neighbor_list_type_str("cell_list"),
     neighbor_list_tile_size(256),
     neighbor_list_update_freq(10),  // Default update frequency: every 10 steps
+    verlet_skin(2.0),               // Default Verlet skin distance
     force_calculation_mode("builtin"),  // Default: use builtin force calculations
     integrator_type("verlet"),
     thermostat_type("none"),
@@ -40,6 +35,9 @@ MDSimulation::MDSimulation() :
     tau_p(1.0),
     output_freq(10),                     // Default: every 10 steps
     output_info("STEP, T, KE"),          // Default output info
+    trajectory_format("xyz"),            // Default: XYZ format
+    trajectory_include_velocities(false), // Default: no velocities
+    trajectory_include_forces(false),    // Default: no forces
     current_step(0), 
     total_steps(0), 
     dt(0.001), 
@@ -54,7 +52,7 @@ void MDSimulation::initialize(const std::string& config_file) {
     system = std::make_unique<MDSystem>();
     system->initialize_mpi();
     
-    if (system->get_rank() == 0 && debug_level(1)) {
+    if (system->get_rank() == 0) {
         std::cout << "Starting MD simulation initialization..." << std::endl;
     }
     
@@ -63,23 +61,7 @@ void MDSimulation::initialize(const std::string& config_file) {
     
     // Parse simulation parameters from config file
     parse_simulation_config(config_file);
-    
-    if (system->get_rank() == 0 && debug_level(2)) {
-        std::cout << "Configuration parsed successfully" << std::endl;
-        std::cout << "  Coordinate file: \"" << coordinate_file << "\"" << std::endl;
-        std::cout << "  Target temperature: " << target_temperature << " K" << std::endl;
-        std::cout << "  Timestep: " << dt << " ps" << std::endl;
-        std::cout << "  Total steps: " << total_steps << std::endl;
-        std::cout << "  Integrator: " << integrator_type << std::endl;
-        std::cout << "  Thermostat: " << thermostat_type << std::endl;
-        std::cout << "  Barostat: " << barostat_type << std::endl;
-        std::cout << "  Neighbor list type: " << neighbor_list_type_str << std::endl;
-        std::cout << "  Neighbor list update frequency: " << neighbor_list_update_freq << " steps" << std::endl;
-        std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
-        std::cout << "  Python force interface: " << (python_force_enabled ? "enabled" : "disabled") << std::endl;
-        std::cout << std::endl;
-    }
-    
+
     // Load coordinate file from configuration first
     system->load_coordinates(coordinate_file);
     
@@ -109,11 +91,11 @@ void MDSimulation::initialize(const std::string& config_file) {
     try {
         force_calc = std::make_unique<ForceCalculatorCUDA>();
         force_calc->initialize();
-        if (system->get_rank() == 0 && debug_level(1)) {
+        if (system->get_rank() == 0) {
             std::cout << "Using CUDA for force calculations" << std::endl;
         }
     } catch (const std::exception& e) {
-        if (system->get_rank() == 0 && debug_level(1)) {
+        if (system->get_rank() == 0) {
             std::cout << "CUDA initialization failed: " << e.what() << std::endl;
             std::cout << "Falling back to CPU force calculations" << std::endl;
         }
@@ -122,14 +104,14 @@ void MDSimulation::initialize(const std::string& config_file) {
     }
 #elif defined(USE_SYCL)
     force_calc = std::make_unique<ForceCalculatorSYCL>();
-    if (system->get_rank() == 0 && debug_level(1)) {
+    if (system->get_rank() == 0) {
         std::cout << "Using SYCL for force calculations" << std::endl;
     }
     force_calc->initialize();
 #else
     // CPU fallback
     force_calc = std::make_unique<ForceCalculatorCPU>();
-    if (system->get_rank() == 0 && debug_level(1)) {
+    if (system->get_rank() == 0) {
         std::cout << "Using CPU for force calculations" << std::endl;
     }
     force_calc->initialize();
@@ -148,47 +130,56 @@ void MDSimulation::initialize(const std::string& config_file) {
     Real cutoff = cutoff_distance; // Use configured cutoff distance
     
     // Parse neighbor list type
-    NeighborListType nlist_type = NeighborListType::OPTIMIZED_CELL_LIST; // Use optimized by default
+    NeighborListType nlist_type = NeighborListType::CELL_LIST; // Use basic cell list by default
     if (neighbor_list_type_str == "morton_hilbert") {
 #ifdef USE_CUDA
         nlist_type = NeighborListType::MORTON_HILBERT_CSR;
-        if (system->get_rank() == 0 && debug_level(1)) {
+        if (system->get_rank() == 0) {
             std::cout << "Using Morton/Hilbert neighbor list with CUDA optimization" << std::endl;
         }
 #else
-        if (system->get_rank() == 0 && debug_level(1)) {
-            std::cout << "Morton/Hilbert neighbor list requires CUDA. Falling back to optimized cell list." << std::endl;
+        if (system->get_rank() == 0) {
+            std::cout << "Morton/Hilbert neighbor list requires CUDA. Falling back to cell list." << std::endl;
         }
-        nlist_type = NeighborListType::OPTIMIZED_CELL_LIST;
+        nlist_type = NeighborListType::CELL_LIST;
 #endif
     } else if (neighbor_list_type_str == "cell_list") {
-        nlist_type = NeighborListType::OPTIMIZED_CELL_LIST;
-        if (system->get_rank() == 0 && debug_level(1)) {
-            std::cout << "Using optimized cell list neighbor list" << std::endl;
+        nlist_type = NeighborListType::CELL_LIST;
+        if (system->get_rank() == 0) {
+            std::cout << "Using cell list neighbor list" << std::endl;
         }
-    } else if (neighbor_list_type_str == "tiled") {
-        nlist_type = NeighborListType::TILED_CELL_LIST;
-        if (system->get_rank() == 0 && debug_level(1)) {
-            std::cout << "Using tiled cell list neighbor list" << std::endl;
+    } else if (neighbor_list_type_str == "verlet_list") {
+        nlist_type = NeighborListType::VERLET_LIST;
+        if (system->get_rank() == 0) {
+            std::cout << "Using Verlet list neighbor list with skin distance: " << verlet_skin << std::endl;
+        }
+    } else if (neighbor_list_type_str == "verlet_cell_list") {
+        nlist_type = NeighborListType::VERLET_CELL_LIST;
+        if (system->get_rank() == 0) {
+            std::cout << "Using Verlet-Cell hybrid neighbor list with skin distance: " << verlet_skin << std::endl;
         }
     } else {
-        if (system->get_rank() == 0 && debug_level(1)) {
-            std::cout << "Using optimized cell list neighbor list (default)" << std::endl;
+        if (system->get_rank() == 0) {
+            std::cout << "Unknown neighbor list type '" << neighbor_list_type_str 
+                      << "', using cell list (default)" << std::endl;
         }
+        nlist_type = NeighborListType::CELL_LIST;
     }
     
     // Set up neighbor list configuration based on type
     std::string nlist_config;
-    if (nlist_type == NeighborListType::OPTIMIZED_CELL_LIST) {
-        // For optimized cell list, use halo width (cutoff * 0.4 for better performance)
-        Real halo_width = cutoff * 0.4;
-        nlist_config = std::to_string(halo_width);
-    } else if (nlist_type == NeighborListType::TILED_CELL_LIST) {
-        // For tiled cell list, use tile size
-        nlist_config = std::to_string(neighbor_list_tile_size);
+    if (nlist_type == NeighborListType::CELL_LIST) {
+        // For cell list, use verlet_skin for stability (like verlet_cell_list)
+        nlist_config = std::to_string(verlet_skin);
+    } else if (nlist_type == NeighborListType::VERLET_LIST) {
+        // For Verlet list, use verlet_skin distance
+        nlist_config = std::to_string(verlet_skin);
+    } else if (nlist_type == NeighborListType::VERLET_CELL_LIST) {
+        // For Verlet-Cell hybrid, use verlet_skin distance
+        nlist_config = std::to_string(verlet_skin);
     } else {
-        // For other types, use tile size as general config
-        nlist_config = std::to_string(neighbor_list_tile_size);
+        // For Morton-Hilbert, use verlet_skin for stability
+        nlist_config = std::to_string(verlet_skin);
     }
     
     neighbor_builder = create_neighbor_list_builder(nlist_type, cutoff, nlist_config, system->get_rank());
@@ -204,39 +195,80 @@ void MDSimulation::initialize(const std::string& config_file) {
 void MDSimulation::single_step() {
     // Build neighbor list (periodically)
     if (current_step % neighbor_list_update_freq == 0) {
+        /*
+        if (system->get_rank() == 0) {
+            std::cout << "Building neighbor list at step " << current_step << std::endl;
+        }
+        */
         neighbor_builder->build(system->get_particles(), system->get_box(), 
                                system->get_neighbor_list());
     }
+    // Check if we're using Velocity-Verlet integrator
+    VelocityVerletIntegrator* vv_integrator = dynamic_cast<VelocityVerletIntegrator*>(integrator.get());
     
-    // Compute forces based on calculation mode
-    if (force_calculation_mode == "python" && python_interface) {
-        // Use Python for all force calculations
-        python_interface->compute_forces(system->get_particles(), system->get_ff_params(), 
-                                        system->get_neighbor_list());
-        // For now, PE calculation with Python forces is not implemented
-        cached_potential_energy = 0.0;
-    } else if (force_calculation_mode == "builtin" && force_calc) {
-        // Use built-in force calculator
-        force_calc->compute_forces(*system);
-        
-        // Energy is now calculated within force calculator
-    } else {
-        // Fallback to built-in if mode is invalid or interface not available
-        if (force_calc) {
+    if (!vv_integrator) {
+        // For non-Velocity-Verlet integrators: Force calculation first
+        // Compute forces based on calculation mode
+        if (force_calculation_mode == "python" && python_interface) {
+            // Use Python for all force calculations
+            python_interface->compute_forces(system->get_particles(), system->get_ff_params(), 
+                                            system->get_neighbor_list());
+            // For now, PE calculation with Python forces is not implemented
+            cached_potential_energy = 0.0;
+        } else if (force_calculation_mode == "builtin" && force_calc) {
+            // Use built-in force calculator
             force_calc->compute_forces(*system);
-            // Energy is now calculated within force calculator
-        }
-        if (system->get_rank() == 0 && force_calculation_mode == "python" && !python_interface) {
-            static bool warned = false;
-            if (!warned) {
-                std::cout << "Warning: Python force calculation requested but interface not available. Using built-in forces." << std::endl;
-                warned = true;
+        } else {
+            // Fallback to built-in if mode is invalid or interface not available
+            if (force_calc) {
+                force_calc->compute_forces(*system);
+            }
+            if (system->get_rank() == 0 && force_calculation_mode == "python" && !python_interface) {
+                static bool warned = false;
+                if (!warned) {
+                    std::cout << "Warning: Python force calculation requested but interface not available. Using built-in forces." << std::endl;
+                    warned = true;
+                }
             }
         }
+        
+        // Then integrate equations of motion
+        integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+    } else {
+        // For Velocity-Verlet: Position update first, then force calculation, then velocity completion
+        // Step 1: Position update (stores old forces for later velocity update)
+        vv_integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+        
+        // Step 2: Compute forces at new positions
+        if (force_calculation_mode == "python" && python_interface) {
+            // Use Python for all force calculations
+            python_interface->compute_forces(system->get_particles(), system->get_ff_params(), 
+                                            system->get_neighbor_list());
+            // For now, PE calculation with Python forces is not implemented
+            cached_potential_energy = 0.0;
+        } else if (force_calculation_mode == "builtin" && force_calc) {
+            // Use built-in force calculator
+            force_calc->compute_forces(*system);
+        } else {
+            // Fallback to built-in if mode is invalid or interface not available
+            if (force_calc) {
+                force_calc->compute_forces(*system);
+            }
+            if (system->get_rank() == 0 && force_calculation_mode == "python" && !python_interface) {
+                static bool warned = false;
+                if (!warned) {
+                    std::cout << "Warning: Python force calculation requested but interface not available. Using built-in forces." << std::endl;
+                    warned = true;
+                }
+            }
+        }
+        
+        // Step 3: Complete velocity update with new forces
+        vv_integrator->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
     }
-    
-    // Integrate equations of motion
-    integrator->integrate(system->get_particles(), dt, system->get_local_particles());
+
+    // Check for numerical instabilities and adjust timestep if needed
+    // check_energy_stability();
     
     // Apply thermostat
     if (thermostat) {
@@ -307,9 +339,8 @@ void MDSimulation::calculate_potential_energy() {
 }
 
 void MDSimulation::run() {
-    auto run_start = std::chrono::high_resolution_clock::now();
-    
-    if (system->get_rank() == 0 && debug_level(1)) {
+   
+    if (system->get_rank() == 0) {
         std::cout << "Starting MD simulation for " << total_steps << " steps" << std::endl;
     }
     
@@ -328,17 +359,6 @@ void MDSimulation::run() {
             MPI_Barrier(MPI_COMM_WORLD);
         }
     }
-    
-    auto run_end = std::chrono::high_resolution_clock::now();
-    
-    if (system->get_rank() == 0 && debug_level(2)) {
-        auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(run_end - run_start);
-        std::cout << "Total simulation time: " << total_duration.count() / 1000.0 << " seconds" << std::endl;
-    }
-    
-    if (system->get_rank() == 0 && debug_level(1)) {
-        std::cout << "MD simulation completed" << std::endl;
-    }
 }
 
 void MDSimulation::output_results(int step, double step_time_ms) {
@@ -351,17 +371,6 @@ void MDSimulation::output_results(int step, double step_time_ms) {
         Real total_pe = 0.0;  // Potential Energy
         ParticleData& particles = system->get_particles();
         
-        // Calculate speed-related values and get energies
-        /* Sj debug : comment out
-        for (size_t i = 0; i < particles.num_particles; i++) {
-            Real v2 = particles.vx[i] * particles.vx[i] + 
-                      particles.vy[i] * particles.vy[i] + 
-                      particles.vz[i] * particles.vz[i];
-            Real speed = std::sqrt(v2);
-            total_speed += speed;
-            if (speed > max_speed) max_speed = speed;
-        }
-        */
         if (force_calc) {
             total_ke = force_calc->get_kinetic_energy();
             total_pe = force_calc->get_potential_energy();
@@ -376,14 +385,6 @@ void MDSimulation::output_results(int step, double step_time_ms) {
             total_pe = cached_potential_energy; // Use cached value as fallback
         }
         
-        // Calculate max force
-        /* Sj debug : comment out
-        for (size_t i = 0; i < std::min(particles.num_particles, size_t(100)); i++) {
-            Real f2 = particles.fx[i]*particles.fx[i] + particles.fy[i]*particles.fy[i] + particles.fz[i]*particles.fz[i];
-            Real f_mag = std::sqrt(f2);
-            if (f_mag > max_force) max_force = f_mag;
-        }
-        */
 
         Real avg_speed = total_speed / particles.num_particles;
         Real temperature = 0.0;
@@ -396,7 +397,6 @@ void MDSimulation::output_results(int step, double step_time_ms) {
         
         // Determine when to output based on debug level and frequency
         bool should_output = false;
-        bool include_timing = false;
         should_output = (step % output_freq == 0);
         
         if (should_output) {
@@ -450,19 +450,11 @@ void MDSimulation::output_results(int step, double step_time_ms) {
             std::cout << output.str() << std::endl;
         }
         
-        // Write trajectory (simplified)
-        /* SJ: implement later....
-        if (step % 1000 == 0) {
-            std::string filename = "trajectory_" + std::to_string(step) + ".xyz";
-            std::ofstream traj_file(filename);
-            traj_file << particles.num_particles << "\n";
-            traj_file << "Step " << step << "\n";
-            
-            for (size_t i = 0; i < particles.num_particles; i++) {
-                traj_file << "C " << particles.x[i] << " " << particles.y[i] << " " << particles.z[i] << "\n";
-            }
+        // Write trajectory at specified frequency
+        if (step % trajectory_output_freq == 0) {
+            write_trajectory(step);
         }
-        */
+        
     }
 }
 
@@ -481,7 +473,7 @@ void MDSimulation::finalize() {
     
     MPI_Finalize();
     
-    if (system->get_rank() == 0) {
+    if (system->get_rank() == 0 && debug_level(2)) {
         std::cout << "MD simulation finalized" << std::endl;
     }
 }
@@ -534,24 +526,43 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         std::string key = line.substr(0, colon_pos);
         std::string value = line.substr(colon_pos + 1);
         
-        // Trim whitespace and indentation
-        key.erase(0, key.find_first_not_of(" \t"));
-        key.erase(key.find_last_not_of(" \t") + 1);
-        value.erase(0, value.find_first_not_of(" \t"));
-        value.erase(value.find_last_not_of(" \t") + 1);
+        // Trim whitespace and indentation (including \r and \n)
+        const char* ws = " \t\n\r";
+        
+        // Trim key
+        size_t key_start = key.find_first_not_of(ws);
+        if (key_start != std::string::npos) {
+            size_t key_end = key.find_last_not_of(ws);
+            key = key.substr(key_start, key_end - key_start + 1);
+        } else {
+            key.clear();
+        }
+        
+        // Trim value
+        size_t value_start = value.find_first_not_of(ws);
+        if (value_start != std::string::npos) {
+            size_t value_end = value.find_last_not_of(ws);
+            value = value.substr(value_start, value_end - value_start + 1);
+        } else {
+            value.clear();
+        }
         
         // Remove quotes from string values
         if (!value.empty() && value.front() == '"' && value.back() == '"') {
             value = value.substr(1, value.length() - 2);
+            // Trim again after removing quotes
+            size_t start = value.find_first_not_of(ws);
+            if (start != std::string::npos) {
+                size_t end = value.find_last_not_of(ws);
+                value = value.substr(start, end - start + 1);
+            } else {
+                value.clear();
+            }
         }
         
         // Parse simulation parameters based on section and key
         if (current_section == "force_calculation") {
-            if (key == "neighbor_list") {
-                neighbor_list_type_str = value;
-            } else if (key == "update_frequency") {
-                neighbor_list_update_freq = std::stoi(value);
-            } else if (key == "mode") {
+            if (key == "mode") {
                 force_calculation_mode = value;
             }
         } else if (key == "coordinate_file") {
@@ -572,6 +583,12 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             output_prefix = value;
         } else if (key == "trajectory_output_freq") {
             trajectory_output_freq = std::stoi(value);
+        } else if (key == "trajectory_format") {
+            trajectory_format = value;
+        } else if (key == "trajectory_include_velocities") {
+            trajectory_include_velocities = (value == "true");
+        } else if (key == "trajectory_include_forces") {
+            trajectory_include_forces = (value == "true");
         } else if (key == "energy_output_freq") {
             energy_output_freq = std::stoi(value);
         } else if (key == "output_freq") {
@@ -584,10 +601,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             cutoff_distance = std::stod(value);
         } else if (key == "neighbor_list_type") {
             neighbor_list_type_str = value;
-        } else if (key == "neighbor_list_tile_size") {
-            neighbor_list_tile_size = std::stoi(value);
         } else if (key == "neighbor_list_update_freq") {
             neighbor_list_update_freq = std::stoi(value);
+        } else if (key == "verlet_skin") {
+            verlet_skin = std::stod(value);
         } else if (key == "integrator") {
             integrator_type = value;
         } else if (key == "thermostat") {
@@ -637,11 +654,14 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         throw std::runtime_error("Invalid neighbor_list_update_freq: must be positive");
     }
     
+    // Set the physical cutoff in the system for force calculations
+    system->set_physical_cutoff(cutoff_distance);
+    
     if (system->get_rank() == 0) {
         std::cout << "Configuration loaded successfully:" << std::endl;
         std::cout << "  Coordinate file: " << coordinate_file << std::endl;
         std::cout << "  Target temperature: " << target_temperature << " K" << std::endl;
-        std::cout << "  Timestep: " << dt << " ps" << std::endl;
+        std::cout << "  Timestep: " << dt << " fs" << std::endl;
         std::cout << "  Total steps: " << total_steps << std::endl;
         std::cout << "  Integrator: " << integrator_type << std::endl;
         std::cout << "  Thermostat: " << thermostat_type << std::endl;
@@ -878,5 +898,181 @@ void MDSimulation::initialize_barostat() {
             std::cout << "Unknown barostat type '" << barostat_type 
                       << "', no barostat initialized" << std::endl;
         }
+    }
+}
+
+void MDSimulation::check_energy_stability() {
+    static Real last_total_energy = 0.0;
+    static bool first_check = true;
+    
+    if (!force_calc) return;
+    
+    Real kinetic_energy = force_calc->get_kinetic_energy();
+    Real potential_energy = force_calc->get_potential_energy();
+    Real total_energy = kinetic_energy + potential_energy;
+    
+    if (first_check) {
+        last_total_energy = total_energy;
+        first_check = false;
+        return;
+    }
+    
+    // Check for energy drift or sudden jumps
+    Real energy_change = std::abs(total_energy - last_total_energy);
+    Real relative_change = energy_change / std::abs(last_total_energy + 1e-10);
+    
+    // If energy change is more than 10% per step, something is wrong
+    if (relative_change > 0.1) {
+        if (system->get_rank() == 0 && debug_level(2)) {
+            std::cout << "Warning: Large energy change detected at step " << current_step 
+                      << " (ΔE/E = " << relative_change << ")" << std::endl;
+            std::cout << "  Previous total energy: " << last_total_energy << " kcal/mol" << std::endl;
+            std::cout << "  Current total energy:  " << total_energy << " kcal/mol" << std::endl;
+            std::cout << "  Kinetic energy:       " << kinetic_energy << " kcal/mol" << std::endl;
+            std::cout << "  Potential energy:     " << potential_energy << " kcal/mol" << std::endl;
+        }
+        
+        // Consider reducing timestep if energy is increasing rapidly
+        if (total_energy > last_total_energy * 1.05) { // More sensitive threshold
+            dt *= 0.5; // Reduce timestep by 50%
+            if (system->get_rank() == 0) {
+                std::cout << "  Reducing timestep to " << dt << " ps" << std::endl;
+            }
+            
+            // If timestep becomes too small, halt simulation
+            if (dt < 1e-6) {
+                if (system->get_rank() == 0) {
+                    std::cout << "ERROR: Timestep became too small (dt < 1e-6 ps). Simulation unstable!" << std::endl;
+                }
+                throw std::runtime_error("Simulation became numerically unstable");
+            }
+        }
+    }
+    
+    last_total_energy = total_energy;
+}
+
+// Trajectory output functions
+void MDSimulation::write_trajectory(int step) {
+    if (trajectory_format == "xyz") {
+        write_xyz_trajectory(step);
+    } else if (trajectory_format == "dump") {
+        write_lammps_dump(step);
+    } else if (trajectory_format == "both") {
+        write_xyz_trajectory(step);
+        write_lammps_dump(step);
+    }
+}
+
+void MDSimulation::write_xyz_trajectory(int step) {
+    if (system->get_rank() == 0) {
+        std::string filename = output_prefix + "_" + std::to_string(step) + ".xyz";
+        std::ofstream traj_file(filename);
+        
+        if (!traj_file.is_open()) {
+            std::cerr << "Warning: Cannot open trajectory file " << filename << std::endl;
+            return;
+        }
+        
+        ParticleData& particles = system->get_particles();
+        
+        // XYZ format header
+        traj_file << particles.num_particles << "\n";
+        traj_file << "Step " << step << " Time " << std::fixed << std::setprecision(3) 
+                  << step * dt << " fs";
+        
+        // Add energy information to comment line
+        if (force_calc) {
+            Real ke = force_calc->get_kinetic_energy();
+            Real pe = force_calc->get_potential_energy();
+            traj_file << " KE=" << std::setprecision(6) << ke 
+                      << " PE=" << pe << " Total=" << (ke + pe);
+        }
+        traj_file << "\n";
+        
+        // Particle coordinates
+        for (size_t i = 0; i < particles.num_particles; i++) {
+            // Use atom type or default to "C"
+            std::string atom_type = "C";  // Could be enhanced to read from topology
+            
+            traj_file << atom_type << " " 
+                      << std::fixed << std::setprecision(6) 
+                      << particles.x[i] << " " 
+                      << particles.y[i] << " " 
+                      << particles.z[i];
+            
+            // Optionally include velocities and forces
+            if (trajectory_include_velocities) {
+                traj_file << " " << particles.vx[i] << " " 
+                          << particles.vy[i] << " " << particles.vz[i];
+            }
+            
+            if (trajectory_include_forces) {
+                traj_file << " " << particles.fx[i] << " " 
+                          << particles.fy[i] << " " << particles.fz[i];
+            }
+            
+            traj_file << "\n";
+        }
+        
+        traj_file.close();
+    }
+}
+
+void MDSimulation::write_lammps_dump(int step) {
+    if (system->get_rank() == 0) {
+        std::string filename = output_prefix + "_dump." + std::to_string(step);
+        std::ofstream dump_file(filename);
+        
+        if (!dump_file.is_open()) {
+            std::cerr << "Warning: Cannot open dump file " << filename << std::endl;
+            return;
+        }
+        
+        ParticleData& particles = system->get_particles();
+        SimulationBox& box = system->get_box();
+        
+        // LAMMPS dump format header
+        dump_file << "ITEM: TIMESTEP\n" << step << "\n";
+        dump_file << "ITEM: NUMBER OF ATOMS\n" << particles.num_particles << "\n";
+        
+        // Box bounds (assuming orthorhombic box)
+        dump_file << "ITEM: BOX BOUNDS pp pp pp\n";
+        dump_file << "0.0 " << std::fixed << std::setprecision(6) << box.lx << "\n";
+        dump_file << "0.0 " << box.ly << "\n";
+        dump_file << "0.0 " << box.lz << "\n";
+        
+        // Atom data header
+        dump_file << "ITEM: ATOMS id type x y z";
+        if (trajectory_include_velocities) {
+            dump_file << " vx vy vz";
+        }
+        if (trajectory_include_forces) {
+            dump_file << " fx fy fz";
+        }
+        dump_file << "\n";
+        
+        // Atom data
+        for (size_t i = 0; i < particles.num_particles; i++) {
+            dump_file << (i + 1) << " " << particles.type[i] << " "
+                      << std::fixed << std::setprecision(6)
+                      << particles.x[i] << " " 
+                      << particles.y[i] << " " 
+                      << particles.z[i];
+            
+            if (trajectory_include_velocities) {
+                dump_file << " " << particles.vx[i] << " " 
+                          << particles.vy[i] << " " << particles.vz[i];
+            }
+            
+            if (trajectory_include_forces) {
+                dump_file << " " << particles.fx[i] << " " 
+                          << particles.fy[i] << " " << particles.fz[i];
+            }
+            
+            dump_file << "\n";
+        }
+        
+        dump_file.close();
     }
 }

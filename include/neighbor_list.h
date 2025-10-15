@@ -13,9 +13,9 @@
 
 enum class NeighborListType {
     CELL_LIST,
-    MORTON_HILBERT_CSR,
-    OPTIMIZED_CELL_LIST,
-    TILED_CELL_LIST
+    VERLET_LIST,
+    VERLET_CELL_LIST,
+    MORTON_HILBERT_CSR
 };
 
 class NeighborListBuilder {
@@ -31,15 +31,50 @@ public:
 class CellListNeighborBuilder : public NeighborListBuilder {
 private:
     Real cell_size;
+    Real verlet_skin;  // Skin distance for stability
     int nx, ny, nz;  // number of cells in each direction
-    std::vector<std::vector<int>> cells;
+    // CSR-style compressed cell -> particle mapping (always on)
+    std::vector<int> cell_offsets;   // size = num_cells + 1
+    std::vector<int> cell_particles; // flattened particle indices
     
 public:
-    CellListNeighborBuilder(Real cutoff);
+    CellListNeighborBuilder(Real cutoff, Real skin = 2.0);
     void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
     void initialize() override;
     void finalize() override;
     NeighborListType get_type() const override { return NeighborListType::CELL_LIST; }
+
+};
+
+// Simple Verlet list builder (all-pairs with cutoff)
+class VerletListNeighborBuilder : public NeighborListBuilder {
+private:
+    Real cutoff;
+    Real verlet_skin;
+    
+public:
+    VerletListNeighborBuilder(Real cutoff, Real skin = 2.0);
+    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
+    void initialize() override;
+    void finalize() override;
+    NeighborListType get_type() const override { return NeighborListType::VERLET_LIST; }
+};
+
+// Verlet list with cell-based acceleration (hybrid approach)
+class VerletCellListNeighborBuilder : public NeighborListBuilder {
+private:
+    Real cutoff;
+    Real cell_size;
+    Real verlet_skin;
+    int nx, ny, nz;
+    std::vector<std::vector<int>> cells;
+    
+public:
+    VerletCellListNeighborBuilder(Real cutoff, Real skin = 1.0);
+    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
+    void initialize() override;
+    void finalize() override;
+    NeighborListType get_type() const override { return NeighborListType::VERLET_CELL_LIST; }
 };
 
 #if defined(USE_CUDA) || defined(USE_SYCL)
@@ -48,6 +83,7 @@ public:
 class MortonHilbertNeighborBuilder : public NeighborListBuilder {
 private:
     Real cutoff;
+    Real verlet_skin;  // Skin distance for stability
     // int max_particles_per_tile;  // Currently unused
     int morton_levels;  // Depth of Morton curve subdivision
     
@@ -98,13 +134,13 @@ private:
     void restore_particle_order(ParticleData& particles);
     
     // CSR neighbor list construction
-    void build_csr_neighbor_list(ParticleData& particles, SimulationBox& box);
+    void build_csr_neighbor_list(ParticleData& particles, SimulationBox& box, int max_cap);
     
     // Tile staging for GPU optimization
     void create_tile_staging();
     
 public:
-    MortonHilbertNeighborBuilder(Real cutoff, int tile_size = 256);
+    MortonHilbertNeighborBuilder(Real cutoff, Real skin = 2.0, int tile_size = 256);
     void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
     void initialize() override;
     void finalize() override;

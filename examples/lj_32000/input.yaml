@@ -9,7 +9,7 @@ coordinate_file: "coordinates.xyz"
 topology_file: "topology.top"
 target_temperature: 300.0
 timestep: 1.0      # 1 fs (LAMMPS units real)
-total_steps: 100  # LAMMPS run 10000
+total_steps: 1000  # LAMMPS run 10000
 
 
 # Simulation box parameters
@@ -22,9 +22,12 @@ periodic_z: true
 
 
 # Output configuration
-output_prefix: "simulation"
+output_prefix: simulation
 trajectory_output_freq: 100
-output_freq: 1
+trajectory_format: xyz                # "xyz", "dump", or "both"
+trajectory_include_velocities: false  # Include velocities in trajectory
+trajectory_include_forces: false      # Include forces in trajectory
+output_freq: 100
 output_info: STEP, T, KE, PE
 
 
@@ -32,13 +35,20 @@ output_info: STEP, T, KE, PE
 cutoff_distance: 12.0
 
 # Neighbor list configuration
-neighbor_list_type: "cell_list"       # or "morton_hilbert" (Morton/Hilbert, CUDA only)
-neighbor_list_tile_size: 32
-neighbor_list_update_freq: 10
+neighbor_list_type: "verlet_cell_list"
+#neighbor_list_type: "verlet_list"
+#neighbor_list_type: "cell_list"
+#neighbor_list_type: "morton_hilbert"
 
+
+verlet_skin: 2.0                          # Verlet list skin distance (for Verlet lists)
+neighbor_list_update_freq: 2                     # More frequent rebuild to prevent divergence
 
 # Integration method
-integrator: "velocity_verlet"
+#integrator: "velocity_verlet"
+#integrator: "verlet"
+integrator: "leapfrog"
+#integrator: "r_respa"
 
 
 # Thermostat (disabled for NVE simulation)
@@ -51,18 +61,13 @@ barostat: "none"
 
 # Force calculation section
 force_calculation:
-  neighbor_list: "cell_list"
-  update_frequency: 10
   mode: "builtin"
-
-
-# Built-in force field parameters (when mode: "builtin")
-builtin_enable_lennard_jones: "true"
-builtin_enable_coulomb: "false"
-builtin_enable_bonds: "false"
-builtin_enable_angles: "false"
-builtin_enable_dihedrals: "false"
+  enable_bonds: false
+  enable_angles: false
+  enable_dihedrals: false
+  enable_lennard_jones: true
+  enable_coulomb: false
 
 # Python force interface (disabled)
-# python_force_enabled: false        # or true (Enable Python forces)
+# python_enabled: false        # or true (Enable Python forces)
 # python_force_path: "python_force/" # or "custom_forces/" (Path to Python modules)

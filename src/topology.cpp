@@ -163,7 +163,7 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
         }
     }
     
-    if (rank == 0 && debug_level(1)) {
+    if (rank == 0) {
         std::cout << "Topology loaded successfully:" << std::endl;
         std::cout << "  Atom types: " << atom_types.size() << std::endl;
         std::cout << "  Atoms: " << atom_type_names.size() << std::endl;

@@ -129,22 +129,44 @@ void ForceCalculatorSYCL::compute_forces(MDSystem& system) {
     last_potential_energy = 0.0;
     last_kinetic_energy = 0.0;
     
-    // Compute different force contributions
-    compute_bond_forces_sycl(system);
-    compute_angle_forces_sycl(system);
-    compute_dihedral_forces_sycl(system);
+    // Get force field configuration from force manager
+    ForceManager& force_manager = system.get_force_manager();
+    const auto& force_config = force_manager.get_config();
     
-    if (use_csr_format) {
-        compute_lj_forces_csr_sycl(system);
-        std::cout << "Using CSR-optimized SYCL force calculation" << std::endl;
-    } else {
-        compute_lj_forces_sycl(system);
+    // Compute different force contributions based on configuration
+    if (force_config.enable_bonds) {
+        compute_bond_forces_sycl(system);
     }
-    compute_electrostatic_forces_sycl(system);
+    if (force_config.enable_angles) {
+        compute_angle_forces_sycl(system);
+    }
+    if (force_config.enable_dihedrals) {
+        compute_dihedral_forces_sycl(system);
+    }
+    
+    if (force_config.enable_lennard_jones) {
+        if (use_csr_format) {
+            compute_lj_forces_csr_sycl(system);
+            std::cout << "Using CSR-optimized SYCL force calculation" << std::endl;
+        } else {
+            compute_lj_forces_sycl(system);
+        }
+    }
+    
+    if (force_config.enable_coulomb) {
+        compute_electrostatic_forces_sycl(system);
+    }
     
     // KE will be calculated after integration
     
     copy_from_device(system);
+    
+    // Sum total potential energy across all MPI ranks
+#ifdef USE_MPI
+    Real global_pe = 0.0;
+    MPI_Allreduce(&last_potential_energy, &global_pe, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    last_potential_energy = global_pe;
+#endif
 }
 
 void ForceCalculatorSYCL::compute_lj_forces_sycl(MDSystem& system) {

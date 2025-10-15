@@ -137,7 +137,6 @@ void AndersenBarostat::apply(ParticleData& particles, SimulationBox& box, Real d
     
     // Get global kinetic energy via MPI reduction
     Real global_kinetic_energy = mpi_allreduce_sum_barostat(local_kinetic_energy);
-    Real global_mass_sum = mpi_allreduce_sum_barostat(local_mass_sum);
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;

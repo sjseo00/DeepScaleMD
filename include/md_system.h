@@ -21,6 +21,9 @@ private:
     std::unique_ptr<Topology> topology;
     std::unique_ptr<ForceManager> force_manager;
     
+    // Physical parameters
+    Real physical_cutoff;  // Physical cutoff distance (without skin)
+    
     // MPI variables
     int rank, size;
     int local_start, local_end;
@@ -70,6 +73,8 @@ public:
     int get_rank() const { return rank; }
     int get_size() const { return size; }
     bool using_gpu() const { return use_gpu; }
+    Real get_physical_cutoff() const { return physical_cutoff; }
+    void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
 };
 
 #endif // MD_SYSTEM_H

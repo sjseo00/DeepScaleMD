@@ -223,16 +223,37 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     last_potential_energy = 0.0;
     last_kinetic_energy = 0.0;
     
-    // Compute different force contributions
-    compute_bond_forces_cuda(system);
-    compute_angle_forces_cuda(system);
-    compute_dihedral_forces_cuda(system);
-    compute_lj_forces_cuda(system);
-    compute_electrostatic_forces_cuda(system);
+    // Get force field configuration from force manager
+    ForceManager& force_manager = system.get_force_manager();
+    const auto& force_config = force_manager.get_config();
+    
+    // Compute different force contributions based on configuration
+    if (force_config.enable_bonds) {
+        compute_bond_forces_cuda(system);
+    }
+    if (force_config.enable_angles) {
+        compute_angle_forces_cuda(system);
+    }
+    if (force_config.enable_dihedrals) {
+        compute_dihedral_forces_cuda(system);
+    }
+    if (force_config.enable_lennard_jones) {
+        compute_lj_forces_cuda(system);
+    }
+    if (force_config.enable_coulomb) {
+        compute_electrostatic_forces_cuda(system);
+    }
     
     // KE will be calculated after integration
     
     copy_from_device(system);
+    
+    // Sum total potential energy across all MPI ranks
+#ifdef USE_MPI
+    Real global_pe = 0.0;
+    MPI_Allreduce(&last_potential_energy, &global_pe, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    last_potential_energy = global_pe;
+#endif
 }
 
 void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
@@ -348,8 +369,13 @@ void ForceCalculatorCUDA::compute_bond_forces_cuda(MDSystem& system) {
         Real r = std::sqrt(dx*dx + dy*dy + dz*dz);
         
         if (r > 1e-10) {
-            Real dr = r - bond.equilibrium_length;
-            Real force_mag = -2.0 * bond.force_constant * dr / r;
+            // Get bond type parameters
+            const BondType& bond_type = topology.get_bond_type(bond.type);
+            Real equilibrium_length = bond_type.r0;
+            Real force_constant = bond_type.k;
+            
+            Real dr = r - equilibrium_length;
+            Real force_mag = -2.0 * force_constant * dr / r;
             
             Real fx = force_mag * dx;
             Real fy = force_mag * dy;
@@ -368,7 +394,7 @@ void ForceCalculatorCUDA::compute_bond_forces_cuda(MDSystem& system) {
             }
             
             // Add to potential energy
-            Real bond_pe = bond.force_constant * dr * dr;
+            Real bond_pe = force_constant * dr * dr;
             last_potential_energy += bond_pe;
         }
     }
@@ -433,9 +459,15 @@ void ForceCalculatorCUDA::compute_angle_forces_cuda(MDSystem& system) {
             cos_theta = std::max(-1.0, std::min(1.0, cos_theta)); // Clamp to [-1,1]
             
             Real theta = std::acos(cos_theta);
-            Real dtheta = theta - angle.equilibrium_angle;
             
-            Real dE_dtheta = -2.0 * angle.force_constant * dtheta;
+            // Get angle type parameters
+            const AngleType& angle_type = topology.get_angle_type(angle.type);
+            Real equilibrium_angle = angle_type.theta0;
+            Real force_constant = angle_type.k;
+            
+            Real dtheta = theta - equilibrium_angle;
+            
+            Real dE_dtheta = -2.0 * force_constant * dtheta;
             Real sin_theta = std::sin(theta);
             
             if (std::abs(sin_theta) > 1e-10) {
@@ -471,7 +503,7 @@ void ForceCalculatorCUDA::compute_angle_forces_cuda(MDSystem& system) {
                 }
                 
                 // Add to potential energy
-                Real angle_pe = angle.force_constant * dtheta * dtheta;
+                Real angle_pe = force_constant * dtheta * dtheta;
                 last_potential_energy += angle_pe;
             }
         }
@@ -560,13 +592,19 @@ void ForceCalculatorCUDA::compute_dihedral_forces_cuda(MDSystem& system) {
             
             Real phi = std::atan2(sin_phi_sign, cos_phi);
             
-            // Calculate potential and its derivative
-            Real dphi = phi - dihedral.phase_angle;
-            Real sin_dphi = std::sin(dihedral.multiplicity * dphi);
-            Real cos_dphi = std::cos(dihedral.multiplicity * dphi);
+            // Get dihedral type parameters
+            const DihedralType& dihedral_type = topology.get_dihedral_type(dihedral.type);
+            Real phase_angle = dihedral_type.phi0;
+            Real force_constant = dihedral_type.k;
+            int multiplicity = dihedral_type.n;
             
-            Real dihedral_pe = dihedral.force_constant * (1.0 + cos_dphi);
-            Real dE_dphi = -dihedral.force_constant * dihedral.multiplicity * sin_dphi;
+            // Calculate potential and its derivative
+            Real dphi = phi - phase_angle;
+            Real sin_dphi = std::sin(multiplicity * dphi);
+            Real cos_dphi = std::cos(multiplicity * dphi);
+            
+            Real dihedral_pe = force_constant * (1.0 + cos_dphi);
+            Real dE_dphi = -force_constant * multiplicity * sin_dphi;
             
             // This is a simplified force calculation
             // In practice, the derivatives are quite complex for dihedral angles

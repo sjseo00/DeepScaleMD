@@ -19,15 +19,14 @@ void parse_arguments(int argc, char* argv[], std::string& config_file, int& debu
         if (strcmp(argv[i], "-debug") == 0 && i + 1 < argc) {
             debug_level = std::atoi(argv[i + 1]);
             if (debug_level < 1) debug_level = 1;
-            if (debug_level > 3) debug_level = 3;
+            if (debug_level > 2) debug_level = 2;
             i++; // Skip next argument since it's the debug level value
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             std::cout << "Usage: " << argv[0] << " [config_file] [-debug LEVEL]" << std::endl;
             std::cout << "  config_file: Configuration file (default: input.yaml)" << std::endl;
-            std::cout << "  -debug LEVEL: Debug verbosity level (1-3, default: 1)" << std::endl;
+            std::cout << "  -debug LEVEL: Debug verbosity level (1-2, default: 1)" << std::endl;
             std::cout << "    Level 1: Basic information only" << std::endl;
-            std::cout << "    Level 2: Detailed performance and timing info" << std::endl;
-            std::cout << "    Level 3: Maximum verbosity with algorithm details" << std::endl;
+            std::cout << "    Level 2: Detailed debug messages and performance info" << std::endl;
             exit(0);
         } else if (argv[i][0] != '-') {
             // Assume it's a config file if it doesn't start with '-'
@@ -91,23 +90,14 @@ int main(int argc, char* argv[]) {
         }
 
         // Finalize
-        auto finalize_start = std::chrono::high_resolution_clock::now();
         simulation.finalize();
-        auto finalize_end = std::chrono::high_resolution_clock::now();
-        
-        if (rank == 0) {
-            auto finalize_duration = std::chrono::duration_cast<std::chrono::milliseconds>(finalize_end - finalize_start);
-            std::cout << "Finalization time: " << std::fixed << std::setprecision(3) 
-                      << finalize_duration.count() / 1000.0 << " seconds" << std::endl;
-        }
-
     } catch (const std::exception& e) {
         if (rank == 0) {
             std::cerr << "Error: " << e.what() << std::endl;
         }
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    
+
     // Calculate and print total execution time
     auto end_time = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -117,7 +107,6 @@ int main(int argc, char* argv[]) {
                   << total_duration.count() / 1000.0 << " seconds ===" << std::endl;
         std::cout << "=== MD Simulation Completed ===" << std::endl;
     }
-    
     // Note: MPI_Finalize() is called in simulation.finalize()
     return 0;
 }

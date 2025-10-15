@@ -74,7 +74,6 @@ void NoseHooverThermostat::apply(ParticleData& particles, Real dt, size_t local_
     
     // Get global kinetic energy and total particles via MPI reduction
     Real global_ke = mpi_allreduce_sum(local_ke);
-    Real global_mass_sum = mpi_allreduce_sum(local_mass_sum);
     int global_particles = mpi_allreduce_sum_int((int)num_particles);
     
     Real temperature = 2.0 * global_ke / (3.0 * global_particles * kb);

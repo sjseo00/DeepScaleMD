@@ -135,27 +135,27 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
     }
     
     // Parse built-in force field configuration
-    auto bonds_it = config_map.find("builtin_enable_bonds");
+    auto bonds_it = config_map.find("force_calculation_enable_bonds");
     if (bonds_it != config_map.end()) {
         config.enable_bonds = (bonds_it->second == "true");
     }
     
-    auto angles_it = config_map.find("builtin_enable_angles");
+    auto angles_it = config_map.find("force_calculation_enable_angles");
     if (angles_it != config_map.end()) {
         config.enable_angles = (angles_it->second == "true");
     }
     
-    auto dihedrals_it = config_map.find("builtin_enable_dihedrals");
+    auto dihedrals_it = config_map.find("force_calculation_enable_dihedrals");
     if (dihedrals_it != config_map.end()) {
         config.enable_dihedrals = (dihedrals_it->second == "true");
     }
     
-    auto lj_it = config_map.find("builtin_enable_lennard_jones");
+    auto lj_it = config_map.find("force_calculation_enable_lennard_jones");
     if (lj_it != config_map.end()) {
         config.enable_lennard_jones = (lj_it->second == "true");
     }
     
-    auto coulomb_it = config_map.find("builtin_enable_coulomb");
+    auto coulomb_it = config_map.find("force_calculation_enable_coulomb");
     if (coulomb_it != config_map.end()) {
         config.enable_coulomb = (coulomb_it->second == "true");
     }

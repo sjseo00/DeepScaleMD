@@ -36,6 +36,7 @@ private:
     std::string neighbor_list_type_str;
     int neighbor_list_tile_size;
     int neighbor_list_update_freq;  // Added neighbor list update frequency
+    Real verlet_skin;               // Verlet list skin distance
     std::string force_calculation_mode;  // "builtin" or "python"
     std::string integrator_type;
     std::string thermostat_type;
@@ -47,6 +48,11 @@ private:
     // Output control variables
     int output_freq;                    // General output frequency
     std::string output_info;            // What information to output (comma-separated)
+    
+    // Trajectory output settings
+    std::string trajectory_format;      // "xyz", "dump", or "both"
+    bool trajectory_include_velocities; // Include velocities in output
+    bool trajectory_include_forces;     // Include forces in output
     
     int current_step;
     int total_steps;
@@ -77,6 +83,12 @@ private:
     void initialize_thermostat();
     void initialize_barostat();
     void calculate_potential_energy();  // Calculate and cache PE
+    void check_energy_stability();      // Check for energy drift and instabilities
+    
+    // Trajectory output functions
+    void write_trajectory(int step);
+    void write_xyz_trajectory(int step);
+    void write_lammps_dump(int step);
 };
 
 #endif // MD_SIMULATION_H

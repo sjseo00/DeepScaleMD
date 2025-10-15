@@ -21,7 +21,6 @@ COMMON_SOURCES = $(SRC_DIR)/md_system.cpp \
                  $(SRC_DIR)/thermostat.cpp \
                  $(SRC_DIR)/barostat.cpp \
                  $(SRC_DIR)/neighbor_list.cpp \
-                 $(SRC_DIR)/optimized_neighbor_list.cpp \
                  $(SRC_DIR)/md_simulation.cpp \
                  $(SRC_DIR)/python_interface.cpp \
                  $(SRC_DIR)/force_calculator_cpu.cpp \

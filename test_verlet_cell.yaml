@@ -1,0 +1,58 @@
+# ============================================================================
+# DeepScaleMD Test Configuration for verlet_cell_list
+# ============================================================================
+
+# ============================================================================
+# BASIC SIMULATION PARAMETERS (REQUIRED)
+# ============================================================================
+coordinate_file: "coordinates.xyz"          # Initial coordinates file
+topology_file: "topology.top"               # Topology file
+target_temperature: 300.0                   # Target temperature (K)
+timestep: 0.001                             # Integration timestep (ps)
+total_steps: 10                             # Small number of steps for testing
+
+# ============================================================================
+# SIMULATION BOX PARAMETERS
+# ============================================================================
+box_x: 80.0                                 # Box length in x direction (Angstrom)
+box_y: 80.0                                 # Box length in y direction (Angstrom)
+box_z: 80.0                                 # Box length in z direction (Angstrom)
+periodic_x: true                            # Periodic boundary conditions in x
+periodic_y: true                            # Periodic boundary conditions in y
+periodic_z: true                            # Periodic boundary conditions in z
+
+# ============================================================================
+# OUTPUT CONFIGURATION
+# ============================================================================
+output_prefix: test_verlet_cell             # Output file prefix
+trajectory_output_freq: 10                  # Trajectory output frequency
+output_freq: 1                              # Console output frequency
+output_info: STEP, T, KE, PE               # Default output fields
+
+# ============================================================================
+# FORCE CALCULATION PARAMETERS
+# ============================================================================
+cutoff_distance: 12.0                       # Force cutoff distance (Angstrom)
+
+# ============================================================================
+# NEIGHBOR LIST CONFIGURATION - USING VERLET_CELL_LIST
+# ============================================================================
+neighbor_list_type: verlet_cell_list        # Verlet list with cell optimization
+neighbor_config: "1.0"                      # Verlet skin distance
+
+# ============================================================================
+# THERMOSTAT AND BAROSTAT (OPTIONAL)
+# ============================================================================
+thermostat: berendsen                       # Thermostat type
+thermostat_coupling_time: 0.1              # Thermostat coupling time (ps)
+
+# Force calculation (required)
+force_type: lj                              # Lennard-Jones forces
+
+# Integration method
+integrator: velocity_verlet                 # Velocity Verlet integration
+
+# ============================================================================
+# PERFORMANCE AND DEBUGGING
+# ============================================================================
+debug_level: 2                              # Debug output level (0-3)

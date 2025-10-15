@@ -1,63 +1,151 @@
 # ============================================================================
-# Custom MD Simulation Configuration File
-# Simple Lennard-Jones System (32,000 particles)
+# DeepScaleMD Complete Configuration File
+# All available options with defaults and alternatives
 # ============================================================================
 
-# Basic simulation parameters (required)
-coordinate_file: "coordinates.xyz"
-topology_file: "topology.top"
-target_temperature: 300.0
-timestep: 0.001
-total_steps: 100
+# ============================================================================
+# BASIC SIMULATION PARAMETERS (REQUIRED)
+# ============================================================================
+coordinate_file: "coordinates.xyz"          # Initial coordinates file
+topology_file: "topology.top"               # Topology file
+target_temperature: 300.0                   # Target temperature (K)
+timestep: 0.001                             # Integration timestep (ps)
+total_steps: 100                            # Total number of steps
 
-# Simulation box parameters
-box_x: 80.0                          # Box length in x direction (Angstrom)
-box_y: 80.0                          # Box length in y direction (Angstrom)
-box_z: 80.0                          # Box length in z direction (Angstrom)
-periodic_x: true                     # Periodic boundary conditions in x
-periodic_y: true                     # Periodic boundary conditions in y
-periodic_z: true                     # Periodic boundary conditions in z
+# ============================================================================
+# SIMULATION BOX PARAMETERS
+# ============================================================================
+box_x: 80.0                                 # Box length in x direction (Angstrom)
+box_y: 80.0                                 # Box length in y direction (Angstrom)
+box_z: 80.0                                 # Box length in z direction (Angstrom)
+periodic_x: true                            # Periodic boundary conditions in x
+periodic_y: true                            # Periodic boundary conditions in y
+periodic_z: true                            # Periodic boundary conditions in z
 
-# Output configuration
-output_prefix: simulation
-trajectory_output_freq: 100           # or 50 (Output trajectory every 50 steps)
-output_freq: 10                       # Output frequency for step info
-output_info: STEP, T, KE, PE  # Available: STEP, T, KE, PE, AVG_SPD, MAX_SPD, MAX_FORCE, SAMPLE_POS, STEP_TIME, PARTICLES
-# Debug level 2 automatically adds timing info to the above output
+# ============================================================================
+# OUTPUT CONFIGURATION
+# ============================================================================
+output_prefix: simulation                   # Output file prefix
+trajectory_output_freq: 100                 # Trajectory output frequency
+output_freq: 10                             # Console output frequency
+output_info: STEP, T, KE, PE               # Default output fields
+# Available output fields: STEP, T, KE, PE, AVG_SPD, MAX_SPD, MAX_FORCE, SAMPLE_POS, STEP_TIME, PARTICLES
+# output_info: STEP, T, KE, PE, AVG_SPD, MAX_SPD, MAX_FORCE, SAMPLE_POS, STEP_TIME, PARTICLES
 
-# Force calculation parameters
-cutoff_distance: 12                  # or "cutoff: 8.5" (Alternative cutoff specification)
+# ============================================================================
+# FORCE CALCULATION PARAMETERS
+# ============================================================================
+cutoff_distance: 12.0                       # Force cutoff distance (Angstrom)
+# cutoff: 8.5                               # Alternative cutoff specification
 
-# Neighbor list configuration
-neighbor_list_type: cell_list       # or "morton_hilbert" (Morton/Hilbert, CUDA only)
-neighbor_list_tile_size: 32
-neighbor_list_update_freq: 10
+# ============================================================================
+# NEIGHBOR LIST CONFIGURATION
+# ============================================================================
+neighbor_list_type: cell_list               # Default neighbor list type
+# Available neighbor list types:
+# neighbor_list_type: cell_list             # Standard cell list
+# neighbor_list_type: verlet_list           # Simple Verlet list
+# neighbor_list_type: verlet_cell_list      # Verlet list with cell optimization
+# neighbor_list_type: morton_hilbert        # Morton-Hilbert ordering (GPU only)
+# neighbor_list_type: optimized_cell_list   # Optimized cell list
+# neighbor_list_type: tiled                 # Tiled cell list
 
-# Integration method
-integrator: velocity_verlet         # or "verlet" (Basic Verlet), "leapfrog" (Leapfrog)
+neighbor_list_tile_size: 32                 # Tile size for Morton-Hilbert
+neighbor_list_update_freq: 10               # Neighbor list update frequency
+# verlet_skin: 2.0                          # Verlet list skin distance (for Verlet lists)
 
-# Thermostat (disabled for NVE simulation)
-# thermostat: "none"                  # or "langevin", "nose_hoover", "andersen"
-# tau_t: 1.0                          # Thermostat coupling constant
+# ============================================================================
+# INTEGRATION METHOD
+# ============================================================================
+integrator: leapfrog                        # Default integrator
+# Available integrators:
+# integrator: verlet                        # Basic Verlet integrator
+# integrator: velocity_verlet               # Velocity-Verlet integrator
+# integrator: leapfrog                      # Leapfrog integrator
 
-# Barostat (disabled for NVE simulation)  
-# barostat: "none"                    # or "andersen", "parrinello_rahman"
-# target_pressure: 1.0                # Target pressure (atm)
-# tau_p: 5.0                          # Barostat coupling constant
+# ============================================================================
+# THERMOSTAT CONFIGURATION
+# ============================================================================
+thermostat: none                            # Default: no thermostat (NVE)
+# Available thermostats:
+# thermostat: none                          # No thermostat (NVE ensemble)
+# thermostat: langevin                      # Langevin thermostat
+# thermostat: nose_hoover                   # Nose-Hoover thermostat
+# thermostat: andersen                      # Andersen thermostat
 
-# Force calculation section
+# Thermostat parameters (when thermostat is not "none"):
+# tau_t: 1.0                                # Thermostat coupling constant
+# gamma: 1.0                                # Friction coefficient (Langevin)
+# Q: 1.0                                    # Thermostat mass (Nose-Hoover)
+# collision_freq: 0.1                      # Collision frequency (Andersen)
+
+# ============================================================================
+# BAROSTAT CONFIGURATION
+# ============================================================================
+barostat: none                              # Default: no barostat (NVE/NVT)
+# Available barostats:
+# barostat: none                            # No barostat
+# barostat: andersen                        # Andersen barostat
+# barostat: parrinello_rahman               # Parrinello-Rahman barostat
+
+# Barostat parameters (when barostat is not "none"):
+# target_pressure: 1.0                     # Target pressure (atm)
+# tau_p: 5.0                               # Barostat coupling constant
+# compressibility: 4.5e-5                  # Isothermal compressibility (Andersen)
+# W: 1.0                                   # Barostat mass (Parrinello-Rahman)
+
+# ============================================================================
+# FORCE CALCULATION CONFIGURATION
+# ============================================================================
 force_calculation:
-  neighbor_list: cell_list         # or "morton_hilbert" (Morton/Hilbert, CUDA only)
-  update_frequency: 10
-  mode: "builtin"                     # or "python" (Python interface for custom forces)
+  neighbor_list: cell_list                  # Neighbor list type for force calculation
+  update_frequency: 10                      # Update frequency
+  mode: "builtin"                           # Default: built-in force calculation
+  # mode: "python"                          # Alternative: Python force interface
 
-# Built-in force field parameters (when mode: "builtin")
-builtin_enable_lennard_jones: "true"   # Enable LJ potential
-builtin_enable_coulomb: "false"        # Enable Coulomb electrostatics  
-builtin_enable_bonds: "false"          # Enable bond forces
-builtin_enable_angles: "false"         # Enable angle forces
-builtin_enable_dihedrals: "false"      # Enable dihedral forces
+# ============================================================================
+# BUILT-IN FORCE FIELD PARAMETERS
+# ============================================================================
+builtin_enable_lennard_jones: "true"        # Enable Lennard-Jones potential
+builtin_enable_coulomb: "false"             # Enable Coulomb electrostatics
+builtin_enable_bonds: "false"               # Enable bond forces
+builtin_enable_angles: "false"              # Enable angle forces
+builtin_enable_dihedrals: "false"           # Enable dihedral forces
 
-# Python force interface (disabled)
-# python_force_enabled: false        # or true (Enable Python forces)
-# python_force_path: "python_force/" # or "custom_forces/" (Path to Python modules)
+# Additional built-in force parameters:
+# lj_epsilon: 1.0                          # LJ epsilon parameter
+# lj_sigma: 1.0                            # LJ sigma parameter
+# coulomb_constant: 332.06                 # Coulomb constant
+
+# ============================================================================
+# PYTHON FORCE INTERFACE (DISABLED BY DEFAULT)
+# ============================================================================
+# python_force_enabled: false              # Enable Python force interface
+# python_force_path: "python_force/"       # Path to Python force modules
+# Custom Python force modules can be placed in the specified directory
+
+# ============================================================================
+# ADVANCED SIMULATION PARAMETERS
+# ============================================================================
+# debug_level: 0                           # Debug output level (0-3)
+# mpi_enabled: false                       # Enable MPI parallelization
+# cuda_enabled: false                      # Enable CUDA acceleration
+# sycl_enabled: false                      # Enable SYCL acceleration
+
+# ============================================================================
+# RESTART AND CHECKPOINT OPTIONS
+# ============================================================================
+# restart: false                           # Enable restart from checkpoint
+# restart_file: "restart.chk"              # Restart file name
+# checkpoint_freq: 1000                    # Checkpoint frequency
+# checkpoint_file: "checkpoint.chk"        # Checkpoint file name
+
+# ============================================================================
+# ANALYSIS AND MONITORING
+# ============================================================================
+# energy_output_freq: 100                  # Energy output frequency
+# pressure_output_freq: 100                # Pressure output frequency
+# temperature_output_freq: 10              # Temperature output frequency
+# rdf_calculation: false                   # Enable radial distribution function
+# rdf_output_freq: 1000                   # RDF calculation frequency
+# rdf_max_distance: 15.0                  # Maximum distance for RDF

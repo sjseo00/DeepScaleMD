@@ -32,6 +32,7 @@ public:
     virtual ~Integrator() = default;
     
     virtual void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) = 0;
+    virtual void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) = 0;
     virtual void set_timestep(Real new_dt) { dt = new_dt; }
 };
 
@@ -42,18 +43,25 @@ private:
 public:
     VerletIntegrator(Real timestep);
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
 };
 
 class VelocityVerletIntegrator : public Integrator {
+private:
+    std::vector<Real> stored_forces;  // Store forces for velocity update
+    
 public:
     VelocityVerletIntegrator(Real timestep);
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
+    void complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles = 0);
 };
 
 class LeapfrogIntegrator : public Integrator {
 public:
     LeapfrogIntegrator(Real timestep);
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
 };
 
 class RRESPAIntegrator : public Integrator {
@@ -61,9 +69,24 @@ private:
     int n_inner;
     Real dt_inner;
     
+    // Helper functions for force separation and calculation
+    void separate_forces(const ParticleData& particles, 
+                        std::vector<Real>& f_fast_x, std::vector<Real>& f_fast_y, std::vector<Real>& f_fast_z,
+                        std::vector<Real>& f_slow_x, std::vector<Real>& f_slow_y, std::vector<Real>& f_slow_z,
+                        size_t num_particles);
+    
+    void calculate_fast_forces(const ParticleData& particles, 
+                              std::vector<Real>& f_fast_x, std::vector<Real>& f_fast_y, std::vector<Real>& f_fast_z,
+                              const SimulationBox& box, size_t num_particles);
+    
+    void calculate_slow_forces(const ParticleData& particles, 
+                              std::vector<Real>& f_slow_x, std::vector<Real>& f_slow_y, std::vector<Real>& f_slow_z,
+                              const SimulationBox& box, size_t num_particles);
+    
 public:
     RRESPAIntegrator(Real timestep, int inner_steps);
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
 };
 
 #ifdef USE_CUDA
@@ -72,23 +95,31 @@ extern "C" {
     void launch_velocity_verlet_kernel(Real *d_x, Real *d_y, Real *d_z,
                                      Real *d_vx, Real *d_vy, Real *d_vz,
                                      Real *d_fx, Real *d_fy, Real *d_fz,
-                                     Real *d_mass, Real dt, size_t num_particles);
+                                     Real *d_mass, Real dt, size_t num_particles,
+                                     Real lx, Real ly, Real lz,
+                                     bool periodic_x, bool periodic_y, bool periodic_z);
     
     void launch_verlet_kernel(Real *d_x, Real *d_y, Real *d_z,
                              Real *d_prev_x, Real *d_prev_y, Real *d_prev_z,
                              Real *d_fx, Real *d_fy, Real *d_fz,
                              Real *d_mass, Real dt, size_t num_particles, bool first_step,
-                             Real *d_vx, Real *d_vy, Real *d_vz);
+                             Real *d_vx, Real *d_vy, Real *d_vz,
+                             Real lx, Real ly, Real lz,
+                             bool periodic_x, bool periodic_y, bool periodic_z);
     
     void launch_leapfrog_kernel(Real *d_x, Real *d_y, Real *d_z,
                                Real *d_vx, Real *d_vy, Real *d_vz,
                                Real *d_fx, Real *d_fy, Real *d_fz,
-                               Real *d_mass, Real dt, size_t num_particles);
+                               Real *d_mass, Real dt, size_t num_particles,
+                               Real lx, Real ly, Real lz,
+                               bool periodic_x, bool periodic_y, bool periodic_z);
     
     void launch_r_respa_kernel(Real *d_x, Real *d_y, Real *d_z,
                               Real *d_vx, Real *d_vy, Real *d_vz,
                               Real *d_fx, Real *d_fy, Real *d_fz,
-                              Real *d_mass, Real dt, size_t num_particles, bool first_half);
+                              Real *d_mass, Real dt, size_t num_particles, bool first_half,
+                              Real lx, Real ly, Real lz,
+                              bool periodic_x, bool periodic_y, bool periodic_z);
     
     void launch_velocity_update_kernel(Real *d_vx, Real *d_vy, Real *d_vz,
                                      Real *d_fx, Real *d_fy, Real *d_fz,
@@ -210,6 +241,7 @@ public:
     VerletIntegratorSYCL(Real timestep);
     ~VerletIntegratorSYCL();
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
     void allocate_device_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);
@@ -228,6 +260,7 @@ public:
     LeapfrogIntegratorSYCL(Real timestep);
     ~LeapfrogIntegratorSYCL();
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
     void allocate_device_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);
@@ -248,6 +281,7 @@ public:
     RRESPAIntegratorSYCL(Real timestep, int inner_steps);
     ~RRESPAIntegratorSYCL();
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
     void allocate_device_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);
@@ -266,6 +300,7 @@ public:
     VelocityVerletIntegratorSYCL(Real timestep);
     ~VelocityVerletIntegratorSYCL();
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
     void allocate_device_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);

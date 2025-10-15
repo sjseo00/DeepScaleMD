@@ -15,7 +15,7 @@
 extern int g_debug_level;
 inline bool debug_level(int level) { return g_debug_level >= level; }
 
-MDSystem::MDSystem() : rank(0), size(1), local_start(0), local_end(0), d_particles(nullptr), use_gpu(false) {
+MDSystem::MDSystem() : physical_cutoff(12.0), rank(0), size(1), local_start(0), local_end(0), d_particles(nullptr), use_gpu(false) {
 #ifdef USE_MPI
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
@@ -122,14 +122,14 @@ void MDSystem::load_config(const std::string& config_file) {
     // Initialize force manager with parsed configuration
     initialize_force_manager(config_map);
     
-    if (rank == 0 && debug_level(1)) {
+    if (rank == 0) {
         std::cout << "Box dimensions: " << box.lx << " x " << box.ly << " x " << box.lz << std::endl;
         // Backend information is printed in initialize_force_manager
     }
 }
 
 void MDSystem::load_coordinates(const std::string& coord_file) {
-    if (rank == 0 && debug_level(1)) {
+    if (rank == 0) {
         std::cout << "Loading coordinates from " << coord_file << std::endl;
     }
     
@@ -141,7 +141,7 @@ void MDSystem::initialize_velocities(Real temperature) {
     if (rank == 0) {
         std::cout << "Initializing velocities at T = " << temperature << " K for " << particles.num_particles << " particles" << std::endl;
     }
-    
+     
     // Generate random velocities
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -181,7 +181,6 @@ void MDSystem::initialize_velocities(Real temperature) {
         Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
         current_ke += 0.5 * particles.mass[i] * v2;
     }
-    
     // Target kinetic energy: KE = (3/2) * N * kB * T
     // kB = 0.0019872041 kcal/(mol·K) for units real
     Real kB = 0.0019872041; // kcal/(mol·K)
@@ -195,13 +194,15 @@ void MDSystem::initialize_velocities(Real temperature) {
         particles.vz[i] *= scale_factor;
     }
     
-    if (rank == 0 && debug_level(1)) {
+    current_ke = 0.0;
+    for (size_t i = 0; i < particles.num_particles; i++) {
+        Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
+        current_ke += 0.5 * particles.mass[i] * v2;
+    }
+
+    if (rank == 0) {
         std::cout << "Velocity initialization: target T = " << temperature 
                   << " K, target KE = " << target_ke << ", scale factor = " << scale_factor << std::endl;
-        if (debug_level(3)) {
-            std::cout << "Sample velocities: particle 0: (" << particles.vx[0] 
-                      << ", " << particles.vy[0] << ", " << particles.vz[0] << ")" << std::endl;
-        }
     }
 }
 
@@ -347,11 +348,8 @@ void MDSystem::load_standard_xyz(const std::string& coord_file) {
         }
     }
     
-    if (rank == 0 && debug_level(1)) {
+    if (rank == 0) {
         std::cout << "Loaded " << atom_count << " particles from " << clean_filename << std::endl;
-        if (debug_level(3)) {
-            std::cout << "Sample data - Particle 0: pos(" << particles.x[0] << "," << particles.y[0] << "," << particles.z[0] << ")" << std::endl;
-        }
     }
     
     file.close();
@@ -381,11 +379,8 @@ void MDSystem::assign_masses_from_topology() {
         }
     }
     
-    if (rank == 0) {
+    if (rank == 0 && debug_level(2)) {
         std::cout << "Assigned masses from topology" << std::endl;
-        if (particles.mass.size() > 0) {
-            std::cout << "Sample mass: particle 0: " << particles.mass[0] << std::endl;
-        }
     }
 }
 
@@ -437,12 +432,8 @@ void MDSystem::setup_force_field_params() {
         }
     }
     
-    if (rank == 0 && debug_level(1)) {
+    if (rank == 0) {
         std::cout << "Force field setup: " << ff_params.epsilon.size() << " particles" << std::endl;
-        if (debug_level(3) && !ff_params.epsilon.empty()) {
-            std::cout << "Sample LJ parameters: epsilon=" << ff_params.epsilon[0] 
-                      << " kcal/mol, sigma=" << ff_params.sigma[0] << " Å" << std::endl;
-        }
     }
 }
 
@@ -476,7 +467,7 @@ void MDSystem::initialize_force_manager(const std::map<std::string, std::string>
     // Initialize force manager
     force_manager->initialize(force_config, backend);
     
-    if (rank == 0 && debug_level(1)) {
+    if (rank == 0) {
         std::cout << "Force manager initialized with " << backend << " backend" << std::endl;
         if (debug_level(2)) {
             if (force_config.mode == ForceManager::ForceMode::BUILTIN) {
