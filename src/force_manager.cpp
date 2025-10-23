@@ -1,4 +1,4 @@
-#define OMPI_SKIP_MPICXX 1
+
 #include "force_manager.h"
 #include "force_calculator_cpu.h"
 #include <mpi.h>

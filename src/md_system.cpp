@@ -1,4 +1,4 @@
-#define OMPI_SKIP_MPICXX 1
+
 #include "md_system.h"
 #include <fstream>
 #include <sstream>
@@ -6,6 +6,7 @@
 #include <cstring>
 #include <random>
 #include <map>
+#include <algorithm>  // For std::sort
 #include <unistd.h>  // For getcwd
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -15,10 +16,13 @@
 extern int g_debug_level;
 inline bool debug_level(int level) { return g_debug_level >= level; }
 
-MDSystem::MDSystem() : physical_cutoff(12.0), rank(0), size(1), local_start(0), local_end(0), d_particles(nullptr), use_gpu(false) {
+MDSystem::MDSystem() : physical_cutoff(12.0), rank(0), size(1), local_start(0), local_end(0), d_particles(nullptr), use_gpu(false), halo_width(14.0) {
 #ifdef USE_MPI
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    cart_comm = MPI_COMM_NULL;  // Initialize cart_comm
+    cart_dims[0] = cart_dims[1] = cart_dims[2] = 0;
+    cart_coords[0] = cart_coords[1] = cart_coords[2] = 0;
 #endif
     topology = std::make_unique<Topology>();
     force_manager = std::make_unique<ForceManager>();
@@ -37,11 +41,6 @@ void MDSystem::initialize_mpi() {
     int provided;
     MPI_Query_thread(&provided);
     
-    if (provided < MPI_THREAD_MULTIPLE) {
-        if (rank == 0) {
-            std::cerr << "Warning: MPI does not support multithreading\n";
-        }
-    }
 #else
     std::cout << "MPI not available - running in single process mode" << std::endl;
 #endif
@@ -183,7 +182,6 @@ void MDSystem::initialize_velocities(Real temperature) {
     }
     // Target kinetic energy: KE = (3/2) * N * kB * T
     // kB = 0.0019872041 kcal/(mol·K) for units real
-    Real kB = 0.0019872041; // kcal/(mol·K)
     Real target_ke = 1.5 * particles.num_particles * kB * temperature;
     
     Real scale_factor = std::sqrt(target_ke / current_ke);
@@ -278,15 +276,6 @@ void MDSystem::copy_from_device() {
 }
 
 void MDSystem::load_standard_xyz(const std::string& coord_file) {
-    // Print current working directory for debugging (debug level 2)
-    if (rank == 0 && debug_level(2)) {
-        char cwd[1024];
-        if (getcwd(cwd, sizeof(cwd)) != NULL) {
-            std::cout << "Current working directory: " << cwd << std::endl;
-        }
-        std::cout << "Attempting to load coordinate file: " << coord_file << std::endl;
-    }
-    
     // Remove quotes from filename if present
     std::string clean_filename = coord_file;
     
@@ -379,9 +368,6 @@ void MDSystem::assign_masses_from_topology() {
         }
     }
     
-    if (rank == 0 && debug_level(2)) {
-        std::cout << "Assigned masses from topology" << std::endl;
-    }
 }
 
 void MDSystem::assign_charges_from_topology() {
@@ -469,13 +455,6 @@ void MDSystem::initialize_force_manager(const std::map<std::string, std::string>
     
     if (rank == 0) {
         std::cout << "Force manager initialized with " << backend << " backend" << std::endl;
-        if (debug_level(2)) {
-            if (force_config.mode == ForceManager::ForceMode::BUILTIN) {
-                std::cout << "Using built-in optimized force modules" << std::endl;
-            } else {
-                std::cout << "Using Python force interface" << std::endl;
-            }
-        }
     }
 }
 
@@ -487,85 +466,59 @@ void MDSystem::compute_forces() {
     force_manager->compute_forces(*this);
 }
 
-// ============================================================================
-// Halo Exchange Implementation
-// ============================================================================
-
 void MDSystem::setup_neighbor_ranks() {
 #ifdef USE_MPI
-    // Create a 3D Cartesian topology for the MPI processes
-    int dims[3] = {0, 0, 0};
-    int periods[3] = {box.periodic_x ? 1 : 0, box.periodic_y ? 1 : 0, box.periodic_z ? 1 : 0};
+    // Create 3D Cartesian topology
+    cart_dims[0] = cart_dims[1] = cart_dims[2] = 0;
+    MPI_Dims_create(size, 3, cart_dims);
     
-    // Let MPI decide the optimal grid dimensions
-    MPI_Dims_create(size, 3, dims);
+    int periods[3] = {1, 1, 1};  // Periodic boundaries
+    MPI_Cart_create(MPI_COMM_WORLD, 3, cart_dims, periods, 1, &cart_comm);
+    MPI_Cart_coords(cart_comm, rank, 3, cart_coords);
     
-    MPI_Comm cart_comm;
-    MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, 1, &cart_comm);
-    
-    // Get the coordinates of this rank in the Cartesian grid
-    int coords[3];
-    MPI_Cart_coords(cart_comm, rank, 3, coords);
-    
-    // Calculate local domain boundaries
-    domain_min[0] = coords[0] * box.lx / dims[0];
-    domain_min[1] = coords[1] * box.ly / dims[1];
-    domain_min[2] = coords[2] * box.lz / dims[2];
-    
-    domain_max[0] = (coords[0] + 1) * box.lx / dims[0];
-    domain_max[1] = (coords[1] + 1) * box.ly / dims[1];
-    domain_max[2] = (coords[2] + 1) * box.lz / dims[2];
-    
-    // Identify neighbor ranks in all 26 directions
+    // Find all 26 neighbors (including corners)
     num_neighbors = 0;
     for (int i = -1; i <= 1; i++) {
         for (int j = -1; j <= 1; j++) {
             for (int k = -1; k <= 1; k++) {
-                if (i == 0 && j == 0 && k == 0) continue; // Skip self
+                if (i == 0 && j == 0 && k == 0) continue;  // Skip self
                 
-                int neighbor_coords[3] = {coords[0] + i, coords[1] + j, coords[2] + k};
+                int coords[3] = {cart_coords[0] + i, cart_coords[1] + j, cart_coords[2] + k};
                 int neighbor_rank;
-                
-                // MPI_Cart_rank returns MPI_PROC_NULL for out-of-bounds non-periodic
-                MPI_Cart_rank(cart_comm, neighbor_coords, &neighbor_rank);
-                
-                if (neighbor_rank != MPI_PROC_NULL) {
-                    neighbor_ranks[num_neighbors] = neighbor_rank;
-                    num_neighbors++;
-                }
+                MPI_Cart_rank(cart_comm, coords, &neighbor_rank);
+                neighbor_ranks[num_neighbors++] = neighbor_rank;
             }
         }
     }
     
-    // Free the Cartesian communicator
-    MPI_Comm_free(&cart_comm);
-    
-#else
-    num_neighbors = 0;
+    if (rank == 0) {
+        std::cout << "Created 3D Cartesian topology: " << cart_dims[0] << "x" 
+                  << cart_dims[1] << "x" << cart_dims[2] << std::endl;
+        std::cout << "Process " << rank << " has " << num_neighbors << " neighbors" << std::endl;
+    }
 #endif
 }
 
 void MDSystem::identify_halo_particles() {
 #ifdef USE_MPI
+    if (num_neighbors == 0) return;
+    
     halo_particles.clear();
+    Real cutoff = get_physical_cutoff();
+    halo_width = cutoff + 2.0;  // cutoff + skin
     
-    // Halo width = cutoff + verlet skin (if using Verlet list)
-    Real halo_width = physical_cutoff + 2.0; // Add 2.0 Å as default skin
-    
-    // Identify particles near domain boundaries that need to be sent
+    // Identify particles within halo_width of domain boundaries
     for (size_t i = 0; i < particles.num_particles; i++) {
         Real x = particles.x[i];
-        Real y = particles.y[i];
+        Real y = particles.y[i]; 
         Real z = particles.z[i];
         
-        // Check if particle is within halo width of any boundary
-        bool in_halo = false;
+        // Check if particle is near any boundary
+        bool is_halo = (x < domain_min[0] + halo_width || x > domain_max[0] - halo_width ||
+                       y < domain_min[1] + halo_width || y > domain_max[1] - halo_width ||
+                       z < domain_min[2] + halo_width || z > domain_max[2] - halo_width);
         
-        if (x < domain_min[0] + halo_width || x > domain_max[0] - halo_width) in_halo = true;
-        if (y < domain_min[1] + halo_width || y > domain_max[1] - halo_width) in_halo = true;
-        if (z < domain_min[2] + halo_width || z > domain_max[2] - halo_width) in_halo = true;
-        
-        if (in_halo) {
+        if (is_halo) {
             halo_particles.push_back(i);
         }
     }
@@ -574,9 +527,7 @@ void MDSystem::identify_halo_particles() {
 
 void MDSystem::exchange_halo_particles() {
 #ifdef USE_MPI
-    if (num_neighbors == 0) {
-        return;  // No neighbors, nothing to exchange
-    }
+    if (num_neighbors == 0) return;
     
     // Resize neighbor_halos to store data from all neighbors
     neighbor_halos.resize(num_neighbors);
@@ -589,7 +540,7 @@ void MDSystem::exchange_halo_particles() {
     std::vector<std::vector<Real>> send_buffers(num_neighbors);
     std::vector<std::vector<Real>> recv_buffers(num_neighbors);
     std::vector<int> send_counts(num_neighbors, 0);
-    std::vector<int> recv_counts(num_neighbors, 0);  // Persistent storage for recv counts
+    std::vector<int> recv_counts(num_neighbors, 0);
     
     // Step 1: Pack data for all neighbors
     for (int n = 0; n < num_neighbors; n++) {
@@ -650,92 +601,78 @@ void MDSystem::exchange_halo_particles() {
             unpack_halo_data(neighbor_ranks[n], recv_buffers[n]);
         }
     }
-    
-    if (debug_level(3)) {
-        std::cout << "Rank " << rank << ": Halo exchange completed" << std::endl;
-    }
 #endif
 }
 
 void MDSystem::pack_halo_data(int neighbor_rank, std::vector<Real>& buffer) {
 #ifdef USE_MPI
-    buffer.clear();
-    
-    // Calculate which particles to send to this specific neighbor
-    // For simplicity, we'll send all halo particles to all neighbors
-    // (more sophisticated implementation would check spatial locality)
-    
-    int num_to_send = halo_particles.size();
-    
-    // Buffer format: [num_particles, x1, y1, z1, vx1, vy1, vz1, mass1, charge1, type1, x2, ...]
-    // 9 values per particle (x, y, z, vx, vy, vz, mass, charge, type)
-    buffer.resize(1 + num_to_send * 9);
-    
-    buffer[0] = static_cast<Real>(num_to_send);
-    
-    for (int i = 0; i < num_to_send; i++) {
-        int idx = halo_particles[i];
-        int offset = 1 + i * 9;
-        
-        buffer[offset + 0] = particles.x[idx];
-        buffer[offset + 1] = particles.y[idx];
-        buffer[offset + 2] = particles.z[idx];
-        buffer[offset + 3] = particles.vx[idx];
-        buffer[offset + 4] = particles.vy[idx];
-        buffer[offset + 5] = particles.vz[idx];
-        buffer[offset + 6] = particles.mass[idx];
-        buffer[offset + 7] = particles.charge[idx];
-        buffer[offset + 8] = static_cast<Real>(particles.type[idx]);
+    // Find which neighbor this is
+    int neighbor_idx = -1;
+    for (int i = 0; i < num_neighbors; i++) {
+        if (neighbor_ranks[i] == neighbor_rank) {
+            neighbor_idx = i;
+            break;
+        }
     }
+    if (neighbor_idx == -1) return;
     
+    // For now, send all halo particles to all neighbors
+    // In a full implementation, this should filter particles relevant to specific neighbor
+    buffer.clear();
+    buffer.push_back(halo_particles.size());  // Number of particles
+    
+    for (int idx : halo_particles) {
+        buffer.push_back(particles.x[idx]);
+        buffer.push_back(particles.y[idx]);
+        buffer.push_back(particles.z[idx]);
+        buffer.push_back(particles.vx[idx]);
+        buffer.push_back(particles.vy[idx]);
+        buffer.push_back(particles.vz[idx]);
+        buffer.push_back(particles.mass[idx]);
+        buffer.push_back(particles.charge[idx]);
+        buffer.push_back(particles.type[idx]);
+    }
 #endif
 }
 
 void MDSystem::unpack_halo_data(int neighbor_rank, const std::vector<Real>& buffer) {
 #ifdef USE_MPI
-    if (buffer.empty()) return;
-    
-    int num_received = static_cast<int>(buffer[0]);
-    
-    // Find the neighbor index
+    // Find which neighbor this is
     int neighbor_idx = -1;
-    for (int n = 0; n < num_neighbors; n++) {
-        if (neighbor_ranks[n] == neighbor_rank) {
-            neighbor_idx = n;
+    for (int i = 0; i < num_neighbors; i++) {
+        if (neighbor_ranks[i] == neighbor_rank) {
+            neighbor_idx = i;
             break;
         }
     }
+    if (neighbor_idx == -1) return;
     
-    if (neighbor_idx < 0) return;
+    size_t num_particles = static_cast<size_t>(buffer[0]);
+    neighbor_halos[neighbor_idx].num_particles = num_particles;
     
-    // Resize the neighbor halo data structure
-    neighbor_halos[neighbor_idx].resize(num_received);
+    // Resize vectors
+    neighbor_halos[neighbor_idx].x.resize(num_particles);
+    neighbor_halos[neighbor_idx].y.resize(num_particles);
+    neighbor_halos[neighbor_idx].z.resize(num_particles);
+    neighbor_halos[neighbor_idx].vx.resize(num_particles);
+    neighbor_halos[neighbor_idx].vy.resize(num_particles);
+    neighbor_halos[neighbor_idx].vz.resize(num_particles);
+    neighbor_halos[neighbor_idx].mass.resize(num_particles);
+    neighbor_halos[neighbor_idx].charge.resize(num_particles);
+    neighbor_halos[neighbor_idx].type.resize(num_particles);
     
-    // Unpack particle data
-    for (int i = 0; i < num_received; i++) {
-        int offset = 1 + i * 9;
-        
-        neighbor_halos[neighbor_idx].x[i] = buffer[offset + 0];
-        neighbor_halos[neighbor_idx].y[i] = buffer[offset + 1];
-        neighbor_halos[neighbor_idx].z[i] = buffer[offset + 2];
-        neighbor_halos[neighbor_idx].vx[i] = buffer[offset + 3];
-        neighbor_halos[neighbor_idx].vy[i] = buffer[offset + 4];
-        neighbor_halos[neighbor_idx].vz[i] = buffer[offset + 5];
-        neighbor_halos[neighbor_idx].mass[i] = buffer[offset + 6];
-        neighbor_halos[neighbor_idx].charge[i] = buffer[offset + 7];
-        neighbor_halos[neighbor_idx].type[i] = static_cast<int>(buffer[offset + 8]);
+    // Unpack data
+    size_t offset = 1;
+    for (size_t i = 0; i < num_particles; i++) {
+        neighbor_halos[neighbor_idx].x[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].y[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].z[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].vx[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].vy[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].vz[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].mass[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].charge[i] = buffer[offset++];
+        neighbor_halos[neighbor_idx].type[i] = static_cast<int>(buffer[offset++]);
     }
-    
-#endif
-}
-
-void MDSystem::update_ghost_positions() {
-#ifdef USE_MPI
-    // This function would update only positions of ghost particles
-    // (used during MD integration when we don't need to re-exchange everything)
-    
-    // For now, this is a placeholder - typically called every timestep
-    // while full exchange_halo_particles() is called less frequently
-    
 #endif
 }

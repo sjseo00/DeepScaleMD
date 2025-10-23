@@ -5,13 +5,18 @@
 
 #include "md_system.h"
 #include <cuda_runtime.h>
+
+#ifdef USE_NCCL
+#include <nccl.h>
+#endif
+
 #include <mpi.h>
 
 class CUDAMPISystem : public MDSystem {
 private:
     // GPU memory pointers for MPI communication
-    Real *d_halo_send_buffer;
-    Real *d_halo_recv_buffer;
+    Real *d_migration_send_buffer;
+    Real *d_migration_recv_buffer;
     int *d_particle_send_indices;
     int *d_particle_recv_indices;
     
@@ -19,8 +24,20 @@ private:
     std::vector<MPI_Request> send_requests;
     std::vector<MPI_Request> recv_requests;
     
-    size_t halo_buffer_size;
+    size_t migration_buffer_size;
     bool cuda_aware_mpi_available;
+    
+#ifdef USE_NCCL
+    // NCCL communication resources
+    ncclComm_t nccl_comm;
+    bool nccl_initialized;
+    cudaStream_t nccl_stream;
+    
+    // GPU buffers for NCCL allreduce
+    Real *d_force_buffer_x;
+    Real *d_force_buffer_y;
+    Real *d_force_buffer_z;
+#endif
     
 public:
     CUDAMPISystem();
@@ -30,19 +47,26 @@ public:
     void finalize();
     
     // CUDA-aware MPI functions
-    void exchange_particles_gpu_direct();
     void allreduce_forces_gpu();
+    
+    // Halo exchange functions
     void exchange_halo_async();
     void wait_halo_exchange();
     
     // Check CUDA-aware MPI availability
     bool check_cuda_aware_mpi();
     
+#ifdef USE_NCCL
+    // NCCL-specific functions
+    void initialize_nccl();
+    void finalize_nccl();
+    void allreduce_forces_nccl();
+    bool is_nccl_available() const { return nccl_initialized; }
+#endif
+    
 private:
-    void allocate_halo_buffers();
-    void free_halo_buffers();
-    void pack_halo_particles_gpu(int neighbor_rank);
-    void unpack_halo_particles_gpu(int neighbor_rank);
+    void allocate_migration_buffers();
+    void free_migration_buffers();
 };
 
 // CUDA kernel wrapper functions (implemented in cuda_mpi_kernels.cu)

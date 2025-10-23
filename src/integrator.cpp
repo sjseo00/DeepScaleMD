@@ -1,3 +1,5 @@
+
+
 #include "integrator.h"
 #include "md_types.h"
 #include <cmath>
@@ -5,7 +7,6 @@
 #include <algorithm>
 
 #ifdef USE_MPI
-#define OMPI_SKIP_MPICXX 1
 #include <mpi.h>
 
 bool is_rank_zero() {
@@ -24,119 +25,7 @@ bool is_rank_zero() { return true; }
 // Note: CUDA kernels are defined in integrator_kernels.cu
 #endif
 
-// Verlet Integrator
-VerletIntegrator::VerletIntegrator(Real timestep) : Integrator(timestep) {}
 
-void VerletIntegrator::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-
-    // Initialize previous positions on first step
-    if (prev_x.empty()) {
-        prev_x.resize(num_particles);
-        prev_y.resize(num_particles);
-        prev_z.resize(num_particles);
-
-        // Calculate x(t-dt) = x(t) - v(t)*dt + 0.5*a(t)*dt^2
-        for (size_t i = 0; i < num_particles; i++) {
-            Real ax = particles.fx[i] / particles.mass[i];
-            Real ay = particles.fy[i] / particles.mass[i];
-            Real az = particles.fz[i] / particles.mass[i];
-
-            prev_x[i] = particles.x[i] - particles.vx[i] * dt + 0.5 * ax * dt * dt;
-            prev_y[i] = particles.y[i] - particles.vy[i] * dt + 0.5 * ay * dt * dt;
-            prev_z[i] = particles.z[i] - particles.vz[i] * dt + 0.5 * az * dt * dt;
-        }
-    }
-
-    // Verlet integration: x(t+dt) = 2*x(t) - x(t-dt) + a(t)*dt^2
-    for (size_t i = 0; i < num_particles; i++) {
-        Real ax = particles.fx[i] / particles.mass[i];
-        Real ay = particles.fy[i] / particles.mass[i];
-        Real az = particles.fz[i] / particles.mass[i];
-
-        Real new_x = 2.0 * particles.x[i] - prev_x[i] + ax * dt * dt;
-        Real new_y = 2.0 * particles.y[i] - prev_y[i] + ay * dt * dt;
-        Real new_z = 2.0 * particles.z[i] - prev_z[i] + az * dt * dt;
-
-        // Store current positions as previous for next step
-        prev_x[i] = particles.x[i];
-        prev_y[i] = particles.y[i];
-        prev_z[i] = particles.z[i];
-
-        // Update to new positions
-        particles.x[i] = new_x;
-        particles.y[i] = new_y;
-        particles.z[i] = new_z;
-    }
-
-    // Calculate velocities using central difference: v(t) = [x(t+dt) - x(t-dt)] / (2*dt)
-    for (size_t i = 0; i < num_particles; i++) {
-        particles.vx[i] = (particles.x[i] - prev_x[i]) / (2.0 * dt);
-        particles.vy[i] = (particles.y[i] - prev_y[i]) / (2.0 * dt);
-        particles.vz[i] = (particles.z[i] - prev_z[i]) / (2.0 * dt);
-    }
-}
-
-// Verlet Integrator with PBC
-void VerletIntegrator::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-
-    // Initialize previous positions on first step
-    if (prev_x.empty()) {
-        prev_x.resize(num_particles);
-        prev_y.resize(num_particles);
-        prev_z.resize(num_particles);
-
-        // Calculate x(t-dt) = x(t) - v(t)*dt + 0.5*a(t)*dt^2
-        for (size_t i = 0; i < num_particles; i++) {
-            Real ax = particles.fx[i] / particles.mass[i];
-            Real ay = particles.fy[i] / particles.mass[i];
-            Real az = particles.fz[i] / particles.mass[i];
-
-            prev_x[i] = particles.x[i] - particles.vx[i] * dt + 0.5 * ax * dt * dt;
-            prev_y[i] = particles.y[i] - particles.vy[i] * dt + 0.5 * ay * dt * dt;
-            prev_z[i] = particles.z[i] - particles.vz[i] * dt + 0.5 * az * dt * dt;
-        }
-    }
-
-    // Verlet integration: x(t+dt) = 2*x(t) - x(t-dt) + a(t)*dt^2
-    for (size_t i = 0; i < num_particles; i++) {
-        Real ax = particles.fx[i] / particles.mass[i];
-        Real ay = particles.fy[i] / particles.mass[i];
-        Real az = particles.fz[i] / particles.mass[i];
-
-        Real new_x = 2.0 * particles.x[i] - prev_x[i] + ax * dt * dt;
-        Real new_y = 2.0 * particles.y[i] - prev_y[i] + ay * dt * dt;
-        Real new_z = 2.0 * particles.z[i] - prev_z[i] + az * dt * dt;
-
-        // Store current positions as previous for next step
-        prev_x[i] = particles.x[i];
-        prev_y[i] = particles.y[i];
-        prev_z[i] = particles.z[i];
-
-        // Update to new positions
-        particles.x[i] = new_x;
-        particles.y[i] = new_y;
-        particles.z[i] = new_z;
-
-        // Apply periodic boundary conditions
-        box.apply_pbc(particles.x[i], particles.y[i], particles.z[i]);
-    }
-
-    // Calculate velocities using central difference with minimum image convention
-    for (size_t i = 0; i < num_particles; i++) {
-        Real dx = particles.x[i] - prev_x[i];
-        Real dy = particles.y[i] - prev_y[i];
-        Real dz = particles.z[i] - prev_z[i];
-
-        // Apply minimum image convention for velocity calculation
-        box.apply_minimum_image(dx, dy, dz);
-
-        particles.vx[i] = dx / (2.0 * dt);
-        particles.vy[i] = dy / (2.0 * dt);
-        particles.vz[i] = dz / (2.0 * dt);
-    }
-}
 
 // Velocity-Verlet Integrator
 VelocityVerletIntegrator::VelocityVerletIntegrator(Real timestep) : Integrator(timestep) {}
@@ -542,6 +431,7 @@ VelocityVerletIntegratorCUDA::VelocityVerletIntegratorCUDA(Real timestep)
     : Integrator(timestep), d_x(nullptr), d_y(nullptr), d_z(nullptr),
       d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
       d_fx(nullptr), d_fy(nullptr), d_fz(nullptr),
+      d_fx_old(nullptr), d_fy_old(nullptr), d_fz_old(nullptr),
       d_mass(nullptr), allocated_size(0) {}
 
 VelocityVerletIntegratorCUDA::~VelocityVerletIntegratorCUDA() {
@@ -555,6 +445,9 @@ VelocityVerletIntegratorCUDA::~VelocityVerletIntegratorCUDA() {
         cudaFree(d_fx);
         cudaFree(d_fy);
         cudaFree(d_fz);
+        cudaFree(d_fx_old);
+        cudaFree(d_fy_old);
+        cudaFree(d_fz_old);
         cudaFree(d_mass);
     }
 }
@@ -572,6 +465,9 @@ void VelocityVerletIntegratorCUDA::allocate_gpu_memory(size_t num_particles) {
             cudaFree(d_fx);
             cudaFree(d_fy);
             cudaFree(d_fz);
+            cudaFree(d_fx_old);
+            cudaFree(d_fy_old);
+            cudaFree(d_fz_old);
             cudaFree(d_mass);
         }
         
@@ -585,6 +481,9 @@ void VelocityVerletIntegratorCUDA::allocate_gpu_memory(size_t num_particles) {
         cudaMalloc(&d_fx, num_particles * sizeof(Real));
         cudaMalloc(&d_fy, num_particles * sizeof(Real));
         cudaMalloc(&d_fz, num_particles * sizeof(Real));
+        cudaMalloc(&d_fx_old, num_particles * sizeof(Real));
+        cudaMalloc(&d_fy_old, num_particles * sizeof(Real));
+        cudaMalloc(&d_fz_old, num_particles * sizeof(Real));
         cudaMalloc(&d_mass, num_particles * sizeof(Real));
         
         allocated_size = num_particles;
@@ -617,134 +516,70 @@ void VelocityVerletIntegratorCUDA::copy_from_device(ParticleData& particles, siz
     cudaMemcpy(particles.vz.data(), d_vz, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
 }
 
+// VelocityVerletIntegratorCUDA without SimulationBox (no PBC)
 void VelocityVerletIntegratorCUDA::integrate(ParticleData& particles, Real dt, size_t local_particles) {
+    // Create a default box with no periodic boundaries
+    SimulationBox box;
+    box.lx = box.ly = box.lz = 1000.0;  // Large box
+    box.periodic_x = box.periodic_y = box.periodic_z = false;
+    integrate(particles, box, dt, local_particles);
+}
+
+// VelocityVerletIntegratorCUDA with SimulationBox
+void VelocityVerletIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
     // Allocate GPU memory if needed
     allocate_gpu_memory(num_particles);
     
-    
     // Copy data to device
     copy_to_device(particles, num_particles);
     
-    // Launch CUDA kernel for integration
-    launch_velocity_verlet_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz, 
-                                 d_fx, d_fy, d_fz, d_mass, dt, num_particles);
+    // Store old forces for velocity update (copy current forces to old forces)
+    cudaMemcpy(d_fx_old, d_fx, num_particles * sizeof(Real), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_fy_old, d_fy, num_particles * sizeof(Real), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_fz_old, d_fz, num_particles * sizeof(Real), cudaMemcpyDeviceToDevice);
+    
+    // Launch CUDA kernel for position update with proper box parameters
+    // Position update: x(t+dt) = x(t) + v(t)*dt + 0.5*a(t)*dt^2
+    launch_velocity_verlet_position_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz, 
+                                          d_fx, d_fy, d_fz, d_mass, dt, num_particles,
+                                          box.lx, box.ly, box.lz, 
+                                          box.periodic_x, box.periodic_y, box.periodic_z);
     
     cudaDeviceSynchronize();
     
-    // Copy results back to host
+    // Copy updated positions back to host (forces will be recalculated externally)
     copy_from_device(particles, num_particles);
     
+    // Note: complete_velocity_update() should be called after force recalculation
 }
 
-// CUDA Verlet Integrator Implementation
-VerletIntegratorCUDA::VerletIntegratorCUDA(Real timestep)
-    : Integrator(timestep), d_x(nullptr), d_y(nullptr), d_z(nullptr),
-      d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
-      d_fx(nullptr), d_fy(nullptr), d_fz(nullptr), d_mass(nullptr),
-      d_prev_x(nullptr), d_prev_y(nullptr), d_prev_z(nullptr), allocated_size(0) {}
-
-VerletIntegratorCUDA::~VerletIntegratorCUDA() {
-    if (d_x) {
-        cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
-        cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
-        cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
-        cudaFree(d_mass);
-        cudaFree(d_prev_x); cudaFree(d_prev_y); cudaFree(d_prev_z);
-    }
-}
-
-void VerletIntegratorCUDA::allocate_gpu_memory(size_t num_particles) {
-    if (allocated_size < num_particles) {
-        if (d_x) {
-            cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
-            cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
-            cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
-            cudaFree(d_mass);
-            cudaFree(d_prev_x); cudaFree(d_prev_y); cudaFree(d_prev_z);
-        }
-        
-        cudaMalloc(&d_x, num_particles * sizeof(Real));
-        cudaMalloc(&d_y, num_particles * sizeof(Real));
-        cudaMalloc(&d_z, num_particles * sizeof(Real));
-        cudaMalloc(&d_vx, num_particles * sizeof(Real));
-        cudaMalloc(&d_vy, num_particles * sizeof(Real));
-        cudaMalloc(&d_vz, num_particles * sizeof(Real));
-        cudaMalloc(&d_fx, num_particles * sizeof(Real));
-        cudaMalloc(&d_fy, num_particles * sizeof(Real));
-        cudaMalloc(&d_fz, num_particles * sizeof(Real));
-        cudaMalloc(&d_mass, num_particles * sizeof(Real));
-        cudaMalloc(&d_prev_x, num_particles * sizeof(Real));
-        cudaMalloc(&d_prev_y, num_particles * sizeof(Real));
-        cudaMalloc(&d_prev_z, num_particles * sizeof(Real));
-        
-        allocated_size = num_particles;
-        
-        if (is_rank_zero()) {
-            std::cout << "Allocated CUDA memory for Verlet integrator: " << num_particles << " particles" << std::endl;
-        }
-    }
-}
-
-void VerletIntegratorCUDA::copy_to_device(ParticleData& particles, size_t local_particles) {
-    cudaMemcpy(d_x, particles.x.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, particles.y.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_z, particles.z.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vx, particles.vx.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vy, particles.vy.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vz, particles.vz.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fx, particles.fx.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fy, particles.fy.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fz, particles.fz.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_mass, particles.mass.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    
-    if (prev_x.size() < local_particles) {
-        prev_x.resize(local_particles);
-        prev_y.resize(local_particles);
-        prev_z.resize(local_particles);
-        for (size_t i = 0; i < local_particles; i++) {
-            prev_x[i] = particles.x[i];
-            prev_y[i] = particles.y[i];
-            prev_z[i] = particles.z[i];
-        }
-    }
-    cudaMemcpy(d_prev_x, prev_x.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_prev_y, prev_y.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_prev_z, prev_z.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-}
-
-void VerletIntegratorCUDA::copy_from_device(ParticleData& particles, size_t local_particles) {
-    cudaMemcpy(particles.x.data(), d_x, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.y.data(), d_y, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.z.data(), d_z, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vx.data(), d_vx, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vy.data(), d_vy, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vz.data(), d_vz, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    
-    cudaMemcpy(prev_x.data(), d_prev_x, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(prev_y.data(), d_prev_y, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(prev_z.data(), d_prev_z, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-}
-
-void VerletIntegratorCUDA::integrate(ParticleData& particles, Real dt, size_t local_particles) {
+void VelocityVerletIntegratorCUDA::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
-    allocate_gpu_memory(num_particles);
-    copy_to_device(particles, num_particles);
+    // Copy new forces to device (positions are already on device from integrate())
+    cudaMemcpy(d_fx, particles.fx.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fy, particles.fy.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fz, particles.fz.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
     
-    bool first_step = prev_x.empty();
-    launch_verlet_kernel(d_x, d_y, d_z, d_prev_x, d_prev_y, d_prev_z,
-                        d_fx, d_fy, d_fz, d_mass, dt, num_particles, first_step,
-                        d_vx, d_vy, d_vz);
+    // Also need velocities on device
+    cudaMemcpy(d_vx, particles.vx.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_vy, particles.vy.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_vz, particles.vz.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
+    
+    // Launch velocity update kernel: v(t+dt) = v(t) + 0.5*[a(t) + a(t+dt)]*dt
+    launch_velocity_verlet_velocity_kernel(d_vx, d_vy, d_vz,
+                                          d_fx_old, d_fy_old, d_fz_old,
+                                          d_fx, d_fy, d_fz,
+                                          d_mass, dt, num_particles);
     
     cudaDeviceSynchronize();
     
-    copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero()) {
-        std::cout << "CUDA Verlet integration completed for " << num_particles << " particles" << std::endl;
-    }
+    // Copy updated velocities back to host
+    cudaMemcpy(particles.vx.data(), d_vx, num_particles * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vy.data(), d_vy, num_particles * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vz.data(), d_vz, num_particles * sizeof(Real), cudaMemcpyDeviceToHost);
 }
 
 // CUDA Leapfrog Integrator Implementation
@@ -812,14 +647,26 @@ void LeapfrogIntegratorCUDA::copy_from_device(ParticleData& particles, size_t lo
     cudaMemcpy(particles.vz.data(), d_vz, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
 }
 
+// LeapfrogIntegratorCUDA without SimulationBox (no PBC)
 void LeapfrogIntegratorCUDA::integrate(ParticleData& particles, Real dt, size_t local_particles) {
+    // Create a default box with no periodic boundaries
+    SimulationBox box;
+    box.lx = box.ly = box.lz = 1000.0;  // Large box
+    box.periodic_x = box.periodic_y = box.periodic_z = false;
+    integrate(particles, box, dt, local_particles);
+}
+
+// LeapfrogIntegratorCUDA with SimulationBox
+void LeapfrogIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
     allocate_gpu_memory(num_particles);
     copy_to_device(particles, num_particles);
     
     launch_leapfrog_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
-                          d_fx, d_fy, d_fz, d_mass, dt, num_particles);
+                          d_fx, d_fy, d_fz, d_mass, dt, num_particles,
+                          box.lx, box.ly, box.lz, 
+                          box.periodic_x, box.periodic_y, box.periodic_z);
     
     cudaDeviceSynchronize();
     
@@ -896,33 +743,52 @@ void RRESPAIntegratorCUDA::copy_from_device(ParticleData& particles, size_t loca
     cudaMemcpy(particles.vz.data(), d_vz, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
 }
 
+// RRESPAIntegratorCUDA without SimulationBox (no PBC)
 void RRESPAIntegratorCUDA::integrate(ParticleData& particles, Real dt, size_t local_particles) {
+    // Create a default box with no periodic boundaries
+    SimulationBox box;
+    box.lx = box.ly = box.lz = 1000.0;  // Large box
+    box.periodic_x = box.periodic_y = box.periodic_z = false;
+    integrate(particles, box, dt, local_particles);
+}
+
+void RRESPAIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
+    // TODO: Implement CUDA r-RESPA integration with PBC
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
-    allocate_gpu_memory(num_particles);
-    copy_to_device(particles, num_particles);
-    
-    
-    for (int step = 0; step < n_inner; step++) {
-        // First half
-        launch_r_respa_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
-                             d_fx, d_fy, d_fz, d_mass, dt_inner, num_particles, true);
-        
-        cudaDeviceSynchronize();
-        
-        // Force calculation would go here
-        
-        // Second half
-        launch_r_respa_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
-                             d_fx, d_fy, d_fz, d_mass, dt_inner, num_particles, false);
-        
-        cudaDeviceSynchronize();
+    // Placeholder: For now, just do a simple velocity-verlet style update
+    // This should be replaced with proper r-RESPA implementation
+    if (is_rank_zero()) {
+        std::cout << "Warning: RRESPAIntegratorCUDA::integrate not yet fully implemented" << std::endl;
     }
     
-    copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero()) {
-        std::cout << "CUDA r-RESPA integration completed for " << num_particles << " particles" << std::endl;
+    // Simple position and velocity update without CUDA kernels for now
+    for (size_t i = 0; i < num_particles; i++) {
+        particles.vx[i] += 0.5 * particles.fx[i] / particles.mass[i] * dt;
+        particles.vy[i] += 0.5 * particles.fy[i] / particles.mass[i] * dt;
+        particles.vz[i] += 0.5 * particles.fz[i] / particles.mass[i] * dt;
+        
+        particles.x[i] += particles.vx[i] * dt;
+        particles.y[i] += particles.vy[i] * dt;
+        particles.z[i] += particles.vz[i] * dt;
+        
+        // Apply periodic boundary conditions
+        if (box.periodic_x) {
+            while (particles.x[i] >= box.lx) particles.x[i] -= box.lx;
+            while (particles.x[i] < 0) particles.x[i] += box.lx;
+        }
+        if (box.periodic_y) {
+            while (particles.y[i] >= box.ly) particles.y[i] -= box.ly;
+            while (particles.y[i] < 0) particles.y[i] += box.ly;
+        }
+        if (box.periodic_z) {
+            while (particles.z[i] >= box.lz) particles.z[i] -= box.lz;
+            while (particles.z[i] < 0) particles.z[i] += box.lz;
+        }
+        
+        particles.vx[i] += 0.5 * particles.fx[i] / particles.mass[i] * dt;
+        particles.vy[i] += 0.5 * particles.fy[i] / particles.mass[i] * dt;
+        particles.vz[i] += 0.5 * particles.fz[i] / particles.mass[i] * dt;
     }
 }
 
@@ -1091,232 +957,7 @@ void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, const Simu
     }
 }
 
-// SYCL Verlet Integrator Implementation
-VerletIntegratorSYCL::VerletIntegratorSYCL(Real timestep)
-    : Integrator(timestep) {
-    queue = sycl::queue(sycl::gpu_selector_v);
-    if (is_rank_zero()) {
-        std::cout << "SYCL Verlet integrator initialized" << std::endl;
-    }
-}
 
-void VerletIntegratorSYCL::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    if (prev_x.size() < num_particles) {
-        prev_x.resize(num_particles);
-        prev_y.resize(num_particles);
-        prev_z.resize(num_particles);
-        
-        for (size_t i = 0; i < num_particles; i++) {
-            prev_x[i] = particles.x[i];
-            prev_y[i] = particles.y[i];
-            prev_z[i] = particles.z[i];
-        }
-    }
-    
-    try {
-        // Allocate device memory
-        sycl::buffer<Real, 1> x_buf(particles.x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> y_buf(particles.y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> z_buf(particles.z.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> prev_x_buf(prev_x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> prev_y_buf(prev_y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> prev_z_buf(prev_z.data(), sycl::range<1>(num_particles));
-        
-        // Submit kernel to compute queue
-        queue.submit([&](sycl::handler& cgh) {
-            auto x = x_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto y = y_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto z = z_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vx = vx_buf.get_access<sycl::access::mode::write>(cgh);
-            auto vy = vy_buf.get_access<sycl::access::mode::write>(cgh);
-            auto vz = vz_buf.get_access<sycl::access::mode::write>(cgh);
-            auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
-            auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
-            auto prev_x = prev_x_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto prev_y = prev_y_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto prev_z = prev_z_buf.get_access<sycl::access::mode::read_write>(cgh);
-            
-            bool first_step = (prev_x.size() == 0);
-            
-            cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                size_t i = idx[0];
-                Real inv_mass = 1.0 / mass[i];
-                
-                Real new_x, new_y, new_z;
-                
-                if (first_step) {
-                    // First step: use velocity-Verlet approximation
-                    Real ax = fx[i] * inv_mass;
-                    Real ay = fy[i] * inv_mass;
-                    Real az = fz[i] * inv_mass;
-                    
-                    new_x = x[i] + dt * vx[i] + 0.5 * dt * dt * ax;
-                    new_y = y[i] + dt * vy[i] + 0.5 * dt * dt * ay;
-                    new_z = z[i] + dt * vz[i] + 0.5 * dt * dt * az;
-                } else {
-                    // Verlet algorithm
-                    Real ax = fx[i] * inv_mass;
-                    Real ay = fy[i] * inv_mass;
-                    Real az = fz[i] * inv_mass;
-                    
-                    new_x = 2.0 * x[i] - prev_x[i] + dt * dt * ax;
-                    new_y = 2.0 * y[i] - prev_y[i] + dt * dt * ay;
-                    new_z = 2.0 * z[i] - prev_z[i] + dt * dt * az;
-                    
-                    // Calculate velocity from position difference
-                    vx[i] = (new_x - prev_x[i]) / (2.0 * dt);
-                    vy[i] = (new_y - prev_y[i]) / (2.0 * dt);
-                    vz[i] = (new_z - prev_z[i]) / (2.0 * dt);
-                }
-                
-                // Update previous positions
-                prev_x[i] = x[i];
-                prev_y[i] = y[i];
-                prev_z[i] = z[i];
-                
-                // Update current positions
-                x[i] = new_x;
-                y[i] = new_y;
-                z[i] = new_z;
-            });
-        }).wait();
-        
-        if (is_rank_zero()) {
-            std::cout << "SYCL Verlet integration completed for " << num_particles << " particles" << std::endl;
-        }
-        
-    } catch (const sycl::exception& e) {
-        if (is_rank_zero()) {
-            std::cerr << "SYCL exception in Verlet integration: " << e.what() << std::endl;
-        }
-        throw;
-    }
-}
-
-// SYCL Verlet with PBC
-void VerletIntegratorSYCL::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    if (prev_x.size() < num_particles) {
-        prev_x.resize(num_particles);
-        prev_y.resize(num_particles);
-        prev_z.resize(num_particles);
-        
-        for (size_t i = 0; i < num_particles; i++) {
-            prev_x[i] = particles.x[i];
-            prev_y[i] = particles.y[i];
-            prev_z[i] = particles.z[i];
-        }
-    }
-    
-    try {
-        // Allocate device memory
-        sycl::buffer<Real, 1> x_buf(particles.x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> y_buf(particles.y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> z_buf(particles.z.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> prev_x_buf(prev_x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> prev_y_buf(prev_y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> prev_z_buf(prev_z.data(), sycl::range<1>(num_particles));
-        
-        // Copy box parameters
-        Real box_x = box.box_length[0];
-        Real box_y = box.box_length[1];
-        Real box_z = box.box_length[2];
-        
-        // Submit kernel to compute queue
-        queue.submit([&](sycl::handler& cgh) {
-            auto x = x_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto y = y_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto z = z_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vx = vx_buf.get_access<sycl::access::mode::write>(cgh);
-            auto vy = vy_buf.get_access<sycl::access::mode::write>(cgh);
-            auto vz = vz_buf.get_access<sycl::access::mode::write>(cgh);
-            auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
-            auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
-            auto prev_x = prev_x_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto prev_y = prev_y_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto prev_z = prev_z_buf.get_access<sycl::access::mode::read_write>(cgh);
-            
-            bool first_step = (prev_x.size() == 0);
-            
-            cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                size_t i = idx[0];
-                Real inv_mass = 1.0 / mass[i];
-                
-                Real new_x, new_y, new_z;
-                
-                if (first_step) {
-                    // First step: use velocity-Verlet approximation
-                    Real ax = fx[i] * inv_mass;
-                    Real ay = fy[i] * inv_mass;
-                    Real az = fz[i] * inv_mass;
-                    
-                    new_x = x[i] + dt * vx[i] + 0.5 * dt * dt * ax;
-                    new_y = y[i] + dt * vy[i] + 0.5 * dt * dt * ay;
-                    new_z = z[i] + dt * vz[i] + 0.5 * dt * dt * az;
-                } else {
-                    // Verlet algorithm
-                    Real ax = fx[i] * inv_mass;
-                    Real ay = fy[i] * inv_mass;
-                    Real az = fz[i] * inv_mass;
-                    
-                    new_x = 2.0 * x[i] - prev_x[i] + dt * dt * ax;
-                    new_y = 2.0 * y[i] - prev_y[i] + dt * dt * ay;
-                    new_z = 2.0 * z[i] - prev_z[i] + dt * dt * az;
-                    
-                    // Calculate velocity from position difference
-                    vx[i] = (new_x - prev_x[i]) / (2.0 * dt);
-                    vy[i] = (new_y - prev_y[i]) / (2.0 * dt);
-                    vz[i] = (new_z - prev_z[i]) / (2.0 * dt);
-                }
-                
-                // Apply periodic boundary conditions before updating positions
-                new_x = new_x - box_x * sycl::floor(new_x / box_x);
-                new_y = new_y - box_y * sycl::floor(new_y / box_y);
-                new_z = new_z - box_z * sycl::floor(new_z / box_z);
-                
-                // Update previous positions
-                prev_x[i] = x[i];
-                prev_y[i] = y[i];
-                prev_z[i] = z[i];
-                
-                // Update current positions
-                x[i] = new_x;
-                y[i] = new_y;
-                z[i] = new_z;
-            });
-        }).wait();
-        
-        if (is_rank_zero()) {
-            std::cout << "SYCL Verlet with PBC integration completed for " << num_particles << " particles" << std::endl;
-        }
-        
-    } catch (const sycl::exception& e) {
-        if (is_rank_zero()) {
-            std::cerr << "SYCL exception in Verlet PBC integration: " << e.what() << std::endl;
-        }
-        throw;
-    }
 }
 
 // SYCL Leapfrog Integrator Implementation

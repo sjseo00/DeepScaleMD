@@ -1,6 +1,6 @@
 #ifdef USE_SYCL
 
-#define OMPI_SKIP_MPICXX 1
+
 #include "force_calculator_sycl.h"
 #include "md_system.h"
 #include <iostream>

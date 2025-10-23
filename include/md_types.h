@@ -9,6 +9,9 @@
 // Precision type
 using Real = double;
 
+// Physical constants
+constexpr Real kB = 0.0019872041; // Boltzmann constant in kcal/(mol·K) for LAMMPS 'real' units
+
 // Structure of Arrays for GPU efficiency
 struct ParticleData {
     std::vector<Real> x, y, z;        // positions

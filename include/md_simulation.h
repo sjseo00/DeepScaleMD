@@ -63,6 +63,21 @@ private:
     // Cached energy values
     Real cached_potential_energy;       // Store PE from force calculation
     
+    // Timing infrastructure
+    bool timing_enabled;
+    struct StepTiming {
+        double domain_ms = 0.0;
+        double nlist_build_ms = 0.0;
+        double migrate_ms = 0.0;
+        double force_ms = 0.0;
+        double integrate_ms = 0.0;
+        double thermostat_ms = 0.0;
+        double ke_ms = 0.0;
+        double barostat_ms = 0.0;
+        double total_ms = 0.0;
+    } last_timing;
+    void print_step_timing(int step);
+    
 public:
     MDSimulation();
     ~MDSimulation();

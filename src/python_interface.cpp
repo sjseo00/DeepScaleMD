@@ -1,4 +1,4 @@
-#define OMPI_SKIP_MPICXX 1
+
 #include "../include/force_calculator.h"
 #include <iostream>
 #include <stdexcept>

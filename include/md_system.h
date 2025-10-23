@@ -1,7 +1,7 @@
 #ifndef MD_SYSTEM_H
 #define MD_SYSTEM_H
 
-#define OMPI_SKIP_MPICXX 1
+
 #include "md_types.h"
 #include "topology.h"
 #include "force_manager.h"
@@ -28,12 +28,30 @@ private:
     int rank, size;
     int local_start, local_end;
     
-    // Domain decomposition and halo exchange
+    // Domain decomposition
     int neighbor_ranks[26];  // Maximum 26 neighbors in 3D (including corners)
     int num_neighbors;
     Real domain_min[3], domain_max[3];  // Local domain boundaries
-    std::vector<int> halo_particles;    // Indices of halo particles
-    std::vector<ParticleData> neighbor_halos;  // Halo particles from neighbors
+    
+    // Halo exchange data
+    std::vector<int> halo_particles;  // Indices of particles to send as halo
+    std::vector<ParticleData> neighbor_halos;  // Received ghost particles from neighbors
+    Real halo_width;  // Width of halo region
+    
+    // MPI Cartesian topology (cached to avoid repeated creation)
+#ifdef USE_MPI
+    MPI_Comm cart_comm;
+    int cart_dims[3];      // Cartesian grid dimensions
+    int cart_coords[3];    // This rank's coordinates in grid
+#endif
+    
+    // Reusable buffers for MPI communication (memory pool for reduced allocation overhead)
+    std::vector<Real> mpi_send_buffer_flat;  // Persistent flat send buffer for Alltoallv
+    std::vector<Real> mpi_recv_buffer_flat;  // Persistent flat receive buffer for Alltoallv
+    std::vector<int> mpi_send_counts;        // Send counts for each neighbor
+    std::vector<int> mpi_recv_counts;        // Receive counts for each neighbor
+    std::vector<int> mpi_send_disps;         // Send displacements for Alltoallv
+    std::vector<int> mpi_recv_disps;         // Receive displacements for Alltoallv
     
     // Device management
     void* d_particles;  // Device particle data
@@ -55,15 +73,7 @@ public:
     void allocate_device_memory();
     void copy_to_device();
     void copy_from_device();
-    
-    // Halo exchange methods
-    void setup_neighbor_ranks();
-    void identify_halo_particles();
-    void exchange_halo_particles();
-    void pack_halo_data(int neighbor_rank, std::vector<Real>& buffer);
-    void unpack_halo_data(int neighbor_rank, const std::vector<Real>& buffer);
-    void update_ghost_positions();
-    
+        
     // Topology-related methods
     void load_standard_xyz(const std::string& coord_file);
     void assign_masses_from_topology();
@@ -91,11 +101,16 @@ public:
     Real get_physical_cutoff() const { return physical_cutoff; }
     void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
     
-    // Halo exchange getters
-    const std::vector<int>& get_halo_particles() const { return halo_particles; }
-    const std::vector<ParticleData>& get_neighbor_halos() const { return neighbor_halos; }
+    // Domain decomposition getters
     int get_num_neighbors() const { return num_neighbors; }
     const int* get_neighbor_ranks() const { return neighbor_ranks; }
+    
+    // Halo exchange methods
+    void setup_neighbor_ranks();
+    void identify_halo_particles();
+    void exchange_halo_particles();
+    void pack_halo_data(int neighbor_rank, std::vector<Real>& buffer);
+    void unpack_halo_data(int neighbor_rank, const std::vector<Real>& buffer);
 };
 
 #endif // MD_SYSTEM_H

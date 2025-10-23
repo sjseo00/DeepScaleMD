@@ -1,6 +1,6 @@
 #if defined(USE_CUDA) && defined(USE_MPI)
 
-#define OMPI_SKIP_MPICXX 1
+
 #include "cuda_mpi_system.h"
 #include <iostream>
 #include <cuda_runtime.h>
@@ -14,13 +14,21 @@ static bool is_rank_zero() {
 }
 
 CUDAMPISystem::CUDAMPISystem() : MDSystem(), 
-    d_halo_send_buffer(nullptr), d_halo_recv_buffer(nullptr),
+    d_migration_send_buffer(nullptr), d_migration_recv_buffer(nullptr),
     d_particle_send_indices(nullptr), d_particle_recv_indices(nullptr),
-    halo_buffer_size(0), cuda_aware_mpi_available(false) {
+    migration_buffer_size(0), cuda_aware_mpi_available(false)
+#ifdef USE_NCCL
+    , nccl_comm(nullptr), nccl_initialized(false), nccl_stream(nullptr),
+    d_force_buffer_x(nullptr), d_force_buffer_y(nullptr), d_force_buffer_z(nullptr)
+#endif
+{
 }
 
 CUDAMPISystem::~CUDAMPISystem() {
-    free_halo_buffers();
+    free_migration_buffers();
+#ifdef USE_NCCL
+    finalize_nccl();
+#endif
 }
 
 void CUDAMPISystem::initialize() {
@@ -29,19 +37,30 @@ void CUDAMPISystem::initialize() {
         std::cout << "Initializing CUDA MPI System" << std::endl;
     }
     
+#ifdef USE_NCCL
+    // Try to initialize NCCL first
+    initialize_nccl();
+    if (nccl_initialized && is_rank_zero()) {
+        std::cout << "NCCL initialized successfully for GPU communication" << std::endl;
+    }
+#endif
+    
     // Check CUDA-aware MPI availability
     cuda_aware_mpi_available = check_cuda_aware_mpi();
     
     if (cuda_aware_mpi_available && is_rank_zero()) {
         std::cout << "CUDA-aware MPI detected and enabled" << std::endl;
-        allocate_halo_buffers();
+        allocate_migration_buffers();
     } else if (is_rank_zero()) {
         std::cout << "CUDA-aware MPI not available, using CPU fallback" << std::endl;
     }
 }
 
 void CUDAMPISystem::finalize() {
-    free_halo_buffers();
+#ifdef USE_NCCL
+    finalize_nccl();
+#endif
+    free_migration_buffers();
     if (is_rank_zero()) {
         std::cout << "CUDA MPI System finalized" << std::endl;
     }
@@ -72,129 +91,42 @@ bool CUDAMPISystem::check_cuda_aware_mpi() {
     return (flag >= 0);
 }
 
-void CUDAMPISystem::allocate_halo_buffers() {
+void CUDAMPISystem::allocate_migration_buffers() {
     if (!cuda_aware_mpi_available) return;
     
     ParticleData& particle_data = get_particles();
     size_t max_particles_per_process = particle_data.num_particles;
-    halo_buffer_size = max_particles_per_process * sizeof(Real) * 7; // x,y,z,vx,vy,vz,mass
+    migration_buffer_size = max_particles_per_process * sizeof(Real) * 9; // x,y,z,vx,vy,vz,mass,charge,type
     
-    cudaMalloc(&d_halo_send_buffer, halo_buffer_size);
-    cudaMalloc(&d_halo_recv_buffer, halo_buffer_size);
+    cudaMalloc(&d_migration_send_buffer, migration_buffer_size);
+    cudaMalloc(&d_migration_recv_buffer, migration_buffer_size);
     cudaMalloc(&d_particle_send_indices, max_particles_per_process * sizeof(int));
     cudaMalloc(&d_particle_recv_indices, max_particles_per_process * sizeof(int));
     
-    std::cout << "Allocated GPU halo buffers: " << (halo_buffer_size * 2) / 1024 / 1024 
+    std::cout << "Allocated GPU migration buffers: " << (migration_buffer_size * 2) / 1024 / 1024 
               << " MB per process" << std::endl;
 }
 
-void CUDAMPISystem::free_halo_buffers() {
-    if (d_halo_send_buffer) cudaFree(d_halo_send_buffer);
-    if (d_halo_recv_buffer) cudaFree(d_halo_recv_buffer);
+void CUDAMPISystem::free_migration_buffers() {
+    if (d_migration_send_buffer) cudaFree(d_migration_send_buffer);
+    if (d_migration_recv_buffer) cudaFree(d_migration_recv_buffer);
     if (d_particle_send_indices) cudaFree(d_particle_send_indices);
     if (d_particle_recv_indices) cudaFree(d_particle_recv_indices);
     
-    d_halo_send_buffer = d_halo_recv_buffer = nullptr;
+    d_migration_send_buffer = d_migration_recv_buffer = nullptr;
     d_particle_send_indices = d_particle_recv_indices = nullptr;
 }
 
-void CUDAMPISystem::exchange_particles_gpu_direct() {
-    if (!cuda_aware_mpi_available) {
-        // Fallback to CPU-based exchange using parent class implementation
-        if (is_rank_zero() && get_rank() == 0) {
-            std::cout << "CUDA-aware MPI not available, using CPU-based halo exchange" << std::endl;
-        }
-        exchange_halo_particles();  // Call parent class method
-        return;
-    }
-    
-    // GPU-direct exchange using CUDA-aware MPI
-    // First, identify halo particles (can use parent class method)
-    identify_halo_particles();
-    
-    const auto& halo_list = get_halo_particles();
-    int num_halo = halo_list.size();
-    
-    if (num_halo == 0) return;
-    
-    // Get particle data reference
-    ParticleData& particles = get_particles();
-    const int* neighbor_ranks_ptr = get_neighbor_ranks();
-    
-    // For CUDA-aware MPI, we would:
-    // 1. Copy halo particle data to GPU send buffer
-    // 2. Use MPI_Isend/Irecv directly on GPU pointers
-    // 3. Unpack received data on GPU
-    
-    // Simplified implementation: use CPU for now, GPU optimization can be added later
-    std::vector<MPI_Request> send_requests(get_num_neighbors());
-    std::vector<MPI_Request> recv_requests(get_num_neighbors());
-    std::vector<std::vector<Real>> send_buffers(get_num_neighbors());
-    std::vector<std::vector<Real>> recv_buffers(get_num_neighbors());
-    
-    // Post receives
-    for (int n = 0; n < get_num_neighbors(); n++) {
-        int recv_count;
-        MPI_Irecv(&recv_count, 1, MPI_INT, neighbor_ranks_ptr[n], 0, 
-                  MPI_COMM_WORLD, &recv_requests[n]);
-    }
-    
-    // Pack and send
-    std::vector<int> send_counts(get_num_neighbors(), 0);
-    for (int n = 0; n < get_num_neighbors(); n++) {
-        pack_halo_data(neighbor_ranks_ptr[n], send_buffers[n]);
-        send_counts[n] = send_buffers[n].size();
-        
-        MPI_Send(&send_counts[n], 1, MPI_INT, neighbor_ranks_ptr[n], 0, MPI_COMM_WORLD);
-        
-        if (send_counts[n] > 0) {
-            MPI_Isend(send_buffers[n].data(), send_counts[n], MPI_DOUBLE, 
-                     neighbor_ranks_ptr[n], 1, MPI_COMM_WORLD, &send_requests[n]);
-        }
-    }
-    
-    // Receive and unpack
-    for (int n = 0; n < get_num_neighbors(); n++) {
-        int recv_count;
-        MPI_Status status;
-        MPI_Wait(&recv_requests[n], &status);
-        MPI_Get_count(&status, MPI_INT, &recv_count);
-        
-        if (recv_count > 0) {
-            recv_buffers[n].resize(recv_count);
-            MPI_Recv(recv_buffers[n].data(), recv_count, MPI_DOUBLE, 
-                    neighbor_ranks_ptr[n], 1, MPI_COMM_WORLD, &status);
-            
-            unpack_halo_data(neighbor_ranks_ptr[n], recv_buffers[n]);
-        }
-    }
-    
-    // Wait for sends
-    for (int n = 0; n < get_num_neighbors(); n++) {
-        if (send_counts[n] > 0) {
-            MPI_Wait(&send_requests[n], MPI_STATUS_IGNORE);
-        }
-    }
-}
-
-void CUDAMPISystem::exchange_halo_async() {
-    if (!cuda_aware_mpi_available) return;
-    
-    exchange_particles_gpu_direct();
-}
-
-void CUDAMPISystem::wait_halo_exchange() {
-    if (!cuda_aware_mpi_available) return;
-    
-    // Wait for all communications to complete
-    MPI_Waitall(send_requests.size(), send_requests.data(), MPI_STATUSES_IGNORE);
-    MPI_Waitall(recv_requests.size(), recv_requests.data(), MPI_STATUSES_IGNORE);
-    
-    // Simplified - would need proper neighbor rank tracking implementation
-    std::cout << "Halo exchange wait completed" << std::endl;
-}
 
 void CUDAMPISystem::allreduce_forces_gpu() {
+#ifdef USE_NCCL
+    // Use NCCL if available (much faster for GPU-to-GPU communication)
+    if (nccl_initialized) {
+        allreduce_forces_nccl();
+        return;
+    }
+#endif
+    
     if (!cuda_aware_mpi_available) {
         // Fallback to CPU reduction - simplified version
         std::cout << "CUDA-aware MPI not available, skipping GPU force reduction" << std::endl;
@@ -213,24 +145,132 @@ void CUDAMPISystem::allreduce_forces_gpu() {
                   MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 }
 
-void CUDAMPISystem::pack_halo_particles_gpu(int neighbor_rank) {
-    // Launch GPU kernel to pack particles
-    // Implementation would depend on specific halo identification logic
-    std::cout << "Packing halo particles for rank " << neighbor_rank << " on GPU" << std::endl;
-    
-    // Example usage of kernel wrapper (when particle indices are available):
-    // launch_pack_particles_kernel(d_positions, d_velocities, d_masses, 
-    //                              d_halo_indices, d_send_buffer, halo_count);
+void CUDAMPISystem::exchange_halo_async() {
+    // Call the parent class halo exchange method
+    // Since CUDAMPISystem inherits from MDSystem, we can call exchange_halo_particles
+    // For now, implement a basic version - this should be enhanced for true async behavior
+    exchange_halo_particles();
 }
 
-void CUDAMPISystem::unpack_halo_particles_gpu(int neighbor_rank) {
-    // Launch GPU kernel to unpack particles  
-    // Implementation would depend on specific halo management logic
-    std::cout << "Unpacking halo particles from rank " << neighbor_rank << " on GPU" << std::endl;
-        
-    // Example usage of kernel wrapper (when particle indices are available):
-    // launch_unpack_particles_kernel(d_positions, d_velocities, d_masses,
-    //                                d_halo_indices, d_recv_buffer, halo_count);
+void CUDAMPISystem::wait_halo_exchange() {
+    // For now, this is a no-op since exchange_halo_async is synchronous
+    // In a full implementation, this would wait for async operations to complete
+    // MPI_Waitall or similar would be called here
 }
+
+#ifdef USE_NCCL
+void CUDAMPISystem::initialize_nccl() {
+    nccl_initialized = false;
+    
+    try {
+        int rank, size;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &size);
+        
+        // Get unique ID from rank 0 and broadcast to all ranks
+        ncclUniqueId id;
+        if (rank == 0) {
+            ncclGetUniqueId(&id);
+        }
+        MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+        
+        // Create NCCL communicator
+        ncclResult_t result = ncclCommInitRank(&nccl_comm, size, id, rank);
+        if (result != ncclSuccess) {
+            if (is_rank_zero()) {
+                std::cerr << "NCCL initialization failed: " << ncclGetErrorString(result) << std::endl;
+            }
+            return;
+        }
+        
+        // Create dedicated CUDA stream for NCCL operations
+        cudaStreamCreate(&nccl_stream);
+        
+        // Allocate GPU buffers for force reduction
+        ParticleData& particle_data = get_particles();
+        size_t num_particles = particle_data.num_particles;
+        
+        cudaMalloc(&d_force_buffer_x, num_particles * sizeof(Real));
+        cudaMalloc(&d_force_buffer_y, num_particles * sizeof(Real));
+        cudaMalloc(&d_force_buffer_z, num_particles * sizeof(Real));
+        
+        nccl_initialized = true;
+        
+        if (is_rank_zero()) {
+            std::cout << "NCCL communicator initialized with " << size << " GPUs" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        if (is_rank_zero()) {
+            std::cerr << "Exception during NCCL initialization: " << e.what() << std::endl;
+        }
+        nccl_initialized = false;
+    }
+}
+
+void CUDAMPISystem::finalize_nccl() {
+    if (!nccl_initialized) return;
+    
+    // Free GPU buffers
+    if (d_force_buffer_x) cudaFree(d_force_buffer_x);
+    if (d_force_buffer_y) cudaFree(d_force_buffer_y);
+    if (d_force_buffer_z) cudaFree(d_force_buffer_z);
+    
+    d_force_buffer_x = nullptr;
+    d_force_buffer_y = nullptr;
+    d_force_buffer_z = nullptr;
+    
+    // Destroy CUDA stream
+    if (nccl_stream) {
+        cudaStreamDestroy(nccl_stream);
+        nccl_stream = nullptr;
+    }
+    
+    // Destroy NCCL communicator
+    if (nccl_comm) {
+        ncclCommDestroy(nccl_comm);
+        nccl_comm = nullptr;
+    }
+    
+    nccl_initialized = false;
+    
+    if (is_rank_zero()) {
+        std::cout << "NCCL resources finalized" << std::endl;
+    }
+}
+
+void CUDAMPISystem::allreduce_forces_nccl() {
+    if (!nccl_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "NCCL not initialized, cannot perform allreduce" << std::endl;
+        }
+        return;
+    }
+    
+    ParticleData& particle_data = get_particles();
+    size_t num_particles = particle_data.num_particles;
+    
+    // Get device pointers to force arrays
+    Real* d_fx = particle_data.fx.data();
+    Real* d_fy = particle_data.fy.data();
+    Real* d_fz = particle_data.fz.data();
+    
+    // Perform NCCL allreduce operations (in-place)
+    // NCCL AllReduce is highly optimized for GPU-to-GPU communication
+    ncclDataType_t nccl_real_type = sizeof(Real) == 8 ? ncclDouble : ncclFloat;
+    
+    // Group NCCL operations for better performance
+    ncclGroupStart();
+    ncclAllReduce((const void*)d_fx, (void*)d_fx, num_particles, 
+                  nccl_real_type, ncclSum, nccl_comm, nccl_stream);
+    ncclAllReduce((const void*)d_fy, (void*)d_fy, num_particles, 
+                  nccl_real_type, ncclSum, nccl_comm, nccl_stream);
+    ncclAllReduce((const void*)d_fz, (void*)d_fz, num_particles, 
+                  nccl_real_type, ncclSum, nccl_comm, nccl_stream);
+    ncclGroupEnd();
+    
+    // Synchronize the NCCL stream to ensure completion
+    cudaStreamSynchronize(nccl_stream);
+}
+#endif // USE_NCCL
 
 #endif // USE_CUDA && USE_MPI

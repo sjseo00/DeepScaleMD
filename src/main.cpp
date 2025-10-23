@@ -1,4 +1,4 @@
-#define OMPI_SKIP_MPICXX 1
+
 #include "md_simulation.h"
 #include <iostream>
 #include <chrono>

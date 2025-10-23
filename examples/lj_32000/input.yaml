@@ -13,9 +13,9 @@ total_steps: 1000  # LAMMPS run 10000
 
 
 # Simulation box parameters
-box_x: 320.0
-box_y: 320.0
-box_z: 320.0
+box_x: 160.0
+box_y: 160.0
+box_z: 160.0
 periodic_x: true
 periodic_y: true
 periodic_z: true
@@ -36,18 +36,15 @@ cutoff_distance: 12.0
 
 # Neighbor list configuration
 neighbor_list_type: "verlet_cell_list"
-#neighbor_list_type: "verlet_list"
-#neighbor_list_type: "cell_list"
 #neighbor_list_type: "morton_hilbert"
 
 
 verlet_skin: 2.0                          # Verlet list skin distance (for Verlet lists)
-neighbor_list_update_freq: 2                     # More frequent rebuild to prevent divergence
+neighbor_list_update_freq: 10                     # More frequent rebuild to prevent divergence
 
 # Integration method
-#integrator: "velocity_verlet"
-#integrator: "verlet"
-integrator: "leapfrog"
+integrator: "velocity_verlet"
+#integrator: "leapfrog"
 #integrator: "r_respa"
 
 

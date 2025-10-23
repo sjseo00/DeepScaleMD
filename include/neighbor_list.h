@@ -12,8 +12,6 @@
 #endif
 
 enum class NeighborListType {
-    CELL_LIST,
-    VERLET_LIST,
     VERLET_CELL_LIST,
     MORTON_HILBERT_CSR
 };
@@ -21,44 +19,13 @@ enum class NeighborListType {
 class NeighborListBuilder {
 public:
     virtual ~NeighborListBuilder() = default;
-    virtual void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) = 0;
+    virtual void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist, size_t num_local = 0) = 0;
     virtual void initialize() = 0;
     virtual void finalize() = 0;
     virtual NeighborListType get_type() const = 0;
 };
 
-// Traditional cell list based neighbor list builder
-class CellListNeighborBuilder : public NeighborListBuilder {
-private:
-    Real cell_size;
-    Real verlet_skin;  // Skin distance for stability
-    int nx, ny, nz;  // number of cells in each direction
-    // CSR-style compressed cell -> particle mapping (always on)
-    std::vector<int> cell_offsets;   // size = num_cells + 1
-    std::vector<int> cell_particles; // flattened particle indices
-    
-public:
-    CellListNeighborBuilder(Real cutoff, Real skin = 2.0);
-    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
-    void initialize() override;
-    void finalize() override;
-    NeighborListType get_type() const override { return NeighborListType::CELL_LIST; }
 
-};
-
-// Simple Verlet list builder (all-pairs with cutoff)
-class VerletListNeighborBuilder : public NeighborListBuilder {
-private:
-    Real cutoff;
-    Real verlet_skin;
-    
-public:
-    VerletListNeighborBuilder(Real cutoff, Real skin = 2.0);
-    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
-    void initialize() override;
-    void finalize() override;
-    NeighborListType get_type() const override { return NeighborListType::VERLET_LIST; }
-};
 
 // Verlet list with cell-based acceleration (hybrid approach)
 class VerletCellListNeighborBuilder : public NeighborListBuilder {
@@ -71,15 +38,14 @@ private:
     
 public:
     VerletCellListNeighborBuilder(Real cutoff, Real skin = 1.0);
-    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
+    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist, size_t num_local = 0) override;
     void initialize() override;
     void finalize() override;
     NeighborListType get_type() const override { return NeighborListType::VERLET_CELL_LIST; }
 };
 
-#if defined(USE_CUDA) || defined(USE_SYCL)
 // Modern Morton/Hilbert curve based neighbor list builder with CSR format and tile staging
-// Compatible with both CUDA and SYCL backends
+// Compatible with CUDA, SYCL, and CPU backends
 class MortonHilbertNeighborBuilder : public NeighborListBuilder {
 private:
     Real cutoff;
@@ -141,7 +107,7 @@ private:
     
 public:
     MortonHilbertNeighborBuilder(Real cutoff, Real skin = 2.0, int tile_size = 256);
-    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist) override;
+    void build(ParticleData& particles, SimulationBox& box, NeighborList& nlist, size_t num_local = 0) override;
     void initialize() override;
     void finalize() override;
     NeighborListType get_type() const override { return NeighborListType::MORTON_HILBERT_CSR; }
@@ -151,7 +117,6 @@ public:
     const CSRNeighborList& get_csr_format() const { return csr_nlist; }
     const TileStaging& get_tile_staging() const { return tile_staging; }
 };
-#endif // USE_CUDA || USE_SYCL
 
 // Factory function to create appropriate neighbor list builder
 std::unique_ptr<NeighborListBuilder> create_neighbor_list_builder(

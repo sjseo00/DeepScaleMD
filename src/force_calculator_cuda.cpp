@@ -1,6 +1,6 @@
 #ifdef USE_CUDA
 
-#define OMPI_SKIP_MPICXX 1
+
 #include "force_calculator_cuda.h"
 #include "md_system.h"
 #include <cuda_runtime.h>
@@ -16,7 +16,9 @@ extern void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
                              int num_particles, Real cutoff,
                              int max_neighbors_total,
                              cudaStream_t stream,
-                             Real box_x, Real box_y, Real box_z);
+                             Real box_x, Real box_y, Real box_z,
+                             int num_local_particles,
+                             Real* d_potential_energy);
 
 extern void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                                  Real* d_fx, Real* d_fy, Real* d_fz,
@@ -25,9 +27,11 @@ extern void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                                  int num_particles, Real cutoff,
                                  int max_neighbors_total,
                                  cudaStream_t stream,
-                                 Real box_x, Real box_y, Real box_z);
+                                 Real box_x, Real box_y, Real box_z,
+                                 int num_local_particles,
+                                 Real* d_potential_energy);
 
-ForceCalculatorCUDA::ForceCalculatorCUDA() : rank(0) {
+ForceCalculatorCUDA::ForceCalculatorCUDA() : rank(0), allocated_size(0) {
     // Get MPI rank for output control
 #ifdef USE_MPI
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -44,6 +48,7 @@ ForceCalculatorCUDA::ForceCalculatorCUDA() : rank(0) {
     d_charge = d_mass = nullptr;
     d_epsilon = d_sigma = nullptr;
     d_neighbors = d_num_neighbors = d_neighbor_offset = nullptr;
+    d_potential_energy = nullptr;
     max_neighbors_allocated = 0;
 }
 
@@ -62,6 +67,7 @@ ForceCalculatorCUDA::~ForceCalculatorCUDA() {
     if (d_neighbors) cudaFree(d_neighbors);
     if (d_num_neighbors) cudaFree(d_num_neighbors);
     if (d_neighbor_offset) cudaFree(d_neighbor_offset);
+    if (d_potential_energy) cudaFree(d_potential_energy);
     
     cublasDestroy(cublas_handle);
     cudaStreamDestroy(stream);
@@ -117,6 +123,9 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
     cudaMalloc(&d_num_neighbors, int_size);
     cudaMalloc(&d_neighbor_offset, int_size);
     
+    // Allocate potential energy accumulator (single Real value)
+    cudaMalloc(&d_potential_energy, sizeof(Real));
+    
     // Allocate neighbor list (will be reallocated based on actual size)
     cudaMalloc(&d_neighbors, num_particles * 200 * sizeof(int)); // Initial estimate
 }
@@ -124,30 +133,47 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
 void ForceCalculatorCUDA::copy_to_device(MDSystem& system) {
     ParticleData& particles = system.get_particles();
     size_t local_particles = system.get_local_particles();
+    size_t total_particles = local_particles;
     
-    cudaMemcpyAsync(d_x, particles.x.data(), local_particles * sizeof(Real), 
+    static bool debug_enabled = (std::getenv("MD_DEBUG") != nullptr);
+    
+    if (debug_enabled && rank == 0) {
+        std::cout << "Rank " << rank << ": [CUDA] copy_to_device - local=" << local_particles << std::endl;
+    }
+    
+    // Check if device memory is allocated and large enough
+    if (!d_x) {
+        if (rank == 0) {
+            std::cerr << "Error: Device memory not allocated in copy_to_device!" << std::endl;
+        }
+        return;
+    }
+    
+    ForceFieldParams& params = system.get_ff_params();
+    
+    // Copy local particles to device
+    cudaMemcpyAsync(d_x, particles.x.data(), total_particles * sizeof(Real), 
                     cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_y, particles.y.data(), local_particles * sizeof(Real), 
+    cudaMemcpyAsync(d_y, particles.y.data(), total_particles * sizeof(Real), 
                     cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_z, particles.z.data(), local_particles * sizeof(Real), 
+    cudaMemcpyAsync(d_z, particles.z.data(), total_particles * sizeof(Real), 
                     cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_charge, particles.charge.data(), local_particles * sizeof(Real), 
+    cudaMemcpyAsync(d_charge, particles.charge.data(), total_particles * sizeof(Real), 
                     cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_mass, particles.mass.data(), local_particles * sizeof(Real), 
+    cudaMemcpyAsync(d_mass, particles.mass.data(), total_particles * sizeof(Real), 
                     cudaMemcpyHostToDevice, stream);
     
     // Copy force field parameters
-    ForceFieldParams& params = system.get_ff_params();
-    cudaMemcpyAsync(d_epsilon, params.epsilon.data(), local_particles * sizeof(Real), 
+    cudaMemcpyAsync(d_epsilon, params.epsilon.data(), total_particles * sizeof(Real), 
                     cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_sigma, params.sigma.data(), local_particles * sizeof(Real), 
+    cudaMemcpyAsync(d_sigma, params.sigma.data(), total_particles * sizeof(Real), 
                     cudaMemcpyHostToDevice, stream);
     
-    // Copy neighbor list
+    // Copy neighbor list (always needed)
     NeighborList& nlist = system.get_neighbor_list();
     
     // Check if neighbor list is too large and truncate if necessary
-    size_t max_neighbors_total = local_particles * 1000; // Max 1000 neighbors per particle
+    size_t max_neighbors_total = total_particles * 1000; // Max 1000 neighbors per particle
     size_t actual_neighbors = nlist.neighbors.size();
     
     static int warning_count = 0;
@@ -161,9 +187,11 @@ void ForceCalculatorCUDA::copy_to_device(MDSystem& system) {
     
     // Reallocate neighbor list if needed
     if (neighbors_to_copy > 0) {
-        cudaFree(d_neighbors);
-        cudaMalloc(&d_neighbors, neighbors_to_copy * sizeof(int));
-        max_neighbors_allocated = neighbors_to_copy;
+        if (neighbors_to_copy != max_neighbors_allocated) {
+            if (d_neighbors) cudaFree(d_neighbors);
+            cudaMalloc(&d_neighbors, neighbors_to_copy * sizeof(int));
+            max_neighbors_allocated = neighbors_to_copy;
+        }
         
         cudaMemcpyAsync(d_neighbors, nlist.neighbors.data(), 
                         neighbors_to_copy * sizeof(int), cudaMemcpyHostToDevice, stream);
@@ -207,19 +235,32 @@ void ForceCalculatorCUDA::copy_from_device(MDSystem& system) {
 }
 
 void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
-    if (!d_x) {
-        allocate_device_memory(system.get_local_particles());
+    size_t local_particles = system.get_local_particles();
+    size_t total_particles = local_particles;
+    
+    if (!d_x || allocated_size < total_particles) {
+        // Reallocate if needed
+        if (d_x) {
+            cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
+            cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
+            cudaFree(d_charge); cudaFree(d_mass);
+            cudaFree(d_epsilon); cudaFree(d_sigma);
+            cudaFree(d_num_neighbors); cudaFree(d_neighbor_offset);
+        }
+        allocate_device_memory(total_particles);
+        allocated_size = total_particles;
     }
     
     copy_to_device(system);
     
-    // Zero forces
-    size_t local_particles = system.get_local_particles();
-    cudaMemsetAsync(d_fx, 0, local_particles * sizeof(Real), stream);
-    cudaMemsetAsync(d_fy, 0, local_particles * sizeof(Real), stream);
-    cudaMemsetAsync(d_fz, 0, local_particles * sizeof(Real), stream);
+    // Zero forces (only for local particles, not ghosts)
+    cudaMemsetAsync(d_fx, 0, total_particles * sizeof(Real), stream);
+    cudaMemsetAsync(d_fy, 0, total_particles * sizeof(Real), stream);
+    cudaMemsetAsync(d_fz, 0, total_particles * sizeof(Real), stream);
     
     // Reset energy accumulators
+    Real zero = 0.0;
+    cudaMemcpyAsync(d_potential_energy, &zero, sizeof(Real), cudaMemcpyHostToDevice, stream);
     last_potential_energy = 0.0;
     last_kinetic_energy = 0.0;
     
@@ -246,6 +287,11 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     
     // KE will be calculated after integration
     
+    // Copy potential energy from device to host
+    cudaMemcpyAsync(&last_potential_energy, d_potential_energy, sizeof(Real), 
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);  // Wait for energy copy to complete
+    
     copy_from_device(system);
     
     // Sum total potential energy across all MPI ranks
@@ -258,7 +304,8 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
 
 void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
-    size_t total_particles = system.get_num_particles();
+    size_t total_particles = local_particles;
+    
     NeighborList& nlist = system.get_neighbor_list();
     SimulationBox& box = system.get_box();
     
@@ -267,12 +314,12 @@ void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
     }
     
     // Use CUDA kernel for LJ force calculation
-    // Pass num_local_particles to kernel to prevent double counting in MPI mode
+    // Pass total_particles for array bounds, but num_local_particles to prevent double counting
     launch_lj_kernel(d_x, d_y, d_z, d_fx, d_fy, d_fz,
                      d_neighbors, d_num_neighbors, d_neighbor_offset,
-                     d_epsilon, d_sigma, local_particles, nlist.cutoff,
+                     d_epsilon, d_sigma, total_particles, nlist.cutoff,
                      max_neighbors_allocated, stream,
-                     box.lx, box.ly, box.lz, local_particles);
+                     box.lx, box.ly, box.lz, local_particles, d_potential_energy);
     
     // Check for CUDA errors
     cudaError_t err = cudaGetLastError();
@@ -280,16 +327,14 @@ void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
         std::cout << "CUDA LJ kernel error: " << cudaGetErrorString(err) << std::endl;
     }
     
-    // For potential energy calculation, we need to do a reduction on GPU
-    // For now, we'll estimate it based on typical LJ interactions
-    // In a full implementation, you would do a proper GPU reduction
-    last_potential_energy += local_particles * 0.1; // Rough estimate
+    // Potential energy is accumulated in d_potential_energy and will be copied back in compute_forces
 }
 
 void ForceCalculatorCUDA::compute_electrostatic_forces_cuda(MDSystem& system) {
     // Use the existing domain decomposition system
     size_t local_particles = system.get_local_particles();
-    size_t total_particles = system.get_num_particles();
+    size_t total_particles = local_particles;
+    
     NeighborList& nlist = system.get_neighbor_list();
     
     // Check if any particles have non-zero charge
@@ -314,7 +359,7 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_cuda(MDSystem& system) {
     if (rank == 0) {
         static bool coulomb_info_printed = false;
         if (!coulomb_info_printed) {
-            std::cout << "CUDA Coulomb Force calculation: " << total_particles << " total particles, " 
+            std::cout << "CUDA Coulomb Force calculation: " << total_particles << " total particles (incl. ghosts), " 
                       << local_particles << " local particles" << std::endl;
             coulomb_info_printed = true;
         }
@@ -322,12 +367,14 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_cuda(MDSystem& system) {
     
     // Launch Coulomb kernel with domain decomposition support
     // The kernel should only process local_particles, not total_particles
-    // Pass num_local_particles to kernel to prevent double counting in MPI mode
+    // Pass total_particles for array bounds, num_local_particles to prevent double counting
     SimulationBox& box = system.get_box();
     launch_coulomb_kernel(d_x, d_y, d_z, d_fx, d_fy, d_fz,
                          d_charge, d_neighbors, d_num_neighbors, d_neighbor_offset,
-                         local_particles, nlist.cutoff, max_neighbors_allocated, stream,
-                         box.lx, box.ly, box.lz, local_particles);
+                         total_particles, nlist.cutoff, max_neighbors_allocated, stream,
+                         box.lx, box.ly, box.lz, local_particles, d_potential_energy);
+    
+    // Potential energy is accumulated in d_potential_energy and will be copied back in compute_forces
 }
 
 // Complete implementations for bond, angle, and dihedral forces
@@ -335,298 +382,294 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_cuda(MDSystem& system) {
 // than non-bonded forces and are typically much fewer in number
 
 void ForceCalculatorCUDA::compute_bond_forces_cuda(MDSystem& system) {
+    ParticleData& particles = system.get_particles();
     Topology& topology = system.get_topology();
-    const std::vector<Bond>& bonds = topology.get_bonds();
     
+    // Check if we have bonds
+    const std::vector<Bond>& bonds = topology.get_bonds();
     if (bonds.empty()) {
         return; // No bonds defined
     }
     
-    ParticleData& particles = system.get_particles();
-    SimulationBox& box = system.get_box();
     size_t local_particles = system.get_local_particles();
     
-    // CPU implementation for bond forces
-    // In a full CUDA implementation, this would be done on GPU
     for (const auto& bond : bonds) {
-        int i = bond.atom1;
-        int j = bond.atom2;
+        size_t i = bond.atom1;
+        size_t j = bond.atom2;
         
-        // Check if at least one atom is local
-        if (i >= static_cast<int>(local_particles) && j >= static_cast<int>(local_particles)) {
-            continue;
-        }
+        // Only compute if at least one particle is local
+        if (i >= local_particles && j >= local_particles) continue;
+        
+        if (i >= particles.x.size() || j >= particles.x.size()) continue;
         
         Real dx = particles.x[i] - particles.x[j];
         Real dy = particles.y[i] - particles.y[j];
         Real dz = particles.z[i] - particles.z[j];
         
-        // Apply PBC
-        if (dx > box.lx * 0.5) dx -= box.lx;
-        else if (dx < -box.lx * 0.5) dx += box.lx;
-        if (dy > box.ly * 0.5) dy -= box.ly;
-        else if (dy < -box.ly * 0.5) dy += box.ly;
-        if (dz > box.lz * 0.5) dz -= box.lz;
-        else if (dz < -box.lz * 0.5) dz += box.lz;
+        // Apply periodic boundary conditions
+        SimulationBox& box = system.get_box();
+        box.apply_minimum_image(dx, dy, dz);
         
         Real r = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (r < 1e-10) continue; // Avoid division by zero
         
-        if (r > 1e-10) {
-            // Get bond type parameters
-            const BondType& bond_type = topology.get_bond_type(bond.type);
-            Real equilibrium_length = bond_type.r0;
-            Real force_constant = bond_type.k;
-            
-            Real dr = r - equilibrium_length;
-            Real force_mag = -2.0 * force_constant * dr / r;
-            
-            Real fx = force_mag * dx;
-            Real fy = force_mag * dy;
-            Real fz = force_mag * dz;
-            
-            if (i < static_cast<int>(local_particles)) {
-                particles.fx[i] += fx;
-                particles.fy[i] += fy;
-                particles.fz[i] += fz;
-            }
-            
-            if (j < static_cast<int>(local_particles)) {
-                particles.fx[j] -= fx;
-                particles.fy[j] -= fy;
-                particles.fz[j] -= fz;
-            }
-            
-            // Add to potential energy
-            Real bond_pe = force_constant * dr * dr;
-            last_potential_energy += bond_pe;
+        // Get bond parameters from topology
+        const BondType& bond_type = topology.get_bond_type(bond.type);
+        Real k_bond = bond_type.k;    // Force constant
+        Real r0 = bond_type.r0;       // Equilibrium distance
+        
+        // Harmonic bond potential: V = 0.5 * k * (r - r0)^2
+        // Force: F = -k * (r - r0) * r_hat
+        Real dr = r - r0;
+        Real force_mag = -k_bond * dr / r;
+        
+        Real fx = force_mag * dx;
+        Real fy = force_mag * dy;
+        Real fz = force_mag * dz;
+        
+        if (i < local_particles) {
+            particles.fx[i] += fx;
+            particles.fy[i] += fy;
+            particles.fz[i] += fz;
+        }
+        
+        if (j < local_particles) {
+            particles.fx[j] -= fx;
+            particles.fy[j] -= fy;
+            particles.fz[j] -= fz;
         }
     }
 }
 
 void ForceCalculatorCUDA::compute_angle_forces_cuda(MDSystem& system) {
+    ParticleData& particles = system.get_particles();
     Topology& topology = system.get_topology();
-    const std::vector<Angle>& angles = topology.get_angles();
     
+    // Check if we have angles
+    const std::vector<Angle>& angles = topology.get_angles();
     if (angles.empty()) {
         return; // No angles defined
     }
     
-    ParticleData& particles = system.get_particles();
-    SimulationBox& box = system.get_box();
     size_t local_particles = system.get_local_particles();
     
-    // CPU implementation for angle forces
     for (const auto& angle : angles) {
-        int i = angle.atom1;
-        int j = angle.atom2; // central atom
-        int k = angle.atom3;
+        size_t i = angle.atom1;  // First atom
+        size_t j = angle.atom2;  // Central atom
+        size_t k = angle.atom3;  // Third atom
         
-        // Check if at least one atom is local
-        if (i >= static_cast<int>(local_particles) && 
-            j >= static_cast<int>(local_particles) && 
-            k >= static_cast<int>(local_particles)) {
-            continue;
+        // Only compute if at least one particle is local
+        if (i >= local_particles && j >= local_particles && k >= local_particles) continue;
+        
+        if (i >= particles.x.size() || j >= particles.x.size() || k >= particles.x.size()) continue;
+        
+        // Vectors from central atom j to atoms i and k
+        Real dx_ij = particles.x[i] - particles.x[j];
+        Real dy_ij = particles.y[i] - particles.y[j];
+        Real dz_ij = particles.z[i] - particles.z[j];
+        
+        Real dx_kj = particles.x[k] - particles.x[j];
+        Real dy_kj = particles.y[k] - particles.y[j];
+        Real dz_kj = particles.z[k] - particles.z[j];
+        
+        // Apply periodic boundary conditions
+        SimulationBox& box = system.get_box();
+        box.apply_minimum_image(dx_ij, dy_ij, dz_ij);
+        box.apply_minimum_image(dx_kj, dy_kj, dz_kj);
+        
+        Real r_ij = std::sqrt(dx_ij*dx_ij + dy_ij*dy_ij + dz_ij*dz_ij);
+        Real r_kj = std::sqrt(dx_kj*dx_kj + dy_kj*dy_kj + dz_kj*dz_kj);
+        
+        if (r_ij < 1e-10 || r_kj < 1e-10) continue; // Avoid division by zero
+        
+        // Calculate angle
+        Real dot_product = dx_ij*dx_kj + dy_ij*dy_kj + dz_ij*dz_kj;
+        Real cos_theta = dot_product / (r_ij * r_kj);
+        
+        // Clamp to avoid numerical issues
+        if (cos_theta > 1.0) cos_theta = 1.0;
+        if (cos_theta < -1.0) cos_theta = -1.0;
+        
+        Real theta = std::acos(cos_theta);
+        
+        // Get angle parameters from topology
+        const AngleType& angle_type = topology.get_angle_type(angle.type);
+        Real k_angle = angle_type.k;         // Force constant
+        Real theta0 = angle_type.theta0;     // Equilibrium angle
+        Real dtheta = theta - theta0;
+        
+        if (std::abs(dtheta) < 1e-10) continue; // No force if at equilibrium
+        
+        // Use more numerically stable force calculation
+        Real sin_theta = std::sqrt(1.0 - cos_theta * cos_theta);
+        if (sin_theta < 1e-10) continue; // Avoid division by zero
+        
+        Real force_constant = -k_angle * dtheta / sin_theta;
+        
+        // Force calculation (simplified - this is a complex derivation)
+        Real r_ij_inv = 1.0 / r_ij;
+        Real r_kj_inv = 1.0 / r_kj;
+        
+        Real cos_theta_ij = cos_theta / r_ij;
+        Real cos_theta_kj = cos_theta / r_kj;
+        
+        Real fx_i = force_constant * (dx_kj * r_ij_inv * r_kj_inv - dx_ij * cos_theta_ij * r_ij_inv);
+        Real fy_i = force_constant * (dy_kj * r_ij_inv * r_kj_inv - dy_ij * cos_theta_ij * r_ij_inv);
+        Real fz_i = force_constant * (dz_kj * r_ij_inv * r_kj_inv - dz_ij * cos_theta_ij * r_ij_inv);
+        
+        Real fx_k = force_constant * (dx_ij * r_ij_inv * r_kj_inv - dx_kj * cos_theta_kj * r_kj_inv);
+        Real fy_k = force_constant * (dy_ij * r_ij_inv * r_kj_inv - dy_kj * cos_theta_kj * r_kj_inv);
+        Real fz_k = force_constant * (dz_ij * r_ij_inv * r_kj_inv - dz_kj * cos_theta_kj * r_kj_inv);
+        
+        // Forces on central atom j (Newton's third law)
+        Real fx_j = -(fx_i + fx_k);
+        Real fy_j = -(fy_i + fy_k);
+        Real fz_j = -(fz_i + fz_k);
+        
+        // Apply forces to local particles only
+        if (i < local_particles) {
+            particles.fx[i] += fx_i;
+            particles.fy[i] += fy_i;
+            particles.fz[i] += fz_i;
         }
         
-        // Vector from j to i
-        Real dx_ji = particles.x[i] - particles.x[j];
-        Real dy_ji = particles.y[i] - particles.y[j];
-        Real dz_ji = particles.z[i] - particles.z[j];
+        if (j < local_particles) {
+            particles.fx[j] += fx_j;
+            particles.fy[j] += fy_j;
+            particles.fz[j] += fz_j;
+        }
         
-        // Vector from j to k
-        Real dx_jk = particles.x[k] - particles.x[j];
-        Real dy_jk = particles.y[k] - particles.y[j];
-        Real dz_jk = particles.z[k] - particles.z[j];
-        
-        // Apply PBC
-        if (dx_ji > box.lx * 0.5) dx_ji -= box.lx;
-        else if (dx_ji < -box.lx * 0.5) dx_ji += box.lx;
-        if (dy_ji > box.ly * 0.5) dy_ji -= box.ly;
-        else if (dy_ji < -box.ly * 0.5) dy_ji += box.ly;
-        if (dz_ji > box.lz * 0.5) dz_ji -= box.lz;
-        else if (dz_ji < -box.lz * 0.5) dz_ji += box.lz;
-        
-        if (dx_jk > box.lx * 0.5) dx_jk -= box.lx;
-        else if (dx_jk < -box.lx * 0.5) dx_jk += box.lx;
-        if (dy_jk > box.ly * 0.5) dy_jk -= box.ly;
-        else if (dy_jk < -box.ly * 0.5) dy_jk += box.ly;
-        if (dz_jk > box.lz * 0.5) dz_jk -= box.lz;
-        else if (dz_jk < -box.lz * 0.5) dz_jk += box.lz;
-        
-        Real r_ji = std::sqrt(dx_ji*dx_ji + dy_ji*dy_ji + dz_ji*dz_ji);
-        Real r_jk = std::sqrt(dx_jk*dx_jk + dy_jk*dy_jk + dz_jk*dz_jk);
-        
-        if (r_ji > 1e-10 && r_jk > 1e-10) {
-            // Calculate angle
-            Real cos_theta = (dx_ji*dx_jk + dy_ji*dy_jk + dz_ji*dz_jk) / (r_ji * r_jk);
-            cos_theta = std::max(-1.0, std::min(1.0, cos_theta)); // Clamp to [-1,1]
-            
-            Real theta = std::acos(cos_theta);
-            
-            // Get angle type parameters
-            const AngleType& angle_type = topology.get_angle_type(angle.type);
-            Real equilibrium_angle = angle_type.theta0;
-            Real force_constant = angle_type.k;
-            
-            Real dtheta = theta - equilibrium_angle;
-            
-            Real dE_dtheta = -2.0 * force_constant * dtheta;
-            Real sin_theta = std::sin(theta);
-            
-            if (std::abs(sin_theta) > 1e-10) {
-                Real dE_dcos = -dE_dtheta / sin_theta;
-                
-                // Force on atom i
-                Real dcos_dxi = (dx_jk / (r_ji * r_jk)) - (cos_theta * dx_ji / (r_ji * r_ji));
-                Real dcos_dyi = (dy_jk / (r_ji * r_jk)) - (cos_theta * dy_ji / (r_ji * r_ji));
-                Real dcos_dzi = (dz_jk / (r_ji * r_jk)) - (cos_theta * dz_ji / (r_ji * r_ji));
-                
-                // Force on atom k
-                Real dcos_dxk = (dx_ji / (r_ji * r_jk)) - (cos_theta * dx_jk / (r_jk * r_jk));
-                Real dcos_dyk = (dy_ji / (r_ji * r_jk)) - (cos_theta * dy_jk / (r_jk * r_jk));
-                Real dcos_dzk = (dz_ji / (r_ji * r_jk)) - (cos_theta * dz_jk / (r_jk * r_jk));
-                
-                if (i < static_cast<int>(local_particles)) {
-                    particles.fx[i] -= dE_dcos * dcos_dxi;
-                    particles.fy[i] -= dE_dcos * dcos_dyi;
-                    particles.fz[i] -= dE_dcos * dcos_dzi;
-                }
-                
-                if (k < static_cast<int>(local_particles)) {
-                    particles.fx[k] -= dE_dcos * dcos_dxk;
-                    particles.fy[k] -= dE_dcos * dcos_dyk;
-                    particles.fz[k] -= dE_dcos * dcos_dzk;
-                }
-                
-                if (j < static_cast<int>(local_particles)) {
-                    // Force on central atom j (negative of sum of forces on i and k)
-                    particles.fx[j] += dE_dcos * (dcos_dxi + dcos_dxk);
-                    particles.fy[j] += dE_dcos * (dcos_dyi + dcos_dyk);
-                    particles.fz[j] += dE_dcos * (dcos_dzi + dcos_dzk);
-                }
-                
-                // Add to potential energy
-                Real angle_pe = force_constant * dtheta * dtheta;
-                last_potential_energy += angle_pe;
-            }
+        if (k < local_particles) {
+            particles.fx[k] += fx_k;
+            particles.fy[k] += fy_k;
+            particles.fz[k] += fz_k;
         }
     }
 }
 
 void ForceCalculatorCUDA::compute_dihedral_forces_cuda(MDSystem& system) {
+    ParticleData& particles = system.get_particles();
     Topology& topology = system.get_topology();
-    const std::vector<Dihedral>& dihedrals = topology.get_dihedrals();
     
+    // Check if we have dihedrals
+    const std::vector<Dihedral>& dihedrals = topology.get_dihedrals();
     if (dihedrals.empty()) {
         return; // No dihedrals defined
     }
     
-    ParticleData& particles = system.get_particles();
-    SimulationBox& box = system.get_box();
     size_t local_particles = system.get_local_particles();
     
-    // CPU implementation for dihedral forces
     for (const auto& dihedral : dihedrals) {
-        int i = dihedral.atom1;
-        int j = dihedral.atom2;
-        int k = dihedral.atom3;
-        int l = dihedral.atom4;
+        size_t i = dihedral.atom1;
+        size_t j = dihedral.atom2;
+        size_t k = dihedral.atom3;
+        size_t l = dihedral.atom4;
         
-        // Check if at least one atom is local
-        if (i >= static_cast<int>(local_particles) && 
-            j >= static_cast<int>(local_particles) && 
-            k >= static_cast<int>(local_particles) &&
-            l >= static_cast<int>(local_particles)) {
-            continue;
+        // Only compute if at least one particle is local
+        if (i >= local_particles && j >= local_particles && 
+            k >= local_particles && l >= local_particles) continue;
+        
+        if (i >= particles.x.size() || j >= particles.x.size() || 
+            k >= particles.x.size() || l >= particles.x.size()) continue;
+        
+        // Vectors for dihedral calculation
+        Real dx_ij = particles.x[i] - particles.x[j];
+        Real dy_ij = particles.y[i] - particles.y[j];
+        Real dz_ij = particles.z[i] - particles.z[j];
+        
+        Real dx_jk = particles.x[j] - particles.x[k];
+        Real dy_jk = particles.y[j] - particles.y[k];
+        Real dz_jk = particles.z[j] - particles.z[k];
+        
+        Real dx_kl = particles.x[k] - particles.x[l];
+        Real dy_kl = particles.y[k] - particles.y[l];
+        Real dz_kl = particles.z[k] - particles.z[l];
+        
+        // Apply periodic boundary conditions
+        SimulationBox& box = system.get_box();
+        box.apply_minimum_image(dx_ij, dy_ij, dz_ij);
+        box.apply_minimum_image(dx_jk, dy_jk, dz_jk);
+        box.apply_minimum_image(dx_kl, dy_kl, dz_kl);
+        
+        // Cross products for plane normals
+        Real n1_x = dy_ij * dz_jk - dz_ij * dy_jk;  // ij x jk
+        Real n1_y = dz_ij * dx_jk - dx_ij * dz_jk;
+        Real n1_z = dx_ij * dy_jk - dy_ij * dx_jk;
+        
+        Real n2_x = dy_jk * dz_kl - dz_jk * dy_kl;  // jk x kl  
+        Real n2_y = dz_jk * dx_kl - dx_jk * dz_kl;
+        Real n2_z = dx_jk * dy_kl - dy_jk * dx_kl;
+        
+        Real n1_mag = std::sqrt(n1_x*n1_x + n1_y*n1_y + n1_z*n1_z);
+        Real n2_mag = std::sqrt(n2_x*n2_x + n2_y*n2_y + n2_z*n2_z);
+        
+        if (n1_mag < 1e-10 || n2_mag < 1e-10) continue; // Avoid division by zero
+        
+        // Normalize
+        n1_x /= n1_mag; n1_y /= n1_mag; n1_z /= n1_mag;
+        n2_x /= n2_mag; n2_y /= n2_mag; n2_z /= n2_mag;
+        
+        // Calculate dihedral angle
+        Real cos_phi = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
+        
+        // Clamp to avoid numerical issues
+        if (cos_phi > 1.0) cos_phi = 1.0;
+        if (cos_phi < -1.0) cos_phi = -1.0;
+        
+        // Determine sign of angle
+        Real jk_mag = std::sqrt(dx_jk*dx_jk + dy_jk*dy_jk + dz_jk*dz_jk);
+        if (jk_mag < 1e-10) continue;
+        
+        Real jk_x = dx_jk / jk_mag;
+        Real jk_y = dy_jk / jk_mag; 
+        Real jk_z = dz_jk / jk_mag;
+        
+        Real triple_product = (n1_y * n2_z - n1_z * n2_y) * jk_x +
+                             (n1_z * n2_x - n1_x * n2_z) * jk_y +
+                             (n1_x * n2_y - n1_y * n2_x) * jk_z;
+        
+        Real phi = std::atan2(triple_product, cos_phi);
+        
+        // Get dihedral parameters from topology
+        const DihedralType& dihedral_type = topology.get_dihedral_type(dihedral.type);
+        Real k_dihedral = dihedral_type.k;
+        Real phi0 = dihedral_type.phi0;  // Phase shift
+        int n = dihedral_type.n;         // Multiplicity
+        
+        // CHARMM-style dihedral potential: V = k * (1 + cos(n*phi - phi0))
+        Real dphi = n * phi - phi0;
+        Real force_magnitude = -k_dihedral * n * std::sin(dphi);
+        
+        // Force calculation is very complex for dihedrals
+        // This is a simplified implementation
+        // In practice, you would need the full analytical derivatives
+        
+        // For now, apply a simplified force proportional to the gradient
+        Real force_scale = force_magnitude / (n1_mag * n2_mag);
+        
+        // Simplified force distribution (not fully accurate)
+        if (i < local_particles) {
+            particles.fx[i] += force_scale * n1_x * 0.25;
+            particles.fy[i] += force_scale * n1_y * 0.25;
+            particles.fz[i] += force_scale * n1_z * 0.25;
         }
         
-        // Vectors between atoms with PBC
-        auto apply_pbc = [&](Real& dx, Real& dy, Real& dz) {
-            if (dx > box.lx * 0.5) dx -= box.lx;
-            else if (dx < -box.lx * 0.5) dx += box.lx;
-            if (dy > box.ly * 0.5) dy -= box.ly;
-            else if (dy < -box.ly * 0.5) dy += box.ly;
-            if (dz > box.lz * 0.5) dz -= box.lz;
-            else if (dz < -box.lz * 0.5) dz += box.lz;
-        };
+        if (j < local_particles) {
+            particles.fx[j] -= force_scale * (n1_x + n2_x) * 0.25;
+            particles.fy[j] -= force_scale * (n1_y + n2_y) * 0.25;
+            particles.fz[j] -= force_scale * (n1_z + n2_z) * 0.25;
+        }
         
-        // Vector from i to j
-        Real dx_ij = particles.x[j] - particles.x[i];
-        Real dy_ij = particles.y[j] - particles.y[i];
-        Real dz_ij = particles.z[j] - particles.z[i];
-        apply_pbc(dx_ij, dy_ij, dz_ij);
+        if (k < local_particles) {
+            particles.fx[k] += force_scale * (n1_x + n2_x) * 0.25;
+            particles.fy[k] += force_scale * (n1_y + n2_y) * 0.25;
+            particles.fz[k] += force_scale * (n1_z + n2_z) * 0.25;
+        }
         
-        // Vector from j to k
-        Real dx_jk = particles.x[k] - particles.x[j];
-        Real dy_jk = particles.y[k] - particles.y[j];
-        Real dz_jk = particles.z[k] - particles.z[j];
-        apply_pbc(dx_jk, dy_jk, dz_jk);
-        
-        // Vector from k to l
-        Real dx_kl = particles.x[l] - particles.x[k];
-        Real dy_kl = particles.y[l] - particles.y[k];
-        Real dz_kl = particles.z[l] - particles.z[k];
-        apply_pbc(dx_kl, dy_kl, dz_kl);
-        
-        // Calculate cross products
-        Real nx1 = dy_ij * dz_jk - dz_ij * dy_jk;  // n1 = r_ij × r_jk
-        Real ny1 = dz_ij * dx_jk - dx_ij * dz_jk;
-        Real nz1 = dx_ij * dy_jk - dy_ij * dx_jk;
-        
-        Real nx2 = dy_jk * dz_kl - dz_jk * dy_kl;  // n2 = r_jk × r_kl
-        Real ny2 = dz_jk * dx_kl - dx_jk * dz_kl;
-        Real nz2 = dx_jk * dy_kl - dy_jk * dx_kl;
-        
-        Real n1_mag2 = nx1*nx1 + ny1*ny1 + nz1*nz1;
-        Real n2_mag2 = nx2*nx2 + ny2*ny2 + nz2*nz2;
-        
-        if (n1_mag2 > 1e-10 && n2_mag2 > 1e-10) {
-            Real n1_mag = std::sqrt(n1_mag2);
-            Real n2_mag = std::sqrt(n2_mag2);
-            
-            // Calculate dihedral angle
-            Real cos_phi = (nx1*nx2 + ny1*ny2 + nz1*nz2) / (n1_mag * n2_mag);
-            cos_phi = std::max(-1.0, std::min(1.0, cos_phi));
-            
-            // Calculate sign of angle using triple product
-            Real sin_phi_sign = (nx1*(dy_jk*dz_kl - dz_jk*dy_kl) + 
-                                ny1*(dz_jk*dx_kl - dx_jk*dz_kl) + 
-                                nz1*(dx_jk*dy_kl - dy_jk*dx_kl)) / (n1_mag * n2_mag);
-            
-            Real phi = std::atan2(sin_phi_sign, cos_phi);
-            
-            // Get dihedral type parameters
-            const DihedralType& dihedral_type = topology.get_dihedral_type(dihedral.type);
-            Real phase_angle = dihedral_type.phi0;
-            Real force_constant = dihedral_type.k;
-            int multiplicity = dihedral_type.n;
-            
-            // Calculate potential and its derivative
-            Real dphi = phi - phase_angle;
-            Real sin_dphi = std::sin(multiplicity * dphi);
-            Real cos_dphi = std::cos(multiplicity * dphi);
-            
-            Real dihedral_pe = force_constant * (1.0 + cos_dphi);
-            Real dE_dphi = -force_constant * multiplicity * sin_dphi;
-            
-            // This is a simplified force calculation
-            // In practice, the derivatives are quite complex for dihedral angles
-            // Here we use an approximation
-            Real force_scale = dE_dphi / (n1_mag * n2_mag + 1e-10);
-            
-            if (i < static_cast<int>(local_particles)) {
-                particles.fx[i] -= force_scale * nx1 * 0.1;
-                particles.fy[i] -= force_scale * ny1 * 0.1;
-                particles.fz[i] -= force_scale * nz1 * 0.1;
-            }
-            
-            if (l < static_cast<int>(local_particles)) {
-                particles.fx[l] -= force_scale * nx2 * 0.1;
-                particles.fy[l] -= force_scale * ny2 * 0.1;
-                particles.fz[l] -= force_scale * nz2 * 0.1;
-            }
-            
-            last_potential_energy += dihedral_pe;
+        if (l < local_particles) {
+            particles.fx[l] -= force_scale * n2_x * 0.25;
+            particles.fy[l] -= force_scale * n2_y * 0.25;
+            particles.fz[l] -= force_scale * n2_z * 0.25;
         }
     }
 }

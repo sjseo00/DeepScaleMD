@@ -1,4 +1,4 @@
-#define OMPI_SKIP_MPICXX 1
+
 #include <mpi.h>
 #include "md_simulation.h"
 #include "neighbor_list.h"
@@ -22,7 +22,7 @@ MDSimulation::MDSimulation() :
     trajectory_output_freq(100),
     energy_output_freq(10),
     cutoff_distance(12.0),
-    neighbor_list_type_str("cell_list"),
+    neighbor_list_type_str("verlet_cell_list"),
     neighbor_list_tile_size(256),
     neighbor_list_update_freq(10),  // Default update frequency: every 10 steps
     verlet_skin(2.0),               // Default Verlet skin distance
@@ -43,7 +43,11 @@ MDSimulation::MDSimulation() :
     dt(0.001), 
     python_force_path("python_force"), 
     python_force_enabled(false),
-    cached_potential_energy(0.0) {}
+    cached_potential_energy(0.0),
+    timing_enabled(false) {
+    const char* env = std::getenv("MD_TIMING");
+    if (env && std::string(env) == "1") timing_enabled = true;
+}
 
 MDSimulation::~MDSimulation() = default;
 
@@ -67,19 +71,14 @@ void MDSimulation::initialize(const std::string& config_file) {
     
     // Set up domain decomposition after particles are loaded
     system->setup_domain_decomposition();
-    
-    // Set up neighbor ranks for halo exchange (MPI only)
-#ifdef USE_MPI
-    system->setup_neighbor_ranks();
-#endif
-    
+        
     // Load topology file from configuration and assign properties to particles
     if (!topology_file.empty()) {
         system->load_topology(topology_file);
         // Set up force field parameters after topology is loaded
         system->setup_force_field_params();
         
-        if (system->get_rank() == 0 && debug_level(2)) {
+        if (system->get_rank() == 0) {
             std::cout << "Topology and force field parameters loaded" << std::endl;
         }
     }
@@ -131,29 +130,10 @@ void MDSimulation::initialize(const std::string& config_file) {
     Real cutoff = cutoff_distance; // Use configured cutoff distance
     
     // Parse neighbor list type
-    NeighborListType nlist_type = NeighborListType::CELL_LIST; // Use basic cell list by default
+    NeighborListType nlist_type = NeighborListType::VERLET_CELL_LIST; // Use verlet cell list by default
     if (neighbor_list_type_str == "morton_hilbert") {
-#ifdef USE_CUDA
         nlist_type = NeighborListType::MORTON_HILBERT_CSR;
-        if (system->get_rank() == 0) {
-            std::cout << "Using Morton/Hilbert neighbor list with CUDA optimization" << std::endl;
-        }
-#else
-        if (system->get_rank() == 0) {
-            std::cout << "Morton/Hilbert neighbor list requires CUDA. Falling back to cell list." << std::endl;
-        }
-        nlist_type = NeighborListType::CELL_LIST;
-#endif
-    } else if (neighbor_list_type_str == "cell_list") {
-        nlist_type = NeighborListType::CELL_LIST;
-        if (system->get_rank() == 0) {
-            std::cout << "Using cell list neighbor list" << std::endl;
-        }
-    } else if (neighbor_list_type_str == "verlet_list") {
-        nlist_type = NeighborListType::VERLET_LIST;
-        if (system->get_rank() == 0) {
-            std::cout << "Using Verlet list neighbor list with skin distance: " << verlet_skin << std::endl;
-        }
+        std::cout << "Using Morton/Hilbert neighbor list" << std::endl;
     } else if (neighbor_list_type_str == "verlet_cell_list") {
         nlist_type = NeighborListType::VERLET_CELL_LIST;
         if (system->get_rank() == 0) {
@@ -162,20 +142,14 @@ void MDSimulation::initialize(const std::string& config_file) {
     } else {
         if (system->get_rank() == 0) {
             std::cout << "Unknown neighbor list type '" << neighbor_list_type_str 
-                      << "', using cell list (default)" << std::endl;
+                      << "', using verlet cell list (default)" << std::endl;
         }
-        nlist_type = NeighborListType::CELL_LIST;
+        nlist_type = NeighborListType::VERLET_CELL_LIST;
     }
     
     // Set up neighbor list configuration based on type
     std::string nlist_config;
-    if (nlist_type == NeighborListType::CELL_LIST) {
-        // For cell list, use verlet_skin for stability (like verlet_cell_list)
-        nlist_config = std::to_string(verlet_skin);
-    } else if (nlist_type == NeighborListType::VERLET_LIST) {
-        // For Verlet list, use verlet_skin distance
-        nlist_config = std::to_string(verlet_skin);
-    } else if (nlist_type == NeighborListType::VERLET_CELL_LIST) {
+    if (nlist_type == NeighborListType::VERLET_CELL_LIST) {
         // For Verlet-Cell hybrid, use verlet_skin distance
         nlist_config = std::to_string(verlet_skin);
     } else {
@@ -194,26 +168,22 @@ void MDSimulation::initialize(const std::string& config_file) {
 }
 
 void MDSimulation::single_step() {
-    // Exchange halo particles more frequently than neighbor list rebuild
-    // This ensures ghost particles are up-to-date for force calculations
-#ifdef USE_MPI
-    // Exchange halo particles every few steps (at least every neighbor_list_update_freq/2 steps)
-    int halo_exchange_freq = std::max(1, neighbor_list_update_freq / 2);
-    if (current_step % halo_exchange_freq == 0) {
-        system->identify_halo_particles();
-        system->exchange_halo_particles();
-    }
-#endif
-    
-    // Build neighbor list less frequently
+    // Build neighbor list less frequently (non-MPI mode)
     if (current_step % neighbor_list_update_freq == 0) {
         neighbor_builder->build(system->get_particles(), system->get_box(), 
-                               system->get_neighbor_list());
+                               system->get_neighbor_list(), system->get_local_particles());
     }
-    // Check if we're using Velocity-Verlet integrator
+
+    // Check if we're using Velocity-Verlet integrator (CPU or CUDA version)
     VelocityVerletIntegrator* vv_integrator = dynamic_cast<VelocityVerletIntegrator*>(integrator.get());
+#ifdef USE_CUDA
+    VelocityVerletIntegratorCUDA* vv_integrator_cuda = dynamic_cast<VelocityVerletIntegratorCUDA*>(integrator.get());
+#else
+    void* vv_integrator_cuda = nullptr;
+#endif
     
-    if (!vv_integrator) {
+    auto t_force_start = std::chrono::high_resolution_clock::now();
+    if (!vv_integrator && !vv_integrator_cuda) {
         // For non-Velocity-Verlet integrators: Force calculation first
         // Compute forces based on calculation mode
         if (force_calculation_mode == "python" && python_interface) {
@@ -238,13 +208,26 @@ void MDSimulation::single_step() {
                 }
             }
         }
+        auto t_force_end = std::chrono::high_resolution_clock::now();
+        if (timing_enabled) last_timing.force_ms = std::chrono::duration<double, std::milli>(t_force_end - t_force_start).count();
         
         // Then integrate equations of motion
+        auto t_int_start = std::chrono::high_resolution_clock::now();
         integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+        auto t_int_end = std::chrono::high_resolution_clock::now();
+        if (timing_enabled) last_timing.integrate_ms = std::chrono::duration<double, std::milli>(t_int_end - t_int_start).count();
     } else {
         // For Velocity-Verlet: Position update first, then force calculation, then velocity completion
         // Step 1: Position update (stores old forces for later velocity update)
-        vv_integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+        auto t_int_start = std::chrono::high_resolution_clock::now();
+        if (vv_integrator) {
+            vv_integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+#ifdef USE_CUDA
+        } else if (vv_integrator_cuda) {
+            vv_integrator_cuda->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+#endif
+        }
+        auto t_int_mid = std::chrono::high_resolution_clock::now();
         
         // Step 2: Compute forces at new positions
         if (force_calculation_mode == "python" && python_interface) {
@@ -269,27 +252,52 @@ void MDSimulation::single_step() {
                 }
             }
         }
+        auto t_force_end = std::chrono::high_resolution_clock::now();
+        if (timing_enabled) last_timing.force_ms = std::chrono::duration<double, std::milli>(t_force_end - t_force_start).count();
         
         // Step 3: Complete velocity update with new forces
-        vv_integrator->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
+        auto t_int_end = std::chrono::high_resolution_clock::now();
+        if (vv_integrator) {
+            vv_integrator->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
+#ifdef USE_CUDA
+        } else if (vv_integrator_cuda) {
+            vv_integrator_cuda->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
+#endif
+        }
+        auto t_int_final = std::chrono::high_resolution_clock::now();
+        if (timing_enabled) last_timing.integrate_ms = std::chrono::duration<double, std::milli>(t_int_mid - t_int_start).count() 
+                                                      + std::chrono::duration<double, std::milli>(t_int_final - t_int_end).count();
     }
 
     // Check for numerical instabilities and adjust timestep if needed
     // check_energy_stability();
     
     // Apply thermostat
+    auto t_thermo_start = std::chrono::high_resolution_clock::now();
     if (thermostat) {
         thermostat->apply(system->get_particles(), dt, system->get_local_particles());
     }
+    auto t_thermo_end = std::chrono::high_resolution_clock::now();
+    if (timing_enabled) last_timing.thermostat_ms = std::chrono::duration<double, std::milli>(t_thermo_end - t_thermo_start).count();
     
     // Update kinetic energy after velocity update and thermostat application
+    auto t_ke_start = std::chrono::high_resolution_clock::now();
     if (force_calc) {
         force_calc->calculate_kinetic_energy(*system);
     }
+    auto t_ke_end = std::chrono::high_resolution_clock::now();
+    if (timing_enabled) last_timing.ke_ms = std::chrono::duration<double, std::milli>(t_ke_end - t_ke_start).count();
     
     // Apply barostat
+    auto t_baro_start = std::chrono::high_resolution_clock::now();
     if (barostat) {
         barostat->apply(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+    }
+    auto t_baro_end = std::chrono::high_resolution_clock::now();
+    if (timing_enabled) {
+        last_timing.barostat_ms = std::chrono::duration<double, std::milli>(t_baro_end - t_baro_start).count();
+        last_timing.total_ms = last_timing.domain_ms + last_timing.force_ms + last_timing.integrate_ms +
+                               last_timing.thermostat_ms + last_timing.ke_ms + last_timing.barostat_ms;
     }
     
     current_step++;
@@ -383,11 +391,35 @@ void MDSimulation::run() {
         
         // Output results based on output_freq
         if (step % output_freq == 0) {
+            if (timing_enabled) print_step_timing(step);
             output_results(step, step_duration.count() / 1000.0);  // Pass step time in milliseconds
             // Only synchronize when outputting results to ensure consistent output
             MPI_Barrier(MPI_COMM_WORLD);
         }
     }
+}
+
+void MDSimulation::print_step_timing(int step) {
+#ifdef USE_MPI
+    int rank; 
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#else
+    int rank = 0;
+#endif
+    std::ostringstream os;
+    os.setf(std::ios::fixed); 
+    os.precision(3);
+    os << "[Rank " << rank << "] STEP " << step
+       << " domain=" << last_timing.domain_ms
+       << " (migrate=" << last_timing.migrate_ms
+       << " nlist=" << last_timing.nlist_build_ms << ")"
+       << "ms force=" << last_timing.force_ms
+       << "ms integrate=" << last_timing.integrate_ms
+       << "ms thermo=" << last_timing.thermostat_ms
+       << "ms KE=" << last_timing.ke_ms
+       << "ms baro=" << last_timing.barostat_ms
+       << "ms total(sum)=" << last_timing.total_ms << "ms";
+    std::cout << os.str() << std::endl;
 }
 
 void MDSimulation::output_results(int step, double step_time_ms) {
@@ -420,8 +452,7 @@ void MDSimulation::output_results(int step, double step_time_ms) {
         if (particles.num_particles > 0) {
                 // Temperature calculation for 'real' units (kcal/mol, LAMMPS convention)
                 // T = (2 * KE) / (3 * N * kB), KE in kcal/mol, kB = 0.0019872041 kcal/(mol·K)
-                constexpr double kB_kcal = 0.0019872041; // Boltzmann constant in kcal/(mol·K)
-                temperature = (2.0 * total_ke) / (3.0 * particles.num_particles * kB_kcal);
+                temperature = (2.0 * total_ke) / (3.0 * particles.num_particles * kB);
         }
         
         // Determine when to output based on debug level and frequency
@@ -500,11 +531,17 @@ void MDSimulation::finalize() {
         neighbor_builder->finalize();
     }
     
-    MPI_Finalize();
-    
-    if (system->get_rank() == 0 && debug_level(2)) {
+    if (system->get_rank() == 0) {
         std::cout << "MD simulation finalized" << std::endl;
     }
+
+#ifdef USE_MPI
+    // Free the Cartesian communicator if it was created
+    //if (cart_comm != MPI_COMM_NULL) {
+    //    MPI_Comm_free(&cart_comm);
+    //}
+    MPI_Finalize();
+#endif
 }
 
 void MDSimulation::parse_simulation_config(const std::string& config_file) {
@@ -727,23 +764,7 @@ void MDSimulation::initialize_integrator() {
             std::cout << "Initialized CPU Velocity-Verlet integrator" << std::endl;
         }
 #endif
-    } else if (integrator_type == "verlet") {
-#ifdef USE_SYCL
-        integrator = std::make_unique<VerletIntegratorSYCL>(dt);
-        if (system->get_rank() == 0) {
-            std::cout << "Initialized SYCL Verlet integrator" << std::endl;
-        }
-#elif defined(USE_CUDA)
-        integrator = std::make_unique<VerletIntegratorCUDA>(dt);
-        if (system->get_rank() == 0) {
-            std::cout << "Initialized CUDA Verlet integrator" << std::endl;
-        }
-#else
-        integrator = std::make_unique<VerletIntegrator>(dt);
-        if (system->get_rank() == 0) {
-            std::cout << "Initialized CPU Verlet integrator" << std::endl;
-        }
-#endif
+
     } else if (integrator_type == "leapfrog") {
 #ifdef USE_SYCL
         integrator = std::make_unique<LeapfrogIntegratorSYCL>(dt);
@@ -797,7 +818,7 @@ void MDSimulation::initialize_integrator() {
 void MDSimulation::initialize_thermostat() {
     if (thermostat_type == "none" || thermostat_type.empty()) {
         thermostat = nullptr;
-        if (system->get_rank() == 0 && debug_level(2)) {
+        if (system->get_rank() == 0) {
             std::cout << "No thermostat initialized" << std::endl;
         }
         return;
@@ -874,7 +895,7 @@ void MDSimulation::initialize_thermostat() {
 void MDSimulation::initialize_barostat() {
     if (barostat_type == "none" || barostat_type.empty()) {
         barostat = nullptr;
-        if (system->get_rank() == 0 && debug_level(2)) {
+        if (system->get_rank() == 0 ) {
             std::cout << "No barostat initialized" << std::endl;
         }
         return;
@@ -952,7 +973,7 @@ void MDSimulation::check_energy_stability() {
     
     // If energy change is more than 10% per step, something is wrong
     if (relative_change > 0.1) {
-        if (system->get_rank() == 0 && debug_level(2)) {
+        if (system->get_rank() == 0) {
             std::cout << "Warning: Large energy change detected at step " << current_step 
                       << " (ΔE/E = " << relative_change << ")" << std::endl;
             std::cout << "  Previous total energy: " << last_total_energy << " kcal/mol" << std::endl;

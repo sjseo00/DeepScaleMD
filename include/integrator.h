@@ -5,6 +5,7 @@
 #include <vector>
 
 #ifdef USE_MPI
+
 #include <mpi.h>
 #endif
 
@@ -17,7 +18,6 @@
 #endif
 
 enum class IntegratorType {
-    VERLET,
     VELOCITY_VERLET,
     LEAPFROG,
     R_RESPA
@@ -36,15 +36,7 @@ public:
     virtual void set_timestep(Real new_dt) { dt = new_dt; }
 };
 
-class VerletIntegrator : public Integrator {
-private:
-    std::vector<Real> prev_x, prev_y, prev_z;
-    
-public:
-    VerletIntegrator(Real timestep);
-    void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
-    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
-};
+
 
 class VelocityVerletIntegrator : public Integrator {
 private:
@@ -92,20 +84,17 @@ public:
 #ifdef USE_CUDA
 // CUDA kernel wrapper function declarations  
 extern "C" {
-    void launch_velocity_verlet_kernel(Real *d_x, Real *d_y, Real *d_z,
-                                     Real *d_vx, Real *d_vy, Real *d_vz,
-                                     Real *d_fx, Real *d_fy, Real *d_fz,
-                                     Real *d_mass, Real dt, size_t num_particles,
-                                     Real lx, Real ly, Real lz,
-                                     bool periodic_x, bool periodic_y, bool periodic_z);
+    void launch_velocity_verlet_position_kernel(Real *d_x, Real *d_y, Real *d_z,
+                                               Real *d_vx, Real *d_vy, Real *d_vz,
+                                               Real *d_fx, Real *d_fy, Real *d_fz,
+                                               Real *d_mass, Real dt, size_t num_particles,
+                                               Real lx, Real ly, Real lz,
+                                               bool periodic_x, bool periodic_y, bool periodic_z);
     
-    void launch_verlet_kernel(Real *d_x, Real *d_y, Real *d_z,
-                             Real *d_prev_x, Real *d_prev_y, Real *d_prev_z,
-                             Real *d_fx, Real *d_fy, Real *d_fz,
-                             Real *d_mass, Real dt, size_t num_particles, bool first_step,
-                             Real *d_vx, Real *d_vy, Real *d_vz,
-                             Real lx, Real ly, Real lz,
-                             bool periodic_x, bool periodic_y, bool periodic_z);
+    void launch_velocity_verlet_velocity_kernel(Real *d_vx, Real *d_vy, Real *d_vz,
+                                               Real *d_fx_old, Real *d_fy_old, Real *d_fz_old,
+                                               Real *d_fx_new, Real *d_fy_new, Real *d_fz_new,
+                                               Real *d_mass, Real dt, size_t num_particles);
     
     void launch_leapfrog_kernel(Real *d_x, Real *d_y, Real *d_z,
                                Real *d_vx, Real *d_vy, Real *d_vz,
@@ -127,11 +116,6 @@ extern "C" {
 }
 
 // CUDA kernel declarations
-__global__ void verlet_kernel(Real *x, Real *y, Real *z,
-                             Real *prev_x, Real *prev_y, Real *prev_z,
-                             Real *fx, Real *fy, Real *fz,
-                             Real *mass, Real dt, size_t n, bool first_step,
-                             Real *vx, Real *vy, Real *vz);
 
 __global__ void leapfrog_kernel(Real *x, Real *y, Real *z,
                                Real *vx, Real *vy, Real *vz,
@@ -152,24 +136,7 @@ __global__ void velocity_update_kernel(Real *vx, Real *vy, Real *vz,
                                      Real *fx, Real *fy, Real *fz,
                                      Real *mass, Real dt, size_t n);
 
-class VerletIntegratorCUDA : public Integrator {
-private:
-    std::vector<Real> prev_x, prev_y, prev_z;
-    Real *d_x, *d_y, *d_z;
-    Real *d_vx, *d_vy, *d_vz;
-    Real *d_fx, *d_fy, *d_fz;
-    Real *d_mass;
-    Real *d_prev_x, *d_prev_y, *d_prev_z;
-    size_t allocated_size;
-    
-public:
-    VerletIntegratorCUDA(Real timestep);
-    ~VerletIntegratorCUDA();
-    void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
-    void allocate_gpu_memory(size_t num_particles);
-    void copy_to_device(ParticleData& particles, size_t local_particles);
-    void copy_from_device(ParticleData& particles, size_t local_particles);
-};
+
 
 class LeapfrogIntegratorCUDA : public Integrator {
 private:
@@ -183,6 +150,7 @@ public:
     LeapfrogIntegratorCUDA(Real timestep);
     ~LeapfrogIntegratorCUDA();
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
     void allocate_gpu_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);
@@ -202,6 +170,7 @@ public:
     RRESPAIntegratorCUDA(Real timestep, int inner_steps);
     ~RRESPAIntegratorCUDA();
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
     void allocate_gpu_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);
@@ -212,6 +181,7 @@ private:
     Real *d_x, *d_y, *d_z;
     Real *d_vx, *d_vy, *d_vz;
     Real *d_fx, *d_fy, *d_fz;
+    Real *d_fx_old, *d_fy_old, *d_fz_old;  // Store old forces
     Real *d_mass;
     size_t allocated_size;
     
@@ -219,6 +189,8 @@ public:
     VelocityVerletIntegratorCUDA(Real timestep);
     ~VelocityVerletIntegratorCUDA();
     void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
+    void complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles = 0);
     void allocate_gpu_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);
@@ -226,26 +198,7 @@ public:
 #endif
 
 #ifdef USE_SYCL
-class VerletIntegratorSYCL : public Integrator {
-private:
-    std::vector<Real> prev_x, prev_y, prev_z;
-    sycl::queue queue;
-    Real *d_x, *d_y, *d_z;
-    Real *d_vx, *d_vy, *d_vz;
-    Real *d_fx, *d_fy, *d_fz;
-    Real *d_mass;
-    Real *d_prev_x, *d_prev_y, *d_prev_z;
-    size_t allocated_size;
-    
-public:
-    VerletIntegratorSYCL(Real timestep);
-    ~VerletIntegratorSYCL();
-    void integrate(ParticleData& particles, Real dt, size_t local_particles = 0) override;
-    void integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles = 0) override;
-    void allocate_device_memory(size_t num_particles);
-    void copy_to_device(ParticleData& particles, size_t local_particles);
-    void copy_from_device(ParticleData& particles, size_t local_particles);
-};
+
 
 class LeapfrogIntegratorSYCL : public Integrator {
 private:

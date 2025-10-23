@@ -1,4 +1,4 @@
-#define OMPI_SKIP_MPICXX 1
+
 #include "../include/force_calculator_cpu.h"
 #include "../include/md_system.h"
 #include "../include/topology.h"
@@ -150,17 +150,7 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
             }
         }
     }
-    
-    // Debug helper (half-list: energy already single-counted)
-    // std::cout << std::fixed << std::setprecision(8) << "LJ energy : " << last_potential_energy << std::endl;
-                    
-    // Communicate forces with neighbors using MPI (if needed)
-    // The halo exchange and force reduction is typically handled by the MD system
-    // For a complete implementation, we would need:
-    // 1. Halo particle exchange before force calculation
-    // 2. Force reduction after calculation
-    // This depends on the specific MPI system being used
- 
+
 }
 
 void ForceCalculatorCPU::compute_electrostatic_forces(MDSystem& system) {

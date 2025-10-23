@@ -1,10 +1,11 @@
+
+
 #include "barostat.h"
 #include "md_types.h"
 #include <cmath>
 #include <iostream>
 
 #ifdef USE_MPI
-#define OMPI_SKIP_MPICXX 1
 #include <mpi.h>
 
 bool is_rank_zero_barostat() {
@@ -40,7 +41,6 @@ extern "C" {
 
 // Note: CUDA kernels are defined in barostat_kernels.cu
 #endif
-const Real kb = 0.0019872041; // kcal/(mol·K)
 
 // Parrinello-Rahman Barostat
 ParrinelloRahmanBarostat::ParrinelloRahmanBarostat(Real press, Real mass) 
@@ -139,8 +139,8 @@ void AndersenBarostat::apply(ParticleData& particles, SimulationBox& box, Real d
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;
-    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kb);
-    Real pressure = global_particles * kb * temperature / volume; // Ideal gas approximation
+    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kB);
+    Real pressure = global_particles * kB * temperature / volume; // Ideal gas approximation
     
     // Volume scaling factor
     Real dV_dt = compressibility * volume * (pressure - target_pressure);
@@ -247,8 +247,8 @@ void AndersenBarostatCUDA::apply(ParticleData& particles, SimulationBox& box, Re
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;
-    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kb);
-    Real pressure = global_particles * kb * temperature / volume;
+    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kB);
+    Real pressure = global_particles * kB * temperature / volume;
     
     // Calculate scaling factor
     Real dV_dt = compressibility * volume * (pressure - target_pressure);
@@ -372,8 +372,8 @@ void AndersenBarostatSYCL::apply(ParticleData& particles, SimulationBox& box, Re
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;
-    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kb);
-    Real pressure = global_particles * kb * temperature / volume;
+    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kB);
+    Real pressure = global_particles * kB * temperature / volume;
     
     // Calculate scaling factor
     Real dV_dt = compressibility * volume * (pressure - target_pressure);
@@ -473,8 +473,8 @@ void ParrinelloRahmanBarostatCUDA::apply(ParticleData& particles, SimulationBox&
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;
-    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kb);
-    Real pressure = global_particles * kb * temperature / volume;
+    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kB);
+    Real pressure = global_particles * kB * temperature / volume;
     
     // Update box matrix velocities (simplified)
     Real pressure_error = pressure - target_pressure;
@@ -540,8 +540,8 @@ void ParrinelloRahmanBarostatSYCL::apply(ParticleData& particles, SimulationBox&
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;
-    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kb);
-    Real pressure = global_particles * kb * temperature / volume;
+    Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kB);
+    Real pressure = global_particles * kB * temperature / volume;
     
     // Update box matrix velocities (simplified)
     Real pressure_error = pressure - target_pressure;

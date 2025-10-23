@@ -19,7 +19,7 @@ dump            1 all xyz 100 *.xyz
 #dump            2 atom0 custom 1 velocity_atom0.txt id vx vy vz fx fy fz
 #dump_modify     2 format line "%d %.6f %.6f %.6f %.6f %.6f %.6f"
 
-run             10000
+run             1000
 
 
 

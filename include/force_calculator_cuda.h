@@ -13,6 +13,7 @@ private:
     cublasHandle_t cublas_handle;
     cudaStream_t stream;
     size_t max_neighbors_allocated;
+    size_t allocated_size;  // Track allocated device memory size
     int rank;  // MPI rank for efficient output control
     
 protected:
@@ -22,6 +23,7 @@ protected:
     Real *d_charge, *d_mass;
     Real *d_epsilon, *d_sigma;
     int *d_neighbors, *d_num_neighbors, *d_neighbor_offset;
+    Real *d_potential_energy;  // Device potential energy accumulator
     
 public:
     ForceCalculatorCUDA();
@@ -54,7 +56,8 @@ void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
                         int max_neighbors_total,
                         cudaStream_t stream,
                         Real box_x, Real box_y, Real box_z,
-                        int num_local_particles);
+                        int num_local_particles,
+                        Real* d_potential_energy);
                         
 void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                             Real* d_fx, Real* d_fy, Real* d_fz,
@@ -64,7 +67,8 @@ void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                             int max_neighbors_total,
                             cudaStream_t stream,
                             Real box_x, Real box_y, Real box_z,
-                            int num_local_particles);
+                            int num_local_particles,
+                            Real* d_potential_energy);
 
 #endif // USE_CUDA
 

@@ -1,3 +1,4 @@
+
 #include "topology.h"
 #include <fstream>
 #include <sstream>
@@ -41,7 +42,6 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
     
     std::ifstream file(clean_filename);
     if (!file.is_open()) {
-        std::cerr << "Error: Cannot open topology file: " << clean_filename << std::endl;
         return false;
     }
     

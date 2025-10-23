@@ -33,12 +33,14 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
                                int num_particles, Real cutoff,
                                int max_neighbors_total,
                                Real box_x, Real box_y, Real box_z,
-                               int num_local_particles) {
+                               int num_local_particles,
+                               Real* potential_energy) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_particles) return;
     
     Real xi = x[i], yi = y[i], zi = z[i];
     Real fxi = 0.0, fyi = 0.0, fzi = 0.0;
+    Real pe_local = 0.0;  // Local potential energy accumulator
     
     int neighbor_start = neighbor_offset[i];
     int num_neigh = num_neighbors[i];
@@ -67,7 +69,7 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
         
         Real r2 = dx*dx + dy*dy + dz*dz;
         
-        if (r2 < cutoff*cutoff && r2 > 0.0) {
+        if (r2 < cutoff*cutoff && r2 > 0.01) {  // Minimum distance to avoid overlaps
             Real eps = sqrt(epsilon[i] * epsilon[j]);
             Real sig = 0.5 * (sigma[i] + sigma[j]);
             
@@ -79,7 +81,14 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
             Real r6inv = r2inv * r2inv * r2inv;
             Real r12inv = r6inv * r6inv;
             
-            Real force_mag = 24.0 * eps * r2inv * (2.0 * sig12 * r12inv - sig6 * r6inv);
+            Real sig6_r6 = sig6 * r6inv;
+            Real sig12_r12 = sig12 * r12inv;
+            
+            Real force_mag = 24.0 * eps * r2inv * (2.0 * sig12_r12 - sig6_r6);
+            
+            // LJ potential energy: V = 4*eps*((sig/r)^12 - (sig/r)^6)
+            Real pe_pair = 4.0 * eps * (sig12_r12 - sig6_r6);
+            pe_local += pe_pair;  // Accumulate potential energy
             
             fxi += force_mag * dx;
             fyi += force_mag * dy;
@@ -99,6 +108,11 @@ __global__ void lj_force_kernel(Real* x, Real* y, Real* z,
     atomicAdd(&fx[i], fxi);
     atomicAdd(&fy[i], fyi);
     atomicAdd(&fz[i], fzi);
+    
+    // Add potential energy to global accumulator
+    if (pe_local != 0.0) {
+        atomicAdd(potential_energy, pe_local);
+    }
 }
 
 __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
@@ -108,15 +122,17 @@ __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
                                     int num_particles, Real cutoff,
                                     int max_neighbors_total,
                                     Real box_x, Real box_y, Real box_z,
-                                    int num_local_particles) {
+                                    int num_local_particles,
+                                    Real* potential_energy) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_particles) return;
     
     Real xi = x[i], yi = y[i], zi = z[i];
     Real qi = charge[i];
     Real fxi = 0.0, fyi = 0.0, fzi = 0.0;
+    Real pe_local = 0.0;  // Local potential energy accumulator
     
-    const Real ke = 8.9875517873681764e9; // Coulomb constant
+    const Real k_coulomb = 332.0636; // kcal/mol·Å·e^-2 (conversion factor)
     
     int neighbor_start = neighbor_offset[i];
     int num_neigh = num_neighbors[i];
@@ -145,11 +161,17 @@ __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
         
         Real r2 = dx*dx + dy*dy + dz*dz;
         
-        if (r2 < cutoff*cutoff && r2 > 0.0) {
-            Real r = sqrt(r2);
+        if (r2 < cutoff*cutoff && r2 > 0.36) {  // Minimum distance ~0.6 Å
+            Real r_inv = 1.0 / sqrt(r2);
+            Real r2_inv = r_inv * r_inv;
             Real qj = charge[j];
             
-            Real force_mag = ke * qi * qj / (r2 * r);
+            // Coulomb force magnitude: F = k * qi * qj / r^2
+            Real force_mag = k_coulomb * qi * qj * r2_inv * r_inv;
+            
+            // Coulomb potential energy: V = k * qi * qj / r
+            Real pe_pair = k_coulomb * qi * qj * r_inv;
+            pe_local += pe_pair;  // Accumulate potential energy
             
             fxi += force_mag * dx;
             fyi += force_mag * dy;
@@ -169,6 +191,11 @@ __global__ void coulomb_force_kernel(Real* x, Real* y, Real* z,
     atomicAdd(&fx[i], fxi);
     atomicAdd(&fy[i], fyi);
     atomicAdd(&fz[i], fzi);
+    
+    // Add potential energy to global accumulator
+    if (pe_local != 0.0) {
+        atomicAdd(potential_energy, pe_local);
+    }
 }
 
 void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
@@ -180,7 +207,8 @@ void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
                                  int max_neighbors_total,
                                  cudaStream_t stream,
                                  Real box_x, Real box_y, Real box_z,
-                                 int num_local_particles) {
+                                 int num_local_particles,
+                                 Real* d_potential_energy) {
     int blockSize = 256;
     int gridSize = (num_particles + blockSize - 1) / blockSize;
     
@@ -188,7 +216,7 @@ void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
         d_neighbors, d_num_neighbors, d_neighbor_offset,
         d_epsilon, d_sigma, num_particles, cutoff, max_neighbors_total,
-        box_x, box_y, box_z, num_local_particles
+        box_x, box_y, box_z, num_local_particles, d_potential_energy
     );
 }
 
@@ -200,7 +228,8 @@ void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                                       int max_neighbors_total,
                                       cudaStream_t stream,
                                       Real box_x, Real box_y, Real box_z,
-                                      int num_local_particles) {
+                                      int num_local_particles,
+                                      Real* d_potential_energy) {
     int blockSize = 256;
     int gridSize = (num_particles + blockSize - 1) / blockSize;
     
@@ -208,7 +237,7 @@ void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
         d_charge, d_neighbors, d_num_neighbors, d_neighbor_offset,
         num_particles, cutoff, max_neighbors_total,
-        box_x, box_y, box_z, num_local_particles
+        box_x, box_y, box_z, num_local_particles, d_potential_energy
     );
 }
 

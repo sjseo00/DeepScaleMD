@@ -37,7 +37,7 @@ A high-performance molecular dynamics simulation code designed for supercomputer
 - **XYZ Coordinates**: Standard coordinate file format
 - **Topology Files**: Bond connectivity and parameters
 - **Trajectory Output**: Standard format trajectories
-
+- **export MD_TIMING=1** : Computing time for each step
 ## Directory Structure
 
 ```
