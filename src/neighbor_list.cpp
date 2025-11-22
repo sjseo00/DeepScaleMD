@@ -78,7 +78,7 @@ void VerletCellListNeighborBuilder::finalize() {
     last_build_z.clear();
 }
 
-bool VerletCellListNeighborBuilder::needs_rebuild(const ParticleData& particles, size_t num_local) {
+bool VerletCellListNeighborBuilder::needs_rebuild(const ParticleData& particles, const SimulationBox& box, size_t num_local) {
     // If check is disabled, always return false (caller controls rebuild)
     if (!check_enabled) return false;
     
@@ -93,11 +93,16 @@ bool VerletCellListNeighborBuilder::needs_rebuild(const ParticleData& particles,
     }
     
     // Find maximum displacement since last build (local particles only)
+    // CRITICAL: Apply minimum image convention to handle periodic boundaries correctly
     Real local_max_disp_sq = 0.0;
     for (size_t i = 0; i < num_local; ++i) {
         Real dx = particles.x[i] - last_build_x[i];
         Real dy = particles.y[i] - last_build_y[i];
         Real dz = particles.z[i] - last_build_z[i];
+        
+        // Apply minimum image convention for periodic boundaries
+        box.apply_minimum_image(dx, dy, dz);
+        
         Real disp_sq = dx*dx + dy*dy + dz*dz;
         local_max_disp_sq = std::max(local_max_disp_sq, disp_sq);
     }
@@ -109,8 +114,6 @@ bool VerletCellListNeighborBuilder::needs_rebuild(const ParticleData& particles,
 }
 
 void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox& box, NeighborList& nlist, size_t num_local) {
-    //auto start = std::chrono::high_resolution_clock::now();
-    
     // LAMMPS-style: num_local = owned particles, num_particles = owned + ghost
     size_t local_N = (num_local > 0) ? num_local : particles.num_particles;
     size_t total_N = particles.num_particles;  // includes ghost particles
@@ -128,9 +131,10 @@ void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox
     Real Ly = (box.yhi > box.ylo) ? (box.yhi - box.ylo) : box.ly;  // Local subdomain extent in y
     Real Lz = (box.zhi > box.zlo) ? (box.zhi - box.zlo) : box.lz;  // Local subdomain extent in z
     
-    // Compute cell grid dimensions: use extended_cutoff/2 for optimal binning (LAMMPS style)
-    // This ensures each bin is roughly half the neighbor cutoff distance
-    Real target_bin_size = extended_cutoff / 2.0;
+    // Compute cell grid dimensions: use extended_cutoff for optimal binning (LAMMPS style)
+    // LAMMPS typically uses cutoff (not cutoff/2) to minimize stencil size
+    // This gives stencil_range=1 (27 cells) instead of 3 (343 cells)
+    Real target_bin_size = extended_cutoff;  // Changed from extended_cutoff/2
     
     // Calculate number of bins based on local subdomain size
     nx = std::max(1, static_cast<int>(Lx / target_bin_size + 0.5)); // Round to nearest
@@ -219,10 +223,9 @@ void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox
         for (int dz = -stencil_range; dz <= stencil_range; ++dz) {
             int zc = iz + dz;
             // Apply periodic wrapping for cells at boundaries
-            bool wrapped = false;
             if (box.periodic_z) {
-                if (zc < 0) { zc += nz; wrapped = true; }
-                else if (zc >= nz) { zc -= nz; wrapped = true; }
+                if (zc < 0) { zc += nz; }
+                else if (zc >= nz) { zc -= nz; }
             } else {
                 if (zc < 0 || zc >= nz) continue;
             }
@@ -230,8 +233,8 @@ void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox
             for (int dy = -stencil_range; dy <= stencil_range; ++dy) {
                 int yc = iy + dy;
                 if (box.periodic_y) {
-                    if (yc < 0) { yc += ny; wrapped = true; }
-                    else if (yc >= ny) { yc -= ny; wrapped = true; }
+                    if (yc < 0) { yc += ny; }
+                    else if (yc >= ny) { yc -= ny; }
                 } else {
                     if (yc < 0 || yc >= ny) continue;
                 }
@@ -239,8 +242,8 @@ void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox
                 for (int dx = -stencil_range; dx <= stencil_range; ++dx) {
                     int xc = ix + dx;
                     if (box.periodic_x) {
-                        if (xc < 0) { xc += nx; wrapped = true; }
-                        else if (xc >= nx) { xc -= nx; wrapped = true; }
+                        if (xc < 0) { xc += nx; }
+                        else if (xc >= nx) { xc -= nx; }
                     } else {
                         if (xc < 0 || xc >= nx) continue;
                     }
@@ -838,24 +841,23 @@ void MortonZOrderNeighborBuilder::build(ParticleData& particles, SimulationBox& 
                         int ncz = cz + dz;
                         
                         // Apply periodic wrapping for cells at boundaries
-                        bool wrapped = false;
                         if (box.periodic_x) {
-                            if (ncx < 0) { ncx += nx; wrapped = true; }
-                            else if (ncx >= nx) { ncx -= nx; wrapped = true; }
+                            if (ncx < 0) { ncx += nx; }
+                            else if (ncx >= nx) { ncx -= nx; }
                         } else {
                             if (ncx < 0 || ncx >= nx) continue;
                         }
                         
                         if (box.periodic_y) {
-                            if (ncy < 0) { ncy += ny; wrapped = true; }
-                            else if (ncy >= ny) { ncy -= ny; wrapped = true; }
+                            if (ncy < 0) { ncy += ny; }
+                            else if (ncy >= ny) { ncy -= ny; }
                         } else {
                             if (ncy < 0 || ncy >= ny) continue;
                         }
                         
                         if (box.periodic_z) {
-                            if (ncz < 0) { ncz += nz; wrapped = true; }
-                            else if (ncz >= nz) { ncz -= nz; wrapped = true; }
+                            if (ncz < 0) { ncz += nz; }
+                            else if (ncz >= nz) { ncz -= nz; }
                         } else {
                             if (ncz < 0 || ncz >= nz) continue;
                         }

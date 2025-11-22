@@ -56,7 +56,7 @@ public:
     void set_update_info(int freq, int delay = 0) { update_frequency = freq; delay_steps = delay; }
     
     // Check if neighbor list needs rebuild (LAMMPS-style displacement check)
-    bool needs_rebuild(const ParticleData& particles, size_t num_local);
+    bool needs_rebuild(const ParticleData& particles, const SimulationBox& box, size_t num_local);
     void enable_check(bool enable) { check_enabled = enable; }
 };
 

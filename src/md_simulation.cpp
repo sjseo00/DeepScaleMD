@@ -201,7 +201,7 @@ void MDSimulation::single_step() {
         VerletCellListNeighborBuilder* verlet_builder = dynamic_cast<VerletCellListNeighborBuilder*>(neighbor_builder.get());
         if (verlet_builder) {
             // This call uses MPI_Allreduce internally, so all ranks get the same result
-            should_rebuild = verlet_builder->needs_rebuild(system->get_particles(), system->get_local_particles());
+            should_rebuild = verlet_builder->needs_rebuild(system->get_particles(), system->get_box(), system->get_local_particles());
         } else {
             // Other neighbor list types: always rebuild at specified frequency
             should_rebuild = true;
