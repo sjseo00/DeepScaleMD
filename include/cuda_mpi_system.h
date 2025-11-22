@@ -52,6 +52,7 @@ public:
     // Halo exchange functions
     void exchange_halo_async();
     void wait_halo_exchange();
+    void perform_reverse_halo_exchange();
     
     // Check CUDA-aware MPI availability
     bool check_cuda_aware_mpi();

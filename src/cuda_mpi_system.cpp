@@ -133,29 +133,75 @@ void CUDAMPISystem::allreduce_forces_gpu() {
         return;
     }
     
-    // Direct GPU-to-GPU force reduction using public getter
+    // Get total particle count across all processes first
     ParticleData& particle_data = get_particles();
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
     
-    // Reduce forces directly on GPU memory
-    MPI_Allreduce(MPI_IN_PLACE, particle_data.fx.data(), particle_data.num_particles, 
-                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, particle_data.fy.data(), particle_data.num_particles, 
-                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, particle_data.fz.data(), particle_data.num_particles, 
-                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    // Get all local particle counts
+    std::vector<int> local_counts(size);
+    std::vector<int> displacements(size);
+    int local_count = static_cast<int>(particle_data.num_particles);
+    
+    // Ensure local force arrays have correct size
+    if (particle_data.fx.size() < particle_data.num_particles) {
+        particle_data.fx.resize(particle_data.num_particles, 0.0);
+    }
+    if (particle_data.fy.size() < particle_data.num_particles) {
+        particle_data.fy.resize(particle_data.num_particles, 0.0);
+    }
+    if (particle_data.fz.size() < particle_data.num_particles) {
+        particle_data.fz.resize(particle_data.num_particles, 0.0);
+    }
+    
+    MPI_Allgather(&local_count, 1, MPI_INT, local_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    
+    
+    // Calculate total particles and displacements
+    int total_particles = 0;
+    displacements[0] = 0;
+    for (int i = 0; i < size; i++) {
+        total_particles += local_counts[i];
+        if (i > 0) displacements[i] = displacements[i-1] + local_counts[i-1];
+    }
+    
+    // Use MPI_Allgatherv to collect forces from all processes
+    std::vector<Real> global_fx(total_particles), global_fy(total_particles), global_fz(total_particles);
+    
+    MPI_Allgatherv(particle_data.fx.data(), local_count, MPI_DOUBLE,
+                   global_fx.data(), local_counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
+    MPI_Allgatherv(particle_data.fy.data(), local_count, MPI_DOUBLE,
+                   global_fy.data(), local_counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
+    MPI_Allgatherv(particle_data.fz.data(), local_count, MPI_DOUBLE,
+                   global_fz.data(), local_counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
+    
+    // Copy back the forces for this process's particles
+    std::copy(global_fx.begin() + displacements[rank], 
+              global_fx.begin() + displacements[rank] + local_count, 
+              particle_data.fx.begin());
+    std::copy(global_fy.begin() + displacements[rank], 
+              global_fy.begin() + displacements[rank] + local_count, 
+              particle_data.fy.begin());
+    std::copy(global_fz.begin() + displacements[rank], 
+              global_fz.begin() + displacements[rank] + local_count, 
+              particle_data.fz.begin());
 }
 
 void CUDAMPISystem::exchange_halo_async() {
-    // Call the parent class halo exchange method
-    // Since CUDAMPISystem inherits from MDSystem, we can call exchange_halo_particles
-    // For now, implement a basic version - this should be enhanced for true async behavior
-    exchange_halo_particles();
+    // Use new halo exchange API (could be extended to launch async CUDA streams)
+    perform_halo_exchange();
 }
 
 void CUDAMPISystem::wait_halo_exchange() {
     // For now, this is a no-op since exchange_halo_async is synchronous
     // In a full implementation, this would wait for async operations to complete
     // MPI_Waitall or similar would be called here
+}
+
+void CUDAMPISystem::perform_reverse_halo_exchange() {
+    // For CUDA version, call the base class method
+    MDSystem::perform_reverse_halo_exchange();
 }
 
 #ifdef USE_NCCL

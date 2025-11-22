@@ -1,6 +1,7 @@
 
 #include "neighbor_list.h"
 #include "md_types.h"
+#include "mpi_utils.h"
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -8,6 +9,7 @@
 #include <string>
 #include <stdexcept>
 #include <mpi.h>
+#include <chrono>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -16,20 +18,53 @@
 #ifdef USE_SYCL
 #include <sycl/sycl.hpp>
 #endif
-// External debug level variable
-extern int g_debug_level;
-inline bool debug_level(int level) { return g_debug_level >= level; }
 
-static bool is_rank_zero() {
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    return rank == 0;
+// Enhanced logging with rank information
+inline void log_message(int level, const std::string& message) {
+    // Use simple rank check - this matches existing code pattern
+    int mpi_rank = 0;
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if (mpi_initialized) {
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    }
+    if (mpi_rank == 0) {
+        std::cout << "[NeighborList] " << message << std::endl;
+    }
 }
+
+inline void log_warning(const std::string& message) {
+    int mpi_rank = 0;
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if (mpi_initialized) {
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    }
+    if (mpi_rank == 0) {
+        std::cerr << "[NeighborList WARNING] " << message << std::endl;
+    }
+}
+
+inline void log_error(const std::string& message) {
+    int mpi_rank = 0;
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if (mpi_initialized) {
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    }
+    if (mpi_rank == 0) {
+        std::cerr << "[NeighborList ERROR] " << message << std::endl;
+    }
+}
+
+
 
 // VerletCellListNeighborBuilder implementation
 VerletCellListNeighborBuilder::VerletCellListNeighborBuilder(Real cutoff_val, Real skin) 
-    : cutoff(cutoff_val), verlet_skin(skin) {
+    : cutoff(cutoff_val), verlet_skin(skin), update_frequency(1), delay_steps(0), info_printed(false), check_enabled(true) {
     cell_size = cutoff + verlet_skin;  // Larger cell size for Verlet skin
+    // Threshold: rebuild when any particle moves more than skin/2
+    max_displacement_threshold = (verlet_skin * 0.5) * (verlet_skin * 0.5);
 }
 
 void VerletCellListNeighborBuilder::initialize() {
@@ -38,229 +73,319 @@ void VerletCellListNeighborBuilder::initialize() {
 
 void VerletCellListNeighborBuilder::finalize() {
     cells.clear();
+    last_build_x.clear();
+    last_build_y.clear();
+    last_build_z.clear();
+}
+
+bool VerletCellListNeighborBuilder::needs_rebuild(const ParticleData& particles, size_t num_local) {
+    // If check is disabled, always return false (caller controls rebuild)
+    if (!check_enabled) return false;
+    
+    // First build always needed
+    if (last_build_x.empty() || last_build_y.empty() || last_build_z.empty()) {
+        return true;
+    }
+    
+    // Check if size changed
+    if (last_build_x.size() != num_local) {
+        return true;
+    }
+    
+    // Find maximum displacement since last build (local particles only)
+    Real local_max_disp_sq = 0.0;
+    for (size_t i = 0; i < num_local; ++i) {
+        Real dx = particles.x[i] - last_build_x[i];
+        Real dy = particles.y[i] - last_build_y[i];
+        Real dz = particles.z[i] - last_build_z[i];
+        Real disp_sq = dx*dx + dy*dy + dz*dz;
+        local_max_disp_sq = std::max(local_max_disp_sq, disp_sq);
+    }
+    
+    // Rebuild if any local particle moved more than threshold (skin/2)
+    // Note: In LAMMPS-style architecture, Comm layer will ensure ghost consistency
+    // Each rank makes decision based on its own owned particles
+    return local_max_disp_sq > max_displacement_threshold;
 }
 
 void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox& box, NeighborList& nlist, size_t num_local) {
-    // MPI setup and data synchronization
-    int mpi_initialized = 0;
-    MPI_Initialized(&mpi_initialized);
-    int mpi_rank = 0, mpi_size = 1;
+    //auto start = std::chrono::high_resolution_clock::now();
     
-    // Only build neighbor lists for local particles
-    // If num_local == 0, fall back to all particles (serial mode)
-    size_t end_particle = (num_local > 0) ? num_local : particles.num_particles;
-    
-    if (mpi_initialized) {
-        MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
-        
-        if (mpi_size > 1) {
-            // Ensure all ranks have consistent particle data
-            MPI_Barrier(MPI_COMM_WORLD);
-            
-            // Broadcast particle count from rank 0
-            size_t N = particles.num_particles;
-            MPI_Bcast(&N, 1, MPI_UNSIGNED_LONG, 0, MPI_COMM_WORLD);
-            
-            // Resize arrays on non-root ranks if needed
-            if (mpi_rank != 0) {
-                particles.x.resize(N);
-                particles.y.resize(N);
-                particles.z.resize(N);
-                particles.num_particles = N;
-            }
-            
-            // Broadcast particle coordinates from rank 0
-            if (N > 0) {
-                MPI_Bcast(particles.x.data(), static_cast<int>(N), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-                MPI_Bcast(particles.y.data(), static_cast<int>(N), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-                MPI_Bcast(particles.z.data(), static_cast<int>(N), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            }
-            
-            // Broadcast simulation box parameters
-            MPI_Bcast(&box.lx, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            MPI_Bcast(&box.ly, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            MPI_Bcast(&box.lz, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            MPI_Bcast(&box.periodic_x, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
-            MPI_Bcast(&box.periodic_y, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
-            MPI_Bcast(&box.periodic_z, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
-            
-            MPI_Barrier(MPI_COMM_WORLD);
-        }
-    }
-    
-    // Extended physical cutoff used for search; physical pairwise force uses 'cutoff'
+    // LAMMPS-style: num_local = owned particles, num_particles = owned + ghost
+    size_t local_N = (num_local > 0) ? num_local : particles.num_particles;
+    size_t total_N = particles.num_particles;  // includes ghost particles
+
+    // Extended cutoff for neighbor search (Verlet skin included)
     const Real extended_cutoff = cutoff + verlet_skin;
-    nlist.cutoff = extended_cutoff;
+    const Real rcut2 = extended_cutoff * extended_cutoff;
+    nlist.cutoff = extended_cutoff; // Store search cutoff; physical cutoff remains 'cutoff'
     nlist.list_type = "verlet_cell";
-    const Real extended_cutoff_sq = extended_cutoff * extended_cutoff;
 
-    // Enforce cell bin length >= physical cutoff (not extended) to retain 3x3x3 stencil validity
-    const Real bin_length_target = std::max(cutoff, cell_size); // cell_size was preset to cutoff+skin in ctor
-    // Choose number of cells via floor; guarantee at least 1 per dimension
-    nx = static_cast<int>(std::floor(box.lx / bin_length_target)); if (nx < 1) nx = 1;
-    ny = static_cast<int>(std::floor(box.ly / bin_length_target)); if (ny < 1) ny = 1;
-    nz = static_cast<int>(std::floor(box.lz / bin_length_target)); if (nz < 1) nz = 1;
+    // LAMMPS-style: Each rank builds neighbor list for its local subdomain
+    // Use local subdomain dimensions (includes ghost layer)
+    // Calculate subdomain extent from bounds (for MPI) or use full box (for serial)
+    Real Lx = (box.xhi > box.xlo) ? (box.xhi - box.xlo) : box.lx;  // Local subdomain extent in x
+    Real Ly = (box.yhi > box.ylo) ? (box.yhi - box.ylo) : box.ly;  // Local subdomain extent in y
+    Real Lz = (box.zhi > box.zlo) ? (box.zhi - box.zlo) : box.lz;  // Local subdomain extent in z
+    
+    // Compute cell grid dimensions: use extended_cutoff/2 for optimal binning (LAMMPS style)
+    // This ensures each bin is roughly half the neighbor cutoff distance
+    Real target_bin_size = extended_cutoff / 2.0;
+    
+    // Calculate number of bins based on local subdomain size
+    nx = std::max(1, static_cast<int>(Lx / target_bin_size + 0.5)); // Round to nearest
+    ny = std::max(1, static_cast<int>(Ly / target_bin_size + 0.5));
+    nz = std::max(1, static_cast<int>(Lz / target_bin_size + 0.5));
 
-    const Real eff_lx = box.lx / nx;
-    const Real eff_ly = box.ly / ny;
-    const Real eff_lz = box.lz / nz;
+    // Calculate actual bin size and stencil range
+    Real actual_bin_size_x = Lx / nx;
+    Real actual_bin_size_y = Ly / ny;
+    Real actual_bin_size_z = Lz / nz;
+    Real max_bin_size = std::max({actual_bin_size_x, actual_bin_size_y, actual_bin_size_z});
+    
+    // Stencil range: how many bins we need to search in each direction
+    // Must cover extended_cutoff distance
+    int stencil_range = static_cast<int>(std::ceil(extended_cutoff / max_bin_size));
+    stencil_range = std::max(1, stencil_range); // At least 1
+
+    const Real inv_lx_cell = nx / Lx;
+    const Real inv_ly_cell = ny / Ly;
+    const Real inv_lz_cell = nz / Lz;
 
     const int total_cells = nx * ny * nz;
     cells.assign(total_cells, {});
 
-    // Assign particles to cells (periodic-aware indexing with robust modulo)
-    // Use more robust cell index calculation to ensure consistency across MPI ranks
-    for (size_t i = 0; i < particles.num_particles; ++i) {
-        // Use floor to ensure consistent cell assignment across different systems
-        int ix = static_cast<int>(std::floor(particles.x[i] / eff_lx));
-        int iy = static_cast<int>(std::floor(particles.y[i] / eff_ly));
-        int iz = static_cast<int>(std::floor(particles.z[i] / eff_lz));
+    // Precompute particle cell indices for ALL particles (owned + ghost)
+    // Transform particle coordinates to local subdomain frame by subtracting origin
+    std::vector<int> cx(total_N);
+    std::vector<int> cy(total_N);
+    std::vector<int> cz(total_N);
+    
+    // Subdomain origin (for serial: xlo=ylo=zlo=0)
+    Real origin_x = (box.xhi > box.xlo) ? box.xlo : 0.0;
+    Real origin_y = (box.yhi > box.ylo) ? box.ylo : 0.0;
+    Real origin_z = (box.zhi > box.zlo) ? box.zlo : 0.0;
+    
+    for (size_t i = 0; i < total_N; ++i) {
+        // Transform to local subdomain coordinates by subtracting origin
+        // This works whether coordinates are global (MPI) or already local (serial)
+        Real rx = particles.x[i] - origin_x;
+        Real ry = particles.y[i] - origin_y;
+        Real rz = particles.z[i] - origin_z;
         
-        // Robust periodic boundary condition handling
-        if (box.periodic_x) {
-            ix = ((ix % nx) + nx) % nx;
-        } else {
-            ix = std::max(0, std::min(ix, nx - 1));
-        }
-        if (box.periodic_y) {
-            iy = ((iy % ny) + ny) % ny;
-        } else {
-            iy = std::max(0, std::min(iy, ny - 1));
-        }
-        if (box.periodic_z) {
-            iz = ((iz % nz) + nz) % nz;
-        } else {
-            iz = std::max(0, std::min(iz, nz - 1));
-        }
+        int ix = static_cast<int>(rx * inv_lx_cell);
+        int iy = static_cast<int>(ry * inv_ly_cell);
+        int iz = static_cast<int>(rz * inv_lz_cell);
+
+        // For local subdomain, clamp to valid cell range (no periodic wrapping within subdomain)
+        // Comm layer handles periodicity via ghost exchange
+        ix = std::clamp(ix, 0, nx - 1);
+        iy = std::clamp(iy, 0, ny - 1);
+        iz = std::clamp(iz, 0, nz - 1);
+
+        cx[i] = ix; 
+        cy[i] = iy; 
+        cz[i] = iz;
         
         int cell_id = iz * nx * ny + iy * nx + ix;
-        cells[cell_id].push_back(static_cast<int>(i));
+        if (cell_id >= 0 && cell_id < total_cells) {
+            cells[cell_id].push_back(static_cast<int>(i));
+        }
     }
 
-    // Initialize neighbor list arrays
+    // Initialize neighbor list arrays (sized for LOCAL particles only)
     nlist.neighbors.clear();
-    nlist.num_neighbors.assign(particles.num_particles, 0);
-    nlist.neighbor_offset.assign(particles.num_particles, 0);
+    nlist.num_neighbors.assign(local_N, 0);
+    nlist.neighbor_offset.assign(local_N, 0);
 
-    // Only rank 0 computes the neighbor list to ensure consistency across MPI ranks
-    if (mpi_rank == 0) {
-        // Optional: track duplicates (we create half list only: j added only when j>i to reduce size)
-        for (size_t i = 0; i < end_particle; ++i) {  // Only build for local particles
-        nlist.neighbor_offset[i] = static_cast<int>(nlist.neighbors.size());
+    // Reserve approximate neighbor capacity to reduce reallocations
+    if (local_N > 0) {
+        Real cell_volume = (Lx * Ly * Lz) / static_cast<Real>(total_cells);
+        Real sphere_volume = (4.0/3.0) * M_PI * extended_cutoff * extended_cutoff * extended_cutoff;
+        size_t est_neighbors_per_particle = static_cast<size_t>(sphere_volume / cell_volume * 1.2);
+        est_neighbors_per_particle = std::min<size_t>(est_neighbors_per_particle, 512);
+        nlist.neighbors.reserve(local_N * est_neighbors_per_particle);
+    }
 
-        // Use consistent cell index calculation (same as in cell assignment)
-        int ix = static_cast<int>(std::floor(particles.x[i] / eff_lx));
-        int iy = static_cast<int>(std::floor(particles.y[i] / eff_ly));
-        int iz = static_cast<int>(std::floor(particles.z[i] / eff_lz));
-        
-        if (box.periodic_x) {
-            ix = ((ix % nx) + nx) % nx;
-        } else {
-            ix = std::max(0, std::min(ix, nx - 1));
-        }
-        if (box.periodic_y) {
-            iy = ((iy % ny) + ny) % ny;
-        } else {
-            iy = std::max(0, std::min(iy, ny - 1));
-        }
-        if (box.periodic_z) {
-            iz = ((iz % nz) + nz) % nz;
-        } else {
-            iz = std::max(0, std::min(iz, nz - 1));
-        }
+    // Neighbors (j) can be from owned OR ghost particles (0..total_N-1)
+    for (size_t i = 0; i < local_N; ++i) {
+        std::vector<int> local_neighbors;
+        local_neighbors.reserve(64);
 
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    int nix = ix + dx;
-                    int niy = iy + dy;
-                    int niz = iz + dz;
+        int ix = cx[i];
+        int iy = cy[i];
+        int iz = cz[i];
+
+        for (int dz = -stencil_range; dz <= stencil_range; ++dz) {
+            int zc = iz + dz;
+            // Apply periodic wrapping for cells at boundaries
+            bool wrapped = false;
+            if (box.periodic_z) {
+                if (zc < 0) { zc += nz; wrapped = true; }
+                else if (zc >= nz) { zc -= nz; wrapped = true; }
+            } else {
+                if (zc < 0 || zc >= nz) continue;
+            }
+            
+            for (int dy = -stencil_range; dy <= stencil_range; ++dy) {
+                int yc = iy + dy;
+                if (box.periodic_y) {
+                    if (yc < 0) { yc += ny; wrapped = true; }
+                    else if (yc >= ny) { yc -= ny; wrapped = true; }
+                } else {
+                    if (yc < 0 || yc >= ny) continue;
+                }
+                
+                for (int dx = -stencil_range; dx <= stencil_range; ++dx) {
+                    int xc = ix + dx;
                     if (box.periodic_x) {
-                        nix = ((nix % nx) + nx) % nx;
-                    } else if (nix < 0 || nix >= nx) {
-                        continue;
+                        if (xc < 0) { xc += nx; wrapped = true; }
+                        else if (xc >= nx) { xc -= nx; wrapped = true; }
+                    } else {
+                        if (xc < 0 || xc >= nx) continue;
                     }
-                    if (box.periodic_y) {
-                        niy = ((niy % ny) + ny) % ny;
-                    } else if (niy < 0 || niy >= ny) {
-                        continue;
-                    }
-                    if (box.periodic_z) {
-                        niz = ((niz % nz) + nz) % nz;
-                    } else if (niz < 0 || niz >= nz) {
-                        continue;
-                    }
-                    int ncell = niz * nx * ny + niy * nx + nix;
-                    for (int j : cells[ncell]) {
-                        // Half-list: only keep j>i
-                        if (j <= static_cast<int>(i)) continue;
-                        Real dx_ij = particles.x[i] - particles.x[j];
-                        Real dy_ij = particles.y[i] - particles.y[j];
-                        Real dz_ij = particles.z[i] - particles.z[j];
-                        box.apply_minimum_image(dx_ij, dy_ij, dz_ij);
-                        Real r2 = dx_ij*dx_ij + dy_ij*dy_ij + dz_ij*dz_ij;
-                        if (r2 < extended_cutoff_sq) {
-                            nlist.neighbors.push_back(j);
-                            ++nlist.num_neighbors[i];
-                            if (nlist.max_neighbors_per_atom <= 0) nlist.max_neighbors_per_atom = 500;
-                            if (nlist.num_neighbors[i] >= nlist.max_neighbors_per_atom) goto next_particle_verlet_fixed;
+                    
+                    int cell_id = zc * nx * ny + yc * nx + xc;
+                    
+                    // Bounds check
+                    if (cell_id < 0 || cell_id >= total_cells) continue;
+                    
+                    for (int j : cells[cell_id]) {
+                        if (j == static_cast<int>(i)) continue; // Skip self
+                        
+                        // Half-list with Newton on: only store j > i for owned-owned pairs
+                        // For owned-ghost pairs (j >= local_N), always store
+                        if (j < static_cast<int>(local_N) && j <= static_cast<int>(i)) continue;
+                            
+                        
+                        Real dx_ = particles.x[i] - particles.x[j];
+                        Real dy_ = particles.y[i] - particles.y[j];
+                        Real dz_ = particles.z[i] - particles.z[j];
+                        
+                        // Apply minimum image convention
+                        // Note: With proper ghost exchange, this should rarely trigger
+                        box.apply_minimum_image(dx_, dy_, dz_);
+                        Real r2 = dx_*dx_ + dy_*dy_ + dz_*dz_;
+                        
+                        if (r2 < rcut2) {
+                            local_neighbors.push_back(j);
                         }
                     }
                 }
             }
-            }
-            next_particle_verlet_fixed:;
         }
-    } // End of rank 0 only neighbor list computation
+
+        nlist.neighbor_offset[i] = static_cast<int>(nlist.neighbors.size());
+        nlist.num_neighbors[i] = static_cast<int>(local_neighbors.size());
+        
+        if (!local_neighbors.empty()) {
+            nlist.neighbors.insert(nlist.neighbors.end(), local_neighbors.begin(), local_neighbors.end());
+        }
+
+    }
+
     
-    // --- MPI synchronization: Broadcast neighbor list from rank 0 to all ranks ---
-    if (mpi_initialized && mpi_size > 1) {
-        // Broadcast neighbor list data from rank 0 to all other ranks
-        Real cutoff_val = nlist.cutoff;
-        MPI_Bcast(&cutoff_val, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        nlist.cutoff = cutoff_val;
-        
-        int max_cap = nlist.max_neighbors_per_atom;
-        MPI_Bcast(&max_cap, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        nlist.max_neighbors_per_atom = max_cap;
-        
-        int N = static_cast<int>(particles.num_particles);
-        
-        // Prepare arrays on non-root ranks (rank 0 already has computed values)
-        if (mpi_rank != 0) {
-            nlist.num_neighbors.assign(N, 0);
-            nlist.neighbor_offset.assign(N, 0);
+    // Print neighbor list information (LAMMPS-style logging) - only once per rank
+    // Note: Each rank will log its own statistics
+    if (!info_printed) {
+        // Calculate max neighbors per atom and average for LOCAL particles
+        int max_neighbors = 0;
+        size_t total_neighbors = 0;
+        if (!nlist.num_neighbors.empty()) {
+            max_neighbors = *std::max_element(nlist.num_neighbors.begin(), nlist.num_neighbors.end());
+            for (size_t i = 0; i < nlist.num_neighbors.size(); ++i) {
+                total_neighbors += nlist.num_neighbors[i];
+            }
         }
+        Real avg_neighbors = (local_N > 0) ? static_cast<Real>(total_neighbors) / static_cast<Real>(local_N) : 0.0;
         
-        // Broadcast neighbor counts and offsets
-        if (N > 0) {
-            MPI_Bcast(nlist.num_neighbors.data(), N, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Bcast(nlist.neighbor_offset.data(), N, MPI_INT, 0, MPI_COMM_WORLD);
+        // Calculate actual bin size (should be approximately extended_cutoff/2)
+        Real bin_size = std::min({Lx / nx, Ly / ny, Lz / nz});
+        
+        // Estimate memory page size (typical value for memory management)
+        
+        std::cout << "\nNeighbor list info ..." << std::endl;
+        std::cout << "  update every " << update_frequency << " steps, delay " << delay_steps << " steps, check yes" << std::endl;
+        std::cout << "  max neighbors/atom: " << max_neighbors <<  std::endl;
+        std::cout << "  master list distance cutoff = " << extended_cutoff << std::endl;
+        std::cout << "  ghost atom cutoff = " << extended_cutoff << std::endl;
+        std::cout << "  binsize = " << bin_size << ", bins = " << nx << " " << ny << " " << nz << std::endl;
+        std::cout << "  1 neighbor lists, perpetual/occasional/extra = 1 0 0" << std::endl;
+        std::cout << "  (1) pair lj/cut, perpetual" << std::endl;
+        std::cout << "      attributes: half, newton on (within rank), newton off (across MPI ranks)" << std::endl;
+        std::cout << "      pair build: half/bin/cell" << std::endl;
+        std::cout << "      stencil: half/bin/3d" << std::endl;
+        std::cout << "      bin: standard" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Total # of neighbors = " << total_neighbors << std::endl;
+        std::cout << "Ave neighs/atom = " << avg_neighbors << std::endl;
+        std::cout << std::endl;
+        
+        info_printed = true;  // Set flag to prevent future printing
+    }
+
+    // Save current positions for next rebuild check (local owned particles only)
+    if (check_enabled) {
+        last_build_x.resize(local_N);
+        last_build_y.resize(local_N);
+        last_build_z.resize(local_N);
+        for (size_t i = 0; i < local_N; ++i) {
+            last_build_x[i] = particles.x[i];
+            last_build_y[i] = particles.y[i];
+            last_build_z[i] = particles.z[i];
         }
-        
-        // Broadcast total neighbor count and neighbor list
-        int total_nbrs = static_cast<int>(nlist.neighbors.size());
-        MPI_Bcast(&total_nbrs, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        
-        if (mpi_rank != 0) {
-            nlist.neighbors.resize(total_nbrs);
-        }
-        
-        if (total_nbrs > 0) {
-            MPI_Bcast(nlist.neighbors.data(), total_nbrs, MPI_INT, 0, MPI_COMM_WORLD);
-        }
-        
-        // Final synchronization barrier
-        MPI_Barrier(MPI_COMM_WORLD);
     }
 }
 
-// Morton/Hilbert curve based neighbor list implementation
-// Compatible with CUDA, SYCL, and CPU backends
+void VerletCellListNeighborBuilder::broadcast_neighbor_list(NeighborList& nlist, size_t n, int mpi_rank, int mpi_size) {
+    if (mpi_size <= 1) return;
 
-MortonHilbertNeighborBuilder::MortonHilbertNeighborBuilder(Real cutoff_val, Real skin, int tile_size) 
-    : cutoff(cutoff_val), verlet_skin(skin), morton_levels(10) {
+    struct NeighborListHeader {
+        int total_neighbors;
+        Real cutoff_val;
+    } header;
+
+    if (mpi_rank == 0) {
+        header.total_neighbors = static_cast<int>(nlist.neighbors.size());
+        header.cutoff_val = nlist.cutoff;
+    }
+
+    MPI_Bcast(&header, sizeof(header), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    if (mpi_rank != 0) {
+        nlist.cutoff = header.cutoff_val;
+        nlist.neighbors.resize(header.total_neighbors);
+        nlist.num_neighbors.assign(n, 0);
+        nlist.neighbor_offset.assign(n, 0);
+    }
+
+    if (header.total_neighbors > 0) {
+        MPI_Bcast(nlist.neighbors.data(), header.total_neighbors, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(nlist.num_neighbors.data(), static_cast<int>(n), MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(nlist.neighbor_offset.data(), static_cast<int>(n), MPI_INT, 0, MPI_COMM_WORLD);
+    }
+}
+
+// Forward declaration for CUDA kernel launcher
+#ifdef USE_CUDA
+extern "C" void launch_cuda_neighbor_list_build(
+    const Real* d_x, const Real* d_y, const Real* d_z,
+    int* d_neighbor_list,
+    int* d_num_neighbors,
+    int* d_neighbor_offset,
+    int n_local, int n_total,
+    Real cutoff, Real verlet_skin,
+    Real lx, Real ly, Real lz,
+    bool periodic_x, bool periodic_y, bool periodic_z,
+    int max_neighbors_per_particle,
+    cudaStream_t stream);
+#endif
+
+// Morton Z-order curve based neighbor list implementation
+// Optimized for MPI parallelism and CUDA/SYCL GPU acceleration
+
+MortonZOrderNeighborBuilder::MortonZOrderNeighborBuilder(Real cutoff_val, Real skin, int tile_size) 
+    : cutoff(cutoff_val), verlet_skin(skin), morton_levels(10), update_frequency(1), delay_steps(0), info_printed(false) {
     tile_staging.tile_size = tile_size;
     // Initialize GPU memory pointers to nullptr
     d_neighbor_list = nullptr;
@@ -270,27 +395,23 @@ MortonHilbertNeighborBuilder::MortonHilbertNeighborBuilder(Real cutoff_val, Real
     gpu_device_id = 0;
 }
 
-void MortonHilbertNeighborBuilder::initialize() {   
+void MortonZOrderNeighborBuilder::initialize() {   
     // Initialize GPU context if available
     #ifdef USE_CUDA
     cudaError_t err = cudaGetDevice(&gpu_device_id);
     if (err == cudaSuccess) {
         gpu_available = true;
-        if (is_rank_zero()) {
-            std::cout << "CUDA device " << gpu_device_id << " detected and ready" << std::endl;
-        }
+        log_message(1, "CUDA device " + std::to_string(gpu_device_id) + " detected for Morton Z-order neighbor list");
     } else {
         gpu_available = false;
-        if (is_rank_zero()) {
-            std::cout << "Warning: CUDA not available, using CPU fallback" << std::endl;
-        }
+        log_warning("CUDA not available for Morton Z-order, using CPU fallback");
     }
     #elif defined(USE_SYCL)
     try {
         sycl_queue = sycl::queue(sycl::gpu_selector_v);
         gpu_available = true;
         if (is_rank_zero()) {
-            std::cout << "SYCL GPU queue created successfully" << std::endl;
+            std::cout << "SYCL GPU queue created for Morton Z-order neighbor list" << std::endl;
         }
     } catch (const std::exception& e) {
         gpu_available = false;
@@ -303,7 +424,7 @@ void MortonHilbertNeighborBuilder::initialize() {
     #endif
 }
 
-void MortonHilbertNeighborBuilder::finalize() {
+void MortonZOrderNeighborBuilder::finalize() {
     // Clean up GPU memory if allocated with proper error handling
     if (gpu_memory_allocated) {
         #ifdef USE_CUDA
@@ -351,27 +472,31 @@ void MortonHilbertNeighborBuilder::finalize() {
     
 }
 
-uint64_t MortonHilbertNeighborBuilder::morton_encode_3d(uint32_t x, uint32_t y, uint32_t z) {
-    // Interleave bits of x, y, z to create Morton code
+// Optimized Morton Z-order encoding using bit interleaving
+// This creates a space-filling curve that preserves spatial locality
+uint64_t MortonZOrderNeighborBuilder::morton_encode_3d(uint32_t x, uint32_t y, uint32_t z) {
+    // Efficient bit interleaving using precomputed masks
     auto split_by_3 = [](uint32_t a) -> uint64_t {
-        uint64_t x = a & 0x1fffff; // we only look at the first 21 bits
+        uint64_t x = a & 0x1fffff; // Use first 21 bits for high resolution
         x = (x | x << 32) & 0x1f00000000ffff;
         x = (x | x << 16) & 0x1f0000ff0000ff;
-        x = (x | x << 8) & 0x100f00f00f00f00f;
-        x = (x | x << 4) & 0x10c30c30c30c30c3;
-        x = (x | x << 2) & 0x1249249249249249;
+        x = (x | x << 8)  & 0x100f00f00f00f00f;
+        x = (x | x << 4)  & 0x10c30c30c30c30c3;
+        x = (x | x << 2)  & 0x1249249249249249;
         return x;
     };
     
+    // Interleave bits: z,y,x pattern for better memory coalescing
     return split_by_3(x) | (split_by_3(y) << 1) | (split_by_3(z) << 2);
 }
 
-void MortonHilbertNeighborBuilder::morton_decode_3d(uint64_t morton, uint32_t& x, uint32_t& y, uint32_t& z) {
+void MortonZOrderNeighborBuilder::morton_decode_3d(uint64_t morton, uint32_t& x, uint32_t& y, uint32_t& z) {
+    // Reverse bit interleaving
     auto compact_by_3 = [](uint64_t x) -> uint32_t {
         x = x & 0x1249249249249249;
-        x = (x | (x >> 2)) & 0x10c30c30c30c30c3;
-        x = (x | (x >> 4)) & 0x100f00f00f00f00f;
-        x = (x | (x >> 8)) & 0x1f0000ff0000ff;
+        x = (x | (x >> 2))  & 0x10c30c30c30c30c3;
+        x = (x | (x >> 4))  & 0x100f00f00f00f00f;
+        x = (x | (x >> 8))  & 0x1f0000ff0000ff;
         x = (x | (x >> 16)) & 0x1f00000000ffff;
         x = (x | (x >> 32)) & 0x1fffff;
         return static_cast<uint32_t>(x);
@@ -382,57 +507,7 @@ void MortonHilbertNeighborBuilder::morton_decode_3d(uint64_t morton, uint32_t& x
     z = compact_by_3(morton >> 2);
 }
 
-uint64_t MortonHilbertNeighborBuilder::hilbert_encode_3d(uint32_t x, uint32_t y, uint32_t z, int level) {
-    // Simplified Hilbert curve encoding - more sophisticated than Morton
-    // This is a basic implementation; for production use, consider a full Hilbert curve library
-    
-    uint64_t h = 0;
-    uint32_t s = 1 << (level - 1);
-    
-    // Rotate and fold coordinates based on Hilbert curve patterns
-    for (int i = level - 1; i >= 0; i--) {
-        uint32_t xi = (x >> i) & 1;
-        uint32_t yi = (y >> i) & 1;
-        uint32_t zi = (z >> i) & 1;
-        
-        // Calculate Hilbert index for this level
-        uint32_t h_level = 0;
-        
-        // 3D Hilbert curve state transitions (simplified)
-        if (zi == 0) {
-            if (yi == 0) {
-                h_level = xi;
-                if (xi == 1) {
-                    // Rotate coordinates
-                    std::swap(x, y);
-                    x = s - 1 - x;
-                    y = s - 1 - y;
-                }
-            } else {
-                h_level = 2 + (1 - xi);
-            }
-        } else {
-            if (yi == 0) {
-                h_level = 4 + (1 - xi);
-            } else {
-                h_level = 6 + xi;
-                if (xi == 0) {
-                    // Rotate coordinates
-                    std::swap(x, z);
-                    x = s - 1 - x;
-                    z = s - 1 - z;
-                }
-            }
-        }
-        
-        h = (h << 3) | h_level;
-        s >>= 1;
-    }
-    
-    return h;
-}
-
-void MortonHilbertNeighborBuilder::reorder_particles(ParticleData& particles) {
+void MortonZOrderNeighborBuilder::reorder_particles(ParticleData& particles) {
     size_t n = particles.num_particles;
     
     // Create backup of original data
@@ -440,6 +515,7 @@ void MortonHilbertNeighborBuilder::reorder_particles(ParticleData& particles) {
     std::vector<Real> orig_vx = particles.vx, orig_vy = particles.vy, orig_vz = particles.vz;
     std::vector<Real> orig_mass = particles.mass, orig_charge = particles.charge;
     std::vector<int> orig_type = particles.type;
+    std::vector<int> orig_gid = particles.global_id;
     
     // Reorder according to Morton codes
     for (size_t i = 0; i < n; i++) {
@@ -453,10 +529,11 @@ void MortonHilbertNeighborBuilder::reorder_particles(ParticleData& particles) {
         particles.mass[i] = orig_mass[new_idx];
         particles.charge[i] = orig_charge[new_idx];
         particles.type[i] = orig_type[new_idx];
+        particles.global_id[i] = orig_gid[new_idx];
     }
 }
 
-void MortonHilbertNeighborBuilder::restore_particle_order(ParticleData& particles) {
+void MortonZOrderNeighborBuilder::restore_particle_order(ParticleData& particles) {
     size_t n = particles.num_particles;
     
     // Create backup of reordered data
@@ -464,6 +541,7 @@ void MortonHilbertNeighborBuilder::restore_particle_order(ParticleData& particle
     std::vector<Real> reord_vx = particles.vx, reord_vy = particles.vy, reord_vz = particles.vz;
     std::vector<Real> reord_mass = particles.mass, reord_charge = particles.charge;
     std::vector<int> reord_type = particles.type;
+    std::vector<int> reord_gid = particles.global_id;
     
     // Restore original order
     for (size_t i = 0; i < n; i++) {
@@ -477,10 +555,11 @@ void MortonHilbertNeighborBuilder::restore_particle_order(ParticleData& particle
         particles.mass[orig_idx] = reord_mass[i];
         particles.charge[orig_idx] = reord_charge[i];
         particles.type[orig_idx] = reord_type[i];
+        particles.global_id[orig_idx] = reord_gid[i];
     }
 }
 
-void MortonHilbertNeighborBuilder::build_csr_neighbor_list(ParticleData& particles, SimulationBox& box, int max_cap) {
+void MortonZOrderNeighborBuilder::build_csr_neighbor_list(ParticleData& particles, SimulationBox& box, int max_neighbors_per_particle) {
     size_t n = particles.num_particles;
     Real extended_cutoff = cutoff + verlet_skin;
     Real cutoff_sq = extended_cutoff * extended_cutoff;
@@ -510,7 +589,7 @@ void MortonHilbertNeighborBuilder::build_csr_neighbor_list(ParticleData& particl
                 csr_nlist.neighbors.push_back(j);
                 csr_nlist.col_indices.push_back(j);
                 // Limit neighbors per particle
-                if (csr_nlist.neighbors.size() - csr_nlist.row_ptr[i] >= max_cap) {
+                if (static_cast<int>(csr_nlist.neighbors.size() - csr_nlist.row_ptr[i]) >= max_neighbors_per_particle) {
                     break;
                 }
             }
@@ -520,7 +599,7 @@ void MortonHilbertNeighborBuilder::build_csr_neighbor_list(ParticleData& particl
     csr_nlist.row_ptr[n] = csr_nlist.neighbors.size();
 }
 
-void MortonHilbertNeighborBuilder::create_tile_staging() {
+void MortonZOrderNeighborBuilder::create_tile_staging() {
     size_t n_neighbors = csr_nlist.neighbors.size();
     int n_tiles = (n_neighbors + tile_staging.tile_size - 1) / tile_staging.tile_size;
     
@@ -534,157 +613,333 @@ void MortonHilbertNeighborBuilder::create_tile_staging() {
     }
 }
 
-void MortonHilbertNeighborBuilder::build(ParticleData& particles, SimulationBox& box, NeighborList& nlist, size_t num_local) {
-    // MPI setup
-    int mpi_initialized = 0;
-    MPI_Initialized(&mpi_initialized);
-    int mpi_rank = 0, mpi_size = 1;
+// Optimized Morton Z-order neighbor list build with Cell List for O(n) complexity
+void MortonZOrderNeighborBuilder::build(ParticleData& particles, SimulationBox& box, NeighborList& nlist, size_t num_local) {
+    //auto start = std::chrono::high_resolution_clock::now();
     
-    if (mpi_initialized) {
-        MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+
+    // LAMMPS-style: num_local = owned particles, num_particles = owned + ghost
+    size_t n_local = (num_local > 0) ? num_local : particles.num_particles;
+    size_t n_total = particles.num_particles;  // includes ghost particles
+    
+    // Initialize neighbor list structure - sized for LOCAL particles only
+    nlist.neighbors.clear();
+    nlist.num_neighbors.assign(n_local, 0);
+    nlist.neighbor_offset.assign(n_local, 0);
+    nlist.cutoff = cutoff + verlet_skin;
+    nlist.list_type = "morton_z_order";
+    
+    Real extended_cutoff = cutoff + verlet_skin;
+    Real cutoff_sq = extended_cutoff * extended_cutoff;
+    
+#ifdef USE_CUDA
+    // === CUDA Path: Build neighbor list directly on GPU ===
+    if (gpu_available) {
+        const int max_neighbors_per_particle = 512;
+        
+        // Allocate GPU memory for particles
+        Real *d_x, *d_y, *d_z;
+        cudaMalloc(&d_x, n_total * sizeof(Real));
+        cudaMalloc(&d_y, n_total * sizeof(Real));
+        cudaMalloc(&d_z, n_total * sizeof(Real));
+        
+        // Copy particle positions to GPU
+        cudaMemcpy(d_x, particles.x.data(), n_total * sizeof(Real), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_y, particles.y.data(), n_total * sizeof(Real), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_z, particles.z.data(), n_total * sizeof(Real), cudaMemcpyHostToDevice);
+        
+        // Allocate GPU memory for neighbor list
+        int* d_neighbor_list_gpu;
+        int* d_num_neighbors_gpu;
+        int* d_neighbor_offset_gpu;
+        
+        cudaMalloc(&d_neighbor_list_gpu, n_local * max_neighbors_per_particle * sizeof(int));
+        cudaMalloc(&d_num_neighbors_gpu, n_local * sizeof(int));
+        cudaMalloc(&d_neighbor_offset_gpu, n_local * sizeof(int));
+        
+        // Launch CUDA kernel
+        cudaStream_t stream = 0;
+        launch_cuda_neighbor_list_build(
+            d_x, d_y, d_z,
+            d_neighbor_list_gpu, d_num_neighbors_gpu, d_neighbor_offset_gpu,
+            n_local, n_total,
+            cutoff, verlet_skin,
+            box.lx, box.ly, box.lz,
+            box.periodic_x, box.periodic_y, box.periodic_z,
+            max_neighbors_per_particle,
+            stream
+        );
+        
+        cudaDeviceSynchronize();
+        
+        // Copy results back to host
+        std::vector<int> h_num_neighbors(n_local);
+        cudaMemcpy(h_num_neighbors.data(), d_num_neighbors_gpu, n_local * sizeof(int), cudaMemcpyDeviceToHost);
+        
+        // Compact neighbor list (remove unused space)
+        size_t total_neighbors = 0;
+        for (size_t i = 0; i < n_local; i++) {
+            total_neighbors += h_num_neighbors[i];
+        }
+        
+        nlist.neighbors.resize(total_neighbors);
+        nlist.num_neighbors = h_num_neighbors;
+        
+        // Copy neighbor data with offsets
+        std::vector<int> h_neighbor_list_full(n_local * max_neighbors_per_particle);
+        cudaMemcpy(h_neighbor_list_full.data(), d_neighbor_list_gpu, 
+                   n_local * max_neighbors_per_particle * sizeof(int), cudaMemcpyDeviceToHost);
+        
+        size_t offset = 0;
+        for (size_t i = 0; i < n_local; i++) {
+            nlist.neighbor_offset[i] = offset;
+            int n_neigh = h_num_neighbors[i];
+            for (int j = 0; j < n_neigh; j++) {
+                nlist.neighbors[offset + j] = h_neighbor_list_full[i * max_neighbors_per_particle + j];
+            }
+            offset += n_neigh;
+        }
+        
+        // Cleanup
+        cudaFree(d_x);
+        cudaFree(d_y);
+        cudaFree(d_z);
+        cudaFree(d_neighbor_list_gpu);
+        cudaFree(d_num_neighbors_gpu);
+        cudaFree(d_neighbor_offset_gpu);
+        
+        //auto end = std::chrono::high_resolution_clock::now();
+        //auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        
+        /*
+        if (mpi_rank == 0) {
+            std::cout << "Morton Z-order + Cell List neighbor build (CUDA): " << duration << " ms "
+                      << "(local particles: " << n_local << ", total: " << n_total 
+                      << ", neighbors: " << total_neighbors << ")" << std::endl;
+        }
+                      */
+        return;
+    }
+#endif
+    
+    // === CPU Path: Cell list + Morton Z-order for cache locality ===
+    // LAMMPS-style: Use local subdomain dimensions
+    Real Lx = box.lx;  // Local subdomain extent
+    Real Ly = box.ly;
+    Real Lz = box.lz;
+    
+    Real target_bin_size = extended_cutoff / 2.0;
+    int nx = std::max(1, static_cast<int>(Lx / target_bin_size + 0.5));
+    int ny = std::max(1, static_cast<int>(Ly / target_bin_size + 0.5));
+    int nz = std::max(1, static_cast<int>(Lz / target_bin_size + 0.5));
+    
+    Real inv_cell_x = nx / Lx;
+    Real inv_cell_y = ny / Ly;
+    Real inv_cell_z = nz / Lz;
+    
+    int total_cells = nx * ny * nz;
+    std::vector<std::vector<int>> cells(total_cells);
+    
+    // Assign all particles (local + ghost) to cells
+    // Note: Ghost particles are already positioned in local subdomain by Comm layer
+    std::vector<int> particle_cell_id(n_total);
+    
+    for (size_t i = 0; i < n_total; i++) {
+        Real px = particles.x[i];
+        Real py = particles.y[i];
+        Real pz = particles.z[i];
+        
+        // For local subdomain: coordinates are already in local frame
+        // When subdomain bounds (xlo, xhi, etc.) are added, shift by: px - box.xlo
+        
+        int cx = static_cast<int>(px * inv_cell_x);
+        int cy = static_cast<int>(py * inv_cell_y);
+        int cz = static_cast<int>(pz * inv_cell_z);
+        
+        // Clamp to valid local cell range (no periodic wrapping within subdomain)
+        cx = std::max(0, std::min(nx - 1, cx));
+        cy = std::max(0, std::min(ny - 1, cy));
+        cz = std::max(0, std::min(nz - 1, cz));
+        
+        int cell_idx = cz * nx * ny + cy * nx + cx;
+        particle_cell_id[i] = cell_idx;
     }
     
-    size_t n = (num_local > 0) ? num_local : particles.num_particles;
+    // Populate cells (serial to avoid race condition)
+    for (size_t i = 0; i < n_total; i++) {
+        cells[particle_cell_id[i]].push_back(i);
+    }
     
-    // Initialize neighbor list structure early
-    nlist.neighbors.clear();
-    nlist.num_neighbors.assign(n, 0);
-    nlist.neighbor_offset.assign(n, 0);
-    nlist.cutoff = cutoff + verlet_skin;
-    if (nlist.max_neighbors_per_atom <= 0) nlist.max_neighbors_per_atom = 500;
-    nlist.list_type = "morton_hilbert";
+    // === Step 2: Morton Z-order encoding for spatial coherence (optional optimization) ===
+    // This helps with cache locality within cells
+    morton_codes.clear();
+    morton_codes.reserve(n_total);
     
-    // Only rank 0 computes the neighbor list to avoid MPI consistency issues
-    if (mpi_rank == 0) {
-        // Step 1: Generate Morton codes for all particles
-        morton_codes.clear();
-        morton_codes.reserve(n);
+    const uint32_t grid_res = 1 << morton_levels;
+    const Real inv_lx = grid_res / Lx;
+    const Real inv_ly = grid_res / Ly;
+    const Real inv_lz = grid_res / Lz;
+    
+    std::vector<MortonCode> local_codes(n_total);
+    
+    for (size_t i = 0; i < n_total; i++) {
+        Real norm_x = particles.x[i];
+        Real norm_y = particles.y[i];
+        Real norm_z = particles.z[i];
         
-        // Calculate grid resolution based on box size
-        uint32_t grid_res = 1 << morton_levels;
-        Real scale_x = grid_res / box.lx;
-        Real scale_y = grid_res / box.ly;
-        Real scale_z = grid_res / box.lz;
+        // For local subdomain: when bounds are added, shift by: norm_x - box.xlo
+        // For now, assume coordinates are in [0, Lx) range
         
-        for (size_t i = 0; i < n; i++) {
-            // Handle periodic boundary conditions properly
-            Real norm_x = particles.x[i];
-            Real norm_y = particles.y[i];
-            Real norm_z = particles.z[i];
+        uint32_t x = static_cast<uint32_t>(std::max(0.0, std::min(static_cast<double>(grid_res-1), norm_x * inv_lx))) & (grid_res - 1);
+        uint32_t y = static_cast<uint32_t>(std::max(0.0, std::min(static_cast<double>(grid_res-1), norm_y * inv_ly))) & (grid_res - 1);
+        uint32_t z = static_cast<uint32_t>(std::max(0.0, std::min(static_cast<double>(grid_res-1), norm_z * inv_lz))) & (grid_res - 1);
+        
+        local_codes[i].code = morton_encode_3d(x, y, z);
+        local_codes[i].particle_id = static_cast<int>(i);
+    }
+    
+    morton_codes = std::move(local_codes);
+    
+    // Sort by Morton code for better cache locality
+    std::sort(morton_codes.begin(), morton_codes.end());
+    
+    // === Step 3: Build neighbor list using Cell List (O(n) complexity) ===
+    // LAMMPS-style: Build only for owned particles (0..n_local-1)
+    size_t estimated_neighbors = n_local * 50;
+    nlist.neighbors.reserve(estimated_neighbors);
+    
+    {
+        std::vector<int> thread_local_neighbors;
+        thread_local_neighbors.reserve(100);
+        
+        for (size_t i = 0; i < n_local; i++) {  // Only owned particles
+            thread_local_neighbors.clear();
             
-            // Normalize coordinates to [0, 1) with periodic boundaries
-            if (box.periodic_x) {
-                norm_x = norm_x - std::floor(norm_x / box.lx) * box.lx;
-            }
-            if (box.periodic_y) {
-                norm_y = norm_y - std::floor(norm_y / box.ly) * box.ly;
-            }
-            if (box.periodic_z) {
-                norm_z = norm_z - std::floor(norm_z / box.lz) * box.lz;
-            }
+            Real xi = particles.x[i];
+            Real yi = particles.y[i];
+            Real zi = particles.z[i];
             
-            uint32_t x = static_cast<uint32_t>(std::max(0.0, std::min(static_cast<double>(grid_res-1), norm_x * scale_x)));
-            uint32_t y = static_cast<uint32_t>(std::max(0.0, std::min(static_cast<double>(grid_res-1), norm_y * scale_y)));
-            uint32_t z = static_cast<uint32_t>(std::max(0.0, std::min(static_cast<double>(grid_res-1), norm_z * scale_z)));
+            // Get cell of particle i in local subdomain
+            Real px = xi;  // When subdomain bounds added: xi - box.xlo
+            Real py = yi;
+            Real pz = zi;
             
-            MortonCode mc;
-            mc.code = morton_encode_3d(x, y, z);
-            mc.particle_id = i;
-            morton_codes.push_back(mc);
-        }
-        
-        // Step 2: Sort particles by Morton code
-        std::sort(morton_codes.begin(), morton_codes.end());
-        
-        // Step 3: Create reordering maps
-        particle_reorder.resize(n);
-        inverse_reorder.resize(n);
-        for (size_t i = 0; i < n; i++) {
-            particle_reorder[i] = morton_codes[i].particle_id;
-            inverse_reorder[morton_codes[i].particle_id] = i;
-        }
-        
-        // Step 4: Build neighbor list using Morton-sorted order for spatial locality
-        Real extended_cutoff = cutoff + verlet_skin;
-        Real cutoff_sq = extended_cutoff * extended_cutoff;
-        
-        for (size_t i = 0; i < n; i++) {
-            int orig_i = morton_codes[i].particle_id;
-            nlist.neighbor_offset[orig_i] = nlist.neighbors.size();
+            int cx = std::clamp(static_cast<int>(px * inv_cell_x), 0, nx - 1);
+            int cy = std::clamp(static_cast<int>(py * inv_cell_y), 0, ny - 1);
+            int cz = std::clamp(static_cast<int>(pz * inv_cell_z), 0, nz - 1);
             
-            // Search neighbors in Morton-sorted order for better cache performance
-            for (size_t j = i + 1; j < n; j++) {
-                int orig_j = morton_codes[j].particle_id;
-                
-                Real dx = particles.x[orig_i] - particles.x[orig_j];
-                Real dy = particles.y[orig_i] - particles.y[orig_j];
-                Real dz = particles.z[orig_i] - particles.z[orig_j];
-                
-                // Apply minimum image convention
-                box.apply_minimum_image(dx, dy, dz);
-                
-                Real r2 = dx*dx + dy*dy + dz*dz;
-                
-                if (r2 < cutoff_sq) {
-                    nlist.neighbors.push_back(orig_j);
-                    nlist.num_neighbors[orig_i]++;
-                    
-                    // Limit neighbors per particle
-                    if (nlist.num_neighbors[orig_i] >= nlist.max_neighbors_per_atom) {
-                        break;
+            // Search in 3x3x3 neighboring cells (27 cells total)
+            // Apply periodic boundary conditions for cells
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int ncx = cx + dx;
+                        int ncy = cy + dy;
+                        int ncz = cz + dz;
+                        
+                        // Apply periodic wrapping for cells at boundaries
+                        bool wrapped = false;
+                        if (box.periodic_x) {
+                            if (ncx < 0) { ncx += nx; wrapped = true; }
+                            else if (ncx >= nx) { ncx -= nx; wrapped = true; }
+                        } else {
+                            if (ncx < 0 || ncx >= nx) continue;
+                        }
+                        
+                        if (box.periodic_y) {
+                            if (ncy < 0) { ncy += ny; wrapped = true; }
+                            else if (ncy >= ny) { ncy -= ny; wrapped = true; }
+                        } else {
+                            if (ncy < 0 || ncy >= ny) continue;
+                        }
+                        
+                        if (box.periodic_z) {
+                            if (ncz < 0) { ncz += nz; wrapped = true; }
+                            else if (ncz >= nz) { ncz -= nz; wrapped = true; }
+                        } else {
+                            if (ncz < 0 || ncz >= nz) continue;
+                        }
+                        
+                        int neighbor_cell = ncz * nx * ny + ncy * nx + ncx;
+                        
+                        // Check all particles in this neighboring cell (owned + ghost)
+                        for (int j : cells[neighbor_cell]) {
+                            if (j == static_cast<int>(i)) continue;  // Skip self
+                            
+                            // Half-list logic: for owned-owned pairs (j < n_local), only store j > i
+                            // For owned-ghost pairs (j >= n_local), always store
+                            if (j < static_cast<int>(n_local) && j <= static_cast<int>(i)) continue;
+                            
+                            Real dx_ij = xi - particles.x[j];
+                            Real dy_ij = yi - particles.y[j];
+                            Real dz_ij = zi - particles.z[j];
+                            
+                            box.apply_minimum_image(dx_ij, dy_ij, dz_ij);
+                            
+                            Real r2 = dx_ij*dx_ij + dy_ij*dy_ij + dz_ij*dz_ij;
+                            
+                            if (r2 < cutoff_sq) {
+                                thread_local_neighbors.push_back(j);
+                            }
+                        }
                     }
                 }
             }
-        }
-    } // End of rank 0 computation
-    
-    // --- MPI synchronization: Broadcast neighbor list from rank 0 ---
-    if (mpi_initialized && mpi_size > 1) {
-        // Broadcast metadata
-        Real cutoff_val = nlist.cutoff;
-        MPI_Bcast(&cutoff_val, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        nlist.cutoff = cutoff_val;
-        
-        int max_cap = nlist.max_neighbors_per_atom;
-        MPI_Bcast(&max_cap, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        nlist.max_neighbors_per_atom = max_cap;
-        
-        int N = static_cast<int>(n);
-        
-        // Prepare arrays on non-root ranks
-        if (mpi_rank != 0) {
-            nlist.num_neighbors.assign(N, 0);
-            nlist.neighbor_offset.assign(N, 0);
-        }
-        
-        // Broadcast per-particle data
-        if (N > 0) {
-            MPI_Bcast(nlist.num_neighbors.data(), N, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Bcast(nlist.neighbor_offset.data(), N, MPI_INT, 0, MPI_COMM_WORLD);
-        }
-        
-        // Broadcast neighbor list
-        int total_nbrs = (mpi_rank == 0) ? static_cast<int>(nlist.neighbors.size()) : 0;
-        MPI_Bcast(&total_nbrs, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        
-        if (mpi_rank != 0) {
-            nlist.neighbors.resize(total_nbrs);
-        }
-        
-        if (total_nbrs > 0) {
-            MPI_Bcast(nlist.neighbors.data(), total_nbrs, MPI_INT, 0, MPI_COMM_WORLD);
+            
+            // Store neighbors (critical section)
+            {
+                nlist.neighbor_offset[i] = nlist.neighbors.size();
+                nlist.num_neighbors[i] = thread_local_neighbors.size();
+                nlist.neighbors.insert(nlist.neighbors.end(), 
+                                      thread_local_neighbors.begin(), 
+                                      thread_local_neighbors.end());
+            }
         }
     }
+    
+    // === Step 4: Copy to GPU if available (async for efficiency) ===
+    if (gpu_available) {
+        copy_to_gpu(nlist);
+    }
+
+    //auto end = std::chrono::high_resolution_clock::now();
+    //auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    // Print neighbor list information (LAMMPS-style logging) - only once per rank
+    if (!info_printed) {
+        // Calculate max neighbors per atom
+        int max_neighbors = 0;
+        if (!nlist.num_neighbors.empty()) {
+            max_neighbors = *std::max_element(nlist.num_neighbors.begin(), nlist.num_neighbors.end());
+        }
+        
+        
+        // Calculate actual bin size (using local cell grid parameters)
+        Real bin_size = std::min({Lx / nx, Ly / ny, Lz / nz});
+        Real extended_cutoff = cutoff + verlet_skin;
+        
+        std::cout << "\nNeighbor list info ..." << std::endl;
+        std::cout << "  update every " << update_frequency << " steps, delay " << delay_steps << " steps, check yes" << std::endl;
+        std::cout << "  max neighbors/atom: " << max_neighbors << std::endl;
+        std::cout << "  master list distance cutoff = " << extended_cutoff << std::endl;
+        std::cout << "  ghost atom cutoff = " << extended_cutoff << std::endl;
+        std::cout << "  binsize = " << bin_size << ", bins = " << nx << " " << ny << " " << nz << std::endl;
+        std::cout << std::endl;
+        
+        info_printed = true;  // Set flag to prevent future printing
+    }
+    
 }
 
-void MortonHilbertNeighborBuilder::copy_to_gpu(NeighborList& nlist) {
+void MortonZOrderNeighborBuilder::copy_to_gpu(NeighborList& nlist) {
     if (!gpu_available) {
         if (is_rank_zero()) {
             std::cout << "GPU not available, skipping GPU memory transfer" << std::endl;
         }
         return;
     }
+    
+
     
     
     #ifdef USE_CUDA
@@ -694,13 +949,17 @@ void MortonHilbertNeighborBuilder::copy_to_gpu(NeighborList& nlist) {
     size_t offset_size = nlist.neighbor_offset.size() * sizeof(int);
     size_t total_size = neighbor_list_size + num_neighbors_size + offset_size;
     
-    // Validate input sizes
+    // Enhanced input validation
     if (total_size == 0) {
         if (is_rank_zero()) {
             std::cout << "Warning: Empty neighbor list, skipping GPU transfer" << std::endl;
         }
         return;
     }
+    
+
+    
+
     
     // Clean up existing GPU memory with proper error checking
     if (gpu_memory_allocated) {
@@ -817,13 +1076,15 @@ void MortonHilbertNeighborBuilder::copy_to_gpu(NeighborList& nlist) {
         size_t offset_size = nlist.neighbor_offset.size();
         size_t total_elements = neighbor_list_size + num_neighbors_size + offset_size;
         
-        // Validate input sizes
+        // Enhanced input validation
         if (total_elements == 0) {
             if (is_rank_zero()) {
                 std::cout << "Warning: Empty neighbor list, skipping GPU transfer" << std::endl;
             }
             return;
         }
+        
+
         
         // Clean up existing GPU memory with proper error handling
         if (gpu_memory_allocated) {
@@ -928,10 +1189,46 @@ void MortonHilbertNeighborBuilder::copy_to_gpu(NeighborList& nlist) {
     }
     #endif
     
-    if (is_rank_zero()) {
-        std::cout << "Successfully copied neighbor list to GPU memory" << std::endl;
+}
+
+
+
+
+
+// Optimized MPI broadcast with chunked transfer for large neighbor lists
+void MortonZOrderNeighborBuilder::optimized_mpi_broadcast(NeighborList& nlist, size_t n, int mpi_rank, int mpi_size) {
+    if (mpi_size <= 1) return;
+    
+    // Broadcast metadata only
+    struct NeighborListHeader {
+        int total_neighbors;
+        Real cutoff_val;
+    } header;
+    
+    if (mpi_rank == 0) {
+        header.total_neighbors = static_cast<int>(nlist.neighbors.size());
+        header.cutoff_val = nlist.cutoff;
+    }
+    
+    MPI_Bcast(&header, sizeof(header), MPI_BYTE, 0, MPI_COMM_WORLD);
+    
+    // Non-root ranks allocate memory
+    if (mpi_rank != 0) {
+        nlist.cutoff = header.cutoff_val;
+        nlist.neighbors.resize(header.total_neighbors);
+        nlist.num_neighbors.assign(n, 0);
+        nlist.neighbor_offset.assign(n, 0);
+    }
+    
+    // Send data efficiently
+    if (header.total_neighbors > 0) {
+        MPI_Bcast(nlist.neighbors.data(), header.total_neighbors, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(nlist.num_neighbors.data(), static_cast<int>(n), MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(nlist.neighbor_offset.data(), static_cast<int>(n), MPI_INT, 0, MPI_COMM_WORLD);
     }
 }
+
+
 
 // Factory function implementation
 std::unique_ptr<NeighborListBuilder> create_neighbor_list_builder(
@@ -961,9 +1258,9 @@ std::unique_ptr<NeighborListBuilder> create_neighbor_list_builder(
             return std::make_unique<VerletCellListNeighborBuilder>(cutoff, skin);
         }
             
-        case NeighborListType::MORTON_HILBERT_CSR: {
+        case NeighborListType::MORTON_Z_ORDER_CSR: {
             Real skin = 2.0; // Default skin for stability
-            int tile_size = 256; // Default tile size
+            int tile_size = 256; // Default tile size (optimized for GPU warps)
             
             // Parse config string for skin distance if provided
             if (!config.empty()) {
@@ -977,10 +1274,10 @@ std::unique_ptr<NeighborListBuilder> create_neighbor_list_builder(
             }
             
             if (rank == 0) {
-                std::cout << "Creating Morton/Hilbert CSR neighbor builder (skin: " 
+                std::cout << "Creating Morton Z-order CSR neighbor builder (skin: " 
                           << skin << ", tile size: " << tile_size << ")" << std::endl;
             }
-            return std::make_unique<MortonHilbertNeighborBuilder>(cutoff, skin, tile_size);
+            return std::make_unique<MortonZOrderNeighborBuilder>(cutoff, skin, tile_size);
         }
         
         default:

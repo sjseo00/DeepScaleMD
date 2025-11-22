@@ -24,7 +24,7 @@ extern "C" {
     
     void launch_andersen_thermostat_kernel(Real *d_vx, Real *d_vy, Real *d_vz,
                                           Real *d_mass, Real *d_rand_x, Real *d_rand_y, Real *d_rand_z,
-                                          Real *d_collision_flags, Real sigma_factor, size_t num_particles);
+                                          Real *d_collision_flags, Real collision_prob, Real sigma_factor, size_t num_particles);
 }
 #endif
 

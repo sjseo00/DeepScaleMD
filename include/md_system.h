@@ -33,10 +33,25 @@ private:
     int num_neighbors;
     Real domain_min[3], domain_max[3];  // Local domain boundaries
     
-    // Halo exchange data
-    std::vector<int> halo_particles;  // Indices of particles to send as halo
-    std::vector<ParticleData> neighbor_halos;  // Received ghost particles from neighbors
-    Real halo_width;  // Width of halo region
+    // New halo exchange data (face-focused, directional)
+    struct HaloParticle {
+        Real x, y, z;
+        Real vx, vy, vz;
+        Real fx, fy, fz;  // forces for reverse halo exchange
+        Real mass, charge;
+        int type;
+        int global_id; // global particle id for MPI pair ownership
+    };
+    struct NeighborInfo { int rank; int dx; int dy; int dz; }; // direction vector (-1,0,1)
+    std::vector<NeighborInfo> neighbor_info;              // up to 26 entries
+    std::vector<std::vector<HaloParticle>> halo_send_buffers; // per neighbor packed particles (host)
+    std::vector<std::vector<HaloParticle>> halo_recv_buffers; // per neighbor received particles (host)
+    Real halo_width_;  // current halo width (cutoff + skin)
+#ifdef USE_CUDA
+    // Optional CUDA device staging (CUDA-aware MPI assumed; if not, host buffers are used)
+    std::vector<void*> d_halo_send; // device pointers mirrored to halo_send_buffers
+    std::vector<void*> d_halo_recv; // device pointers mirrored to halo_recv_buffers
+#endif
     
     // MPI Cartesian topology (cached to avoid repeated creation)
 #ifdef USE_MPI
@@ -56,6 +71,8 @@ private:
     // Device management
     void* d_particles;  // Device particle data
     bool use_gpu;
+    bool cuda_direct_halo_; // use CUDA-aware MPI direct device buffers if available
+    size_t ghost_count_ = 0; // number of ghost particles currently appended
 
 public:
     MDSystem();
@@ -95,22 +112,34 @@ public:
     
     size_t get_num_particles() const { return particles.num_particles; }
     size_t get_local_particles() const { return local_end - local_start; }
+    size_t get_ghost_count() const { return ghost_count_; }
+    size_t get_total_particles() const { return get_local_particles() + ghost_count_; }  // local + ghost
     int get_rank() const { return rank; }
     int get_size() const { return size; }
     bool using_gpu() const { return use_gpu; }
     Real get_physical_cutoff() const { return physical_cutoff; }
     void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
+    int get_local_start() const { return local_start; }
     
     // Domain decomposition getters
     int get_num_neighbors() const { return num_neighbors; }
     const int* get_neighbor_ranks() const { return neighbor_ranks; }
     
-    // Halo exchange methods
-    void setup_neighbor_ranks();
-    void identify_halo_particles();
-    void exchange_halo_particles();
-    void pack_halo_data(int neighbor_rank, std::vector<Real>& buffer);
-    void unpack_halo_data(int neighbor_rank, const std::vector<Real>& buffer);
+    // Halo exchange methods (new API)
+    void setup_neighbor_ranks();            // builds neighbor_info and Cartesian topology
+    void update_domain_bounds();            // compute domain_min/max arrays from cart coords
+    void build_halo_send_buffers();         // select boundary particles per neighbor and pack
+    void perform_halo_exchange();           // non-blocking MPI exchange (CUDA-aware if enabled)
+    void perform_reverse_halo_exchange();   // send back accumulated ghost forces
+    size_t get_total_halo_particles() const; // convenience for diagnostics
+    const std::vector<std::vector<HaloParticle>>& get_halo_recv_buffers() const { return halo_recv_buffers; }
+    // Ghost integration helpers
+    void assemble_ghost_particles();    // append received ghosts to particles arrays
+    void remove_ghost_particles();      // truncate particles arrays back to local only
+
+    // MPI datatype creation for HaloParticle (lazily initialized)
+    static MPI_Datatype get_halo_particle_type();
+    static void free_halo_particle_type();
 };
 
 #endif // MD_SYSTEM_H

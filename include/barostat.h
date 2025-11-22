@@ -14,6 +14,12 @@
 // CUDA kernel wrapper function declarations
 extern "C" {
     void launch_scale_positions_kernel(Real *d_x, Real *d_y, Real *d_z, Real scale_factor, size_t num_particles);
+    void launch_scale_positions_anisotropic_kernel(Real *d_x, Real *d_y, Real *d_z,
+                                                   Real scale_x, Real scale_y, Real scale_z,
+                                                   size_t num_particles);
+    void launch_scale_velocities_anisotropic_kernel(Real *d_vx, Real *d_vy, Real *d_vz,
+                                                    Real scale_x, Real scale_y, Real scale_z,
+                                                    size_t num_particles);
 }
 #endif
 

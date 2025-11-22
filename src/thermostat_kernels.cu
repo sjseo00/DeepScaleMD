@@ -28,11 +28,12 @@ __global__ void nose_hoover_thermostat_kernel(Real *vx, Real *vy, Real *vz,
 
 __global__ void andersen_thermostat_kernel(Real *vx, Real *vy, Real *vz,
                                           Real *mass, Real *rand_x, Real *rand_y, Real *rand_z,
-                                          Real *collision_flags, Real sigma_factor, size_t n) {
+                                          Real *collision_flags, Real collision_prob, Real sigma_factor, size_t n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     
-    if (collision_flags[idx] > 0.0) {
+    // Apply collision if random number is less than collision probability
+    if (collision_flags[idx] < collision_prob) {
         Real sigma = sigma_factor / sqrt(mass[idx]);
         vx[idx] = sigma * rand_x[idx];
         vy[idx] = sigma * rand_y[idx];
@@ -63,11 +64,11 @@ extern "C" {
     
     void launch_andersen_thermostat_kernel(Real *d_vx, Real *d_vy, Real *d_vz,
                                           Real *d_mass, Real *d_rand_x, Real *d_rand_y, Real *d_rand_z,
-                                          Real *d_collision_flags, Real sigma_factor, size_t num_particles) {
+                                          Real *d_collision_flags, Real collision_prob, Real sigma_factor, size_t num_particles) {
         int block_size = 256;
         int grid_size = (num_particles + block_size - 1) / block_size;
         
         andersen_thermostat_kernel<<<grid_size, block_size>>>(
-            d_vx, d_vy, d_vz, d_mass, d_rand_x, d_rand_y, d_rand_z, d_collision_flags, sigma_factor, num_particles);
+            d_vx, d_vy, d_vz, d_mass, d_rand_x, d_rand_y, d_rand_z, d_collision_flags, collision_prob, sigma_factor, num_particles);
     }
 }

@@ -1,4 +1,3 @@
-
 #include <mpi.h>
 #include "md_simulation.h"
 #include "neighbor_list.h"
@@ -26,6 +25,7 @@ MDSimulation::MDSimulation() :
     neighbor_list_tile_size(256),
     neighbor_list_update_freq(10),  // Default update frequency: every 10 steps
     verlet_skin(2.0),               // Default Verlet skin distance
+    neighbor_list_builds(0),        // Initialize counter
     force_calculation_mode("builtin"),  // Default: use builtin force calculations
     integrator_type("verlet"),
     thermostat_type("none"),
@@ -44,6 +44,7 @@ MDSimulation::MDSimulation() :
     python_force_path("python_force"), 
     python_force_enabled(false),
     cached_potential_energy(0.0),
+    neighbor_rebuild_forced(false),
     timing_enabled(false) {
     const char* env = std::getenv("MD_TIMING");
     if (env && std::string(env) == "1") timing_enabled = true;
@@ -69,10 +70,8 @@ void MDSimulation::initialize(const std::string& config_file) {
     // Load coordinate file from configuration first
     system->load_coordinates(coordinate_file);
     
-    // Set up domain decomposition after particles are loaded
-    system->setup_domain_decomposition();
-        
     // Load topology file from configuration and assign properties to particles
+    // MUST be done BEFORE velocity initialization to ensure masses are set
     if (!topology_file.empty()) {
         system->load_topology(topology_file);
         // Set up force field parameters after topology is loaded
@@ -84,7 +83,11 @@ void MDSimulation::initialize(const std::string& config_file) {
     }
     
     // Initialize velocities with Maxwell-Boltzmann distribution using target temperature
+    // CRITICAL: Must be done BEFORE domain decomposition so all particles get velocities
     system->initialize_velocities(target_temperature);
+    
+    // Set up domain decomposition after particles are loaded and velocities initialized
+    system->setup_domain_decomposition();
     
     // Initialize force calculator based on compile-time flags
 #ifdef USE_CUDA
@@ -116,7 +119,6 @@ void MDSimulation::initialize(const std::string& config_file) {
     }
     force_calc->initialize();
 #endif
-    
     // Initialize Python interface for custom forces (only if python mode is enabled)
     if (system->get_rank() == 0 && force_calculation_mode == "python") {
         python_interface = std::make_unique<PythonForceInterface>();
@@ -131,9 +133,11 @@ void MDSimulation::initialize(const std::string& config_file) {
     
     // Parse neighbor list type
     NeighborListType nlist_type = NeighborListType::VERLET_CELL_LIST; // Use verlet cell list by default
-    if (neighbor_list_type_str == "morton_hilbert") {
-        nlist_type = NeighborListType::MORTON_HILBERT_CSR;
-        std::cout << "Using Morton/Hilbert neighbor list" << std::endl;
+    if (neighbor_list_type_str == "morton_z_order") {
+        nlist_type = NeighborListType::MORTON_Z_ORDER_CSR;
+        if (system->get_rank() == 0) {
+            std::cout << "Using Morton Z-order neighbor list (optimized for MPI/CUDA)" << std::endl;
+        }
     } else if (neighbor_list_type_str == "verlet_cell_list") {
         nlist_type = NeighborListType::VERLET_CELL_LIST;
         if (system->get_rank() == 0) {
@@ -153,12 +157,24 @@ void MDSimulation::initialize(const std::string& config_file) {
         // For Verlet-Cell hybrid, use verlet_skin distance
         nlist_config = std::to_string(verlet_skin);
     } else {
-        // For Morton-Hilbert, use verlet_skin for stability
+        // For Morton Z-order, use verlet_skin for stability
         nlist_config = std::to_string(verlet_skin);
     }
     
     neighbor_builder = create_neighbor_list_builder(nlist_type, cutoff, nlist_config, system->get_rank());
     neighbor_builder->initialize();
+    
+    // Set update frequency information for proper logging
+    VerletCellListNeighborBuilder* verlet_builder = dynamic_cast<VerletCellListNeighborBuilder*>(neighbor_builder.get());
+    if (verlet_builder) {
+        verlet_builder->set_update_info(neighbor_list_update_freq, 0);
+        // Enable automatic rebuild check for better performance (LAMMPS-style)
+        verlet_builder->enable_check(true);
+    }
+    MortonZOrderNeighborBuilder* morton_builder = dynamic_cast<MortonZOrderNeighborBuilder*>(neighbor_builder.get());
+    if (morton_builder) {
+        morton_builder->set_update_info(neighbor_list_update_freq, 0);
+    }
     
     // Initialize components based on configuration
     initialize_integrator();
@@ -168,139 +184,239 @@ void MDSimulation::initialize(const std::string& config_file) {
 }
 
 void MDSimulation::single_step() {
-    // Build neighbor list less frequently (non-MPI mode)
-    if (current_step % neighbor_list_update_freq == 0) {
-        neighbor_builder->build(system->get_particles(), system->get_box(), 
-                               system->get_neighbor_list(), system->get_local_particles());
-    }
+    // Performance timing (enabled via MD_TIMING=1 environment variable)
+    auto step_start = std::chrono::high_resolution_clock::now();
+    
+    double comm_time = 0.0;  // Track communication time
 
-    // Check if we're using Velocity-Verlet integrator (CPU or CUDA version)
-    VelocityVerletIntegrator* vv_integrator = dynamic_cast<VelocityVerletIntegrator*>(integrator.get());
-#ifdef USE_CUDA
-    VelocityVerletIntegratorCUDA* vv_integrator_cuda = dynamic_cast<VelocityVerletIntegratorCUDA*>(integrator.get());
-#else
-    void* vv_integrator_cuda = nullptr;
+    // ==================== Neighbor List Management ====================
+    auto nlist_start = std::chrono::high_resolution_clock::now();
+    bool should_rebuild = false;
+    
+    if (neighbor_rebuild_forced) {
+        should_rebuild = true;
+        neighbor_rebuild_forced = false;  // Reset flag after use
+        
+    } else if (current_step % neighbor_list_update_freq == 0) {
+        VerletCellListNeighborBuilder* verlet_builder = dynamic_cast<VerletCellListNeighborBuilder*>(neighbor_builder.get());
+        if (verlet_builder) {
+            // This call uses MPI_Allreduce internally, so all ranks get the same result
+            should_rebuild = verlet_builder->needs_rebuild(system->get_particles(), system->get_local_particles());
+        } else {
+            // Other neighbor list types: always rebuild at specified frequency
+            should_rebuild = true;
+        }
+    }
+    
+    // Perform halo exchange ONLY when rebuild is needed (optimization)
+    if (should_rebuild) {
+#ifdef USE_MPI
+        {
+            auto comm_start = std::chrono::high_resolution_clock::now();
+            system->perform_halo_exchange();
+            system->assemble_ghost_particles();
+            auto comm_end = std::chrono::high_resolution_clock::now();
+            comm_time += std::chrono::duration<double>(comm_end - comm_start).count();
+        }
+#endif
+        // build() contains MPI_Barrier and MPI_Bcast internally
+        neighbor_builder->build(system->get_particles(), system->get_box(),
+                                system->get_neighbor_list(), system->get_local_particles());
+        neighbor_list_builds++;
+    }
+    
+    auto nlist_end = std::chrono::high_resolution_clock::now();
+    double nlist_time = std::chrono::duration<double>(nlist_end - nlist_start).count();
+    
+    
+    auto integrate_start = std::chrono::high_resolution_clock::now();
+    
+
+    // Step 1: Position update and half-step velocity update
+    // Uses F(t) computed in previous step (or initial force for first step)
+    integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+    
+    auto integrate1_end = std::chrono::high_resolution_clock::now();
+    double integrate1_time = std::chrono::duration<double>(integrate1_end - integrate_start).count();
+    
+#ifdef USE_MPI
+    // After position update, perform halo exchange for force calculation
+    // This is the MAIN halo exchange for every step
+    {
+        auto comm_start = std::chrono::high_resolution_clock::now();
+        system->perform_halo_exchange();
+        system->assemble_ghost_particles();  // Assemble ghost particles into ParticleData
+        MPI_Barrier(MPI_COMM_WORLD);
+        auto comm_end = std::chrono::high_resolution_clock::now();
+        comm_time += std::chrono::duration<double>(comm_end - comm_start).count();
+    }
 #endif
     
-    auto t_force_start = std::chrono::high_resolution_clock::now();
-    if (!vv_integrator && !vv_integrator_cuda) {
-        // For non-Velocity-Verlet integrators: Force calculation first
-        // Compute forces based on calculation mode
-        if (force_calculation_mode == "python" && python_interface) {
-            // Use Python for all force calculations
-            python_interface->compute_forces(system->get_particles(), system->get_ff_params(), 
-                                            system->get_neighbor_list());
-            // For now, PE calculation with Python forces is not implemented
-            cached_potential_energy = 0.0;
-        } else if (force_calculation_mode == "builtin" && force_calc) {
-            // Use built-in force calculator
-            force_calc->compute_forces(*system);
-        } else {
-            // Fallback to built-in if mode is invalid or interface not available
-            if (force_calc) {
-                force_calc->compute_forces(*system);
-            }
-            if (system->get_rank() == 0 && force_calculation_mode == "python" && !python_interface) {
-                static bool warned = false;
-                if (!warned) {
-                    std::cout << "Warning: Python force calculation requested but interface not available. Using built-in forces." << std::endl;
-                    warned = true;
-                }
-            }
-        }
-        auto t_force_end = std::chrono::high_resolution_clock::now();
-        if (timing_enabled) last_timing.force_ms = std::chrono::duration<double, std::milli>(t_force_end - t_force_start).count();
-        
-        // Then integrate equations of motion
-        auto t_int_start = std::chrono::high_resolution_clock::now();
-        integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
-        auto t_int_end = std::chrono::high_resolution_clock::now();
-        if (timing_enabled) last_timing.integrate_ms = std::chrono::duration<double, std::milli>(t_int_end - t_int_start).count();
+    // ==================== Force Calculation at t+dt ====================
+    auto force_start = std::chrono::high_resolution_clock::now();
+    
+    // Zero forces for ALL particles (local + ghost)
+    zero_forces();
+
+    // Step 2: Compute forces at new positions F(t+dt)
+    if (force_calculation_mode == "python" && python_interface) {
+        python_interface->compute_forces(system->get_particles(), system->get_ff_params(), 
+                                        system->get_neighbor_list());
+        cached_potential_energy = 0.0;
+    } else if (force_calculation_mode == "builtin" && force_calc) {
+        force_calc->compute_forces(*system);
     } else {
-        // For Velocity-Verlet: Position update first, then force calculation, then velocity completion
-        // Step 1: Position update (stores old forces for later velocity update)
-        auto t_int_start = std::chrono::high_resolution_clock::now();
-        if (vv_integrator) {
-            vv_integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
-#ifdef USE_CUDA
-        } else if (vv_integrator_cuda) {
-            vv_integrator_cuda->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
-#endif
-        }
-        auto t_int_mid = std::chrono::high_resolution_clock::now();
-        
-        // Step 2: Compute forces at new positions
-        if (force_calculation_mode == "python" && python_interface) {
-            // Use Python for all force calculations
-            python_interface->compute_forces(system->get_particles(), system->get_ff_params(), 
-                                            system->get_neighbor_list());
-            // For now, PE calculation with Python forces is not implemented
-            cached_potential_energy = 0.0;
-        } else if (force_calculation_mode == "builtin" && force_calc) {
-            // Use built-in force calculator
+        if (force_calc) {
             force_calc->compute_forces(*system);
-        } else {
-            // Fallback to built-in if mode is invalid or interface not available
-            if (force_calc) {
-                force_calc->compute_forces(*system);
-            }
-            if (system->get_rank() == 0 && force_calculation_mode == "python" && !python_interface) {
-                static bool warned = false;
-                if (!warned) {
-                    std::cout << "Warning: Python force calculation requested but interface not available. Using built-in forces." << std::endl;
-                    warned = true;
-                }
-            }
         }
-        auto t_force_end = std::chrono::high_resolution_clock::now();
-        if (timing_enabled) last_timing.force_ms = std::chrono::duration<double, std::milli>(t_force_end - t_force_start).count();
-        
-        // Step 3: Complete velocity update with new forces
-        auto t_int_end = std::chrono::high_resolution_clock::now();
-        if (vv_integrator) {
-            vv_integrator->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
-#ifdef USE_CUDA
-        } else if (vv_integrator_cuda) {
-            vv_integrator_cuda->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
-#endif
-        }
-        auto t_int_final = std::chrono::high_resolution_clock::now();
-        if (timing_enabled) last_timing.integrate_ms = std::chrono::duration<double, std::milli>(t_int_mid - t_int_start).count() 
-                                                      + std::chrono::duration<double, std::milli>(t_int_final - t_int_end).count();
     }
 
-    // Check for numerical instabilities and adjust timestep if needed
-    // check_energy_stability();
-    
-    // Apply thermostat
-    auto t_thermo_start = std::chrono::high_resolution_clock::now();
-    if (thermostat) {
-        thermostat->apply(system->get_particles(), dt, system->get_local_particles());
+#ifdef USE_MPI
+    // Perform reverse halo exchange to accumulate ghost forces back to local particles
+    {
+        auto comm_start = std::chrono::high_resolution_clock::now();
+        system->perform_reverse_halo_exchange();
+        MPI_Barrier(MPI_COMM_WORLD);
+        auto comm_end = std::chrono::high_resolution_clock::now();
+        comm_time += std::chrono::duration<double>(comm_end - comm_start).count();
     }
-    auto t_thermo_end = std::chrono::high_resolution_clock::now();
-    if (timing_enabled) last_timing.thermostat_ms = std::chrono::duration<double, std::milli>(t_thermo_end - t_thermo_start).count();
+#endif
+    
+    auto force_end = std::chrono::high_resolution_clock::now();
+    double force_time = std::chrono::duration<double>(force_end - force_start).count();
+    
+    auto integrate2_start = std::chrono::high_resolution_clock::now();
+    
+    // Step 3: Complete velocity update with new forces
+    // Implementation varies by integrator type (VV, Leapfrog, r-RESPA)
+    // VelocityVerlet: v(t+dt) = v(t+dt/2) + 0.5*a(t+dt)*dt
+    // Leapfrog: v(t+3dt/2) = v(t+dt/2) + a(t+dt)*dt
+    integrator->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
+    
+    auto integrate2_end = std::chrono::high_resolution_clock::now();
+    double integrate2_time = std::chrono::duration<double>(integrate2_end - integrate2_start).count();
+    
+    // ==================== Apply thermostat and barostat ====================
+    auto modify_start = std::chrono::high_resolution_clock::now();
+    if (thermostat) {
+#ifdef USE_MPI
+        MPI_Barrier(MPI_COMM_WORLD);
+#endif
+        thermostat->apply(system->get_particles(), dt, system->get_local_particles());
+#ifdef USE_MPI
+        MPI_Barrier(MPI_COMM_WORLD);
+#endif
+    }
     
     // Update kinetic energy after velocity update and thermostat application
-    auto t_ke_start = std::chrono::high_resolution_clock::now();
     if (force_calc) {
         force_calc->calculate_kinetic_energy(*system);
     }
-    auto t_ke_end = std::chrono::high_resolution_clock::now();
-    if (timing_enabled) last_timing.ke_ms = std::chrono::duration<double, std::milli>(t_ke_end - t_ke_start).count();
     
     // Apply barostat
-    auto t_baro_start = std::chrono::high_resolution_clock::now();
     if (barostat) {
+        // Store old box dimensions to detect significant changes
+        Real old_lx = system->get_box().lx;
+        Real old_ly = system->get_box().ly;
+        Real old_lz = system->get_box().lz;
+        
         barostat->apply(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+        
+        // CRITICAL FIX 3: Force neighbor rebuild if box changed significantly
+        Real dlx = std::abs(system->get_box().lx - old_lx) / old_lx;
+        Real dly = std::abs(system->get_box().ly - old_ly) / old_ly;
+        Real dlz = std::abs(system->get_box().lz - old_lz) / old_lz;
+        
+        const Real box_change_threshold = 0.01;  // 1% relative change
+        if (dlx > box_change_threshold || dly > box_change_threshold || dlz > box_change_threshold) {
+            neighbor_rebuild_forced = true;  // Will trigger rebuild in next step
+        }
     }
-    auto t_baro_end = std::chrono::high_resolution_clock::now();
-    if (timing_enabled) {
-        last_timing.barostat_ms = std::chrono::duration<double, std::milli>(t_baro_end - t_baro_start).count();
-        last_timing.total_ms = last_timing.domain_ms + last_timing.force_ms + last_timing.integrate_ms +
-                               last_timing.thermostat_ms + last_timing.ke_ms + last_timing.barostat_ms;
+    auto modify_end = std::chrono::high_resolution_clock::now();
+    double modify_time = std::chrono::duration<double>(modify_end - modify_start).count();
+    
+#ifdef USE_MPI
+    // Remove ghost particles after force/thermo/barostat application to restore local-only arrays
+    system->remove_ghost_particles();
+#endif
+    
+    auto step_end = std::chrono::high_resolution_clock::now();
+    double total_time = std::chrono::duration<double>(step_end - step_start).count();
+    
+    // Accumulate timing statistics
+    cumulative_timing.pair_time += force_time;
+    cumulative_timing.neigh_time += nlist_time;
+    cumulative_timing.comm_time += comm_time;
+    cumulative_timing.modify_time += (integrate1_time + integrate2_time + modify_time);
+    cumulative_timing.total_time += total_time;
+    cumulative_timing.step_count++;
+        
+    current_step++;
+}
+
+void MDSimulation::prepare_first_step() {
+
+#ifdef USE_MPI
+    // Initial halo exchange to populate ghost particles
+    system->perform_halo_exchange();
+    system->assemble_ghost_particles();
+#endif
+    
+    // Build initial neighbor list at t=0 (with ghost particles)
+    neighbor_builder->build(system->get_particles(), system->get_box(),
+                            system->get_neighbor_list(), system->get_local_particles());
+    neighbor_list_builds++;
+    
+    // Zero forces for ALL particles (local + ghost)
+    zero_forces();
+    
+    // Compute initial forces F(t=0)
+    if (force_calculation_mode == "python" && python_interface) {
+        python_interface->compute_forces(system->get_particles(), system->get_ff_params(), 
+                                        system->get_neighbor_list());
+        cached_potential_energy = 0.0;
+    } else if (force_calculation_mode == "builtin" && force_calc) {
+        force_calc->compute_forces(*system);
+    } else {
+        if (force_calc) {
+            force_calc->compute_forces(*system);
+        }
     }
     
-    current_step++;
+#ifdef USE_MPI
+    // Accumulate ghost forces back to local particles
+    system->perform_reverse_halo_exchange();
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+    
+    // Special initialization for Leapfrog integrator
+    if (integrator_type == "leap_frog") {
+        integrator->initialize_velocities(system->get_particles(), dt, system->get_local_particles());
+    }
+    
+    // Calculate initial kinetic energy after velocity initialization
+    if (force_calc) {
+        force_calc->calculate_kinetic_energy(*system);
+    }
+    
+#ifdef USE_MPI
+    // Clean up ghost particles after initial force calculation
+    system->remove_ghost_particles();
+#endif
+
+}
+
+void MDSimulation::zero_forces() {
+    // Zero forces for ALL particles (local + ghost)
+    // This is necessary because force calculation writes to both local and ghost particle forces
+    ParticleData& particles = system->get_particles();
+    size_t total_count = system->get_total_particles();  // local + ghost
+    
+    for (size_t i = 0; i < total_count; i++) {
+        particles.fx[i] = 0.0;
+        particles.fy[i] = 0.0;
+        particles.fz[i] = 0.0;
+    }
 }
 
 void MDSimulation::calculate_potential_energy() {
@@ -339,30 +455,27 @@ void MDSimulation::calculate_potential_energy() {
                 Real dy = particles.y[i] - particles.y[j];
                 Real dz = particles.z[i] - particles.z[j];
                 
-                // Apply periodic boundary conditions
-                if (box.periodic_x && std::abs(dx) > box.lx * 0.5) {
-                    dx = (dx > 0) ? dx - box.lx : dx + box.lx;
-                }
-                if (box.periodic_y && std::abs(dy) > box.ly * 0.5) {
-                    dy = (dy > 0) ? dy - box.ly : dy + box.ly;
-                }
-                if (box.periodic_z && std::abs(dz) > box.lz * 0.5) {
-                    dz = (dz > 0) ? dz - box.lz : dz + box.lz;
-                }
+                // Apply minimum image convention (periodic boundary conditions)
+                box.apply_minimum_image(dx, dy, dz);
                 
                 Real r2 = dx*dx + dy*dy + dz*dz;
-                Real r = std::sqrt(r2);
                 
-                // Use average parameters (simple approximation)
-                Real epsilon = (ff_params.epsilon[i] + ff_params.epsilon[j]) * 0.5;
-                Real sigma = (ff_params.sigma[i] + ff_params.sigma[j]) * 0.5;
+                if (r2 >= cutoff_distance * cutoff_distance || r2 < 1e-10) continue;
                 
-                if (r > 0.1 && r < cutoff_distance) { // Avoid singularity and cutoff
-                    Real sr = sigma / r;
-                    Real sr6 = sr * sr * sr * sr * sr * sr;
-                    Real sr12 = sr6 * sr6;
-                    local_pe += 4.0 * epsilon * (sr12 - sr6);
-                }
+                // Use pre-computed mixing rules from lookup table (consistent with force calculation)
+                int type_i = particles.type[i];
+                int type_j = particles.type[j];
+                Real epsilon = ff_params.epsilon_mixed[type_i][type_j];
+                Real sigma = ff_params.sigma_mixed[type_i][type_j];
+                
+                Real sig2 = sigma * sigma;
+                Real sig6 = sig2 * sig2 * sig2;
+                Real r2inv = 1.0 / r2;
+                Real r6inv = r2inv * r2inv * r2inv;
+                Real sig6_r6 = sig6 * r6inv;
+                Real sig12_r12 = sig6_r6 * sig6_r6;
+                
+                local_pe += 4.0 * epsilon * (sig12_r12 - sig6_r6);
             }
         }
     }
@@ -381,144 +494,162 @@ void MDSimulation::run() {
         std::cout << "Starting MD simulation for " << total_steps << " steps" << std::endl;
     }
     
-    for (int step = 0; step < total_steps; step++) {
-        auto step_start = std::chrono::high_resolution_clock::now();
-        
+    // Reset state flags
+    current_step = 0;
+    neighbor_rebuild_forced = false;
+    
+    // Prepare initial forces at t=0 before starting MD loop
+    prepare_first_step();
+
+    // Output initial state (step 0)
+    output_results(0);
+    
+    // Main simulation loop - current_step is already 1 from initialization
+    for (int step = 1; step <= total_steps; step++) {
         single_step();
-        
-        auto step_end = std::chrono::high_resolution_clock::now();
-        auto step_duration = std::chrono::duration_cast<std::chrono::microseconds>(step_end - step_start);
         
         // Output results based on output_freq
         if (step % output_freq == 0) {
-            if (timing_enabled) print_step_timing(step);
-            output_results(step, step_duration.count() / 1000.0);  // Pass step time in milliseconds
-            // Only synchronize when outputting results to ensure consistent output
+#ifdef USE_MPI
+            // Synchronize before output to ensure consistent state across ranks
             MPI_Barrier(MPI_COMM_WORLD);
+#endif
+            output_results(step);  // Pass step number
         }
+    }
+    
+    // Output neighbor list statistics at end
+    if (system->get_rank() == 0) {
+        std::cout << "Neighbor list builds = " << neighbor_list_builds << std::endl;
     }
 }
 
-void MDSimulation::print_step_timing(int step) {
+void MDSimulation::output_results(int step) {
+    // Track output timing
+    auto output_start = std::chrono::high_resolution_clock::now();
+    
+    // Calculate all possible values
+    Real total_ke = 0.0;
+    Real max_speed = 0.0;
+    Real total_speed = 0.0;
+    Real total_pe = 0.0;  // Potential Energy
+    Real max_force = 0.0; // Maximum force magnitude
+    ParticleData& particles = system->get_particles();
+    
+    if (force_calc) {
+        total_ke = force_calc->get_kinetic_energy();
+        total_ke *= mvv2e;
+
+        total_pe = force_calc->get_potential_energy();
+    } else {
+        // Fallback: calculate KE manually if no force calculator
+        for (size_t i = 0; i < particles.num_particles; i++) {
+            Real v2 = particles.vx[i] * particles.vx[i] + 
+                      particles.vy[i] * particles.vy[i] + 
+                      particles.vz[i] * particles.vz[i];
+            total_ke += 0.5 * particles.mass[i] * v2;
+        }
+        total_ke *= mvv2e;
+        total_pe = cached_potential_energy; // Use cached value as fallback
+    }
+    
+    // Calculate maximum force magnitude - ONLY for LOCAL particles to avoid ghost particle issues
 #ifdef USE_MPI
-    int rank; 
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    size_t num_particles_for_fmax = system->get_local_particles();
 #else
-    int rank = 0;
+    size_t num_particles_for_fmax = particles.num_particles;
 #endif
-    std::ostringstream os;
-    os.setf(std::ios::fixed); 
-    os.precision(3);
-    os << "[Rank " << rank << "] STEP " << step
-       << " domain=" << last_timing.domain_ms
-       << " (migrate=" << last_timing.migrate_ms
-       << " nlist=" << last_timing.nlist_build_ms << ")"
-       << "ms force=" << last_timing.force_ms
-       << "ms integrate=" << last_timing.integrate_ms
-       << "ms thermo=" << last_timing.thermostat_ms
-       << "ms KE=" << last_timing.ke_ms
-       << "ms baro=" << last_timing.barostat_ms
-       << "ms total(sum)=" << last_timing.total_ms << "ms";
-    std::cout << os.str() << std::endl;
-}
+    
+    size_t max_force_particle_id = 0;
+    for (size_t i = 0; i < num_particles_for_fmax; i++) {
+        Real f_mag = std::sqrt(particles.fx[i] * particles.fx[i] + 
+                               particles.fy[i] * particles.fy[i] + 
+                               particles.fz[i] * particles.fz[i]);
+        if (f_mag > max_force) {
+            max_force = f_mag;
+            max_force_particle_id = i;
+        }
+    }
+    
+    Real avg_speed = (particles.num_particles > 0) ? (total_speed / particles.num_particles) : 0.0;
+    Real temperature = 0.0;
 
-void MDSimulation::output_results(int step, double step_time_ms) {
+#ifdef USE_MPI
+    // In MPI mode, get global LOCAL particle count for accurate temperature
+    // Do NOT count ghost particles - only owned particles contribute to N
+    int global_particles = 0;
+    int local_particle_count = static_cast<int>(system->get_local_particles());
+    MPI_Allreduce(&local_particle_count, &global_particles, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    
+    // Get global maximum force across all ranks and which rank has it
+    struct {
+        Real value;
+        int rank;
+    } local_max, global_max;
+    
+    local_max.value = max_force;
+    local_max.rank = system->get_rank();
+    
+    MPI_Allreduce(&local_max, &global_max, 1, MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+    max_force = global_max.value;
+    
+    // Broadcast the particle ID from the rank that has the maximum force
+    int max_force_rank = global_max.rank;
+    unsigned long long global_max_force_particle_id = static_cast<unsigned long long>(max_force_particle_id);
+    MPI_Bcast(&global_max_force_particle_id, 1, MPI_UNSIGNED_LONG_LONG, max_force_rank, MPI_COMM_WORLD);
+    max_force_particle_id = static_cast<size_t>(global_max_force_particle_id);
+#else
+    int global_particles = particles.num_particles;
+#endif
+
+    if (particles.num_particles > 0 && system->get_rank() == 0) {
+        // Temperature calculation for 'real' units (kcal/mol, LAMMPS convention)
+        // T = (2 * KE) / (3 * N * kB), KE in kcal/mol, kB = 0.0019872041 kcal/(mol·K)
+        temperature = (2.0 * total_ke) / (3.0 * global_particles * kB);
+    }
+    
     if (system->get_rank() == 0) {
-        // Calculate all possible values
-        Real total_ke = 0.0;
-        Real max_speed = 0.0;
-        Real total_speed = 0.0;
-        Real max_force = 0.0;
-        Real total_pe = 0.0;  // Potential Energy
-        ParticleData& particles = system->get_particles();
-        
-        if (force_calc) {
-            total_ke = force_calc->get_kinetic_energy();
-            total_pe = force_calc->get_potential_energy();
-        } else {
-            // Fallback: calculate KE manually if no force calculator
-            for (size_t i = 0; i < particles.num_particles; i++) {
-                Real v2 = particles.vx[i] * particles.vx[i] + 
-                          particles.vy[i] * particles.vy[i] + 
-                          particles.vz[i] * particles.vz[i];
-                total_ke += 0.5 * particles.mass[i] * v2;
-            }
-            total_pe = cached_potential_energy; // Use cached value as fallback
-        }
-        
+        // Output logic remains on rank 0
+        std::stringstream output_line;
+        output_line << std::fixed << std::setprecision(6);
 
-        Real avg_speed = total_speed / particles.num_particles;
-        Real temperature = 0.0;
-        if (particles.num_particles > 0) {
-                // Temperature calculation for 'real' units (kcal/mol, LAMMPS convention)
-                // T = (2 * KE) / (3 * N * kB), KE in kcal/mol, kB = 0.0019872041 kcal/(mol·K)
-                temperature = (2.0 * total_ke) / (3.0 * particles.num_particles * kB);
+        // Split output_info string by comma
+        std::stringstream ss(output_info);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            // Trim whitespace
+            item.erase(0, item.find_first_not_of(" \t\r\n"));
+            item.erase(item.find_last_not_of(" \t\r\n") + 1);
+
+            if (item == "STEP") output_line << "Step: " << step;
+            else if (item == "T") output_line << ", T: " << temperature;
+            else if (item == "KE") output_line << ", KE: " << total_ke;
+            else if (item == "PE") output_line << ", PE: " << total_pe;
+            else if (item == "ETOTAL") output_line << ", Etot: " << total_ke + total_pe;
+            else if (item == "MAX_SPEED") output_line << ", MaxSpd: " << max_speed;
+            else if (item == "AVG_SPEED") output_line << ", AvgSpd: " << avg_speed;
+            else if (item == "FMAX") output_line << ", Fmax: " << max_force << " (particle " << max_force_particle_id << ")";
         }
-        
-        // Determine when to output based on debug level and frequency
-        bool should_output = false;
-        should_output = (step % output_freq == 0);
-        
-        if (should_output) {
-            // Parse output_info and build output string
-            std::stringstream output;
-            std::stringstream ss(output_info);
-            std::string item;
-            bool first = true;
-            
-            while (std::getline(ss, item, ',')) {
-                // Trim all whitespace (space, tab, newline, carriage return) from both ends
-                auto trim = [](std::string& s) {
-                    const char* ws = " \t\n\r";
-                    size_t start = s.find_first_not_of(ws);
-                    if (start == std::string::npos) {
-                        s.clear();
-                        return;
-                    }
-                    size_t end = s.find_last_not_of(ws);
-                    s = s.substr(start, end - start + 1);
-                };
-                trim(item);
-                
-                if (!first) output << ", ";
-                first = false;
-                
-                if (item == "STEP") {
-                    output << "Step " << step;
-                } else if (item == "T") {
-                    output << "T = " << std::fixed << std::setprecision(3) << temperature << " K";
-                } else if (item == "KE") {
-                    output << "KE = " << std::setprecision(8) << total_ke;
-                } else if (item == "PE") {
-                    output << "PE = " << std::setprecision(8) << total_pe;
-                } else if (item == "AVG_SPD") {
-                    output << "Avg Speed = " << std::setprecision(3) << avg_speed;
-                } else if (item == "MAX_SPD") {
-                    output << "Max Speed = " << std::setprecision(3) << max_speed;
-                } else if (item == "MAX_FORCE") {
-                    output << "Max Force = " << std::setprecision(3) << max_force;
-                } else if (item == "SAMPLE_POS") {
-                    output << "Sample pos = (" << std::setprecision(3) << particles.x[0] << "," 
-                           << particles.y[0] << "," << particles.z[0] << ")";
-                } else if (item == "PARTICLES") {
-                    output << "Particles = " << particles.num_particles;
-                } else if (item == "STEP_TIME") {
-                    output << "Step time = " << std::setprecision(3) << step_time_ms << " ms";
-                }
-            }
-            
-            std::cout << output.str() << std::endl;
-        }
-        
-        // Write trajectory at specified frequency
+        std::cout << output_line.str() << std::endl;
+
+        // Trajectory writing
         if (step % trajectory_output_freq == 0) {
             write_trajectory(step);
         }
-        
     }
+    
+    // Accumulate output timing
+    auto output_end = std::chrono::high_resolution_clock::now();
+    double output_time = std::chrono::duration<double>(output_end - output_start).count();
+    cumulative_timing.output_time += output_time;
 }
 
 void MDSimulation::finalize() {
+    // Print LAMMPS-style timing breakdown
+    if (system->get_rank() == 0 && cumulative_timing.step_count > 0) {
+        print_timing_breakdown();
+    }
+    
     if (force_calc) {
         force_calc->finalize();
     }
@@ -535,13 +666,7 @@ void MDSimulation::finalize() {
         std::cout << "MD simulation finalized" << std::endl;
     }
 
-#ifdef USE_MPI
-    // Free the Cartesian communicator if it was created
-    //if (cart_comm != MPI_COMM_NULL) {
-    //    MPI_Comm_free(&cart_comm);
-    //}
-    MPI_Finalize();
-#endif
+    // Note: MPI_Finalize() should be called in main() after simulation object is destroyed
 }
 
 void MDSimulation::parse_simulation_config(const std::string& config_file) {
@@ -687,6 +812,18 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             python_force_path = value;
         } else if (key == "python_force_enabled") {
             python_force_enabled = (value == "true");
+        } else if (key == "box_x") {
+            system->get_box().lx = std::stod(value);
+        } else if (key == "box_y") {
+            system->get_box().ly = std::stod(value);
+        } else if (key == "box_z") {
+            system->get_box().lz = std::stod(value);
+        } else if (key == "periodic_x") {
+            system->get_box().periodic_x = (value == "true");
+        } else if (key == "periodic_y") {
+            system->get_box().periodic_y = (value == "true");
+        } else if (key == "periodic_z") {
+            system->get_box().periodic_z = (value == "true");
         }
     }
     
@@ -732,6 +869,11 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         std::cout << "  Integrator: " << integrator_type << std::endl;
         std::cout << "  Thermostat: " << thermostat_type << std::endl;
         std::cout << "  Barostat: " << barostat_type << std::endl;
+        std::cout << "  Box size: " << system->get_box().lx << " x " << system->get_box().ly << " x " << system->get_box().lz << std::endl;
+        std::cout << "  Periodic BC: " << (system->get_box().periodic_x ? "T" : "F") 
+                  << " " << (system->get_box().periodic_y ? "T" : "F") 
+                  << " " << (system->get_box().periodic_z ? "T" : "F") << std::endl;
+        std::cout << "  Cutoff distance: " << cutoff_distance << std::endl;
         std::cout << "  Neighbor list type: " << neighbor_list_type_str << std::endl;
         std::cout << "  Neighbor list update frequency: " << neighbor_list_update_freq << " steps" << std::endl;
         std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
@@ -765,23 +907,6 @@ void MDSimulation::initialize_integrator() {
         }
 #endif
 
-    } else if (integrator_type == "leapfrog") {
-#ifdef USE_SYCL
-        integrator = std::make_unique<LeapfrogIntegratorSYCL>(dt);
-        if (system->get_rank() == 0) {
-            std::cout << "Initialized SYCL Leapfrog integrator" << std::endl;
-        }
-#elif defined(USE_CUDA)
-        integrator = std::make_unique<LeapfrogIntegratorCUDA>(dt);
-        if (system->get_rank() == 0) {
-            std::cout << "Initialized CUDA Leapfrog integrator" << std::endl;
-        }
-#else
-        integrator = std::make_unique<LeapfrogIntegrator>(dt);
-        if (system->get_rank() == 0) {
-            std::cout << "Initialized CPU Leapfrog integrator" << std::endl;
-        }
-#endif
     } else if (integrator_type == "r_respa") {
 #ifdef USE_SYCL
         integrator = std::make_unique<RRESPAIntegratorSYCL>(dt, 4);
@@ -797,6 +922,24 @@ void MDSimulation::initialize_integrator() {
         integrator = std::make_unique<RRESPAIntegrator>(dt, 4);
         if (system->get_rank() == 0) {
             std::cout << "Initialized CPU r-RESPA integrator" << std::endl;
+        }
+#endif
+
+    } else if (integrator_type == "leap_frog" || integrator_type == "leapfrog") {
+#ifdef USE_SYCL
+        integrator = std::make_unique<LeapFrogIntegratorSYCL>(dt);
+        if (system->get_rank() == 0) {
+            std::cout << "Initialized SYCL Leap-frog integrator" << std::endl;
+        }
+#elif defined(USE_CUDA)
+        integrator = std::make_unique<LeapFrogIntegratorCUDA>(dt);
+        if (system->get_rank() == 0) {
+            std::cout << "Initialized CUDA Leap-frog integrator" << std::endl;
+        }
+#else
+        integrator = std::make_unique<LeapFrogIntegrator>(dt);
+        if (system->get_rank() == 0) {
+            std::cout << "Initialized CPU Leap-frog integrator" << std::endl;
         }
 #endif
     } else {
@@ -1125,4 +1268,126 @@ void MDSimulation::write_lammps_dump(int step) {
         
         dump_file.close();
     }
+}
+
+// Print LAMMPS-style timing breakdown
+void MDSimulation::print_timing_breakdown() {
+#ifdef USE_MPI
+    int mpi_size = 1;
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+    
+    // Gather timing statistics from all ranks
+    double local_times[6] = {
+        cumulative_timing.pair_time,
+        cumulative_timing.neigh_time,
+        cumulative_timing.comm_time,
+        cumulative_timing.output_time,
+        cumulative_timing.modify_time,
+        cumulative_timing.other_time
+    };
+    
+    double min_times[6], max_times[6], sum_times[6];
+    
+    MPI_Reduce(local_times, min_times, 6, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_times, max_times, 6, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_times, sum_times, 6, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    
+    if (system->get_rank() == 0) {
+        double avg_times[6];
+        for (int i = 0; i < 6; i++) {
+            avg_times[i] = sum_times[i] / mpi_size;
+        }
+        
+        std::cout << "\n";
+        std::cout << "Loop time of " << std::fixed << std::setprecision(5) 
+                  << cumulative_timing.total_time << " on " << mpi_size 
+                  << " procs for " << cumulative_timing.step_count << " steps\n";
+        std::cout << "\n";
+        std::cout << "MPI task timing breakdown:\n";
+        std::cout << "Section |  min time  |  avg time  |  max time  |%varavg| %total\n";
+        std::cout << "---------------------------------------------------------------\n";
+        
+        auto print_section = [&](const char* name, int idx) {
+            double pct = (avg_times[idx] / cumulative_timing.total_time) * 100.0;
+            double variance = 0.0;
+            if (avg_times[idx] > 1e-10) {
+                variance = ((max_times[idx] - min_times[idx]) / avg_times[idx]) * 100.0;
+            }
+            
+            std::cout << std::left << std::setw(8) << name << "| "
+                      << std::right << std::fixed << std::setprecision(4) << std::setw(10) << min_times[idx] << " | "
+                      << std::setw(10) << avg_times[idx] << " | "
+                      << std::setw(10) << max_times[idx] << " | "
+                      << std::setw(5) << std::setprecision(1) << variance << " | "
+                      << std::setw(6) << std::setprecision(2) << pct << "\n";
+        };
+        
+        print_section("Pair", 0);
+        print_section("Neigh", 1);
+        print_section("Comm", 2);
+        print_section("Output", 3);
+        print_section("Modify", 4);
+        
+        // Calculate "Other" time
+        double other_time = cumulative_timing.total_time - 
+                           (avg_times[0] + avg_times[1] + avg_times[2] + avg_times[3] + avg_times[4]);
+        double other_pct = (other_time / cumulative_timing.total_time) * 100.0;
+        
+        std::cout << std::left << std::setw(8) << "Other" << "|            | "
+                  << std::right << std::fixed << std::setprecision(4) << std::setw(10) << other_time << " |"
+                  << "            |       | "
+                  << std::setw(6) << std::setprecision(2) << other_pct << "\n";
+        
+        std::cout << "\n";
+        
+        // Performance metrics
+        double natoms = system->get_num_particles();
+        
+        std::cout << "Nlocal:    " << std::fixed << std::setprecision(1) << natoms 
+                  << " ave " << natoms << " max " << natoms << " min\n";
+        std::cout << "Ave neighs/atom = " << std::setprecision(2) << 0.0 << "\n";
+        std::cout << "Neighbor list builds = " << neighbor_list_builds << "\n";
+        std::cout << "\n";
+    }
+#else
+    // Single processor version
+    double total = cumulative_timing.total_time;
+    
+    std::cout << "\n";
+    std::cout << "Loop time of " << std::fixed << std::setprecision(5) 
+              << total << " on 1 procs for " << cumulative_timing.step_count << " steps\n";
+    std::cout << "\n";
+    std::cout << "Section timing breakdown:\n";
+    std::cout << "Section |    time    | %total\n";
+    std::cout << "--------------------------------\n";
+    
+    auto print_section = [&](const char* name, double time) {
+        double pct = (time / total) * 100.0;
+        std::cout << std::left << std::setw(8) << name << "| "
+                  << std::right << std::fixed << std::setprecision(4) << std::setw(10) << time << " | "
+                  << std::setw(6) << std::setprecision(2) << pct << "\n";
+    };
+    
+    print_section("Pair", cumulative_timing.pair_time);
+    print_section("Neigh", cumulative_timing.neigh_time);
+    print_section("Comm", cumulative_timing.comm_time);
+    print_section("Output", cumulative_timing.output_time);
+    print_section("Modify", cumulative_timing.modify_time);
+    
+    double other_time = total - (cumulative_timing.pair_time + cumulative_timing.neigh_time + 
+                                 cumulative_timing.comm_time + cumulative_timing.output_time + 
+                                 cumulative_timing.modify_time);
+    print_section("Other", other_time);
+    
+    std::cout << "\n";
+    
+    // Performance metrics
+    double nsteps = cumulative_timing.step_count;
+    double natoms = system->get_num_particles();
+    
+    std::cout << "Neighbor list builds = " << neighbor_list_builds << "\n";
+    std::cout << "Performance: " << std::fixed << std::setprecision(3) 
+              << (nsteps * natoms / total / 1e6) << " million atom-steps/sec\n";
+    std::cout << "\n";
+#endif
 }

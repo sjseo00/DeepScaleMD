@@ -2,20 +2,14 @@
 
 #include "integrator.h"
 #include "md_types.h"
+#include "mpi_utils.h"
 #include <cmath>
 #include <iostream>
 #include <algorithm>
+#include <limits>
 
 #ifdef USE_MPI
 #include <mpi.h>
-
-bool is_rank_zero() {
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    return rank == 0;
-}
-#else
-bool is_rank_zero() { return true; }
 #endif
 
 #ifdef USE_CUDA
@@ -25,144 +19,167 @@ bool is_rank_zero() { return true; }
 // Note: CUDA kernels are defined in integrator_kernels.cu
 #endif
 
+// ==================== Simplified Velocity-Verlet Integrator ====================
+// Clean two-stage implementation optimized for MPI parallelism
+// 
+// Algorithm:
+//   Step 1 (integrate):
+//     v(t+dt/2) = v(t) + 0.5 * a(t) * dt
+//     x(t+dt) = x(t) + v(t+dt/2) * dt
+//     [Force calculation happens externally]
+//   
+//   Step 2 (complete_velocity_update):
+//     v(t+dt) = v(t+dt/2) + 0.5 * a(t+dt) * dt
+// ================================================================================
 
-
-// Velocity-Verlet Integrator
 VelocityVerletIntegrator::VelocityVerletIntegrator(Real timestep) : Integrator(timestep) {}
 
-void VelocityVerletIntegrator::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    // Store old forces for velocity update
-    if (stored_forces.size() != num_particles) {
-        stored_forces.resize(num_particles * 3);
-    }
-    
-    // Store current forces before position update
-    for (size_t i = 0; i < num_particles; i++) {
-        stored_forces[i*3] = particles.fx[i];
-        stored_forces[i*3+1] = particles.fy[i];
-        stored_forces[i*3+2] = particles.fz[i];
-    }
-    
-    // Position update: x(t+dt) = x(t) + v(t)*dt + 0.5*a(t)*dt^2
-    for (size_t i = 0; i < num_particles; i++) {
-        Real ax = particles.fx[i] / particles.mass[i];
-        Real ay = particles.fy[i] / particles.mass[i];
-        Real az = particles.fz[i] / particles.mass[i];
-        
-        particles.x[i] += particles.vx[i] * dt + 0.5 * ax * dt * dt;
-        particles.y[i] += particles.vy[i] * dt + 0.5 * ay * dt * dt;
-        particles.z[i] += particles.vz[i] * dt + 0.5 * az * dt * dt;
-    }
-    
-    // Note: Forces will be recalculated externally after position update
-    // The complete_velocity_update() method should be called after force calculation
-}
-
-// Velocity-Verlet Integrator with PBC
 void VelocityVerletIntegrator::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    // MPI-AWARE: Only integrate LOCAL particles (domain decomposition already applied)
+    // Ghost particles are NOT integrated (they will be updated via halo exchange)
+    size_t n = local_particles;
     
-    // Store old forces for velocity update
-    if (stored_forces.size() != num_particles) {
-        stored_forces.resize(num_particles * 3);
-    }
-    
-    // Store current forces before position update
-    for (size_t i = 0; i < num_particles; i++) {
-        stored_forces[i*3] = particles.fx[i];
-        stored_forces[i*3+1] = particles.fy[i];
-        stored_forces[i*3+2] = particles.fz[i];
-    }
-    
-    // Position update: x(t+dt) = x(t) + v(t)*dt + 0.5*a(t)*dt^2
-    for (size_t i = 0; i < num_particles; i++) {
-        Real ax = particles.fx[i] / particles.mass[i];
-        Real ay = particles.fy[i] / particles.mass[i];
-        Real az = particles.fz[i] / particles.mass[i];
+    // Step 1: Half-step velocity update + full-step position update with PBC
+    // This is a purely LOCAL operation - no MPI communication needed
+    // Each rank integrates its own domain independently
+    Real half_dt = 0.5 * dt;
         
-        particles.x[i] += particles.vx[i] * dt + 0.5 * ax * dt * dt;
-        particles.y[i] += particles.vy[i] * dt + 0.5 * ay * dt * dt;
-        particles.z[i] += particles.vz[i] * dt + 0.5 * az * dt * dt;
+    for (size_t i = 0; i < n; i++) {
+        Real inv_m = 1.0 / particles.mass[i];
         
-        // Apply periodic boundary conditions after position update
+        // a(t) = F(t) / m (with unit conversion)
+        Real ax = particles.fx[i] * inv_m * FORCE_TO_ACCEL;
+        Real ay = particles.fy[i] * inv_m * FORCE_TO_ACCEL;
+        Real az = particles.fz[i] * inv_m * FORCE_TO_ACCEL;
+        
+        // v(t+dt/2) = v(t) + 0.5 * a(t) * dt
+        particles.vx[i] += half_dt * ax;
+        particles.vy[i] += half_dt * ay;
+        particles.vz[i] += half_dt * az;
+        
+        // x(t+dt) = x(t) + v(t+dt/2) * dt
+        particles.x[i] += dt * particles.vx[i];
+        particles.y[i] += dt * particles.vy[i];
+        particles.z[i] += dt * particles.vz[i];
+
+        // Apply periodic boundary conditions (LOCAL operation)
         box.apply_pbc(particles.x[i], particles.y[i], particles.z[i]);
     }
     
-    // Note: Forces will be recalculated externally after position update
-    // The complete_velocity_update() method should be called after force calculation
+    // NOTE: Halo exchange for updated positions is performed EXTERNALLY by md_simulation.cpp
+    // This keeps integrator simple and allows overlapping communication with other work
 }
 
 void VelocityVerletIntegrator::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    // MPI-AWARE: Only update velocities for LOCAL particles
+    // Velocities are NOT communicated (each rank owns its particles' velocities)
+    size_t n = local_particles;
     
-    // Velocity update: v(t+dt) = v(t) + 0.5*[a(t) + a(t+dt)]*dt
-    for (size_t i = 0; i < num_particles; i++) {
-        Real old_ax = stored_forces[i*3] / particles.mass[i];
-        Real old_ay = stored_forces[i*3+1] / particles.mass[i];
-        Real old_az = stored_forces[i*3+2] / particles.mass[i];
+    // Step 2: Second half-step velocity update
+    // This is a purely LOCAL operation - no MPI communication needed
+    // Forces have been accumulated via reverse halo exchange before calling this
+    
+    for (size_t i = 0; i < n; i++) {
+        Real inv_m = 1.0 / particles.mass[i];
+        Real half_dt = 0.5 * dt;
         
-        Real new_ax = particles.fx[i] / particles.mass[i];
-        Real new_ay = particles.fy[i] / particles.mass[i];
-        Real new_az = particles.fz[i] / particles.mass[i];
+        // a(t+dt) = F(t+dt) / m (with unit conversion)
+        // CRITICAL FIX: FORCE_TO_ACCEL must be applied in BOTH velocity update stages
+        Real ax = particles.fx[i] * inv_m * FORCE_TO_ACCEL;
+        Real ay = particles.fy[i] * inv_m * FORCE_TO_ACCEL;
+        Real az = particles.fz[i] * inv_m * FORCE_TO_ACCEL;
         
-        particles.vx[i] += 0.5 * (old_ax + new_ax) * dt;
-        particles.vy[i] += 0.5 * (old_ay + new_ay) * dt;
-        particles.vz[i] += 0.5 * (old_az + new_az) * dt;
+        // v(t+dt) = v(t+dt/2) + 0.5 * a(t+dt) * dt
+        particles.vx[i] += half_dt * ax;
+        particles.vy[i] += half_dt * ay;
+        particles.vz[i] += half_dt * az;
     }
+    
+    // NOTE: No MPI communication needed for velocities
+    // Each rank exclusively owns the velocities of its local particles
 }
 
-// Leapfrog Integrator
-LeapfrogIntegrator::LeapfrogIntegrator(Real timestep) : Integrator(timestep) {}
 
-void LeapfrogIntegrator::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    // Update velocities at half-step
-    for (size_t i = 0; i < num_particles; i++) {
-        particles.vx[i] += particles.fx[i] / particles.mass[i] * dt;
-        particles.vy[i] += particles.fy[i] / particles.mass[i] * dt;
-        particles.vz[i] += particles.fz[i] / particles.mass[i] * dt;
-        
-        // Update positions
-        particles.x[i] += particles.vx[i] * dt;
-        particles.y[i] += particles.vy[i] * dt;
-        particles.z[i] += particles.vz[i] * dt;
-       
-    }
-}
+LeapFrogIntegrator::LeapFrogIntegrator(Real timestep) : Integrator(timestep), first_step(true) {}
 
-// Leapfrog Integrator with PBC
-void LeapfrogIntegrator::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+void LeapFrogIntegrator::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
+    // MPI-AWARE: Only integrate LOCAL particles (exclude ghosts)
+    size_t n = local_particles;
     
-    // Leapfrog algorithm:
-    // v(t+dt/2) = v(t-dt/2) + a(t)*dt
-    // x(t+dt) = x(t) + v(t+dt/2)*dt
-    // where velocities are staggered by dt/2 relative to positions
+    // LEAP-FROG POSITION UPDATE:
+    // At this point, velocities are already at half-step ahead (v(t+dt/2)).
+    // initialize_velocities() was called ONCE before the simulation loop started,
+    // which converted v(t=0) → v(t=dt/2) using the initial forces.
+    // 
+    // Now we update positions using the half-step-ahead velocities:
+    //   x(t+dt) = x(t) + v(t+dt/2) * dt
+    // 
+    // This is the standard leap-frog position update. After this, positions are
+    // at time t+dt, while velocities remain at t+dt/2 until complete_velocity_update().
     
-    for (size_t i = 0; i < num_particles; i++) {
-        // Update velocities by full timestep (from v(t-dt/2) to v(t+dt/2))
-        particles.vx[i] += particles.fx[i] / particles.mass[i] * dt;
-        particles.vy[i] += particles.fy[i] / particles.mass[i] * dt;
-        particles.vz[i] += particles.fz[i] / particles.mass[i] * dt;
-        
-        // Update positions using the newly updated velocities v(t+dt/2)
+    for (size_t i = 0; i < n; i++) {
+        // Update positions using half-step-ahead velocities
         particles.x[i] += particles.vx[i] * dt;
         particles.y[i] += particles.vy[i] * dt;
         particles.z[i] += particles.vz[i] * dt;
         
-/* sjseo
-        std::cout << "After Leapfrog step for particle " << i << ", dt : " << dt << ":\n";
-        std::cout << "x: " << particles.x[i] << " y: " << particles.y[i] << " z: " << particles.z[i] << std::endl;
-        std::cout << "vx: " << particles.vx[i] << " vy: " << particles.vy[i] << " vz: " << particles.vz[i] << std::endl;
-        std::cout << "fx: " << particles.fx[i] << " fy: " << particles.fy[i] << " fz: " << particles.fz[i] << std::endl;
-        std::cin.get();
-*/
-        // Apply periodic boundary conditions
+        // Apply periodic boundary conditions (wrap coordinates into [0, L))
+        // Using box method for consistency with VelocityVerlet integrator
         box.apply_pbc(particles.x[i], particles.y[i], particles.z[i]);
     }
+    
+}
+
+void LeapFrogIntegrator::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
+    // LEAP-FROG VELOCITY UPDATE:
+    // This advances velocities by a full timestep using the forces at new positions.
+    // 
+    // 
+    // v(t+3dt/2) = v(t+dt/2) + a(t+dt) * dt
+    // 
+    // This is a FULL timestep velocity update (not half-step), which is correct
+    // for leap-frog. The half-step offset is maintained throughout the simulation.
+    
+    size_t n = local_particles;
+    
+    for (size_t i = 0; i < n; i++) {
+        Real inv_m = 1.0 / particles.mass[i];
+        
+        // Compute acceleration from force: a = F/m (with unit conversion)
+        Real ax = particles.fx[i] * inv_m * FORCE_TO_ACCEL;
+        Real ay = particles.fy[i] * inv_m * FORCE_TO_ACCEL;
+        Real az = particles.fz[i] * inv_m * FORCE_TO_ACCEL;
+        
+        // Full timestep velocity update
+        particles.vx[i] += ax * dt;
+        particles.vy[i] += ay * dt;
+        particles.vz[i] += az * dt;
+    }
+}
+
+void LeapFrogIntegrator::initialize_velocities(ParticleData& particles, Real dt, size_t local_particles) {
+    // LEAP-FROG INITIALIZATION:
+    // This function converts velocities from t=0 to t=dt/2, establishing the
+    // half-step offset required for leap-frog integration.
+    
+    size_t n = local_particles;
+    Real half_dt = 0.5 * dt;
+    
+    for (size_t i = 0; i < n; i++) {
+        Real inv_m = 1.0 / particles.mass[i];
+        
+        // Compute acceleration from initial force: a = F/m (with unit conversion)
+        Real ax = particles.fx[i] * inv_m * FORCE_TO_ACCEL;
+        Real ay = particles.fy[i] * inv_m * FORCE_TO_ACCEL;
+        Real az = particles.fz[i] * inv_m * FORCE_TO_ACCEL;
+        
+        // Half-step velocity advance to establish leap-frog offset
+        particles.vx[i] += ax * half_dt;
+        particles.vy[i] += ay * half_dt;
+        particles.vz[i] += az * half_dt;
+    }
+    
+    first_step = false;  // Mark that initialization is complete
 }
 
 // r-RESPA Integrator
@@ -171,39 +188,9 @@ RRESPAIntegrator::RRESPAIntegrator(Real timestep, int inner_steps)
     dt_inner = timestep / inner_steps;
 }
 
-void RRESPAIntegrator::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    // This is a simplified r-RESPA implementation
-    // In practice, you would separate fast and slow forces
-    
-    for (int step = 0; step < n_inner; step++) {
-        // Update velocities with fast forces
-        for (size_t i = 0; i < num_particles; i++) {
-            particles.vx[i] += 0.5 * particles.fx[i] / particles.mass[i] * dt_inner;
-            particles.vy[i] += 0.5 * particles.fy[i] / particles.mass[i] * dt_inner;
-            particles.vz[i] += 0.5 * particles.fz[i] / particles.mass[i] * dt_inner;
-            
-            // Update positions
-            particles.x[i] += particles.vx[i] * dt_inner;
-            particles.y[i] += particles.vy[i] * dt_inner;
-            particles.z[i] += particles.vz[i] * dt_inner;
-        }
-        
-        // Fast force calculation would go here
-        
-        // Complete velocity update
-        for (size_t i = 0; i < num_particles; i++) {
-            particles.vx[i] += 0.5 * particles.fx[i] / particles.mass[i] * dt_inner;
-            particles.vy[i] += 0.5 * particles.fy[i] / particles.mass[i] * dt_inner;
-            particles.vz[i] += 0.5 * particles.fz[i] / particles.mass[i] * dt_inner;
-        }
-    }
-}
-
-// r-RESPA Integrator with PBC
 void RRESPAIntegrator::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    // Only integrate local particles (exclude ghosts)
+    size_t num_particles = local_particles;
     
     // r-RESPA (reversible Reference System Propagator Algorithm)
     // Multi-timestep integrator that separates fast and slow forces
@@ -426,255 +413,321 @@ void RRESPAIntegrator::calculate_slow_forces(const ParticleData& particles,
 }
 
 #ifdef USE_CUDA
-// CUDA Velocity-Verlet Integrator Implementation
-VelocityVerletIntegratorCUDA::VelocityVerletIntegratorCUDA(Real timestep) 
-    : Integrator(timestep), d_x(nullptr), d_y(nullptr), d_z(nullptr),
+// ==================== CUDA Leap-frog Integrator ====================
+// GPU-optimized symplectic integrator with minimal CPU-GPU transfers
+// Key features:
+// - Persistent GPU memory allocation
+// - Single kernel execution for position and velocity updates
+// - Efficient handling of first step initialization
+// ====================================================================
+
+LeapFrogIntegratorCUDA::LeapFrogIntegratorCUDA(Real timestep) 
+    : Integrator(timestep), 
+      d_x(nullptr), d_y(nullptr), d_z(nullptr),
       d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
       d_fx(nullptr), d_fy(nullptr), d_fz(nullptr),
-      d_fx_old(nullptr), d_fy_old(nullptr), d_fz_old(nullptr),
-      d_mass(nullptr), allocated_size(0) {}
-
-VelocityVerletIntegratorCUDA::~VelocityVerletIntegratorCUDA() {
-    if (d_x) {
-        cudaFree(d_x);
-        cudaFree(d_y);
-        cudaFree(d_z);
-        cudaFree(d_vx);
-        cudaFree(d_vy);
-        cudaFree(d_vz);
-        cudaFree(d_fx);
-        cudaFree(d_fy);
-        cudaFree(d_fz);
-        cudaFree(d_fx_old);
-        cudaFree(d_fy_old);
-        cudaFree(d_fz_old);
-        cudaFree(d_mass);
-    }
+      d_mass(nullptr), allocated_size(0), first_step(true) {
 }
 
-void VelocityVerletIntegratorCUDA::allocate_gpu_memory(size_t num_particles) {
-    if (allocated_size < num_particles) {
-        // Free existing memory
-        if (d_x) {
-            cudaFree(d_x);
-            cudaFree(d_y);
-            cudaFree(d_z);
-            cudaFree(d_vx);
-            cudaFree(d_vy);
-            cudaFree(d_vz);
-            cudaFree(d_fx);
-            cudaFree(d_fy);
-            cudaFree(d_fz);
-            cudaFree(d_fx_old);
-            cudaFree(d_fy_old);
-            cudaFree(d_fz_old);
-            cudaFree(d_mass);
-        }
-        
-        // Allocate new memory
-        cudaMalloc(&d_x, num_particles * sizeof(Real));
-        cudaMalloc(&d_y, num_particles * sizeof(Real));
-        cudaMalloc(&d_z, num_particles * sizeof(Real));
-        cudaMalloc(&d_vx, num_particles * sizeof(Real));
-        cudaMalloc(&d_vy, num_particles * sizeof(Real));
-        cudaMalloc(&d_vz, num_particles * sizeof(Real));
-        cudaMalloc(&d_fx, num_particles * sizeof(Real));
-        cudaMalloc(&d_fy, num_particles * sizeof(Real));
-        cudaMalloc(&d_fz, num_particles * sizeof(Real));
-        cudaMalloc(&d_fx_old, num_particles * sizeof(Real));
-        cudaMalloc(&d_fy_old, num_particles * sizeof(Real));
-        cudaMalloc(&d_fz_old, num_particles * sizeof(Real));
-        cudaMalloc(&d_mass, num_particles * sizeof(Real));
-        
-        allocated_size = num_particles;
-        
-        if (is_rank_zero()) {
-            std::cout << "Allocated CUDA memory for integrator: " << num_particles << " particles" << std::endl;
-        }
-    }
+LeapFrogIntegratorCUDA::~LeapFrogIntegratorCUDA() {
+    if (d_x) cudaFree(d_x);
+    if (d_y) cudaFree(d_y);
+    if (d_z) cudaFree(d_z);
+    if (d_vx) cudaFree(d_vx);
+    if (d_vy) cudaFree(d_vy);
+    if (d_vz) cudaFree(d_vz);
+    if (d_fx) cudaFree(d_fx);
+    if (d_fy) cudaFree(d_fy);
+    if (d_fz) cudaFree(d_fz);
+    if (d_mass) cudaFree(d_mass);
 }
 
-void VelocityVerletIntegratorCUDA::copy_to_device(ParticleData& particles, size_t local_particles) {
-    cudaMemcpy(d_x, particles.x.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, particles.y.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_z, particles.z.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vx, particles.vx.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vy, particles.vy.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vz, particles.vz.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fx, particles.fx.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fy, particles.fy.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fz, particles.fz.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_mass, particles.mass.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
+void LeapFrogIntegratorCUDA::allocate_gpu_memory(size_t num_particles) {
+    if (allocated_size >= num_particles) return;
+    
+    // Free existing memory
+    if (d_x) cudaFree(d_x);
+    if (d_y) cudaFree(d_y);
+    if (d_z) cudaFree(d_z);
+    if (d_vx) cudaFree(d_vx);
+    if (d_vy) cudaFree(d_vy);
+    if (d_vz) cudaFree(d_vz);
+    if (d_fx) cudaFree(d_fx);
+    if (d_fy) cudaFree(d_fy);
+    if (d_fz) cudaFree(d_fz);
+    if (d_mass) cudaFree(d_mass);
+    
+    // Allocate new memory
+    size_t bytes = num_particles * sizeof(Real);
+    cudaMalloc(&d_x, bytes);
+    cudaMalloc(&d_y, bytes);
+    cudaMalloc(&d_z, bytes);
+    cudaMalloc(&d_vx, bytes);
+    cudaMalloc(&d_vy, bytes);
+    cudaMalloc(&d_vz, bytes);
+    cudaMalloc(&d_fx, bytes);
+    cudaMalloc(&d_fy, bytes);
+    cudaMalloc(&d_fz, bytes);
+    cudaMalloc(&d_mass, bytes);
+    
+    allocated_size = num_particles;
 }
 
-void VelocityVerletIntegratorCUDA::copy_from_device(ParticleData& particles, size_t local_particles) {
-    cudaMemcpy(particles.x.data(), d_x, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.y.data(), d_y, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.z.data(), d_z, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vx.data(), d_vx, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vy.data(), d_vy, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vz.data(), d_vz, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-}
-
-// VelocityVerletIntegratorCUDA without SimulationBox (no PBC)
-void VelocityVerletIntegratorCUDA::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    // Create a default box with no periodic boundaries
-    SimulationBox box;
-    box.lx = box.ly = box.lz = 1000.0;  // Large box
-    box.periodic_x = box.periodic_y = box.periodic_z = false;
-    integrate(particles, box, dt, local_particles);
-}
-
-// VelocityVerletIntegratorCUDA with SimulationBox
-void VelocityVerletIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+void LeapFrogIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
+    size_t n = local_particles;
     
     // Allocate GPU memory if needed
-    allocate_gpu_memory(num_particles);
+    allocate_gpu_memory(n);
     
     // Copy data to device
-    copy_to_device(particles, num_particles);
+    copy_to_device(particles, n);
     
-    // Store old forces for velocity update (copy current forces to old forces)
-    cudaMemcpy(d_fx_old, d_fx, num_particles * sizeof(Real), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(d_fy_old, d_fy, num_particles * sizeof(Real), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(d_fz_old, d_fz, num_particles * sizeof(Real), cudaMemcpyDeviceToDevice);
+    // Launch leap-frog kernel
+    launch_leap_frog_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz, d_fx, d_fy, d_fz, d_mass, dt, n,
+                           box.lx, box.ly, box.lz, 
+                           box.periodic_x, box.periodic_y, box.periodic_z, first_step);
     
-    // Launch CUDA kernel for position update with proper box parameters
-    // Position update: x(t+dt) = x(t) + v(t)*dt + 0.5*a(t)*dt^2
-    launch_velocity_verlet_position_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz, 
-                                          d_fx, d_fy, d_fz, d_mass, dt, num_particles,
-                                          box.lx, box.ly, box.lz, 
-                                          box.periodic_x, box.periodic_y, box.periodic_z);
-    
+    // Check for CUDA errors
     cudaDeviceSynchronize();
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::cerr << "CUDA error in leap-frog kernel: " << cudaGetErrorString(error) << std::endl;
+    }
     
-    // Copy updated positions back to host (forces will be recalculated externally)
-    copy_from_device(particles, num_particles);
+    // Copy results back to host
+    copy_from_device(particles, n);
     
-    // Note: complete_velocity_update() should be called after force recalculation
+    // After first step, we're in the main loop
+    if (first_step) {
+        first_step = false;
+    }
 }
 
-void VelocityVerletIntegratorCUDA::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+void LeapFrogIntegratorCUDA::initialize_velocities(ParticleData& particles, Real dt, size_t local_particles) {
+    // For leap-frog, we need to advance velocities by half a timestep initially
+    // This is automatically handled by the first_step flag in the integrate method
+    size_t n = local_particles;
     
-    // Copy new forces to device (positions are already on device from integrate())
-    cudaMemcpy(d_fx, particles.fx.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fy, particles.fy.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fz, particles.fz.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
+    // Allocate GPU memory if needed
+    allocate_gpu_memory(n);
     
-    // Also need velocities on device
-    cudaMemcpy(d_vx, particles.vx.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vy, particles.vy.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vz, particles.vz.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice);
+    // Copy data to device
+    copy_to_device(particles, n);
     
-    // Launch velocity update kernel: v(t+dt) = v(t) + 0.5*[a(t) + a(t+dt)]*dt
-    launch_velocity_verlet_velocity_kernel(d_vx, d_vy, d_vz,
-                                          d_fx_old, d_fy_old, d_fz_old,
-                                          d_fx, d_fy, d_fz,
-                                          d_mass, dt, num_particles);
+    // Launch kernel with first_step = true
+    SimulationBox default_box;
+    default_box.lx = default_box.ly = default_box.lz = 1e10;
+    default_box.periodic_x = default_box.periodic_y = default_box.periodic_z = false;
     
+    launch_leap_frog_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz, d_fx, d_fy, d_fz, d_mass, dt, n,
+                           default_box.lx, default_box.ly, default_box.lz, 
+                           default_box.periodic_x, default_box.periodic_y, default_box.periodic_z, true);
+    
+    // Check for CUDA errors
     cudaDeviceSynchronize();
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::cerr << "CUDA error in leap-frog initialization: " << cudaGetErrorString(error) << std::endl;
+    }
     
-    // Copy updated velocities back to host
-    cudaMemcpy(particles.vx.data(), d_vx, num_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vy.data(), d_vy, num_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vz.data(), d_vz, num_particles * sizeof(Real), cudaMemcpyDeviceToHost);
+    // Copy velocities back to host
+    cudaMemcpy(particles.vx.data(), d_vx, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vy.data(), d_vy, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vz.data(), d_vz, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    
+    first_step = false;
 }
 
-// CUDA Leapfrog Integrator Implementation
-LeapfrogIntegratorCUDA::LeapfrogIntegratorCUDA(Real timestep)
-    : Integrator(timestep), d_x(nullptr), d_y(nullptr), d_z(nullptr),
+void LeapFrogIntegratorCUDA::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
+    // CUDA version of leap-frog velocity update
+    // Advances v(t+dt/2) -> v(t+3dt/2) using forces at t+dt
+    size_t n = local_particles;
+    
+    // Allocate GPU memory if needed
+    allocate_gpu_memory(n);
+    
+    // Copy current state to device
+    copy_to_device(particles, n);
+    
+    // Launch kernel with first_step = false (full timestep velocity update)
+    SimulationBox default_box;
+    default_box.lx = default_box.ly = default_box.lz = 1e10;
+    default_box.periodic_x = default_box.periodic_y = default_box.periodic_z = false;
+    
+    launch_leap_frog_velocity_update_kernel(d_vx, d_vy, d_vz, d_fx, d_fy, d_fz, d_mass, dt, n);
+    
+    // Check for CUDA errors
+    cudaDeviceSynchronize();
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::cerr << "CUDA error in leap-frog velocity update: " << cudaGetErrorString(error) << std::endl;
+    }
+    
+    // Copy velocities back to host
+    cudaMemcpy(particles.vx.data(), d_vx, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vy.data(), d_vy, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vz.data(), d_vz, n * sizeof(Real), cudaMemcpyDeviceToHost);
+}
+
+void LeapFrogIntegratorCUDA::copy_to_device(ParticleData& particles, size_t local_particles) {
+    size_t bytes = local_particles * sizeof(Real);
+    
+    cudaMemcpy(d_x, particles.x.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_y, particles.y.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_z, particles.z.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_vx, particles.vx.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_vy, particles.vy.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_vz, particles.vz.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fx, particles.fx.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fy, particles.fy.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fz, particles.fz.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mass, particles.mass.data(), bytes, cudaMemcpyHostToDevice);
+}
+
+void LeapFrogIntegratorCUDA::copy_from_device(ParticleData& particles, size_t local_particles) {
+    size_t bytes = local_particles * sizeof(Real);
+    
+    cudaMemcpy(particles.x.data(), d_x, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.y.data(), d_y, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.z.data(), d_z, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vx.data(), d_vx, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vy.data(), d_vy, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(particles.vz.data(), d_vz, bytes, cudaMemcpyDeviceToHost);
+}
+
+// ==================== Simplified CUDA Velocity-Verlet Integrator ====================
+// Optimized for GPU parallelism with minimal CPU-GPU data transfers
+// Key optimizations:
+// - Persistent GPU memory allocation (amortized cost)
+// - Minimal data transfers (only necessary data at necessary times)
+// - Asynchronous copies where possible
+// ======================================================================================
+
+VelocityVerletIntegratorCUDA::VelocityVerletIntegratorCUDA(Real timestep) 
+    : Integrator(timestep), 
+      d_x(nullptr), d_y(nullptr), d_z(nullptr),
       d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
-      d_fx(nullptr), d_fy(nullptr), d_fz(nullptr), d_mass(nullptr), allocated_size(0) {}
+      d_fx(nullptr), d_fy(nullptr), d_fz(nullptr),
+      d_mass(nullptr), allocated_size(0) {
+}
 
-LeapfrogIntegratorCUDA::~LeapfrogIntegratorCUDA() {
+VelocityVerletIntegratorCUDA::~VelocityVerletIntegratorCUDA() {
+    finalize();
+}
+
+void VelocityVerletIntegratorCUDA::finalize() {
     if (d_x) {
         cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
         cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
         cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
         cudaFree(d_mass);
+        d_x = d_y = d_z = nullptr;
+        d_vx = d_vy = d_vz = nullptr;
+        d_fx = d_fy = d_fz = nullptr;
+        d_mass = nullptr;
+        allocated_size = 0;
     }
 }
 
-void LeapfrogIntegratorCUDA::allocate_gpu_memory(size_t num_particles) {
-    if (allocated_size < num_particles) {
-        if (d_x) {
-            cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
-            cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
-            cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
-            cudaFree(d_mass);
-        }
-        
-        cudaMalloc(&d_x, num_particles * sizeof(Real));
-        cudaMalloc(&d_y, num_particles * sizeof(Real));
-        cudaMalloc(&d_z, num_particles * sizeof(Real));
-        cudaMalloc(&d_vx, num_particles * sizeof(Real));
-        cudaMalloc(&d_vy, num_particles * sizeof(Real));
-        cudaMalloc(&d_vz, num_particles * sizeof(Real));
-        cudaMalloc(&d_fx, num_particles * sizeof(Real));
-        cudaMalloc(&d_fy, num_particles * sizeof(Real));
-        cudaMalloc(&d_fz, num_particles * sizeof(Real));
-        cudaMalloc(&d_mass, num_particles * sizeof(Real));
-        
-        allocated_size = num_particles;
-        
-        if (is_rank_zero()) {
-            std::cout << "Allocated CUDA memory for Leapfrog integrator: " << num_particles << " particles" << std::endl;
-        }
-    }
-}
-
-void LeapfrogIntegratorCUDA::copy_to_device(ParticleData& particles, size_t local_particles) {
-    cudaMemcpy(d_x, particles.x.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, particles.y.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_z, particles.z.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vx, particles.vx.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vy, particles.vy.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vz, particles.vz.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fx, particles.fx.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fy, particles.fy.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fz, particles.fz.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_mass, particles.mass.data(), local_particles * sizeof(Real), cudaMemcpyHostToDevice);
-}
-
-void LeapfrogIntegratorCUDA::copy_from_device(ParticleData& particles, size_t local_particles) {
-    cudaMemcpy(particles.x.data(), d_x, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.y.data(), d_y, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.z.data(), d_z, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vx.data(), d_vx, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vy.data(), d_vy, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-    cudaMemcpy(particles.vz.data(), d_vz, local_particles * sizeof(Real), cudaMemcpyDeviceToHost);
-}
-
-// LeapfrogIntegratorCUDA without SimulationBox (no PBC)
-void LeapfrogIntegratorCUDA::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    // Create a default box with no periodic boundaries
-    SimulationBox box;
-    box.lx = box.ly = box.lz = 1000.0;  // Large box
-    box.periodic_x = box.periodic_y = box.periodic_z = false;
-    integrate(particles, box, dt, local_particles);
-}
-
-// LeapfrogIntegratorCUDA with SimulationBox
-void LeapfrogIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+void VelocityVerletIntegratorCUDA::allocate_gpu_memory(size_t num_particles) {
+    if (allocated_size >= num_particles) return;
     
-    allocate_gpu_memory(num_particles);
-    copy_to_device(particles, num_particles);
+    // Free existing memory
+    finalize();
     
-    launch_leapfrog_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
-                          d_fx, d_fy, d_fz, d_mass, dt, num_particles,
-                          box.lx, box.ly, box.lz, 
-                          box.periodic_x, box.periodic_y, box.periodic_z);
+    // Allocate GPU memory
+    cudaMalloc(&d_x, num_particles * sizeof(Real));
+    cudaMalloc(&d_y, num_particles * sizeof(Real));
+    cudaMalloc(&d_z, num_particles * sizeof(Real));
+    cudaMalloc(&d_vx, num_particles * sizeof(Real));
+    cudaMalloc(&d_vy, num_particles * sizeof(Real));
+    cudaMalloc(&d_vz, num_particles * sizeof(Real));
+    cudaMalloc(&d_fx, num_particles * sizeof(Real));
+    cudaMalloc(&d_fy, num_particles * sizeof(Real));
+    cudaMalloc(&d_fz, num_particles * sizeof(Real));
+    cudaMalloc(&d_mass, num_particles * sizeof(Real));
     
-    cudaDeviceSynchronize();
-    
-    copy_from_device(particles, num_particles);
+    allocated_size = num_particles;
     
     if (is_rank_zero()) {
-        std::cout << "CUDA Leapfrog integration completed for " << num_particles << " particles" << std::endl;
+        std::cout << "CUDA integrator: Allocated GPU memory for " << num_particles << " particles" << std::endl;
     }
+}
+
+void VelocityVerletIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
+    // MPI-AWARE: Only integrate LOCAL particles (domain decomposition already applied)
+    // Ghost particles are NOT integrated on GPU (they will be updated via MPI halo exchange)
+    size_t n = local_particles;
+    
+    // Allocate GPU memory (only once or when size increases)
+    allocate_gpu_memory(n);
+    
+    // 🚀 OPTIMIZATION: Only copy to device on FIRST call or when data structure changes
+    // In subsequent calls, data stays on GPU (GPU-resident approach)
+    // For now, we copy every time but this should be optimized to keep data on GPU
+    
+    // Copy to device: positions, velocities, forces, masses
+    cudaMemcpyAsync(d_x, particles.x.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_y, particles.y.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_z, particles.z.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_vx, particles.vx.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_vy, particles.vy.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_vz, particles.vz.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_fx, particles.fx.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_fy, particles.fy.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_fz, particles.fz.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_mass, particles.mass.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    
+    // Launch kernel: Step 1 (position update + half-step velocity update)
+    // CUDA kernel processes LOCAL particles only (n threads for n local particles)
+    // This is LOCAL GPU computation - no GPU-GPU communication between MPI ranks yet
+    launch_vv_step1_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz, 
+                          d_fx, d_fy, d_fz, d_mass, dt, n,
+                          box.lx, box.ly, box.lz,
+                          box.periodic_x, box.periodic_y, box.periodic_z);
+    
+    // 🚀 OPTIMIZATION: Only copy back positions (not velocities!) to minimize transfer
+    // Velocities stay on GPU for complete_velocity_update()
+    cudaMemcpyAsync(particles.x.data(), d_x, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(particles.y.data(), d_y, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(particles.z.data(), d_z, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    // DO NOT copy velocities back - keep them on GPU!
+    
+    // Synchronize all transfers
+    cudaDeviceSynchronize();
+    
+    // NOTE: MPI halo exchange for updated positions is performed EXTERNALLY by md_simulation.cpp
+    // This allows CPU-based MPI communication while GPU completes other work
+}
+
+void VelocityVerletIntegratorCUDA::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
+    // MPI-AWARE: Only update velocities for LOCAL particles on GPU
+    // Velocities are NOT communicated between MPI ranks (each rank owns its particles' velocities)
+    size_t n = local_particles;
+    
+    // 🚀 OPTIMIZATION: Only copy NEW forces to device
+    // Velocities are already on GPU from integrate() call!
+    // Forces have been accumulated via MPI reverse halo exchange before calling this
+    cudaMemcpyAsync(d_fx, particles.fx.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_fy, particles.fy.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_fz, particles.fz.data(), n * sizeof(Real), cudaMemcpyHostToDevice);
+    // DO NOT copy velocities - they're already on GPU!
+    
+    // Launch kernel: Step 2 (second half-step velocity update)
+    // CUDA kernel processes LOCAL particles only (n threads for n local particles)
+    launch_vv_step2_kernel(d_vx, d_vy, d_vz, d_fx, d_fy, d_fz, d_mass, dt, n);
+    
+    // 🚀 OPTIMIZATION: Only copy velocities back for output/thermostat
+    // In future, thermostat should also run on GPU to avoid this copy
+    cudaMemcpyAsync(particles.vx.data(), d_vx, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(particles.vy.data(), d_vy, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(particles.vz.data(), d_vz, n * sizeof(Real), cudaMemcpyDeviceToHost);
+    
+    // Synchronize
+    cudaDeviceSynchronize();
+    
+    // NOTE: No MPI communication needed for velocities
+    // Each rank exclusively owns the velocities of its local particles
 }
 
 // CUDA r-RESPA Integrator Implementation
@@ -753,8 +806,8 @@ void RRESPAIntegratorCUDA::integrate(ParticleData& particles, Real dt, size_t lo
 }
 
 void RRESPAIntegratorCUDA::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    // TODO: Implement CUDA r-RESPA integration with PBC
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    // Only integrate local particles (exclude ghosts)
+    size_t num_particles = local_particles;
     
     // Placeholder: For now, just do a simple velocity-verlet style update
     // This should be replaced with proper r-RESPA implementation
@@ -793,6 +846,234 @@ void RRESPAIntegratorCUDA::integrate(ParticleData& particles, const SimulationBo
 }
 
 #ifdef USE_SYCL
+// ==================== SYCL Leap-frog Integrator ====================
+// Cross-platform GPU implementation using SYCL
+// Symplectic integrator with good energy conservation properties
+// ================================================================
+
+LeapFrogIntegratorSYCL::LeapFrogIntegratorSYCL(Real timestep)
+    : Integrator(timestep), first_step(true) {
+    queue = sycl::queue(sycl::gpu_selector_v);
+    if (is_rank_zero()) {
+        std::cout << "SYCL Leap-frog integrator initialized" << std::endl;
+    }
+}
+
+LeapFrogIntegratorSYCL::~LeapFrogIntegratorSYCL() {
+    // SYCL buffers clean up automatically
+}
+
+void LeapFrogIntegratorSYCL::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
+    // Only integrate local particles (exclude ghosts)
+    size_t num_particles = local_particles;
+    
+    try {
+        // Allocate device memory
+        sycl::buffer<Real, 1> x_buf(particles.x.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> y_buf(particles.y.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> z_buf(particles.z.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
+        
+        if (first_step) {
+            // First step: advance velocities by half timestep
+            queue.submit([&](sycl::handler& cgh) {
+                auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
+                auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
+                auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
+                auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
+                
+                cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
+                    size_t i = idx[0];
+                    Real inv_mass = 1.0 / mass[i];
+                    Real half_dt = 0.5 * dt;
+                    
+                    // v(t+dt/2) = v(t) + 0.5 * a(t) * dt
+                    Real ax = fx[i] * inv_mass * FORCE_TO_ACCEL;
+                    Real ay = fy[i] * inv_mass * FORCE_TO_ACCEL;
+                    Real az = fz[i] * inv_mass * FORCE_TO_ACCEL;
+                    
+                    vx[i] += half_dt * ax;
+                    vy[i] += half_dt * ay;
+                    vz[i] += half_dt * az;
+                });
+            }).wait();
+            
+            first_step = false;
+        } else {
+            // Main leap-frog step with periodic boundary conditions
+            queue.submit([&](sycl::handler& cgh) {
+                auto x = x_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto y = y_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto z = z_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
+                auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
+                auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
+                auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
+                auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
+                
+                cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
+                    size_t i = idx[0];
+                    Real inv_mass = 1.0 / mass[i];
+                    
+                    // 1. Update positions: x(t+dt) = x(t) + v(t+dt/2) * dt
+                    x[i] += dt * vx[i];
+                    y[i] += dt * vy[i];
+                    z[i] += dt * vz[i];
+                    
+                    // Apply periodic boundary conditions
+                    if (box.periodic_x) {
+                        while (x[i] >= box.lx) x[i] -= box.lx;
+                        while (x[i] < 0.0) x[i] += box.lx;
+                    }
+                    if (box.periodic_y) {
+                        while (y[i] >= box.ly) y[i] -= box.ly;
+                        while (y[i] < 0.0) y[i] += box.ly;
+                    }
+                    if (box.periodic_z) {
+                        while (z[i] >= box.lz) z[i] -= box.lz;
+                        while (z[i] < 0.0) z[i] += box.lz;
+                    }
+                    
+                    // 2. Update velocities: v(t+3dt/2) = v(t+dt/2) + a(t+dt) * dt
+                    Real ax = fx[i] * inv_mass * FORCE_TO_ACCEL;
+                    Real ay = fy[i] * inv_mass * FORCE_TO_ACCEL;
+                    Real az = fz[i] * inv_mass * FORCE_TO_ACCEL;
+                    
+                    vx[i] += dt * ax;
+                    vy[i] += dt * ay;
+                    vz[i] += dt * az;
+                });
+            }).wait();
+        }
+        
+    } catch (const sycl::exception& e) {
+        if (is_rank_zero()) {
+            std::cerr << "SYCL exception in leap-frog integration with PBC: " << e.what() << std::endl;
+        }
+        throw;
+    }
+}
+
+void LeapFrogIntegratorSYCL::initialize_velocities(ParticleData& particles, Real dt, size_t local_particles) {
+    // Initialize velocities for leap-frog by advancing them half a timestep
+    size_t num_particles = local_particles;
+    
+    try {
+        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
+        
+        queue.submit([&](sycl::handler& cgh) {
+            auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
+            auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
+            auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
+            auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
+            auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
+            auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
+            auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
+            
+            cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
+                size_t i = idx[0];
+                Real inv_mass = 1.0 / mass[i];
+                Real half_dt = 0.5 * dt;
+                
+                // v(t+dt/2) = v(t) + 0.5 * a(t) * dt
+                Real ax = fx[i] * inv_mass * FORCE_TO_ACCEL;
+                Real ay = fy[i] * inv_mass * FORCE_TO_ACCEL;
+                Real az = fz[i] * inv_mass * FORCE_TO_ACCEL;
+                
+                vx[i] += half_dt * ax;
+                vy[i] += half_dt * ay;
+                vz[i] += half_dt * az;
+            });
+        }).wait();
+        
+        first_step = false;  // No longer need the first step treatment
+        
+    } catch (const sycl::exception& e) {
+        if (is_rank_zero()) {
+            std::cerr << "SYCL exception in leap-frog velocity initialization: " << e.what() << std::endl;
+        }
+        throw;
+    }
+}
+
+void LeapFrogIntegratorSYCL::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
+    // SYCL version of leap-frog velocity update
+    // Advances v(t+dt/2) -> v(t+3dt/2) using forces at t+dt
+    size_t num_particles = local_particles;
+    
+    try {
+        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
+        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
+        
+        queue.submit([&](sycl::handler& cgh) {
+            auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
+            auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
+            auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
+            auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
+            auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
+            auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
+            auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
+            
+            cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
+                size_t i = idx[0];
+                Real inv_mass = 1.0 / mass[i];
+                
+                // v(t+3dt/2) = v(t+dt/2) + a(t+dt) * dt (full timestep)
+                Real ax = fx[i] * inv_mass * FORCE_TO_ACCEL;
+                Real ay = fy[i] * inv_mass * FORCE_TO_ACCEL;
+                Real az = fz[i] * inv_mass * FORCE_TO_ACCEL;
+                
+                vx[i] += dt * ax;
+                vy[i] += dt * ay;
+                vz[i] += dt * az;
+            });
+        }).wait();
+        
+    } catch (const sycl::exception& e) {
+        if (is_rank_zero()) {
+            std::cerr << "SYCL exception in leap-frog velocity update: " << e.what() << std::endl;
+        }
+        throw;
+    }
+}
+
+void LeapFrogIntegratorSYCL::allocate_device_memory(size_t num_particles) {
+    // SYCL buffers manage memory automatically - this function is for compatibility
+    // No explicit allocation needed
+}
+
+void LeapFrogIntegratorSYCL::copy_to_device(ParticleData& particles, size_t local_particles) {
+    // SYCL buffers handle data transfer automatically - this function is for compatibility
+    // No explicit copying needed
+}
+
+void LeapFrogIntegratorSYCL::copy_from_device(ParticleData& particles, size_t local_particles) {
+    // SYCL buffers handle data transfer automatically - this function is for compatibility
+    // No explicit copying needed
+}
+
 // SYCL Velocity-Verlet Integrator Implementation
 VelocityVerletIntegratorSYCL::VelocityVerletIntegratorSYCL(Real timestep)
     : Integrator(timestep) {
@@ -802,87 +1083,9 @@ VelocityVerletIntegratorSYCL::VelocityVerletIntegratorSYCL(Real timestep)
     }
 }
 
-void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    try {
-        // Allocate device memory
-        sycl::buffer<Real, 1> x_buf(particles.x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> y_buf(particles.y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> z_buf(particles.z.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
-        
-        // Submit kernel to compute queue
-        queue.submit([&](sycl::handler& cgh) {
-            auto x = x_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto y = y_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto z = z_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
-            auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
-            
-            cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                size_t i = idx[0];
-                Real inv_mass = 1.0 / mass[i];
-                
-                // Update velocities by half timestep
-                Real ax = fx[i] * inv_mass;
-                Real ay = fy[i] * inv_mass;
-                Real az = fz[i] * inv_mass;
-                
-                vx[i] += 0.5 * dt * ax;
-                vy[i] += 0.5 * dt * ay;
-                vz[i] += 0.5 * dt * az;
-                
-                // Update positions
-                x[i] += dt * vx[i];
-                y[i] += dt * vy[i];
-                z[i] += dt * vz[i];
-                
-                // Update velocities by another half timestep (forces would be recalculated)
-                vx[i] += 0.5 * dt * ax;
-                vy[i] += 0.5 * dt * ay;
-                vz[i] += 0.5 * dt * az;
-            });
-        }).wait();
-        
-        // MPI all-reduce for global consistency
-        if (local_particles > 0) {
-            Real total_ke = 0.0;
-            for (size_t i = 0; i < num_particles; i++) {
-                Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
-                total_ke += 0.5 * particles.mass[i] * v2;
-            }
-            
-            Real global_ke;
-            MPI_Allreduce(&total_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-            
-            if (is_rank_zero()) {
-                std::cout << "SYCL velocity-Verlet integration completed for " << num_particles << " particles, total KE: " << global_ke << std::endl;
-            }
-        }
-        
-    } catch (const sycl::exception& e) {
-        if (is_rank_zero()) {
-            std::cerr << "SYCL exception in velocity-Verlet integration: " << e.what() << std::endl;
-        }
-        throw;
-    }
-}
-
-// SYCL Velocity-Verlet Integrator with PBC
 void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    // Only integrate local particles (exclude ghosts)
+    size_t num_particles = local_particles;
     
     try {
         // Allocate device memory
@@ -914,16 +1117,18 @@ void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, const Simu
                 size_t i = idx[0];
                 Real inv_mass = 1.0 / mass[i];
                 
-                // Update velocities by half timestep
-                Real ax = fx[i] * inv_mass;
-                Real ay = fy[i] * inv_mass;
-                Real az = fz[i] * inv_mass;
+                // Calculate acceleration from current forces: a(t) = F(t) / m
+                // FORCE_TO_ACCEL 적용: integrate() 단계에서만 적용
+                Real ax = fx[i] * inv_mass * FORCE_TO_ACCEL;
+                Real ay = fy[i] * inv_mass * FORCE_TO_ACCEL;
+                Real az = fz[i] * inv_mass * FORCE_TO_ACCEL;
                 
+                // Half-step velocity update: v(t + dt/2) = v(t) + 0.5 * a(t) * dt
                 vx[i] += 0.5 * dt * ax;
                 vy[i] += 0.5 * dt * ay;
                 vz[i] += 0.5 * dt * az;
                 
-                // Update positions
+                // Full-step position update: x(t + dt) = x(t) + v(t + dt/2) * dt
                 x[i] += dt * vx[i];
                 y[i] += dt * vy[i];
                 z[i] += dt * vz[i];
@@ -941,11 +1146,6 @@ void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, const Simu
                     while (z[i] >= box.lz) z[i] -= box.lz;
                     while (z[i] < 0.0) z[i] += box.lz;
                 }
-                
-                // Update velocities by another half timestep (forces would be recalculated)
-                vx[i] += 0.5 * dt * ax;
-                vy[i] += 0.5 * dt * ay;
-                vz[i] += 0.5 * dt * az;
             });
         }).wait();
         
@@ -960,148 +1160,6 @@ void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, const Simu
 
 }
 
-// SYCL Leapfrog Integrator Implementation
-LeapfrogIntegratorSYCL::LeapfrogIntegratorSYCL(Real timestep)
-    : Integrator(timestep) {
-    queue = sycl::queue(sycl::gpu_selector_v);
-    if (is_rank_zero()) {
-        std::cout << "SYCL Leapfrog integrator initialized" << std::endl;
-    }
-}
-
-void LeapfrogIntegratorSYCL::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    try {
-        // Allocate device memory
-        sycl::buffer<Real, 1> x_buf(particles.x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> y_buf(particles.y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> z_buf(particles.z.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
-        
-        // Submit kernel to compute queue
-        queue.submit([&](sycl::handler& cgh) {
-            auto x = x_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto y = y_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto z = z_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
-            auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
-            
-            cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                size_t i = idx[0];
-                Real inv_mass = 1.0 / mass[i];
-                
-                // Update velocities
-                Real ax = fx[i] * inv_mass;
-                Real ay = fy[i] * inv_mass;
-                Real az = fz[i] * inv_mass;
-                
-                vx[i] += dt * ax;
-                vy[i] += dt * ay;
-                vz[i] += dt * az;
-                
-                // Update positions
-                x[i] += dt * vx[i];
-                y[i] += dt * vy[i];
-                z[i] += dt * vz[i];
-            });
-        }).wait();
-        
-        if (is_rank_zero()) {
-            std::cout << "SYCL Leapfrog integration completed for " << num_particles << " particles" << std::endl;
-        }
-        
-    } catch (const sycl::exception& e) {
-        if (is_rank_zero()) {
-            std::cerr << "SYCL exception in Leapfrog integration: " << e.what() << std::endl;
-        }
-        throw;
-    }
-}
-
-// SYCL Leapfrog with PBC
-void LeapfrogIntegratorSYCL::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    try {
-        // Allocate device memory
-        sycl::buffer<Real, 1> x_buf(particles.x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> y_buf(particles.y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> z_buf(particles.z.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
-        
-        // Copy box parameters
-        Real box_x = box.box_length[0];
-        Real box_y = box.box_length[1];
-        Real box_z = box.box_length[2];
-        
-        // Submit kernel to compute queue
-        queue.submit([&](sycl::handler& cgh) {
-            auto x = x_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto y = y_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto z = z_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
-            auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
-            auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
-            auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
-            
-            cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                size_t i = idx[0];
-                Real inv_mass = 1.0 / mass[i];
-                
-                // Update velocities
-                Real ax = fx[i] * inv_mass;
-                Real ay = fy[i] * inv_mass;
-                Real az = fz[i] * inv_mass;
-                
-                vx[i] += dt * ax;
-                vy[i] += dt * ay;
-                vz[i] += dt * az;
-                
-                // Update positions
-                x[i] += dt * vx[i];
-                y[i] += dt * vy[i];
-                z[i] += dt * vz[i];
-                
-                // Apply periodic boundary conditions
-                x[i] = x[i] - box_x * sycl::floor(x[i] / box_x);
-                y[i] = y[i] - box_y * sycl::floor(y[i] / box_y);
-                z[i] = z[i] - box_z * sycl::floor(z[i] / box_z);
-            });
-        }).wait();
-        
-        if (is_rank_zero()) {
-            std::cout << "SYCL Leapfrog with PBC integration completed for " << num_particles << " particles" << std::endl;
-        }
-        
-    } catch (const sycl::exception& e) {
-        if (is_rank_zero()) {
-            std::cerr << "SYCL exception in Leapfrog PBC integration: " << e.what() << std::endl;
-        }
-        throw;
-    }
-}
-
 // SYCL r-RESPA Integrator Implementation
 RRESPAIntegratorSYCL::RRESPAIntegratorSYCL(Real timestep, int inner_steps)
     : Integrator(timestep), n_inner(inner_steps), dt_inner(timestep / inner_steps) {
@@ -1111,101 +1169,9 @@ RRESPAIntegratorSYCL::RRESPAIntegratorSYCL(Real timestep, int inner_steps)
     }
 }
 
-void RRESPAIntegratorSYCL::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    try {
-        // Allocate device memory
-        sycl::buffer<Real, 1> x_buf(particles.x.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> y_buf(particles.y.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> z_buf(particles.z.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vy_buf(particles.vy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> vz_buf(particles.vz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fx_buf(particles.fx.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fy_buf(particles.fy.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> fz_buf(particles.fz.data(), sycl::range<1>(num_particles));
-        sycl::buffer<Real, 1> mass_buf(particles.mass.data(), sycl::range<1>(num_particles));
-        
-        for (int step = 0; step < n_inner; step++) {
-            // First half of velocity update
-            queue.submit([&](sycl::handler& cgh) {
-                auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
-                auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
-                auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
-                auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
-                
-                cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                    size_t i = idx[0];
-                    Real inv_mass = 1.0 / mass[i];
-                    
-                    vx[i] += 0.5 * dt_inner * fx[i] * inv_mass;
-                    vy[i] += 0.5 * dt_inner * fy[i] * inv_mass;
-                    vz[i] += 0.5 * dt_inner * fz[i] * inv_mass;
-                });
-            }).wait();
-            
-            // Position update
-            queue.submit([&](sycl::handler& cgh) {
-                auto x = x_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto y = y_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto z = z_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto vx = vx_buf.get_access<sycl::access::mode::read>(cgh);
-                auto vy = vy_buf.get_access<sycl::access::mode::read>(cgh);
-                auto vz = vz_buf.get_access<sycl::access::mode::read>(cgh);
-                
-                cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                    size_t i = idx[0];
-                    
-                    x[i] += dt_inner * vx[i];
-                    y[i] += dt_inner * vy[i];
-                    z[i] += dt_inner * vz[i];
-                });
-            }).wait();
-            
-            // Note: Force calculation should be performed here by the force manager
-            // For r-RESPA, forces are typically split into fast/slow components
-            // This implementation assumes forces are already calculated and stored in fx, fy, fz
-            
-            // Second half of velocity update
-            queue.submit([&](sycl::handler& cgh) {
-                auto vx = vx_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto vy = vy_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto vz = vz_buf.get_access<sycl::access::mode::read_write>(cgh);
-                auto fx = fx_buf.get_access<sycl::access::mode::read>(cgh);
-                auto fy = fy_buf.get_access<sycl::access::mode::read>(cgh);
-                auto fz = fz_buf.get_access<sycl::access::mode::read>(cgh);
-                auto mass = mass_buf.get_access<sycl::access::mode::read>(cgh);
-                
-                cgh.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-                    size_t i = idx[0];
-                    Real inv_mass = 1.0 / mass[i];
-                    
-                    vx[i] += 0.5 * dt_inner * fx[i] * inv_mass;
-                    vy[i] += 0.5 * dt_inner * fy[i] * inv_mass;
-                    vz[i] += 0.5 * dt_inner * fz[i] * inv_mass;
-                });
-            }).wait();
-        }
-        
-        if (is_rank_zero()) {
-            std::cout << "SYCL r-RESPA integration completed for " << num_particles << " particles" << std::endl;
-        }
-        
-    } catch (const sycl::exception& e) {
-        if (is_rank_zero()) {
-            std::cerr << "SYCL exception in r-RESPA integration: " << e.what() << std::endl;
-        }
-        throw;
-    }
-}
-
-// SYCL r-RESPA with PBC
 void RRESPAIntegratorSYCL::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    // Only integrate local particles (exclude ghosts)
+    size_t num_particles = local_particles;
     
     try {
         // Allocate device memory
@@ -1294,10 +1260,6 @@ void RRESPAIntegratorSYCL::integrate(ParticleData& particles, const SimulationBo
             }).wait();
         }
         
-        if (is_rank_zero()) {
-            std::cout << "SYCL r-RESPA with PBC integration completed for " << num_particles << " particles" << std::endl;
-        }
-        
     } catch (const sycl::exception& e) {
         if (is_rank_zero()) {
             std::cerr << "SYCL exception in r-RESPA PBC integration: " << e.what() << std::endl;
@@ -1315,6 +1277,7 @@ VelocityVerletIntegratorSYCL::VelocityVerletIntegratorSYCL(Real timestep)
       d_x(nullptr), d_y(nullptr), d_z(nullptr),
       d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
       d_fx(nullptr), d_fy(nullptr), d_fz(nullptr),
+      d_fx_old(nullptr), d_fy_old(nullptr), d_fz_old(nullptr),
       d_mass(nullptr), allocated_size(0) {}
 
 VelocityVerletIntegratorSYCL::~VelocityVerletIntegratorSYCL() {
@@ -1328,6 +1291,9 @@ VelocityVerletIntegratorSYCL::~VelocityVerletIntegratorSYCL() {
         sycl::free(d_fx, queue);
         sycl::free(d_fy, queue);
         sycl::free(d_fz, queue);
+        sycl::free(d_fx_old, queue);
+        sycl::free(d_fy_old, queue);
+        sycl::free(d_fz_old, queue);
         sycl::free(d_mass, queue);
     }
 }
@@ -1345,6 +1311,9 @@ void VelocityVerletIntegratorSYCL::allocate_device_memory(size_t num_particles) 
             sycl::free(d_fx, queue);
             sycl::free(d_fy, queue);
             sycl::free(d_fz, queue);
+            sycl::free(d_fx_old, queue);
+            sycl::free(d_fy_old, queue);
+            sycl::free(d_fz_old, queue);
             sycl::free(d_mass, queue);
         }
         
@@ -1358,6 +1327,9 @@ void VelocityVerletIntegratorSYCL::allocate_device_memory(size_t num_particles) 
         d_fx = sycl::malloc_device<Real>(num_particles, queue);
         d_fy = sycl::malloc_device<Real>(num_particles, queue);
         d_fz = sycl::malloc_device<Real>(num_particles, queue);
+        d_fx_old = sycl::malloc_device<Real>(num_particles, queue);
+        d_fy_old = sycl::malloc_device<Real>(num_particles, queue);
+        d_fz_old = sycl::malloc_device<Real>(num_particles, queue);
         d_mass = sycl::malloc_device<Real>(num_particles, queue);
         
         allocated_size = num_particles;
@@ -1392,78 +1364,21 @@ void VelocityVerletIntegratorSYCL::copy_from_device(ParticleData& particles, siz
     queue.wait();
 }
 
-void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
-    
-    // Allocate device memory if needed
-    allocate_device_memory(num_particles);
-    
-    // Copy data to device
-    copy_to_device(particles, num_particles);
-    
-    // Copy device pointers to local variables for kernel capture
-    Real* dev_x = d_x;
-    Real* dev_y = d_y;
-    Real* dev_z = d_z;
-    Real* dev_vx = d_vx;
-    Real* dev_vy = d_vy;
-    Real* dev_vz = d_vz;
-    Real* dev_fx = d_fx;
-    Real* dev_fy = d_fy;
-    Real* dev_fz = d_fz;
-    Real* dev_mass = d_mass;
-    
-    // SYCL kernel for velocity-Verlet integration
-    queue.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-        int i = idx[0];
-        Real inv_mass = 1.0 / dev_mass[i];
-        
-        // First half of velocity update
-        dev_vx[i] += 0.5 * dev_fx[i] * inv_mass * dt;
-        dev_vy[i] += 0.5 * dev_fy[i] * inv_mass * dt;
-        dev_vz[i] += 0.5 * dev_fz[i] * inv_mass * dt;
-        
-        // Position update
-        dev_x[i] += dev_vx[i] * dt;
-        dev_y[i] += dev_vy[i] * dt;
-        dev_z[i] += dev_vz[i] * dt;
-    });
-    
-    queue.wait();
-    
-    // Note: Force calculation should be performed here by the force manager
-    // This implementation assumes forces are recalculated after position update
-    
-    // Second half of velocity update
-    queue.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
-        int i = idx[0];
-        Real inv_mass = 1.0 / dev_mass[i];
-        
-        // Complete velocity update with new forces
-        dev_vx[i] += 0.5 * dev_fx[i] * inv_mass * dt;
-        dev_vy[i] += 0.5 * dev_fy[i] * inv_mass * dt;
-        dev_vz[i] += 0.5 * dev_fz[i] * inv_mass * dt;
-    });
-    
-    queue.wait();
-    
-    // Copy results back to host
-    copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero()) {
-        std::cout << "SYCL velocity-Verlet integration completed for " << num_particles << " particles" << std::endl;
-    }
-}
-
-// SYCL Velocity-Verlet with PBC
 void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, const SimulationBox& box, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    // Only integrate local particles (exclude ghosts)
+    size_t num_particles = local_particles;
     
     // Allocate device memory if needed
     allocate_device_memory(num_particles);
     
     // Copy data to device
     copy_to_device(particles, num_particles);
+    
+    // Store old forces on device (device-to-device copy)
+    queue.memcpy(d_fx_old, d_fx, num_particles * sizeof(Real));
+    queue.memcpy(d_fy_old, d_fy, num_particles * sizeof(Real));
+    queue.memcpy(d_fz_old, d_fz, num_particles * sizeof(Real));
+    queue.wait();
     
     // Copy device pointers to local variables for kernel capture
     Real* dev_x = d_x;
@@ -1478,54 +1393,106 @@ void VelocityVerletIntegratorSYCL::integrate(ParticleData& particles, const Simu
     Real* dev_mass = d_mass;
     
     // Copy box parameters
-    Real box_x = box.box_length[0];
-    Real box_y = box.box_length[1];
-    Real box_z = box.box_length[2];
+    Real box_x = box.lx;
+    Real box_y = box.ly;
+    Real box_z = box.lz;
+    bool periodic_x = box.periodic_x;
+    bool periodic_y = box.periodic_y;
+    bool periodic_z = box.periodic_z;
     
-    // SYCL kernel for velocity-Verlet integration with PBC
+    // SYCL kernel for position update (first half of Velocity-Verlet)
     queue.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
         int i = idx[0];
         Real inv_mass = 1.0 / dev_mass[i];
         
-        // First half of velocity update
-        dev_vx[i] += 0.5 * dev_fx[i] * inv_mass * dt;
-        dev_vy[i] += 0.5 * dev_fy[i] * inv_mass * dt;
-        dev_vz[i] += 0.5 * dev_fz[i] * inv_mass * dt;
+        // First half of velocity update: v(t + dt/2) = v(t) + 0.5 * a(t) * dt
+        Real ax = dev_fx[i] * inv_mass * FORCE_TO_ACCEL;
+        Real ay = dev_fy[i] * inv_mass * FORCE_TO_ACCEL;
+        Real az = dev_fz[i] * inv_mass * FORCE_TO_ACCEL;
         
-        // Position update
+        dev_vx[i] += 0.5 * ax * dt;
+        dev_vy[i] += 0.5 * ay * dt;
+        dev_vz[i] += 0.5 * az * dt;
+        
+        // Position update: x(t + dt) = x(t) + v(t + dt/2) * dt
         dev_x[i] += dev_vx[i] * dt;
         dev_y[i] += dev_vy[i] * dt;
         dev_z[i] += dev_vz[i] * dt;
         
         // Apply periodic boundary conditions
-        dev_x[i] = dev_x[i] - box_x * sycl::floor(dev_x[i] / box_x);
-        dev_y[i] = dev_y[i] - box_y * sycl::floor(dev_y[i] / box_y);
-        dev_z[i] = dev_z[i] - box_z * sycl::floor(dev_z[i] / box_z);
+        if (periodic_x) {
+            if (dev_x[i] >= box_x) dev_x[i] -= box_x;
+            if (dev_x[i] < 0.0) dev_x[i] += box_x;
+        }
+        if (periodic_y) {
+            if (dev_y[i] >= box_y) dev_y[i] -= box_y;
+            if (dev_y[i] < 0.0) dev_y[i] += box_y;
+        }
+        if (periodic_z) {
+            if (dev_z[i] >= box_z) dev_z[i] -= box_z;
+            if (dev_z[i] < 0.0) dev_z[i] += box_z;
+        }
     });
     
     queue.wait();
     
-    // Note: Force calculation should be performed here by the force manager
-    // This implementation assumes forces are recalculated after position update
+    // Copy only positions back to host (velocities stay on device)
+    queue.memcpy(particles.x.data(), d_x, num_particles * sizeof(Real));
+    queue.memcpy(particles.y.data(), d_y, num_particles * sizeof(Real));
+    queue.memcpy(particles.z.data(), d_z, num_particles * sizeof(Real));
+    queue.wait();
     
-    // Second half of velocity update
+    // Note: Forces will be recalculated externally at new positions
+    // Then complete_velocity_update() should be called to finish the velocity update
+}
+
+void VelocityVerletIntegratorSYCL::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
+    // Only update local particles (exclude ghosts)
+    size_t num_particles = local_particles;
+    
+    // Copy only new forces to device (velocities already on device from integrate())
+    queue.memcpy(d_fx, particles.fx.data(), num_particles * sizeof(Real));
+    queue.memcpy(d_fy, particles.fy.data(), num_particles * sizeof(Real));
+    queue.memcpy(d_fz, particles.fz.data(), num_particles * sizeof(Real));
+    queue.wait();
+    
+    // Copy device pointers to local variables for kernel capture
+    Real* dev_vx = d_vx;
+    Real* dev_vy = d_vy;
+    Real* dev_vz = d_vz;
+    Real* dev_fx_old = d_fx_old;
+    Real* dev_fy_old = d_fy_old;
+    Real* dev_fz_old = d_fz_old;
+    Real* dev_fx = d_fx;
+    Real* dev_fy = d_fy;
+    Real* dev_fz = d_fz;
+    Real* dev_mass = d_mass;
+    
+    // Complete velocity update: v(t + dt) = v(t + dt/2) + 0.5 * a(t + dt) * dt
     queue.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
         int i = idx[0];
         Real inv_mass = 1.0 / dev_mass[i];
         
-        // Complete velocity update with new forces
-        dev_vx[i] += 0.5 * dev_fx[i] * inv_mass * dt;
-        dev_vy[i] += 0.5 * dev_fy[i] * inv_mass * dt;
-        dev_vz[i] += 0.5 * dev_fz[i] * inv_mass * dt;
+    // Calculate new acceleration: a(t + dt) = F(t + dt) / m
+    // Apply FORCE_TO_ACCEL here as well so both halves of the integrator
+    // use the same force->acceleration conversion (units conversion).
+    Real ax_new = dev_fx[i] * inv_mass * FORCE_TO_ACCEL;
+    Real ay_new = dev_fy[i] * inv_mass * FORCE_TO_ACCEL;
+    Real az_new = dev_fz[i] * inv_mass * FORCE_TO_ACCEL;
+        
+        // Second half-step velocity update
+        dev_vx[i] += 0.5 * ax_new * dt;
+        dev_vy[i] += 0.5 * ay_new * dt;
+        dev_vz[i] += 0.5 * az_new * dt;
     });
     
     queue.wait();
     
-    // Copy results back to host
-    copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero()) {
-        std::cout << "SYCL velocity-Verlet with PBC integration completed for " << num_particles << " particles" << std::endl;
-    }
+    // Copy updated velocities back to host
+    queue.memcpy(particles.vx.data(), d_vx, num_particles * sizeof(Real));
+    queue.memcpy(particles.vy.data(), d_vy, num_particles * sizeof(Real));
+    queue.memcpy(particles.vz.data(), d_vz, num_particles * sizeof(Real));
+    queue.wait();
 }
 #endif
+

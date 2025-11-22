@@ -9,10 +9,6 @@
 #include <mpi.h>
 #endif
 
-// External debug level variable
-extern int g_debug_level;
-inline bool debug_level(int level) { return g_debug_level >= level; }
-
 Topology::Topology() : rank(0) {}
 
 Topology::~Topology() {}

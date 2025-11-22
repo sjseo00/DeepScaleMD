@@ -9,12 +9,6 @@
 #include "neighbor_list.h"
 #include <memory>
 
-// Global debug level variable
-extern int g_debug_level;
-
-// Helper functions for debug output
-inline bool debug_level(int level) { return g_debug_level >= level; }
-
 class MDSimulation {
 private:
     std::unique_ptr<MDSystem> system;
@@ -37,6 +31,7 @@ private:
     int neighbor_list_tile_size;
     int neighbor_list_update_freq;  // Added neighbor list update frequency
     Real verlet_skin;               // Verlet list skin distance
+    int neighbor_list_builds;       // Count of neighbor list builds
     std::string force_calculation_mode;  // "builtin" or "python"
     std::string integrator_type;
     std::string thermostat_type;
@@ -63,6 +58,9 @@ private:
     // Cached energy values
     Real cached_potential_energy;       // Store PE from force calculation
     
+    // Critical simulation state flags (LAMMPS-style)
+    bool neighbor_rebuild_forced;       // Force neighbor rebuild (e.g., after barostat)
+    
     // Timing infrastructure
     bool timing_enabled;
     struct StepTiming {
@@ -76,7 +74,21 @@ private:
         double barostat_ms = 0.0;
         double total_ms = 0.0;
     } last_timing;
+    
+    // Cumulative timing statistics (LAMMPS-style)
+    struct CumulativeTiming {
+        double pair_time = 0.0;      // Force calculation (Pair in LAMMPS)
+        double neigh_time = 0.0;     // Neighbor list build
+        double comm_time = 0.0;      // MPI communication (halo exchange)
+        double output_time = 0.0;    // Output/IO operations
+        double modify_time = 0.0;    // Thermostat/Barostat/Integrate
+        double other_time = 0.0;     // Everything else
+        double total_time = 0.0;     // Total simulation time
+        int step_count = 0;          // Number of steps timed
+    } cumulative_timing;
+    
     void print_step_timing(int step);
+    void print_timing_breakdown();   // Print LAMMPS-style timing breakdown
     
 public:
     MDSimulation();
@@ -87,18 +99,21 @@ public:
     void finalize();
     
     void single_step();
-    void output_results(int step, double step_time_ms = 0.0);
+    void output_results(int step);
+    void force_neighbor_rebuild() { neighbor_rebuild_forced = true; }  // Force rebuild (e.g., after barostat)
     
     // Getters
     MDSystem* get_system() { return system.get(); }
     
 private:
     void parse_simulation_config(const std::string& config_file);
+    void prepare_first_step();          // Initialize forces before first MD step
     void initialize_integrator();
     void initialize_thermostat();
     void initialize_barostat();
     void calculate_potential_energy();  // Calculate and cache PE
     void check_energy_stability();      // Check for energy drift and instabilities
+    void zero_forces();                 // Zero all forces (local + ghost particles)
     
     // Trajectory output functions
     void write_trajectory(int step);

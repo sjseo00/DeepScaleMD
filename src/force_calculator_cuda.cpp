@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <mpi.h>
+#ifdef USE_NCCL
+#include <nccl.h>
+#endif
 
 // Forward declarations for CUDA kernels
 extern void launch_lj_kernel(Real* d_x, Real* d_y, Real* d_z,
@@ -31,10 +34,11 @@ extern void launch_coulomb_kernel(Real* d_x, Real* d_y, Real* d_z,
                                  int num_local_particles,
                                  Real* d_potential_energy);
 
-ForceCalculatorCUDA::ForceCalculatorCUDA() : rank(0), allocated_size(0) {
-    // Get MPI rank for output control
+ForceCalculatorCUDA::ForceCalculatorCUDA() : rank(0), allocated_size(0), mpi_size(1) {
+    // Get MPI rank and size for output control
 #ifdef USE_MPI
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 #endif
     
     // Initialize CUDA context and cuBLAS
@@ -50,10 +54,20 @@ ForceCalculatorCUDA::ForceCalculatorCUDA() : rank(0), allocated_size(0) {
     d_neighbors = d_num_neighbors = d_neighbor_offset = nullptr;
     d_potential_energy = nullptr;
     max_neighbors_allocated = 0;
+
+#ifdef USE_NCCL
+    nccl_initialized = false;
+    d_force_buffer_x = d_force_buffer_y = d_force_buffer_z = nullptr;
+#endif
 }
 
 ForceCalculatorCUDA::~ForceCalculatorCUDA() {
-    // Cleanup
+    // Cleanup NCCL first
+#ifdef USE_NCCL
+    finalize_nccl();
+#endif
+
+    // Cleanup device memory
     if (d_x) cudaFree(d_x);
     if (d_y) cudaFree(d_y);
     if (d_z) cudaFree(d_z);
@@ -100,6 +114,16 @@ void ForceCalculatorCUDA::initialize() {
     if (rank == 0) {
         std::cout << "Using GPU: " << prop.name << std::endl;
     }
+
+#ifdef USE_NCCL
+    // Initialize NCCL if multiple MPI processes
+    if (mpi_size > 1) {
+        initialize_nccl();
+        if (rank == 0) {
+            std::cout << "NCCL initialized for " << mpi_size << " GPUs" << std::endl;
+        }
+    }
+#endif
 }
 
 void ForceCalculatorCUDA::finalize() {
@@ -128,20 +152,22 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
     
     // Allocate neighbor list (will be reallocated based on actual size)
     cudaMalloc(&d_neighbors, num_particles * 200 * sizeof(int)); // Initial estimate
+
+#ifdef USE_NCCL
+    // Allocate NCCL buffers if NCCL is initialized
+    if (nccl_initialized && mpi_size > 1) {
+        allocate_nccl_buffers(num_particles);
+    }
+#endif
 }
 
 void ForceCalculatorCUDA::copy_to_device(MDSystem& system) {
     ParticleData& particles = system.get_particles();
     size_t local_particles = system.get_local_particles();
-    size_t total_particles = local_particles;
+    NeighborList& nlist = system.get_neighbor_list();
+    ForceFieldParams& params = system.get_ff_params();
     
-    static bool debug_enabled = (std::getenv("MD_DEBUG") != nullptr);
-    
-    if (debug_enabled && rank == 0) {
-        std::cout << "Rank " << rank << ": [CUDA] copy_to_device - local=" << local_particles << std::endl;
-    }
-    
-    // Check if device memory is allocated and large enough
+    // Check if device memory is allocated
     if (!d_x) {
         if (rank == 0) {
             std::cerr << "Error: Device memory not allocated in copy_to_device!" << std::endl;
@@ -149,43 +175,113 @@ void ForceCalculatorCUDA::copy_to_device(MDSystem& system) {
         return;
     }
     
-    ForceFieldParams& params = system.get_ff_params();
+    // === OPTIMIZATION 1: Build unique particle index set (local + neighbors) ===
+    // Only copy particles that are actually needed: local atoms + their neighbors
+    std::vector<bool> particle_needed(particles.num_particles, false);
+    std::vector<int> compact_index_map(particles.num_particles, -1);
+    std::vector<int> reverse_map;
+    std::vector<bool> is_local_in_compact;  // Track which compact indices are local
+    reverse_map.reserve(local_particles * 100); // Estimate
+    is_local_in_compact.reserve(local_particles * 100);
     
-    // Copy local particles to device
-    cudaMemcpyAsync(d_x, particles.x.data(), total_particles * sizeof(Real), 
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_y, particles.y.data(), total_particles * sizeof(Real), 
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_z, particles.z.data(), total_particles * sizeof(Real), 
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_charge, particles.charge.data(), total_particles * sizeof(Real), 
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_mass, particles.mass.data(), total_particles * sizeof(Real), 
-                    cudaMemcpyHostToDevice, stream);
-    
-    // Copy force field parameters
-    cudaMemcpyAsync(d_epsilon, params.epsilon.data(), total_particles * sizeof(Real), 
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_sigma, params.sigma.data(), total_particles * sizeof(Real), 
-                    cudaMemcpyHostToDevice, stream);
-    
-    // Copy neighbor list (always needed)
-    NeighborList& nlist = system.get_neighbor_list();
-    
-    // Check if neighbor list is too large and truncate if necessary
-    size_t max_neighbors_total = total_particles * 1000; // Max 1000 neighbors per particle
-    size_t actual_neighbors = nlist.neighbors.size();
-    
-    static int warning_count = 0;
-    if (actual_neighbors > max_neighbors_total && warning_count < 3 && rank == 0) {
-        std::cout << "Warning: Neighbor list too large (" << actual_neighbors 
-                  << " > " << max_neighbors_total << "). Truncating to avoid GPU memory issues." << std::endl;
-        warning_count++;
+    // Mark local particles as needed - add them FIRST to compact space
+    // This ensures local particles come first in compact arrays
+    for (size_t i = 0; i < local_particles; i++) {
+        if (!particle_needed[i]) {
+            particle_needed[i] = true;
+            compact_index_map[i] = reverse_map.size();
+            reverse_map.push_back(i);
+            is_local_in_compact.push_back(true);  // This is a local particle
+        }
     }
     
-    size_t neighbors_to_copy = std::min(actual_neighbors, max_neighbors_total);
+    // Then mark all neighbors of local particles as needed
+    for (size_t i = 0; i < local_particles; i++) {
+        int neighbor_start = nlist.neighbor_offset[i];
+        int neighbor_count = nlist.num_neighbors[i];
+        
+        for (int n = 0; n < neighbor_count; n++) {
+            int neighbor_idx = nlist.neighbors[neighbor_start + n];
+            if (neighbor_idx >= 0 && neighbor_idx < static_cast<int>(particles.num_particles)) {
+                if (!particle_needed[neighbor_idx]) {
+                    particle_needed[neighbor_idx] = true;
+                    compact_index_map[neighbor_idx] = reverse_map.size();
+                    reverse_map.push_back(neighbor_idx);
+                    is_local_in_compact.push_back(false);  // This is a ghost/neighbor particle
+                }
+            }
+        }
+    }
+    
+    size_t particles_to_copy = reverse_map.size();
+    
+    // === OPTIMIZATION 2: Pack only needed particles ===
+    std::vector<Real> packed_x(particles_to_copy);
+    std::vector<Real> packed_y(particles_to_copy);
+    std::vector<Real> packed_z(particles_to_copy);
+    std::vector<Real> packed_charge(particles_to_copy);
+    std::vector<Real> packed_mass(particles_to_copy);
+    std::vector<Real> packed_epsilon(particles_to_copy);
+    std::vector<Real> packed_sigma(particles_to_copy);
+    
+    #pragma omp parallel for if(particles_to_copy > 1000)
+    for (size_t i = 0; i < particles_to_copy; i++) {
+        int orig_idx = reverse_map[i];
+        packed_x[i] = particles.x[orig_idx];
+        packed_y[i] = particles.y[orig_idx];
+        packed_z[i] = particles.z[orig_idx];
+        packed_charge[i] = particles.charge[orig_idx];
+        packed_mass[i] = particles.mass[orig_idx];
+        packed_epsilon[i] = params.epsilon[orig_idx];
+        packed_sigma[i] = params.sigma[orig_idx];
+    }
+    
+    // Copy packed data to device (much smaller transfer!)
+    cudaMemcpyAsync(d_x, packed_x.data(), particles_to_copy * sizeof(Real), 
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_y, packed_y.data(), particles_to_copy * sizeof(Real), 
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_z, packed_z.data(), particles_to_copy * sizeof(Real), 
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_charge, packed_charge.data(), particles_to_copy * sizeof(Real), 
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_mass, packed_mass.data(), particles_to_copy * sizeof(Real), 
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_epsilon, packed_epsilon.data(), particles_to_copy * sizeof(Real), 
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_sigma, packed_sigma.data(), particles_to_copy * sizeof(Real), 
+                    cudaMemcpyHostToDevice, stream);
+    
+    // === OPTIMIZATION 3: Remap neighbor indices to compact space ===
+    std::vector<int> remapped_neighbors;
+    std::vector<int> remapped_num_neighbors(local_particles);
+    std::vector<int> remapped_neighbor_offset(local_particles);
+    
+    remapped_neighbors.reserve(nlist.neighbors.size());
+    
+    for (size_t i = 0; i < local_particles; i++) {
+        remapped_neighbor_offset[i] = remapped_neighbors.size();
+        
+        int neighbor_start = nlist.neighbor_offset[i];
+        int neighbor_count = nlist.num_neighbors[i];
+        int valid_count = 0;
+        
+        for (int n = 0; n < neighbor_count; n++) {
+            int orig_neighbor = nlist.neighbors[neighbor_start + n];
+            if (orig_neighbor >= 0 && orig_neighbor < static_cast<int>(particles.num_particles)) {
+                int compact_neighbor = compact_index_map[orig_neighbor];
+                if (compact_neighbor >= 0) {
+                    remapped_neighbors.push_back(compact_neighbor);
+                    valid_count++;
+                }
+            }
+        }
+        
+        remapped_num_neighbors[i] = valid_count;
+    }
     
     // Reallocate neighbor list if needed
+    size_t neighbors_to_copy = remapped_neighbors.size();
     if (neighbors_to_copy > 0) {
         if (neighbors_to_copy != max_neighbors_allocated) {
             if (d_neighbors) cudaFree(d_neighbors);
@@ -193,70 +289,99 @@ void ForceCalculatorCUDA::copy_to_device(MDSystem& system) {
             max_neighbors_allocated = neighbors_to_copy;
         }
         
-        cudaMemcpyAsync(d_neighbors, nlist.neighbors.data(), 
+        cudaMemcpyAsync(d_neighbors, remapped_neighbors.data(), 
                         neighbors_to_copy * sizeof(int), cudaMemcpyHostToDevice, stream);
     }
     
-    // Adjust num_neighbors to account for truncation
-    std::vector<int> adjusted_num_neighbors = nlist.num_neighbors;
-    if (actual_neighbors > max_neighbors_total) {
-        // Truncate neighbor counts proportionally
-        for (size_t i = 0; i < local_particles; i++) {
-            if (adjusted_num_neighbors[i] > 1000) {
-                adjusted_num_neighbors[i] = 1000; // Max 1000 per particle
-            }
-        }
-    }
-    
-    cudaMemcpyAsync(d_num_neighbors, adjusted_num_neighbors.data(), 
+    cudaMemcpyAsync(d_num_neighbors, remapped_num_neighbors.data(), 
                     local_particles * sizeof(int), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_neighbor_offset, nlist.neighbor_offset.data(), 
+    cudaMemcpyAsync(d_neighbor_offset, remapped_neighbor_offset.data(), 
                     local_particles * sizeof(int), cudaMemcpyHostToDevice, stream);
     
     cudaStreamSynchronize(stream);
+    
+    // Store for unpacking forces later
+    current_compact_size = particles_to_copy;
+    current_compact_map = reverse_map;
+    current_is_local = is_local_in_compact;  // Store which compact indices are local
 }
 
 void ForceCalculatorCUDA::copy_from_device(MDSystem& system) {
     ParticleData& particles = system.get_particles();
     size_t local_particles = system.get_local_particles();
     
-    cudaMemcpyAsync(particles.fx.data(), d_fx, local_particles * sizeof(Real), 
+    // === OPTIMIZATION: Only copy back forces for LOCAL particles ===
+    // We only need forces for particles we own, not for neighbor particles
+    std::vector<Real> compact_fx(current_compact_size);
+    std::vector<Real> compact_fy(current_compact_size);
+    std::vector<Real> compact_fz(current_compact_size);
+    
+    // Copy ALL forces from device (including neighbor contributions)
+    cudaMemcpyAsync(compact_fx.data(), d_fx, current_compact_size * sizeof(Real), 
                     cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(particles.fy.data(), d_fy, local_particles * sizeof(Real), 
+    cudaMemcpyAsync(compact_fy.data(), d_fy, current_compact_size * sizeof(Real), 
                     cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(particles.fz.data(), d_fz, local_particles * sizeof(Real), 
+    cudaMemcpyAsync(compact_fz.data(), d_fz, current_compact_size * sizeof(Real), 
                     cudaMemcpyDeviceToHost, stream);
     
     cudaStreamSynchronize(stream);
     
-    // Debug: Check if forces were computed
-    static int debug_count = 0;
-    debug_count++;
+    // Unpack forces ONLY for local particles using is_local flag
+    #pragma omp parallel for if(current_compact_size > 1000)
+    for (size_t compact_i = 0; compact_i < current_compact_size; compact_i++) {
+        if (current_is_local[compact_i]) {  // Only unpack if this is a local particle
+            int orig_idx = current_compact_map[compact_i];
+            particles.fx[orig_idx] = compact_fx[compact_i];
+            particles.fy[orig_idx] = compact_fy[compact_i];
+            particles.fz[orig_idx] = compact_fz[compact_i];
+        }
+    }
 }
 
 void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
-    size_t total_particles = local_particles;
     
-    if (!d_x || allocated_size < total_particles) {
-        // Reallocate if needed
-        if (d_x) {
-            cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
-            cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
-            cudaFree(d_charge); cudaFree(d_mass);
-            cudaFree(d_epsilon); cudaFree(d_sigma);
-            cudaFree(d_num_neighbors); cudaFree(d_neighbor_offset);
-        }
-        allocate_device_memory(total_particles);
-        allocated_size = total_particles;
+    // === MPI-AWARE: Only allocate for particles we actually need ===
+    // This will be determined in copy_to_device (local + neighbors)
+    // First call to copy_to_device will set current_compact_size
+    
+    // Initial allocation with estimated size
+    if (!d_x) {
+        // Estimate: local particles + ~50% for neighbors (heuristic)
+        size_t estimated_size = local_particles * 3 / 2;
+        allocate_device_memory(estimated_size);
+        allocated_size = estimated_size;
     }
     
+    // Copy data to device (optimized sparse copy)
     copy_to_device(system);
     
-    // Zero forces (only for local particles, not ghosts)
-    cudaMemsetAsync(d_fx, 0, total_particles * sizeof(Real), stream);
-    cudaMemsetAsync(d_fy, 0, total_particles * sizeof(Real), stream);
-    cudaMemsetAsync(d_fz, 0, total_particles * sizeof(Real), stream);
+    // Reallocate if compact size exceeds allocated size
+    if (current_compact_size > allocated_size) {
+        if (rank == 0) {
+            std::cout << "Reallocating GPU memory: " << allocated_size << " -> " 
+                      << current_compact_size << " particles" << std::endl;
+        }
+        
+        // Free old memory
+        cudaFree(d_x); cudaFree(d_y); cudaFree(d_z);
+        cudaFree(d_fx); cudaFree(d_fy); cudaFree(d_fz);
+        cudaFree(d_charge); cudaFree(d_mass);
+        cudaFree(d_epsilon); cudaFree(d_sigma);
+        cudaFree(d_num_neighbors); cudaFree(d_neighbor_offset);
+        
+        // Allocate with margin
+        allocated_size = current_compact_size * 11 / 10;  // 10% margin
+        allocate_device_memory(allocated_size);
+        
+        // Re-copy with new allocation
+        copy_to_device(system);
+    }
+    
+    // Zero forces (only for compact array size)
+    cudaMemsetAsync(d_fx, 0, current_compact_size * sizeof(Real), stream);
+    cudaMemsetAsync(d_fy, 0, current_compact_size * sizeof(Real), stream);
+    cudaMemsetAsync(d_fz, 0, current_compact_size * sizeof(Real), stream);
     
     // Reset energy accumulators
     Real zero = 0.0;
@@ -292,19 +417,103 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
                     cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);  // Wait for energy copy to complete
     
-    copy_from_device(system);
-    
-    // Sum total potential energy across all MPI ranks
+    // Perform force reduction across MPI ranks
+#ifdef USE_NCCL
+    // Use NCCL for GPU-to-GPU force reduction if available
+    if (nccl_initialized && mpi_size > 1) {
+        allreduce_forces_nccl();
+    }
+#endif
+
 #ifdef USE_MPI
+    // If NCCL is not available or not initialized, fall back to MPI
+#ifndef USE_NCCL
+    if (mpi_size > 1) {
+        // Copy forces back to host for MPI reduction
+        copy_from_device(system);
+        
+        ParticleData& particles = system.get_particles();
+        int rank, size;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &size);
+        
+        // Get all local particle counts
+        std::vector<int> local_counts(size);
+        std::vector<int> displacements(size);
+        int local_count = static_cast<int>(local_particles);
+        
+        // Ensure local force arrays have correct size
+        if (particles.fx.size() < local_particles) {
+            particles.fx.resize(local_particles, 0.0);
+        }
+        if (particles.fy.size() < local_particles) {
+            particles.fy.resize(local_particles, 0.0);
+        }
+        if (particles.fz.size() < local_particles) {
+            particles.fz.resize(local_particles, 0.0);
+        }
+        
+        MPI_Allgather(&local_count, 1, MPI_INT, local_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+        
+                
+        // Calculate total particles and displacements
+        int total_particles = 0;
+        displacements[0] = 0;
+        for (int i = 0; i < size; i++) {
+            total_particles += local_counts[i];
+            if (i > 0) displacements[i] = displacements[i-1] + local_counts[i-1];
+        }
+        
+        // Use MPI_Allgatherv instead of MPI_Allreduce to handle different local particle counts
+        std::vector<Real> global_fx(total_particles), global_fy(total_particles), global_fz(total_particles);
+        
+        MPI_Allgatherv(particles.fx.data(), local_count, MPI_DOUBLE,
+                       global_fx.data(), local_counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
+        MPI_Allgatherv(particles.fy.data(), local_count, MPI_DOUBLE,
+                       global_fy.data(), local_counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
+        MPI_Allgatherv(particles.fz.data(), local_count, MPI_DOUBLE,
+                       global_fz.data(), local_counts.data(), displacements.data(), MPI_DOUBLE, MPI_COMM_WORLD);
+        
+        // Copy back only this process's forces
+        std::copy(global_fx.begin() + displacements[rank], 
+                  global_fx.begin() + displacements[rank] + local_count, 
+                  particles.fx.begin());
+        std::copy(global_fy.begin() + displacements[rank], 
+                  global_fy.begin() + displacements[rank] + local_count, 
+                  particles.fy.begin());
+        std::copy(global_fz.begin() + displacements[rank], 
+                  global_fz.begin() + displacements[rank] + local_count, 
+                  particles.fz.begin());
+    } else {
+        copy_from_device(system);
+    }
+#else
+    // NCCL is available, only copy back if not using NCCL
+    if (!nccl_initialized || mpi_size <= 1) {
+        copy_from_device(system);
+    } else {
+        // Forces are already reduced on GPU, copy them back
+        copy_from_device(system);
+    }
+#endif
+#else
+    // No MPI, just copy back
+    copy_from_device(system);
+#endif
+    
+    // MPI-AWARE: Sum potential energy across all ranks
+    // Each rank computes PE for pairs it "owns" (global_id[i] < global_id[j]),
+    // so we need to sum these partial energies to get the total system PE
+#ifdef USE_MPI
+    Real local_pe = last_potential_energy;
     Real global_pe = 0.0;
-    MPI_Allreduce(&last_potential_energy, &global_pe, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_pe, &global_pe, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     last_potential_energy = global_pe;
 #endif
 }
 
 void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
-    size_t total_particles = local_particles;
     
     NeighborList& nlist = system.get_neighbor_list();
     SimulationBox& box = system.get_box();
@@ -313,13 +522,18 @@ void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
         return;
     }
     
-    // Use CUDA kernel for LJ force calculation
-    // Pass total_particles for array bounds, but num_local_particles to prevent double counting
+    // === MPI-AWARE + OPTIMIZED: Use compact particle array size ===
+    // Pass current_compact_size for array bounds (includes local + neighbor atoms only)
+    // Pass local_particles to prevent Newton's 3rd law double counting in MPI
     launch_lj_kernel(d_x, d_y, d_z, d_fx, d_fy, d_fz,
                      d_neighbors, d_num_neighbors, d_neighbor_offset,
-                     d_epsilon, d_sigma, total_particles, nlist.cutoff,
+                     d_epsilon, d_sigma, 
+                     current_compact_size,  // Use compact size, not total
+                     nlist.cutoff,
                      max_neighbors_allocated, stream,
-                     box.lx, box.ly, box.lz, local_particles, d_potential_energy);
+                     box.lx, box.ly, box.lz, 
+                     local_particles,  // Only local particles for Newton's 3rd law
+                     d_potential_energy);
     
     // Check for CUDA errors
     cudaError_t err = cudaGetLastError();
@@ -333,7 +547,6 @@ void ForceCalculatorCUDA::compute_lj_forces_cuda(MDSystem& system) {
 void ForceCalculatorCUDA::compute_electrostatic_forces_cuda(MDSystem& system) {
     // Use the existing domain decomposition system
     size_t local_particles = system.get_local_particles();
-    size_t total_particles = local_particles;
     
     NeighborList& nlist = system.get_neighbor_list();
     
@@ -356,23 +569,22 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_cuda(MDSystem& system) {
         return;
     }
     
-    if (rank == 0) {
-        static bool coulomb_info_printed = false;
-        if (!coulomb_info_printed) {
-            std::cout << "CUDA Coulomb Force calculation: " << total_particles << " total particles (incl. ghosts), " 
-                      << local_particles << " local particles" << std::endl;
-            coulomb_info_printed = true;
-        }
+    static bool coulomb_info_printed = false;
+    if (rank == 0 && !coulomb_info_printed) {
+        std::cout << "CUDA Coulomb Force calculation (MPI-aware, compact array): " 
+                  << current_compact_size << " particles (local=" << local_particles << ")" << std::endl;
+        coulomb_info_printed = true;
     }
     
-    // Launch Coulomb kernel with domain decomposition support
-    // The kernel should only process local_particles, not total_particles
-    // Pass total_particles for array bounds, num_local_particles to prevent double counting
+    // === MPI-AWARE + OPTIMIZED: Use compact particle array ===
     SimulationBox& box = system.get_box();
     launch_coulomb_kernel(d_x, d_y, d_z, d_fx, d_fy, d_fz,
                          d_charge, d_neighbors, d_num_neighbors, d_neighbor_offset,
-                         total_particles, nlist.cutoff, max_neighbors_allocated, stream,
-                         box.lx, box.ly, box.lz, local_particles, d_potential_energy);
+                         current_compact_size,  // Use compact size
+                         nlist.cutoff, max_neighbors_allocated, stream,
+                         box.lx, box.ly, box.lz, 
+                         local_particles,  // Only local particles for Newton's 3rd law
+                         d_potential_energy);
     
     // Potential energy is accumulated in d_potential_energy and will be copied back in compute_forces
 }
@@ -695,5 +907,105 @@ void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
     last_kinetic_energy = local_ke;
 #endif
 }
+
+#ifdef USE_NCCL
+void ForceCalculatorCUDA::initialize_nccl() {
+    if (nccl_initialized || mpi_size <= 1) return;
+    
+    // Get unique ID from rank 0
+    ncclUniqueId id;
+    if (rank == 0) {
+        ncclGetUniqueId(&id);
+    }
+    
+    // Broadcast unique ID to all ranks
+#ifdef USE_MPI
+    MPI_Bcast(&id, sizeof(ncclUniqueId), MPI_BYTE, 0, MPI_COMM_WORLD);
+#endif
+    
+    // Initialize NCCL communicator
+    ncclResult_t nccl_result = ncclCommInitRank(&nccl_comm, mpi_size, id, rank);
+    if (nccl_result != ncclSuccess) {
+        throw std::runtime_error("NCCL initialization failed: " + std::string(ncclGetErrorString(nccl_result)));
+    }
+    
+    // Create separate stream for NCCL operations
+    cudaStreamCreate(&nccl_stream);
+    
+    nccl_initialized = true;
+    
+    if (rank == 0) {
+        std::cout << "NCCL initialized successfully with " << mpi_size << " ranks" << std::endl;
+    }
+}
+
+void ForceCalculatorCUDA::finalize_nccl() {
+    if (!nccl_initialized) return;
+    
+    // Cleanup NCCL buffers
+    if (d_force_buffer_x) cudaFree(d_force_buffer_x);
+    if (d_force_buffer_y) cudaFree(d_force_buffer_y);
+    if (d_force_buffer_z) cudaFree(d_force_buffer_z);
+    d_force_buffer_x = d_force_buffer_y = d_force_buffer_z = nullptr;
+    
+    // Destroy NCCL communicator
+    if (nccl_initialized) {
+        ncclCommDestroy(nccl_comm);
+    }
+    
+    // Destroy NCCL stream
+    if (nccl_stream) {
+        cudaStreamDestroy(nccl_stream);
+    }
+    
+    nccl_initialized = false;
+}
+
+void ForceCalculatorCUDA::allocate_nccl_buffers(size_t num_particles) {
+    if (!nccl_initialized || mpi_size <= 1) return;
+    
+    size_t buffer_size = num_particles * sizeof(Real);
+    
+    // Allocate buffers for force reduction
+    cudaMalloc(&d_force_buffer_x, buffer_size);
+    cudaMalloc(&d_force_buffer_y, buffer_size);
+    cudaMalloc(&d_force_buffer_z, buffer_size);
+    
+    // Initialize buffers to zero
+    cudaMemset(d_force_buffer_x, 0, buffer_size);
+    cudaMemset(d_force_buffer_y, 0, buffer_size);
+    cudaMemset(d_force_buffer_z, 0, buffer_size);
+    
+    if (rank == 0) {
+        std::cout << "NCCL buffers allocated for " << num_particles << " particles" << std::endl;
+    }
+}
+
+void ForceCalculatorCUDA::allreduce_forces_nccl() {
+    if (!nccl_initialized || mpi_size <= 1) return;
+    
+    // === MPI-AWARE OPTIMIZATION: Only reduce LOCAL particle forces ===
+    // Ghost/neighbor particle forces don't need to be communicated
+    // They were only needed for local force calculations
+    
+    // Count local particles in compact space using is_local flag
+    size_t local_particles = std::count(current_is_local.begin(), current_is_local.end(), true);
+    
+    if (local_particles == 0) return;
+    
+    // NCCL AllReduce (in-place, asynchronous) - only for local particles
+    // Since local particles are at the BEGINNING of compact arrays, we can reduce [0, local_particles)
+    ncclDataType_t nccl_dtype = (sizeof(Real) == 8) ? ncclDouble : ncclFloat;
+    
+    ncclGroupStart();
+    ncclAllReduce(d_fx, d_fx, local_particles, nccl_dtype, ncclSum, nccl_comm, nccl_stream);
+    ncclAllReduce(d_fy, d_fy, local_particles, nccl_dtype, ncclSum, nccl_comm, nccl_stream);
+    ncclAllReduce(d_fz, d_fz, local_particles, nccl_dtype, ncclSum, nccl_comm, nccl_stream);
+    ncclGroupEnd();
+    
+    // Synchronize to ensure completion
+    cudaStreamSynchronize(nccl_stream);
+}
+#endif // USE_NCCL
 
 #endif // USE_CUDA

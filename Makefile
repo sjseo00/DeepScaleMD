@@ -25,6 +25,7 @@ COMMON_SOURCES = $(SRC_DIR)/md_system.cpp \
                  $(SRC_DIR)/python_interface.cpp \
                  $(SRC_DIR)/force_calculator_cpu.cpp \
                  $(SRC_DIR)/force_manager.cpp \
+                 $(SRC_DIR)/mpi_utils.cpp \
                  $(SRC_DIR)/main.cpp
 
 # NCCL support (set USE_NCCL=1 to enable)
@@ -32,7 +33,7 @@ USE_NCCL ?= 0
 
 # Conditional sources and settings
 ifeq ($(BUILD_TYPE),cuda)
-    SOURCES = $(COMMON_SOURCES) $(SRC_DIR)/integrator_kernels.cu $(SRC_DIR)/barostat_kernels.cu $(SRC_DIR)/thermostat_kernels.cu $(SRC_DIR)/force_calculator_cuda.cpp $(SRC_DIR)/kernels_cuda.cu $(SRC_DIR)/cuda_mpi_system.cpp $(SRC_DIR)/cuda_mpi_kernels.cu $(SRC_DIR)/overlap_force_calculator.cpp $(SRC_DIR)/cuda_graphs_system.cpp
+    SOURCES = $(COMMON_SOURCES) $(SRC_DIR)/integrator_kernels.cu $(SRC_DIR)/barostat_kernels.cu $(SRC_DIR)/thermostat_kernels.cu $(SRC_DIR)/force_calculator_cuda.cpp $(SRC_DIR)/kernels_cuda.cu $(SRC_DIR)/neighbor_list_kernels.cu $(SRC_DIR)/cuda_mpi_system.cpp $(SRC_DIR)/cuda_mpi_kernels.cu $(SRC_DIR)/overlap_force_calculator.cpp $(SRC_DIR)/cuda_graphs_system.cpp
     CXXFLAGS_EXTRA = -DUSE_CUDA -DUSE_MPI -I/usr/local/cuda-12.9/include
     LIBS_EXTRA = -lcudart -lcublas -lcurand -L/usr/local/cuda-12.9/lib64 -lmpi_cxx
     
@@ -73,7 +74,7 @@ endif
 MPI_FLAGS = $(shell mpicc --showme:compile)
 MPI_LIBS = $(shell mpicc --showme:link)
 
-CXXFLAGS = -std=c++17 -O3 -Wall -I$(INCLUDE_DIR) $(MPI_FLAGS) $(CXXFLAGS_EXTRA)
+CXXFLAGS = -std=c++17 -O3 -march=native -mtune=native -DNDEBUG -Wall -I$(INCLUDE_DIR) $(MPI_FLAGS) $(CXXFLAGS_EXTRA)
 NVCC_FLAGS = -std=c++17 -O3 -I$(INCLUDE_DIR) $(MPI_FLAGS) $(CXXFLAGS_EXTRA) -Wno-deprecated-gpu-targets
 
 # Library flags

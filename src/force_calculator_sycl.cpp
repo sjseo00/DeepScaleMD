@@ -292,13 +292,6 @@ void ForceCalculatorSYCL::compute_electrostatic_forces_sycl(MDSystem& system) {
         return;
     }
     
-    static int debug_count = 0;
-    if (debug_count < 2 && is_rank_zero()) {
-        std::cout << "SYCL Electrostatic Force calculation: " << system.get_num_particles() << " total particles, " 
-                  << local_particles << " local particles" << std::endl;
-        debug_count++;
-    }
-    
     const Real ke = 8.9875517873681764e9; // Coulomb constant
     
     // Create local copies for kernel capture

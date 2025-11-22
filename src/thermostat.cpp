@@ -47,7 +47,7 @@ extern "C" {
     
     void launch_andersen_thermostat_kernel(Real *d_vx, Real *d_vy, Real *d_vz,
                                           Real *d_mass, Real *d_rand_x, Real *d_rand_y, Real *d_rand_z,
-                                          Real *d_collision_flags, Real sigma_factor, size_t num_particles);
+                                          Real *d_collision_flags, Real collision_prob, Real sigma_factor, size_t num_particles);
 }
 
 // Note: CUDA kernels are defined in thermostat_kernels.cu
@@ -62,24 +62,24 @@ void NoseHooverThermostat::apply(ParticleData& particles, Real dt, size_t local_
     
     // Calculate local kinetic energy
     Real local_ke = 0.0;
-    Real local_mass_sum = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i] * particles.vx[i] + 
                   particles.vy[i] * particles.vy[i] + 
                   particles.vz[i] * particles.vz[i];
         local_ke += 0.5 * particles.mass[i] * v2;
-        local_mass_sum += particles.mass[i];
     }
     
     // Get global kinetic energy and total particles via MPI reduction
     Real global_ke = mpi_allreduce_sum(local_ke);
     int global_particles = mpi_allreduce_sum_int((int)num_particles);
     
+    // Calculate temperature using proper units with kB constant
+    // Temperature = 2 * KE / (3 * N * kB) for 'real' units
     Real temperature = 2.0 * global_ke / (3.0 * global_particles * kB);
     
-    // Update thermostat velocity
-    Real dxi_dt = (temperature - target_temperature) / Q;
-    xi += dxi_dt * dt;
+    // Update thermostat velocity using proper Nose-Hoover equation
+    Real G = (temperature - target_temperature) / target_temperature;
+    xi += G * dt / Q;
     
     // Scale velocities
     Real scale_factor = exp(-xi * dt);
@@ -97,6 +97,7 @@ LangevinThermostat::LangevinThermostat(Real temp, Real friction)
 void LangevinThermostat::apply(ParticleData& particles, Real dt, size_t local_particles) {
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
+    // Use proper units with kB constant
     Real sigma = std::sqrt(2.0 * gamma * kB * target_temperature);
     
     for (size_t i = 0; i < num_particles; i++) {
@@ -118,6 +119,7 @@ void AndersenThermostat::apply(ParticleData& particles, Real dt, size_t local_pa
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
     Real collision_prob = collision_freq * dt;
+    // Use proper units with kB constant
     Real sigma = std::sqrt(kB * target_temperature);
     
     for (size_t i = 0; i < num_particles; i++) {
@@ -205,7 +207,7 @@ void LangevinThermostatCUDA::apply(ParticleData& particles, Real dt, size_t loca
     curandGenerateNormalDouble(gen, d_random_y, num_particles, 0.0, 1.0);
     curandGenerateNormalDouble(gen, d_random_z, num_particles, 0.0, 1.0);
     
-    // Compute Langevin coefficients
+    // Compute Langevin coefficients using proper units with kB constant
     Real c1 = exp(-gamma * dt);
     Real sigma = std::sqrt(2.0 * gamma * kB * target_temperature);
     Real c2_factor = sigma * std::sqrt(1.0 - c1 * c1);
@@ -315,7 +317,7 @@ void LangevinThermostatSYCL::apply(ParticleData& particles, Real dt, size_t loca
     copy_to_device(particles, num_particles);
     generate_random_numbers(num_particles);
     
-    // Compute Langevin coefficients
+    // Compute Langevin coefficients using proper units with kB constant
     Real c1 = exp(-gamma * dt);
     Real sigma = std::sqrt(2.0 * gamma * kB * target_temperature);
     Real c2_factor = sigma * std::sqrt(1.0 - c1 * c1);
@@ -397,19 +399,20 @@ void NoseHooverThermostatCUDA::apply(ParticleData& particles, Real dt, size_t lo
     allocate_gpu_memory(num_particles);
     copy_to_device(particles, num_particles);
     
-    // Calculate current kinetic energy
+    // Calculate current kinetic energy from host data
     Real kinetic_energy = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
-        kinetic_energy += particles.mass[i] * v2;
+        kinetic_energy += 0.5 * particles.mass[i] * v2;
     }
-    kinetic_energy *= 0.5;
     
     Real global_kinetic = mpi_allreduce_sum(kinetic_energy);
     int global_particles = mpi_allreduce_sum_int((int)num_particles);
+    
+    // Calculate temperature using proper units with kB constant
     Real current_temp = 2.0 * global_kinetic / (3.0 * global_particles * kB);
     
-    // Update thermostat velocity
+    // Update thermostat velocity using proper Nose-Hoover equation
     Real G = (current_temp - target_temperature) / target_temperature;
     xi += G * dt / Q;
     
@@ -495,19 +498,16 @@ void AndersenThermostatCUDA::apply(ParticleData& particles, Real dt, size_t loca
     curandGenerateNormalDouble(gen, d_random_y, num_particles, 0.0, 1.0);
     curandGenerateNormalDouble(gen, d_random_z, num_particles, 0.0, 1.0);
     
+    // Use proper units with kB constant
     Real sigma_factor = std::sqrt(kB * target_temperature);
     Real collision_prob = collision_freq * dt;
     
     int block_size = 256;
     int grid_size = (num_particles + block_size - 1) / block_size;
     
-    // Apply collision mask first
-    cudaMemset(d_collision_flags, 0, num_particles * sizeof(Real));
-    curandGenerateUniformDouble(gen, d_collision_flags, num_particles);
-    
     // Apply thermostat where collision_flag < collision_prob
     launch_andersen_thermostat_kernel(d_vx, d_vy, d_vz, d_mass, d_random_x, d_random_y, d_random_z,
-                                     d_collision_flags, sigma_factor, num_particles);
+                                     d_collision_flags, collision_prob, sigma_factor, num_particles);
     
     cudaDeviceSynchronize();
     copy_from_device(particles, num_particles);
@@ -532,12 +532,13 @@ void NoseHooverThermostatSYCL::apply(ParticleData& particles, Real dt, size_t lo
     Real kinetic_energy = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
-        kinetic_energy += particles.mass[i] * v2;
+        kinetic_energy += 0.5 * particles.mass[i] * v2;
     }
-    kinetic_energy *= 0.5;
     
     Real global_kinetic = mpi_allreduce_sum(kinetic_energy);
     int global_particles = mpi_allreduce_sum_int((int)num_particles);
+    
+    // Calculate temperature using proper units with kB constant
     Real current_temp = 2.0 * global_kinetic / (3.0 * global_particles * kB);
     
     // Update thermostat velocity
@@ -587,6 +588,7 @@ void AndersenThermostatSYCL::apply(ParticleData& particles, Real dt, size_t loca
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
     Real collision_prob = collision_freq * dt;
+    // Use proper units with kB constant
     Real sigma_factor = std::sqrt(kB * target_temperature);
     
     // Generate random numbers on host (simplified)

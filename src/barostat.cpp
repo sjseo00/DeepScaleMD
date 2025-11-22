@@ -1,5 +1,4 @@
 
-
 #include "barostat.h"
 #include "md_types.h"
 #include <cmath>
@@ -25,10 +24,47 @@ int mpi_allreduce_sum_int_barostat(int local_value) {
     MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     return global_value;
 }
+
+void mpi_broadcast_box_barostat(SimulationBox& box) {
+    // Broadcast box dimensions from rank 0 to ensure all processes have identical values
+    MPI_Bcast(&box.lx, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&box.ly, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&box.lz, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    box.update_box_length();
+}
+
+bool mpi_validate_particle_distribution_barostat(size_t local_particles) {
+    int total_particles = mpi_allreduce_sum_int_barostat((int)local_particles);
+    int num_procs;
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+    
+    // Check if total particles is reasonable
+    if (total_particles <= 0) {
+        if (is_rank_zero_barostat()) {
+            std::cerr << "ERROR: No particles found across all MPI processes!" << std::endl;
+        }
+        return false;
+    }
+    
+    // Warn if particle distribution is very uneven
+    Real avg_particles_per_proc = (Real)total_particles / num_procs;
+    Real imbalance_ratio = local_particles / avg_particles_per_proc;
+    
+    if (imbalance_ratio > 2.0 || imbalance_ratio < 0.5) {
+        if (is_rank_zero_barostat()) {
+            std::cout << "WARNING: Uneven particle distribution detected. " 
+                      << "Total=" << total_particles << ", Avg/proc=" << avg_particles_per_proc << std::endl;
+        }
+    }
+    
+    return true;
+}
 #else
 bool is_rank_zero_barostat() { return true; }
 Real mpi_allreduce_sum_barostat(Real local_value) { return local_value; }
 int mpi_allreduce_sum_int_barostat(int local_value) { return local_value; }
+void mpi_broadcast_box_barostat(SimulationBox& box) { box.update_box_length(); }
+bool mpi_validate_particle_distribution_barostat(size_t local_particles) { return true; }
 #endif
 
 #ifdef USE_CUDA
@@ -57,11 +93,16 @@ ParrinelloRahmanBarostat::ParrinelloRahmanBarostat(Real press, Real mass)
 void ParrinelloRahmanBarostat::apply(ParticleData& particles, SimulationBox& box, Real dt, size_t local_particles) {
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
+    // Validate MPI particle distribution
+    if (!mpi_validate_particle_distribution_barostat(num_particles)) {
+        return;  // Skip barostat if particle distribution is invalid
+    }
+    
     // Calculate local pressure tensor
     Real local_P[3][3] = {{0.0}};
     Real volume = box.lx * box.ly * box.lz;
     
-    // Kinetic contribution to pressure
+    // Kinetic contribution to pressure tensor
     for (size_t i = 0; i < num_particles; i++) {
         local_P[0][0] += particles.mass[i] * particles.vx[i] * particles.vx[i];
         local_P[1][1] += particles.mass[i] * particles.vy[i] * particles.vy[i];
@@ -83,36 +124,64 @@ void ParrinelloRahmanBarostat::apply(ParticleData& particles, SimulationBox& box
         }
     }
     
-    // Virial contribution would be added here from force calculations
+    // Note: Virial contribution should be added from force calculations
+    // For now using kinetic pressure as approximation
     
-    // Update box matrix velocities
-    Real pressure_diff = (global_P[0][0] + global_P[1][1] + global_P[2][2]) / 3.0 - target_pressure;
-    
+    // Calculate pressure tensor difference from target
+    Real P_tensor[3][3];
     for (int i = 0; i < 3; i++) {
-        h_dot[i][i] += pressure_diff / W * dt;
+        for (int j = 0; j < 3; j++) {
+            P_tensor[i][j] = global_P[i][j];
+            if (i == j) P_tensor[i][j] -= target_pressure;
+        }
+    }
+    
+    // Update box matrix velocities using proper Parrinello-Rahman equations
+    Real dt_over_W = dt / W;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            h_dot[i][j] += P_tensor[i][j] * volume * dt_over_W;
+        }
     }
     
     // Update box matrix
+    Real h_new[3][3];
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
-            h[i][j] += h_dot[i][j] * dt;
+            h_new[i][j] = h[i][j] + h_dot[i][j] * dt;
+        }
+    }
+    
+    // Calculate scaling factors from diagonal elements
+    Real scale_x = h_new[0][0] / h[0][0];
+    Real scale_y = h_new[1][1] / h[1][1];  
+    Real scale_z = h_new[2][2] / h[2][2];
+    
+    // Update h matrix
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            h[i][j] = h_new[i][j];
         }
     }
     
     // Update box dimensions
-    box.lx *= (1.0 + h_dot[0][0] * dt);
-    box.ly *= (1.0 + h_dot[1][1] * dt);
-    box.lz *= (1.0 + h_dot[2][2] * dt);
+    box.lx *= scale_x;
+    box.ly *= scale_y;
+    box.lz *= scale_z;
     
-    // Scale particle positions
-    Real scale_x = 1.0 + h_dot[0][0] * dt;
-    Real scale_y = 1.0 + h_dot[1][1] * dt;
-    Real scale_z = 1.0 + h_dot[2][2] * dt;
+    // Ensure all MPI processes have identical box dimensions
+    mpi_broadcast_box_barostat(box);
     
+    // Scale particle positions and velocities
     for (size_t i = 0; i < num_particles; i++) {
         particles.x[i] *= scale_x;
         particles.y[i] *= scale_y;
         particles.z[i] *= scale_z;
+        
+        // Also need to scale velocities for proper dynamics
+        particles.vx[i] *= scale_x;
+        particles.vy[i] *= scale_y;
+        particles.vz[i] *= scale_z;
     }
 }
 
@@ -123,40 +192,66 @@ AndersenBarostat::AndersenBarostat(Real press, Real compress)
 void AndersenBarostat::apply(ParticleData& particles, SimulationBox& box, Real dt, size_t local_particles) {
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
-    // Calculate local kinetic energy
+    // Calculate local kinetic energy and virial contribution
     Real local_kinetic_energy = 0.0;
-    Real local_mass_sum = 0.0;
+    Real local_virial = 0.0;
+    
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i] * particles.vx[i] + 
                   particles.vy[i] * particles.vy[i] + 
                   particles.vz[i] * particles.vz[i];
         local_kinetic_energy += 0.5 * particles.mass[i] * v2;
-        local_mass_sum += particles.mass[i];
+        
+        // Virial contribution (would be calculated from forces in complete implementation)
+        // For now, using position-dependent approximation
+        local_virial += particles.x[i] * particles.fx[i] + 
+                       particles.y[i] * particles.fy[i] + 
+                       particles.z[i] * particles.fz[i];
     }
     
-    // Get global kinetic energy via MPI reduction
+    // Get global values via MPI reduction
     Real global_kinetic_energy = mpi_allreduce_sum_barostat(local_kinetic_energy);
+    Real global_virial = mpi_allreduce_sum_barostat(local_virial);
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;
     Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kB);
-    Real pressure = global_particles * kB * temperature / volume; // Ideal gas approximation
     
-    // Volume scaling factor
-    Real dV_dt = compressibility * volume * (pressure - target_pressure);
+    // More accurate pressure calculation including virial
+    Real kinetic_pressure = global_particles * kB * temperature / volume;
+    Real virial_pressure = global_virial / (3.0 * volume);
+    Real pressure = kinetic_pressure + virial_pressure;
+    
+    // Volume scaling with improved stability
+    Real pressure_error = pressure - target_pressure;
+    Real dV_dt = -compressibility * volume * pressure_error;  // Note the negative sign for stability
     Real new_volume = volume + dV_dt * dt;
-    Real scale_factor = std::cbrt(new_volume / volume);
     
-    // Update box dimensions (synchronized across all ranks)
+    // Limit volume changes for stability
+    Real volume_ratio = new_volume / volume;
+    if (volume_ratio > 1.1) volume_ratio = 1.1;  // Max 10% increase
+    if (volume_ratio < 0.9) volume_ratio = 0.9;  // Max 10% decrease
+    
+    Real scale_factor = std::cbrt(volume_ratio);
+    
+    // Update box dimensions
     box.lx *= scale_factor;
     box.ly *= scale_factor;
     box.lz *= scale_factor;
+    
+    // Ensure all MPI processes have identical box dimensions
+    mpi_broadcast_box_barostat(box);
     
     // Scale particle positions
     for (size_t i = 0; i < num_particles; i++) {
         particles.x[i] *= scale_factor;
         particles.y[i] *= scale_factor;
         particles.z[i] *= scale_factor;
+    }
+    
+    if (is_rank_zero_barostat()) {
+        std::cout << "Andersen barostat: P=" << pressure << " (target=" << target_pressure 
+                  << "), scale=" << scale_factor << std::endl;
     }
 }
 
@@ -230,44 +325,71 @@ void AndersenBarostatCUDA::scale_positions_cuda(Real scale_factor, size_t num_pa
 void AndersenBarostatCUDA::apply(ParticleData& particles, SimulationBox& box, Real dt, size_t local_particles) {
     size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
     
-    // Calculate kinetic energy on CPU (could be optimized to GPU later)
+    // Calculate kinetic energy and virial on CPU
     Real local_kinetic_energy = 0.0;
-    Real local_mass_sum = 0.0;
+    Real local_virial = 0.0;
+    
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i] * particles.vx[i] + 
                   particles.vy[i] * particles.vy[i] + 
                   particles.vz[i] * particles.vz[i];
         local_kinetic_energy += 0.5 * particles.mass[i] * v2;
-        local_mass_sum += particles.mass[i];
+        
+        // Add virial contribution
+        local_virial += particles.x[i] * particles.fx[i] + 
+                       particles.y[i] * particles.fy[i] + 
+                       particles.z[i] * particles.fz[i];
     }
     
     // Get global values via MPI
     Real global_kinetic_energy = mpi_allreduce_sum_barostat(local_kinetic_energy);
-    Real global_mass_sum = mpi_allreduce_sum_barostat(local_mass_sum);
+    Real global_virial = mpi_allreduce_sum_barostat(local_virial);
     int global_particles = mpi_allreduce_sum_int_barostat((int)num_particles);
     
     Real volume = box.lx * box.ly * box.lz;
     Real temperature = 2.0 * global_kinetic_energy / (3.0 * global_particles * kB);
-    Real pressure = global_particles * kB * temperature / volume;
     
-    // Calculate scaling factor
-    Real dV_dt = compressibility * volume * (pressure - target_pressure);
+    // More accurate pressure calculation
+    Real kinetic_pressure = global_particles * kB * temperature / volume;
+    Real virial_pressure = global_virial / (3.0 * volume);
+    Real pressure = kinetic_pressure + virial_pressure;
+    
+    // Calculate scaling factor with stability limits
+    Real pressure_error = pressure - target_pressure;
+    Real dV_dt = -compressibility * volume * pressure_error;
     Real new_volume = volume + dV_dt * dt;
-    Real scale_factor = std::cbrt(new_volume / volume);
+    Real volume_ratio = new_volume / volume;
+    
+    // Limit volume changes for stability
+    if (volume_ratio > 1.1) volume_ratio = 1.1;
+    if (volume_ratio < 0.9) volume_ratio = 0.9;
+    
+    Real scale_factor = std::cbrt(volume_ratio);
     
     // Update box dimensions
     box.lx *= scale_factor;
     box.ly *= scale_factor;
     box.lz *= scale_factor;
     
+    // Ensure all MPI processes have identical box dimensions
+    mpi_broadcast_box_barostat(box);
+    
     // Scale positions on GPU
     allocate_gpu_memory(num_particles);
+    
+    // Check for CUDA errors before operations
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess && is_rank_zero_barostat()) {
+        std::cerr << "CUDA error before Andersen barostat operations: " << cudaGetErrorString(err) << std::endl;
+    }
+    
     copy_to_device(particles, num_particles);
     scale_positions_cuda(scale_factor, num_particles);
     copy_from_device(particles, num_particles);
     
     if (is_rank_zero_barostat()) {
-        std::cout << "CUDA Andersen barostat applied to " << num_particles << " particles, scale_factor=" << scale_factor << std::endl;
+        std::cout << "CUDA Andersen barostat: P=" << pressure << " (target=" << target_pressure 
+                  << "), scale=" << scale_factor << std::endl;
     }
 }
 #endif
@@ -478,34 +600,66 @@ void ParrinelloRahmanBarostatCUDA::apply(ParticleData& particles, SimulationBox&
     
     // Update box matrix velocities (simplified)
     Real pressure_error = pressure - target_pressure;
+    Real dt_over_W = dt / W;
     for (int i = 0; i < 3; i++) {
-        h_dot[i][i] += pressure_error * dt / W;
+        h_dot[i][i] += pressure_error * volume * dt_over_W;
     }
     
     // Update box matrix
+    Real h_new[3][3];
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
-            h[i][j] += h_dot[i][j] * dt;
+            h_new[i][j] = h[i][j] + h_dot[i][j] * dt;
+        }
+    }
+    
+    // Calculate scaling factors
+    Real scale_x = h_new[0][0] / h[0][0];
+    Real scale_y = h_new[1][1] / h[1][1];
+    Real scale_z = h_new[2][2] / h[2][2];
+    
+    // Update h matrix
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            h[i][j] = h_new[i][j];
         }
     }
     
     // Update box dimensions
-    Real scale_factor = h[0][0];
-    box.lx *= scale_factor;
-    box.ly *= scale_factor;
-    box.lz *= scale_factor;
+    box.lx *= scale_x;
+    box.ly *= scale_y;
+    box.lz *= scale_z;
+    
+    // Ensure all MPI processes have identical box dimensions
+    mpi_broadcast_box_barostat(box);
     
     // Scale positions and velocities on GPU
     allocate_gpu_memory(num_particles);
+    
+    // Check for CUDA errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess && is_rank_zero_barostat()) {
+        std::cerr << "CUDA error before barostat operations: " << cudaGetErrorString(err) << std::endl;
+    }
+    
     copy_to_device(particles, num_particles);
     
-    launch_scale_positions_kernel(d_x, d_y, d_z, scale_factor, num_particles);
-    cudaDeviceSynchronize();
+    // Scale positions using anisotropic kernel
+    launch_scale_positions_anisotropic_kernel(d_x, d_y, d_z, scale_x, scale_y, scale_z, num_particles);
+    
+    // Scale velocities using anisotropic kernel
+    launch_scale_velocities_anisotropic_kernel(d_vx, d_vy, d_vz, scale_x, scale_y, scale_z, num_particles);
+    
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess && is_rank_zero_barostat()) {
+        std::cerr << "CUDA error in barostat scaling: " << cudaGetErrorString(err) << std::endl;
+    }
     
     copy_from_device(particles, num_particles);
     
     if (is_rank_zero_barostat()) {
-        std::cout << "CUDA Parrinello-Rahman barostat applied, scale_factor=" << scale_factor << std::endl;
+        std::cout << "CUDA Parrinello-Rahman barostat applied, scale_factors=[" 
+                  << scale_x << "," << scale_y << "," << scale_z << "]" << std::endl;
     }
 }
 #endif

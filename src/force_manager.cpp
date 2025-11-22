@@ -134,33 +134,86 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
         }
     }
     
-    // Parse built-in force field configuration
-    auto bonds_it = config_map.find("force_calculation_enable_bonds");
-    if (bonds_it != config_map.end()) {
-        config.enable_bonds = (bonds_it->second == "true");
+    // New format: type-based configuration (comma-separated list)
+    auto type_it = config_map.find("force_calculation_type");
+    if (type_it != config_map.end()) {
+        std::string types_str = type_it->second;
+        // Parse comma-separated list: "bonds, angles, lj, PME"
+        size_t start = 0;
+        while (start < types_str.length()) {
+            size_t comma_pos = types_str.find(',', start);
+            size_t end = (comma_pos == std::string::npos) ? types_str.length() : comma_pos;
+            std::string type_name = types_str.substr(start, end - start);
+            
+            // Trim whitespace and quotes
+            type_name.erase(0, type_name.find_first_not_of(" \t\r\n\""));
+            type_name.erase(type_name.find_last_not_of(" \t\r\n\"") + 1);
+            
+            if (!type_name.empty()) {
+                config.force_types.push_back(type_name);
+            }
+            
+            start = end + 1;
+        }
+        
+        // If type list was provided, disable all forces by default, then enable only those in the list
+        if (!config.force_types.empty()) {
+            config.enable_bonds = false;
+            config.enable_angles = false;
+            config.enable_dihedrals = false;
+            config.enable_lennard_jones = false;
+            config.enable_coulomb = false;
+            
+            for (const auto& t : config.force_types) {
+                if (t == "bonds" || t == "bond") {
+                    config.enable_bonds = true;
+                } else if (t == "angles" || t == "angle") {
+                    config.enable_angles = true;
+                } else if (t == "dihedrals" || t == "dihedral") {
+                    config.enable_dihedrals = true;
+                } else if (t == "lj" || t == "lennard_jones" || t == "LJ") {
+                    config.enable_lennard_jones = true;
+                } else if (t == "coulomb" || t == "PME" || t == "electrostatic") {
+                    config.enable_coulomb = true;
+                }
+            }
+        }
+    } else {
+        // Old format: individual enable flags (backward compatibility)
+        auto bonds_it = config_map.find("force_calculation_enable_bonds");
+        if (bonds_it != config_map.end()) {
+            config.enable_bonds = (bonds_it->second == "true");
+        }
+        
+        auto angles_it = config_map.find("force_calculation_enable_angles");
+        if (angles_it != config_map.end()) {
+            config.enable_angles = (angles_it->second == "true");
+        }
+        
+        auto dihedrals_it = config_map.find("force_calculation_enable_dihedrals");
+        if (dihedrals_it != config_map.end()) {
+            config.enable_dihedrals = (dihedrals_it->second == "true");
+        }
+        
+        auto lj_it = config_map.find("force_calculation_enable_lennard_jones");
+        if (lj_it != config_map.end()) {
+            config.enable_lennard_jones = (lj_it->second == "true");
+        }
+        
+        auto coulomb_it = config_map.find("force_calculation_enable_coulomb");
+        if (coulomb_it != config_map.end()) {
+            config.enable_coulomb = (coulomb_it->second == "true");
+        }
     }
     
-    auto angles_it = config_map.find("force_calculation_enable_angles");
-    if (angles_it != config_map.end()) {
-        config.enable_angles = (angles_it->second == "true");
+    // Python path (new format)
+    auto path_it = config_map.find("force_calculation_path");
+    if (path_it != config_map.end()) {
+        config.python_path = path_it->second;
+        config.python_force_path = path_it->second;  // Also set old field
     }
     
-    auto dihedrals_it = config_map.find("force_calculation_enable_dihedrals");
-    if (dihedrals_it != config_map.end()) {
-        config.enable_dihedrals = (dihedrals_it->second == "true");
-    }
-    
-    auto lj_it = config_map.find("force_calculation_enable_lennard_jones");
-    if (lj_it != config_map.end()) {
-        config.enable_lennard_jones = (lj_it->second == "true");
-    }
-    
-    auto coulomb_it = config_map.find("force_calculation_enable_coulomb");
-    if (coulomb_it != config_map.end()) {
-        config.enable_coulomb = (coulomb_it->second == "true");
-    }
-    
-    // Parse Python interface configuration
+    // Parse Python interface configuration (old format - backward compatibility)
     auto python_enabled_it = config_map.find("python_enabled");
     if (python_enabled_it != config_map.end()) {
         config.python_enabled = (python_enabled_it->second == "true");
@@ -169,6 +222,9 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
     auto python_path_it = config_map.find("python_force_path");
     if (python_path_it != config_map.end()) {
         config.python_force_path = python_path_it->second;
+        if (config.python_path.empty()) {
+            config.python_path = python_path_it->second;
+        }
     }
     
     return config;

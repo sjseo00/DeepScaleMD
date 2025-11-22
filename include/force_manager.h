@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <map>
+#include <vector>
 
 // Forward declaration
 class MDSystem;
@@ -35,9 +36,13 @@ public:
         bool enable_lennard_jones = true;
         bool enable_coulomb = true;
         
+        // New type-based configuration (alternative to individual enable flags)
+        std::vector<std::string> force_types;  // e.g., {"bonds", "angles", "lj", "PME"}
+        
         // Python interface configuration
         bool python_enabled = false;
         std::string python_force_path = "../python_force";
+        std::string python_path = "";  // New: direct path for python mode
     };
 
 private:
