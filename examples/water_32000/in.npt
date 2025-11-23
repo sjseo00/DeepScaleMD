@@ -1,3 +1,0 @@
-# NPT ensemble
-fix             1 all npt temp 300.0 300.0 100.0 iso 1.0 1.0 1000.0
-run             10000
