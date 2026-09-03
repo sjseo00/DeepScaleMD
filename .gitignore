@@ -1,0 +1,17 @@
+/dsDecomp/
+build*/
+benchmark*/
+example*/
+test*/
+obj/
+bin/
+CMakeFiles/
+*.log
+*.xyz
+log.lammps
+log_kokkos.lammps
+nohup.out
+*.alyac
+__pycache__/
+*.pyc
+.claude/

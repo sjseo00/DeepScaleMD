@@ -1,0 +1,2896 @@
+#include "../include/force_calculator_cuda.h"
+#include "../include/force_calculator.h"
+#include "../include/md_system.h"
+#include "../include/topology.h"
+#include "../include/mpi_utils.h"
+#include "../include/md_types.h"
+#include "../include/integrator.h"  // For integrator kernel declarations
+
+// ── C++ LibTorch MLIP path ───────────────────────────────────────────────────
+// Only include mlip_types.h here (no operation_registry/execution_plan deps).
+// The full MlipRuntime + register_md_sources calls are bridged via C++ functions
+// in src/mlip_force_bridge.cpp to avoid Meyers-singleton duplication across
+// multiple CUDA translation units.
+#include "../include/mlip/mlip_types.h"
+using namespace mlip;
+#include <algorithm>   // std::sort, std::unique, std::distance
+#include <unordered_map>
+#include <utility>     // std::pair
+
+// C bridge functions (defined in src/mlip_force_bridge.cpp):
+void mlip_bridge_register_md_sources(void* fc_cuda_ptr);
+void mlip_bridge_compute(void* runtime_ptr,
+                         const mlip::MlipInputView* in_view,
+                         mlip::MlipOutputView* out_view);
+
+// Forward declarations of CUDA kernel launchers defined in
+// potential/mlip/cuda/edge_conversion.cu and force_accumulation.cu
+extern "C" {
+    void launch_half_to_full_edges(
+        const int32_t* src, const int32_t* dst,
+        int32_t* out_src, int32_t* out_dst,
+        int64_t E_half, cudaStream_t stream);
+
+    void launch_interleave_positions(
+        const double* d_x, const double* d_y, const double* d_z,
+        double* out, int N, cudaStream_t stream);
+
+    void launch_accumulate_forces_scaled(
+        const double* mlip_forces,
+        double* d_fx, double* d_fy, double* d_fz,
+        double scale, int N,
+        int* d_error_flag, cudaStream_t stream);
+}
+
+// Minimum-image edge vector kernel
+__global__ void k_min_image_edge_vectors(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const double* __restrict__ z,
+    const int32_t* __restrict__ src,
+    const int32_t* __restrict__ dst,
+    float* __restrict__ ev,
+    int64_t E_half,
+    float lx, float ly, float lz,
+    bool px, bool py, bool pz)
+{
+    int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E_half) return;
+    int s = src[e], d = dst[e];
+    float dx = (float)(x[d] - x[s]);
+    float dy = (float)(y[d] - y[s]);
+    float dz = (float)(z[d] - z[s]);
+    if (px) { if (dx >  lx*0.5f) dx -= lx; else if (dx < -lx*0.5f) dx += lx; }
+    if (py) { if (dy >  ly*0.5f) dy -= ly; else if (dy < -ly*0.5f) dy += ly; }
+    if (pz) { if (dz >  lz*0.5f) dz -= lz; else if (dz < -lz*0.5f) dz += lz; }
+    ev[e*3]           = dx;  ev[e*3+1]           = dy;  ev[e*3+2]           = dz;
+    ev[(E_half+e)*3]  = -dx; ev[(E_half+e)*3+1]  = -dy; ev[(E_half+e)*3+2]  = -dz;
+}
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+#include <mpi.h>
+#include <cmath>
+#include <cufft.h>
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) do { \
+    cudaError_t error = call; \
+    if (error != cudaSuccess) { \
+        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ \
+                  << " - " << cudaGetErrorString(error) << std::endl; \
+        exit(1); \
+    } \
+} while(0)
+
+// cuFFT error checking macro
+#define CUFFT_CHECK(call) do { \
+    cufftResult_t error = call; \
+    if (error != CUFFT_SUCCESS) { \
+        std::cerr << "cuFFT error at " << __FILE__ << ":" << __LINE__ \
+                  << " - error code: " << error << std::endl; \
+        exit(1); \
+    } \
+} while(0)
+
+// Custom atomicAdd implementation for double precision
+// (needed for older CUDA architectures < 6.0)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+// Native double atomicAdd is available
+#else
+__device__ double atomicAdd(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                       __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    
+    return __longlong_as_double(old);
+}
+#endif
+
+// Device constants for performance
+__constant__ Real d_cutoff_sq;
+__constant__ Real d_k_coulomb;
+__constant__ size_t d_local_particles;
+__constant__ size_t d_total_particles;
+
+// CUDA kernels
+
+__global__ void clear_forces_kernel(Real* fx, Real* fy, Real* fz, size_t n) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) {
+        fx[tid] = 0.0;
+        fy[tid] = 0.0;
+        fz[tid] = 0.0;
+    }
+}
+
+__device__ inline void apply_minimum_image_device(Real& dx, Real& dy, Real& dz,
+                                                   Real box_x, Real box_y, Real box_z,
+                                                   Real inv_box_x, Real inv_box_y, Real inv_box_z) {
+    // Branchless optimization using round
+    dx -= box_x * round(dx * inv_box_x);
+    dy -= box_y * round(dy * inv_box_y);
+    dz -= box_z * round(dz * inv_box_z);
+}
+
+__global__ void compute_lj_forces_kernel(
+    Real* x, Real* y, Real* z, 
+    Real* fx, Real* fy, Real* fz,
+    int* type, int* global_id,
+    int* neighbors, int* num_neighbors, int* neighbor_offset,
+    Real* epsilon_mixed, Real* sigma_mixed,
+    Real* potential_energy,
+    Real* virial,  // NEW: virial for pressure calculation
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    size_t local_particles, size_t total_particles,
+    int max_types,
+    Real cutoff_sq) {
+    
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    // REMOVED early return to allow all threads to participate in reduction
+    // if (i >= local_particles) return;
+    
+    Real fx_acc = 0.0;
+    Real fy_acc = 0.0;
+    Real fz_acc = 0.0;
+    Real pe_acc = 0.0;
+    Real virial_acc = 0.0;  // NEW: virial accumulator
+    
+    // Only active particles compute forces
+    if (i < local_particles) {
+        // Load particle i data
+        Real xi = x[i];
+        Real yi = y[i];
+        Real zi = z[i];
+        int type_i = type[i];
+        int gid_i = global_id[i];
+        
+        int n_start = neighbor_offset[i];
+        int n_count = num_neighbors[i];
+        
+        // Optimized loop - use direct neighbor count instead of end calculation
+        for (int n = 0; n < n_count; ++n) {
+            size_t j = neighbors[n_start + n];
+            if (j >= total_particles) continue;
+            
+            Real dx = xi - x[j];
+            Real dy = yi - y[j];
+            Real dz = zi - z[j];
+            
+            apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z, 
+                                       inv_box_x, inv_box_y, inv_box_z);
+            
+            Real r2 = dx*dx + dy*dy + dz*dz;
+            
+            if (r2 >= cutoff_sq || r2 < 1e-10) continue;
+            
+            bool j_is_local = (j < local_particles);
+            
+            int type_j = type[j];
+            size_t type_idx = type_i * max_types + type_j;
+            Real eps = epsilon_mixed[type_idx];
+            Real sig = sigma_mixed[type_idx];
+            
+            Real sig2 = sig * sig;
+            Real sig6 = sig2 * sig2 * sig2;
+            
+            Real r2inv = 1.0 / r2;
+            Real r6inv = r2inv * r2inv * r2inv;
+            Real sig6_r6 = sig6 * r6inv;
+            Real sig12_r12 = sig6_r6 * sig6_r6;
+            
+            // Force calculation: F = 24*eps/r^2 * (2*sig^12/r^12 - sig^6/r^6)
+            Real force_mag = 24.0 * eps * r2inv * (2.0 * sig12_r12 - sig6_r6);
+            
+            // Potential energy: U = 4*eps * (sig^12/r^12 - sig^6/r^6)
+            Real pe_pair = 4.0 * eps * (sig12_r12 - sig6_r6);
+            
+            // Energy counting (Newton off, full list):
+            // - local-local pair: counted twice, use factor 0.5
+            // - local-ghost pair: use global_id to avoid double counting
+            int gid_j = global_id[j];
+            if (j_is_local) {
+                pe_acc += 0.5 * pe_pair;
+            } else {
+                if (gid_i < gid_j) {
+                    pe_acc += pe_pair;
+                }
+            }
+            
+            // Force components
+            Real fx_pair = force_mag * dx;
+            Real fy_pair = force_mag * dy;
+            Real fz_pair = force_mag * dz;
+            
+            fx_acc += fx_pair;
+            fy_acc += fy_pair;
+            fz_acc += fz_pair;
+            
+            // NEW: Virial calculation (r · F)
+            // Count only local-local pairs with factor 0.5, or local-ghost with gid check
+            if (j_is_local) {
+                virial_acc += 0.5 * (dx * fx_pair + dy * fy_pair + dz * fz_pair);
+            } else {
+                if (gid_i < gid_j) {
+                    virial_acc += (dx * fx_pair + dy * fy_pair + dz * fz_pair);
+                }
+            }
+        }
+        
+        // Direct write - no atomics needed since each thread updates its own particle
+        fx[i] += fx_acc;
+        fy[i] += fy_acc;
+        fz[i] += fz_acc;
+    }
+    
+    // Warp-level reduction for potential energy and virial
+    // All threads in the warp must participate. 
+    // Threads with i >= local_particles contribute 0.0 (pe_acc initialized to 0.0)
+    // Use __activemask() to be safe, but 0xffffffff is fine if we ensure no divergence in control flow reaching here
+    // (which we did by removing early return)
+    // unsigned int mask = __activemask(); 
+    for (int offset = 16; offset > 0; offset /= 2) {
+        pe_acc += __shfl_down_sync(0xffffffff, pe_acc, offset);
+        virial_acc += __shfl_down_sync(0xffffffff, virial_acc, offset);  // NEW: reduce virial too
+    }
+
+    // Only the first thread in each warp adds to global memory
+    if ((threadIdx.x & 31) == 0) {
+        if (pe_acc != 0.0) {
+            atomicAdd(potential_energy, pe_acc);
+        }
+        if (virial_acc != 0.0) {
+            atomicAdd(virial, virial_acc);  // NEW: accumulate virial
+        }
+    }
+}
+
+// Real-space (near-field) half of the Ewald sum: erfc(alpha*r)-screened
+// Coulomb interaction over the neighbor list. Must always be combined with
+// the reciprocal-space PME grid contribution (see
+// ForceCalculatorCUDA::compute_electrostatic_forces_ewald) -- together they
+// reproduce the exact 1/r Coulomb sum over all periodic images.
+__global__ void compute_electrostatic_forces_kernel(
+
+    Real* x, Real* y, Real* z,
+    Real* fx, Real* fy, Real* fz,
+    Real* charge, int* global_id,
+    int* neighbors, int* num_neighbors, int* neighbor_offset,
+    Real* potential_energy,
+    Real* virial,  // NEW: virial for pressure calculation
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    size_t local_particles, size_t total_particles,
+    Real cutoff_sq, Real k_coulomb, Real alpha) {
+
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= local_particles) return;
+
+    Real qi = charge[i];
+    if (fabs(qi) < 1e-10) return;
+
+    Real xi = x[i];
+    Real yi = y[i];
+    Real zi = z[i];
+    int gid_i = global_id[i];
+
+    Real fx_acc = 0.0;
+    Real fy_acc = 0.0;
+    Real fz_acc = 0.0;
+    Real pe_acc = 0.0;
+    Real virial_acc = 0.0;  // NEW: virial accumulator
+
+    const Real two_alpha_over_sqrt_pi = 1.1283791670955126 * alpha;  // 2/sqrt(pi) * alpha
+
+    size_t neighbor_start = neighbor_offset[i];
+    size_t neighbor_end = neighbor_start + num_neighbors[i];
+
+    for (size_t n_idx = neighbor_start; n_idx < neighbor_end; ++n_idx) {
+        size_t j = neighbors[n_idx];
+        if (j >= total_particles) continue;
+
+        Real qj = charge[j];
+        if (fabs(qj) < 1e-10) continue;
+
+        Real dx = xi - x[j];
+        Real dy = yi - y[j];
+        Real dz = zi - z[j];
+
+        apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z,
+                                   inv_box_x, inv_box_y, inv_box_z);
+
+        Real r2 = dx*dx + dy*dy + dz*dz;
+
+        if (r2 >= cutoff_sq || r2 < 1e-10) continue;
+
+        bool j_is_local = (j < local_particles);
+        int gid_j = global_id[j];
+
+        Real r = sqrt(r2);
+        Real qq = k_coulomb * qi * qj;
+        Real erfc_ar = erfc(alpha * r);
+        Real exp_term = exp(-alpha * alpha * r2);
+        Real u_pair = qq * erfc_ar / r;
+        // F/r = qq * [erfc(a r)/r^3 + (2a/sqrt(pi)) exp(-a^2 r^2)/r^2]
+        Real force_mag = qq * (erfc_ar / (r2 * r) + two_alpha_over_sqrt_pi * exp_term / r2);
+
+        // Energy counting (Newton off, full list):
+        // - local-local pair: counted twice, use factor 0.5
+        // - local-ghost pair: use global_id to avoid double counting
+        if (j_is_local) {
+            pe_acc += 0.5 * u_pair;
+        } else {
+            if (gid_i < gid_j) {
+                pe_acc += u_pair;
+            }
+        }
+
+        Real fx_ij = force_mag * dx;
+        Real fy_ij = force_mag * dy;
+        Real fz_ij = force_mag * dz;
+
+        fx_acc += fx_ij;
+        fy_acc += fy_ij;
+        fz_acc += fz_ij;
+
+        // NEW: Virial calculation
+        // Count only local-local pairs with factor 0.5, or local-ghost with gid check
+        if (j_is_local) {
+            virial_acc += 0.5 * (dx * fx_ij + dy * fy_ij + dz * fz_ij);
+        } else {
+            if (gid_i < gid_j) {
+                virial_acc += (dx * fx_ij + dy * fy_ij + dz * fz_ij);
+            }
+        }
+
+        // Newton off: no reverse force update
+    }
+
+    atomicAdd(&fx[i], fx_acc);
+    atomicAdd(&fy[i], fy_acc);
+    atomicAdd(&fz[i], fz_acc);
+    atomicAdd(potential_energy, pe_acc);
+    if (virial_acc != 0.0) {
+        atomicAdd(virial, virial_acc);  // NEW: accumulate virial
+    }
+}
+
+// ============================================================================
+// PME (Particle Mesh Ewald) reciprocal-space kernels
+//
+// Full complex-to-complex (C2C) grid layout: the charge grid is stored as
+// complex (imaginary part always 0) and transformed with a single forward/
+// inverse Z2Z FFT plan. This avoids the R2C/C2R half-spectrum packing
+// (nz/2+1) that the original implementation's indexing did not account for.
+// ============================================================================
+
+__device__ void pme_compute_bspline_weights(
+    Real u, int order, Real* weights, int* grid_indices)
+{
+    int base_index = static_cast<int>(floor(u));
+    Real w = u - static_cast<Real>(base_index);
+
+    if (order == 4) {
+        weights[0] = (1.0 - w) * (1.0 - w) * (1.0 - w) / 6.0;
+        weights[1] = (3.0 * w * w * w - 6.0 * w * w + 4.0) / 6.0;
+        weights[2] = (-3.0 * w * w * w + 3.0 * w * w + 3.0 * w + 1.0) / 6.0;
+        weights[3] = w * w * w / 6.0;
+
+        grid_indices[0] = base_index - 1;
+        grid_indices[1] = base_index;
+        grid_indices[2] = base_index + 1;
+        grid_indices[3] = base_index + 2;
+    } else if (order == 6) {
+        Real w2 = w * w, w3 = w2 * w, w4 = w2 * w2, w5 = w3 * w2;
+
+        weights[0] = (1.0 - w) * (1.0 - w) * (1.0 - w) * (1.0 - w) * (1.0 - w) / 120.0;
+        weights[1] = (5.0 * w5 - 20.0 * w4 + 20.0 * w3 + 20.0 * w2 - 50.0 * w + 26.0) / 120.0;
+        weights[2] = (-10.0 * w5 + 30.0 * w4 - 60.0 * w2 + 66.0) / 120.0;
+        weights[3] = (10.0 * w5 - 30.0 * w4 + 20.0 * w3 + 30.0 * w2 + 10.0 * w + 26.0) / 120.0;
+        weights[4] = (-5.0 * w5 + 20.0 * w4 - 20.0 * w3 - 20.0 * w2 + 50.0 * w + 26.0) / 120.0;
+        weights[5] = w5 / 120.0;
+
+        grid_indices[0] = base_index - 2;
+        grid_indices[1] = base_index - 1;
+        grid_indices[2] = base_index;
+        grid_indices[3] = base_index + 1;
+        grid_indices[4] = base_index + 2;
+        grid_indices[5] = base_index + 3;
+    }
+}
+
+__device__ inline int pme_pbc_grid_index(int idx, int grid_size) {
+    idx = idx % grid_size;
+    if (idx < 0) idx += grid_size;
+    return idx;
+}
+
+constexpr int PME_MAX_SPLINE_ORDER = 8;
+
+__global__ void pme_clear_grid_kernel(cufftDoubleComplex* grid, size_t grid_size) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < grid_size) {
+        grid[tid].x = 0.0;
+        grid[tid].y = 0.0;
+    }
+}
+
+// Spread particle charges onto the (complex, imag=0) grid via B-spline
+// interpolation (charge assignment step of P3M/PME).
+__global__ void pme_spread_charges_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const Real* __restrict__ charge, cufftDoubleComplex* charge_grid,
+    int grid_nx, int grid_ny, int grid_nz,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    int spline_order, size_t num_particles)
+{
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_particles) return;
+
+    Real qi = charge[i];
+    if (fabs(qi) < 1e-12) return;
+
+    Real u_x = (x[i] * inv_box_x + 0.5) * static_cast<Real>(grid_nx);
+    Real u_y = (y[i] * inv_box_y + 0.5) * static_cast<Real>(grid_ny);
+    Real u_z = (z[i] * inv_box_z + 0.5) * static_cast<Real>(grid_nz);
+
+    u_x = u_x - floor(u_x / grid_nx) * grid_nx;
+    u_y = u_y - floor(u_y / grid_ny) * grid_ny;
+    u_z = u_z - floor(u_z / grid_nz) * grid_nz;
+
+    Real wx[PME_MAX_SPLINE_ORDER], wy[PME_MAX_SPLINE_ORDER], wz[PME_MAX_SPLINE_ORDER];
+    int ix[PME_MAX_SPLINE_ORDER], iy[PME_MAX_SPLINE_ORDER], iz[PME_MAX_SPLINE_ORDER];
+
+    pme_compute_bspline_weights(u_x, spline_order, wx, ix);
+    pme_compute_bspline_weights(u_y, spline_order, wy, iy);
+    pme_compute_bspline_weights(u_z, spline_order, wz, iz);
+
+    for (int kx = 0; kx < spline_order; kx++) {
+        int gx = pme_pbc_grid_index(ix[kx], grid_nx);
+        Real weight_x = wx[kx] * qi;
+
+        for (int ky = 0; ky < spline_order; ky++) {
+            int gy = pme_pbc_grid_index(iy[ky], grid_ny);
+            Real weight_xy = wy[ky] * weight_x;
+
+            for (int kz = 0; kz < spline_order; kz++) {
+                int gz = pme_pbc_grid_index(iz[kz], grid_nz);
+                Real weight = wz[kz] * weight_xy;
+
+                size_t idx = static_cast<size_t>(gx) * grid_ny * grid_nz
+                           + static_cast<size_t>(gy) * grid_nz
+                           + static_cast<size_t>(gz);
+
+                atomicAdd(&charge_grid[idx].x, weight);
+            }
+        }
+    }
+}
+
+// Solve the Poisson equation in reciprocal space: multiply rho(k) by the
+// (B-spline-corrected) Gaussian Green's function to get the potential
+// Phi(k), in place, and accumulate the reciprocal-space energy.
+// k_coulomb is folded into `prefactor` by the caller.
+__global__ void pme_solve_poisson_kernel(
+    cufftDoubleComplex* fft_grid,
+    const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
+    Real* reciprocal_energy_out, Real prefactor, Real alpha,
+    int grid_nx, int grid_ny, int grid_nz,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z)
+{
+    int kx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ky = blockIdx.y * blockDim.y + threadIdx.y;
+    int kz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nz) return;
+
+    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nz
+               + static_cast<size_t>(ky) * grid_nz
+               + static_cast<size_t>(kz);
+
+    if (kx == 0 && ky == 0 && kz == 0) {
+        fft_grid[idx].x = 0.0;
+        fft_grid[idx].y = 0.0;
+        return;
+    }
+
+    Real kx_wave = (kx <= grid_nx/2) ? static_cast<Real>(kx) : static_cast<Real>(kx - grid_nx);
+    Real ky_wave = (ky <= grid_ny/2) ? static_cast<Real>(ky) : static_cast<Real>(ky - grid_ny);
+    Real kz_wave = (kz <= grid_nz/2) ? static_cast<Real>(kz) : static_cast<Real>(kz - grid_nz);
+
+    kx_wave *= 2.0 * M_PI * inv_box_x;
+    ky_wave *= 2.0 * M_PI * inv_box_y;
+    kz_wave *= 2.0 * M_PI * inv_box_z;
+
+    Real k_sq = kx_wave * kx_wave + ky_wave * ky_wave + kz_wave * kz_wave;
+
+    Real mx = b_mod_x[kx];
+    Real my = b_mod_y[ky];
+    Real mz = b_mod_z[kz];
+    Real m_sq = mx * mx * my * my * mz * mz;
+
+    Real alpha_sq = alpha * alpha;
+    Real gauss_screen = exp(-k_sq / (4.0 * alpha_sq));
+    Real green = prefactor * gauss_screen / (k_sq * m_sq + 1e-12);
+
+    Real rho_real = fft_grid[idx].x;
+    Real rho_imag = fft_grid[idx].y;
+
+    fft_grid[idx].x = green * rho_real;
+    fft_grid[idx].y = green * rho_imag;
+
+    Real energy_contrib = 0.5 * green * (rho_real * rho_real + rho_imag * rho_imag);
+    atomicAdd(reciprocal_energy_out, energy_contrib);
+}
+
+// E(k) = -i * k * Phi(k) -- gradient of the potential in reciprocal space.
+// This kernel was present in the original codebase but never invoked; the
+// math checks out (verified against E = -i*k*(re + i*im) = k*im - i*k*re)
+// so it is reused as-is.
+__global__ void pme_compute_electric_field_kernel(
+    const cufftDoubleComplex* __restrict__ phi_grid,
+    cufftDoubleComplex* ex_grid, cufftDoubleComplex* ey_grid, cufftDoubleComplex* ez_grid,
+    int grid_nx, int grid_ny, int grid_nz,
+    Real box_x, Real box_y, Real box_z)
+{
+    int kx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ky = blockIdx.y * blockDim.y + threadIdx.y;
+    int kz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nz) return;
+
+    Real kx_wave = (kx <= grid_nx/2) ? static_cast<Real>(kx) : static_cast<Real>(kx - grid_nx);
+    Real ky_wave = (ky <= grid_ny/2) ? static_cast<Real>(ky) : static_cast<Real>(ky - grid_ny);
+    Real kz_wave = (kz <= grid_nz/2) ? static_cast<Real>(kz) : static_cast<Real>(kz - grid_nz);
+
+    kx_wave *= 2.0 * M_PI / box_x;
+    ky_wave *= 2.0 * M_PI / box_y;
+    kz_wave *= 2.0 * M_PI / box_z;
+
+    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nz
+               + static_cast<size_t>(ky) * grid_nz
+               + static_cast<size_t>(kz);
+
+    Real phi_real = phi_grid[idx].x;
+    Real phi_imag = phi_grid[idx].y;
+
+    ex_grid[idx].x = phi_imag * kx_wave;
+    ex_grid[idx].y = -phi_real * kx_wave;
+
+    ey_grid[idx].x = phi_imag * ky_wave;
+    ey_grid[idx].y = -phi_real * ky_wave;
+
+    ez_grid[idx].x = phi_imag * kz_wave;
+    ez_grid[idx].y = -phi_real * kz_wave;
+}
+
+// After the inverse FFT, E(r) is complex but should be purely real (up to
+// numerical noise) since E(k) has Hermitian symmetry for a real charge
+// distribution. Keep only the real part and normalize by grid_size (cuFFT
+// does not normalize inverse transforms).
+__global__ void pme_extract_real_part_kernel(
+    const cufftDoubleComplex* complex_grid, Real* real_grid, size_t grid_size)
+{
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= grid_size) return;
+    real_grid[i] = complex_grid[i].x / static_cast<Real>(grid_size);
+}
+
+// Interpolate the (already gradient-correct) field grid back onto particles:
+// F_i = q_i * E(r_i), using the same B-spline weights as charge spreading.
+__global__ void pme_interpolate_forces_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const Real* __restrict__ charge,
+    const Real* __restrict__ field_grid_x, const Real* __restrict__ field_grid_y,
+    const Real* __restrict__ field_grid_z,
+    Real* fx, Real* fy, Real* fz,
+    int grid_nx, int grid_ny, int grid_nz,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    int spline_order, size_t num_particles)
+{
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_particles) return;
+
+    Real qi = charge[i];
+    if (fabs(qi) < 1e-12) return;
+
+    Real u_x = (x[i] * inv_box_x + 0.5) * static_cast<Real>(grid_nx);
+    Real u_y = (y[i] * inv_box_y + 0.5) * static_cast<Real>(grid_ny);
+    Real u_z = (z[i] * inv_box_z + 0.5) * static_cast<Real>(grid_nz);
+
+    u_x = u_x - floor(u_x / grid_nx) * grid_nx;
+    u_y = u_y - floor(u_y / grid_ny) * grid_ny;
+    u_z = u_z - floor(u_z / grid_nz) * grid_nz;
+
+    Real wx[PME_MAX_SPLINE_ORDER], wy[PME_MAX_SPLINE_ORDER], wz[PME_MAX_SPLINE_ORDER];
+    int ix[PME_MAX_SPLINE_ORDER], iy[PME_MAX_SPLINE_ORDER], iz[PME_MAX_SPLINE_ORDER];
+
+    pme_compute_bspline_weights(u_x, spline_order, wx, ix);
+    pme_compute_bspline_weights(u_y, spline_order, wy, iy);
+    pme_compute_bspline_weights(u_z, spline_order, wz, iz);
+
+    Real ex = 0.0, ey = 0.0, ez = 0.0;
+
+    for (int kx = 0; kx < spline_order; kx++) {
+        int gx = pme_pbc_grid_index(ix[kx], grid_nx);
+        Real weight_x = wx[kx];
+
+        for (int ky = 0; ky < spline_order; ky++) {
+            int gy = pme_pbc_grid_index(iy[ky], grid_ny);
+            Real weight_xy = wy[ky] * weight_x;
+
+            for (int kz = 0; kz < spline_order; kz++) {
+                int gz = pme_pbc_grid_index(iz[kz], grid_nz);
+                Real weight = wz[kz] * weight_xy;
+
+                size_t idx = static_cast<size_t>(gx) * grid_ny * grid_nz
+                           + static_cast<size_t>(gy) * grid_nz
+                           + static_cast<size_t>(gz);
+
+                ex += weight * field_grid_x[idx];
+                ey += weight * field_grid_y[idx];
+                ez += weight * field_grid_z[idx];
+            }
+        }
+    }
+
+    atomicAdd(&fx[i], qi * ex);
+    atomicAdd(&fy[i], qi * ey);
+    atomicAdd(&fz[i], qi * ez);
+}
+
+// Self-energy correction: E_self = -k_coulomb * alpha/sqrt(pi) * sum(q_i^2)
+__global__ void pme_self_energy_kernel(
+    const Real* __restrict__ charge, Real* potential_energy,
+    Real k_coulomb, Real alpha, size_t num_particles)
+{
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_particles) return;
+
+    Real qi = charge[i];
+    Real self_contrib = -k_coulomb * alpha / 1.7724538509055159 * qi * qi;  // sqrt(pi)
+
+    atomicAdd(potential_energy, self_contrib);
+}
+
+// Reciprocal-space virial contribution: W_recip = sum_k (1 + k^2/(2a^2)) * energy_contrib(k)
+__global__ void pme_reciprocal_virial_kernel(
+    const cufftDoubleComplex* __restrict__ fft_grid,
+    const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
+    Real* virial, Real prefactor, Real alpha,
+    int grid_nx, int grid_ny, int grid_nz,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z)
+{
+    int kx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ky = blockIdx.y * blockDim.y + threadIdx.y;
+    int kz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nz) return;
+    if (kx == 0 && ky == 0 && kz == 0) return;
+
+    Real kx_wave = (kx <= grid_nx/2) ? static_cast<Real>(kx) : static_cast<Real>(kx - grid_nx);
+    Real ky_wave = (ky <= grid_ny/2) ? static_cast<Real>(ky) : static_cast<Real>(ky - grid_ny);
+    Real kz_wave = (kz <= grid_nz/2) ? static_cast<Real>(kz) : static_cast<Real>(kz - grid_nz);
+
+    kx_wave *= 2.0 * M_PI * inv_box_x;
+    ky_wave *= 2.0 * M_PI * inv_box_y;
+    kz_wave *= 2.0 * M_PI * inv_box_z;
+
+    Real k_sq = kx_wave * kx_wave + ky_wave * ky_wave + kz_wave * kz_wave;
+
+    Real mx = b_mod_x[kx];
+    Real my = b_mod_y[ky];
+    Real mz = b_mod_z[kz];
+    Real m_sq = mx * mx * my * my * mz * mz;
+
+    Real alpha_sq = alpha * alpha;
+    Real gauss_screen = exp(-k_sq / (4.0 * alpha_sq));
+    Real green = prefactor * gauss_screen / (k_sq * m_sq + 1e-12);
+
+    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nz
+               + static_cast<size_t>(ky) * grid_nz
+               + static_cast<size_t>(kz);
+
+    Real rho_real = fft_grid[idx].x;
+    Real rho_imag = fft_grid[idx].y;
+    Real rho_sq = rho_real * rho_real + rho_imag * rho_imag;
+
+    Real virial_factor = 1.0 + k_sq / (2.0 * alpha_sq);
+    Real virial_contrib = virial_factor * green * rho_sq;
+
+    atomicAdd(virial, virial_contrib);
+}
+
+__global__ void compute_bond_forces_kernel(
+    Real* x, Real* y, Real* z,
+    Real* fx, Real* fy, Real* fz,
+    int* global_id,  // for ownership rule
+    size_t* bond_atom1, size_t* bond_atom2,
+    Real* bond_k, Real* bond_r0,
+    size_t num_bonds,
+    Real* potential_energy,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    size_t local_particles) {
+    
+    size_t bond_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bond_idx >= num_bonds) return;
+    
+    size_t i = bond_atom1[bond_idx];
+    size_t j = bond_atom2[bond_idx];
+    
+    // MPI ownership rule: only compute if at least one atom is local
+    bool i_is_local = (i < local_particles);
+    bool j_is_local = (j < local_particles);
+    
+    if (!i_is_local && !j_is_local) return;  // Neither is local, skip
+    
+    // Avoid double-counting: only the rank that owns the atom with smaller global_id computes
+    // This ensures each bond is computed exactly once across all ranks
+    int gid_i = global_id[i];
+    int gid_j = global_id[j];
+    
+    // Only compute if owner atom is local on this rank
+    bool owner_is_i = (gid_i < gid_j);
+    bool should_compute = (owner_is_i && i_is_local) || (!owner_is_i && j_is_local);
+    
+    if (!should_compute) return;
+    
+    Real dx = x[i] - x[j];
+    Real dy = y[i] - y[j];
+    Real dz = z[i] - z[j];
+    
+    apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z,
+                               inv_box_x, inv_box_y, inv_box_z);
+    
+    Real r = sqrt(dx*dx + dy*dy + dz*dz);
+    if (r < 1e-10) return;
+    
+    Real k = bond_k[bond_idx];
+    Real r0 = bond_r0[bond_idx];
+    Real dr = r - r0;
+    
+    Real force_mag = -2.0 * k * dr / r;
+    Real pe = k * dr * dr;
+    
+    Real fx_bond = force_mag * dx;
+    Real fy_bond = force_mag * dy;
+    Real fz_bond = force_mag * dz;
+    
+    // Apply forces to both atoms (use atomicAdd for thread safety)
+    // Forces on ghost atoms will be collected via reverse halo exchange
+    atomicAdd(&fx[i], fx_bond);
+    atomicAdd(&fy[i], fy_bond);
+    atomicAdd(&fz[i], fz_bond);
+    
+    atomicAdd(&fx[j], -fx_bond);
+    atomicAdd(&fy[j], -fy_bond);
+    atomicAdd(&fz[j], -fz_bond);
+    
+    // Only accumulate energy once (ownership ensures no double-counting)
+    atomicAdd(potential_energy, pe);
+}
+
+__global__ void compute_angle_forces_kernel(
+    Real* x, Real* y, Real* z,
+    Real* fx, Real* fy, Real* fz,
+    int* global_id,  // for ownership rule
+    size_t* angle_atom1, size_t* angle_atom2, size_t* angle_atom3,
+    Real* angle_k, Real* angle_theta0,
+    size_t num_angles,
+    Real* potential_energy,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    size_t local_particles) {
+    
+    size_t angle_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (angle_idx >= num_angles) return;
+    
+    size_t i = angle_atom1[angle_idx];
+    size_t j = angle_atom2[angle_idx];  // center atom
+    size_t k = angle_atom3[angle_idx];
+    
+    // MPI ownership rule: only compute if at least one atom is local
+    bool i_is_local = (i < local_particles);
+    bool j_is_local = (j < local_particles);
+    bool k_is_local = (k < local_particles);
+    
+    if (!i_is_local && !j_is_local && !k_is_local) return;
+    
+    // Ownership: angle belongs to the rank that owns the center atom (j)
+    // This is a natural choice since j is geometrically central
+    if (!j_is_local) return;  // Only compute if center atom is local
+    
+    Real dx_ij = x[i] - x[j];
+    Real dy_ij = y[i] - y[j];
+    Real dz_ij = z[i] - z[j];
+    
+    Real dx_kj = x[k] - x[j];
+    Real dy_kj = y[k] - y[j];
+    Real dz_kj = z[k] - z[j];
+    
+    apply_minimum_image_device(dx_ij, dy_ij, dz_ij, box_x, box_y, box_z,
+                               inv_box_x, inv_box_y, inv_box_z);
+    apply_minimum_image_device(dx_kj, dy_kj, dz_kj, box_x, box_y, box_z,
+                               inv_box_x, inv_box_y, inv_box_z);
+    
+    Real r_ij_sq = dx_ij*dx_ij + dy_ij*dy_ij + dz_ij*dz_ij;
+    Real r_kj_sq = dx_kj*dx_kj + dy_kj*dy_kj + dz_kj*dz_kj;
+    Real r_ij = sqrt(r_ij_sq);
+    Real r_kj = sqrt(r_kj_sq);
+    
+    if (r_ij < 1e-10 || r_kj < 1e-10) return;
+    
+    Real cos_theta = (dx_ij*dx_kj + dy_ij*dy_kj + dz_ij*dz_kj) / (r_ij * r_kj);
+    cos_theta = fmax(-1.0, fmin(1.0, cos_theta));
+    
+    Real theta = acos(cos_theta);
+    Real k_angle = angle_k[angle_idx];
+    Real theta0 = angle_theta0[angle_idx];
+    Real dtheta = theta - theta0;
+    
+    Real pe = k_angle * dtheta * dtheta;
+    
+    if (fabs(dtheta) < 1e-10) return;
+    
+    Real sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+    if (sin_theta < 1e-10) return;
+    
+    Real force_constant = -2.0 * k_angle * dtheta / sin_theta;
+    
+    Real r_ij_inv = 1.0 / r_ij;
+    Real r_kj_inv = 1.0 / r_kj;
+    
+    Real cos_theta_ij = cos_theta / r_ij;
+    Real cos_theta_kj = cos_theta / r_kj;
+    
+    Real fx_i = force_constant * (dx_kj * r_ij_inv * r_kj_inv - dx_ij * cos_theta_ij * r_ij_inv);
+    Real fy_i = force_constant * (dy_kj * r_ij_inv * r_kj_inv - dy_ij * cos_theta_ij * r_ij_inv);
+    Real fz_i = force_constant * (dz_kj * r_ij_inv * r_kj_inv - dz_ij * cos_theta_ij * r_ij_inv);
+    
+    Real fx_k = force_constant * (dx_ij * r_ij_inv * r_kj_inv - dx_kj * cos_theta_kj * r_kj_inv);
+    Real fy_k = force_constant * (dy_ij * r_ij_inv * r_kj_inv - dy_kj * cos_theta_kj * r_kj_inv);
+    Real fz_k = force_constant * (dz_ij * r_ij_inv * r_kj_inv - dz_kj * cos_theta_kj * r_kj_inv);
+    
+    Real fx_j = -(fx_i + fx_k);
+    Real fy_j = -(fy_i + fy_k);
+    Real fz_j = -(fz_i + fz_k);
+    
+    // Apply forces (atomicAdd handles both local and ghost atoms)
+    atomicAdd(&fx[i], fx_i);
+    atomicAdd(&fy[i], fy_i);
+    atomicAdd(&fz[i], fz_i);
+    
+    atomicAdd(&fx[j], fx_j);
+    atomicAdd(&fy[j], fy_j);
+    atomicAdd(&fz[j], fz_j);
+    
+    atomicAdd(&fx[k], fx_k);
+    atomicAdd(&fy[k], fy_k);
+    atomicAdd(&fz[k], fz_k);
+    
+    // Energy accumulation (only once per angle since we enforce ownership)
+    atomicAdd(potential_energy, pe);
+}
+
+// ============================================================================
+// DIHEDRAL FORCES KERNEL (Proper dihedral: CHARMM/OPLS style)
+// ============================================================================
+__global__ void compute_dihedral_forces_kernel(
+    Real* x, Real* y, Real* z,
+    Real* fx, Real* fy, Real* fz,
+    int* global_id,  // for ownership rule
+    size_t* dihedral_atom1, size_t* dihedral_atom2, 
+    size_t* dihedral_atom3, size_t* dihedral_atom4,
+    Real* dihedral_k, Real* dihedral_phi0, int* dihedral_n,
+    size_t num_dihedrals,
+    Real* potential_energy,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    size_t local_particles) {
+    
+    size_t dihedral_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dihedral_idx >= num_dihedrals) return;
+    
+    size_t i = dihedral_atom1[dihedral_idx];  // atom 1
+    size_t j = dihedral_atom2[dihedral_idx];  // atom 2 (central bond)
+    size_t k = dihedral_atom3[dihedral_idx];  // atom 3 (central bond)
+    size_t l = dihedral_atom4[dihedral_idx];  // atom 4
+    
+    // MPI ownership rule: dihedral belongs to rank that owns the central bond
+    // Use the atom with smaller global_id among j and k as the owner
+    bool j_is_local = (j < local_particles);
+    bool k_is_local = (k < local_particles);
+    
+    if (!j_is_local && !k_is_local) return;  // Neither central atom is local
+    
+    int gid_j = global_id[j];
+    int gid_k = global_id[k];
+    bool owner_is_j = (gid_j < gid_k);
+    bool should_compute = (owner_is_j && j_is_local) || (!owner_is_j && k_is_local);
+    
+    if (!should_compute) return;
+    
+    // Compute vectors for dihedral i-j-k-l
+    // r_ij = r_j - r_i, etc.
+    Real dx_ij = x[j] - x[i];
+    Real dy_ij = y[j] - y[i];
+    Real dz_ij = z[j] - z[i];
+    
+    Real dx_kj = x[j] - x[k];
+    Real dy_kj = y[j] - y[k];
+    Real dz_kj = z[j] - z[k];
+    
+    Real dx_lk = x[k] - x[l];
+    Real dy_lk = y[k] - y[l];
+    Real dz_lk = z[k] - z[l];
+    
+    apply_minimum_image_device(dx_ij, dy_ij, dz_ij, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+    apply_minimum_image_device(dx_kj, dy_kj, dz_kj, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+    apply_minimum_image_device(dx_lk, dy_lk, dz_lk, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+    
+    // Cross products: m = ij x kj, n = kj x lk
+    Real mx = dy_ij * dz_kj - dz_ij * dy_kj;
+    Real my = dz_ij * dx_kj - dx_ij * dz_kj;
+    Real mz = dx_ij * dy_kj - dy_ij * dx_kj;
+    
+    Real nx = dy_kj * dz_lk - dz_kj * dy_lk;
+    Real ny = dz_kj * dx_lk - dx_kj * dz_lk;
+    Real nz = dx_kj * dy_lk - dy_kj * dx_lk;
+    
+    Real m_mag_sq = mx*mx + my*my + mz*mz;
+    Real n_mag_sq = nx*nx + ny*ny + nz*nz;
+    
+    if (m_mag_sq < 1e-10 || n_mag_sq < 1e-10) return;  // Degenerate geometry
+    
+    Real m_mag = sqrt(m_mag_sq);
+    Real n_mag = sqrt(n_mag_sq);
+    
+    // Dihedral angle phi
+    Real cos_phi = (mx*nx + my*ny + mz*nz) / (m_mag * n_mag);
+    cos_phi = fmax(-1.0, fmin(1.0, cos_phi));
+    
+    // Sign of phi using triple product
+    Real kj_mag = sqrt(dx_kj*dx_kj + dy_kj*dy_kj + dz_kj*dz_kj);
+    Real sign_check = mx * dx_lk + my * dy_lk + mz * dz_lk;
+    Real phi = acos(cos_phi);
+    if (sign_check < 0.0) phi = -phi;
+    
+    // Dihedral potential: V = k * (1 + cos(n*phi - phi0))
+    Real k_dih = dihedral_k[dihedral_idx];
+    Real phi0 = dihedral_phi0[dihedral_idx];
+    int n_mult = dihedral_n[dihedral_idx];
+    
+    Real n_phi = n_mult * phi;
+    Real pe = k_dih * (1.0 + cos(n_phi - phi0));
+    
+    // Force magnitude: dV/dphi = -k * n * sin(n*phi - phi0)
+    Real dEdphi = -k_dih * n_mult * sin(n_phi - phi0);
+    
+    if (fabs(dEdphi) < 1e-10) return;
+    
+    // Force calculation (simplified approximation for efficiency)
+    // Full analytical derivative is complex; use numerical gradient approximation
+    // For production, implement full analytical gradient
+    
+    // Approximate force distribution (this is simplified; proper implementation needs chain rule)
+    Real force_scale = dEdphi / (kj_mag + 1e-10);
+    
+    Real fx_i = force_scale * mx / (m_mag + 1e-10);
+    Real fy_i = force_scale * my / (m_mag + 1e-10);
+    Real fz_i = force_scale * mz / (m_mag + 1e-10);
+    
+    Real fx_l = -force_scale * nx / (n_mag + 1e-10);
+    Real fy_l = -force_scale * ny / (n_mag + 1e-10);
+    Real fz_l = -force_scale * nz / (n_mag + 1e-10);
+    
+    // Central atoms j and k get the remainder (Newton's 3rd law)
+    Real fx_j = -0.5 * (fx_i + fx_l);
+    Real fy_j = -0.5 * (fy_i + fy_l);
+    Real fz_j = -0.5 * (fz_i + fz_l);
+    
+    Real fx_k = -0.5 * (fx_i + fx_l);
+    Real fy_k = -0.5 * (fy_i + fy_l);
+    Real fz_k = -0.5 * (fz_i + fz_l);
+    
+    // Apply forces
+    atomicAdd(&fx[i], fx_i);
+    atomicAdd(&fy[i], fy_i);
+    atomicAdd(&fz[i], fz_i);
+    
+    atomicAdd(&fx[j], fx_j);
+    atomicAdd(&fy[j], fy_j);
+    atomicAdd(&fz[j], fz_j);
+    
+    atomicAdd(&fx[k], fx_k);
+    atomicAdd(&fy[k], fy_k);
+    atomicAdd(&fz[k], fz_k);
+    
+    atomicAdd(&fx[l], fx_l);
+    atomicAdd(&fy[l], fy_l);
+    atomicAdd(&fz[l], fz_l);
+    
+    // Energy accumulation
+    atomicAdd(potential_energy, pe);
+}
+
+__global__ void calculate_kinetic_energy_kernel(
+    Real* vx, Real* vy, Real* vz,
+    Real* mass,
+    Real* kinetic_energy,
+    size_t n) {
+    
+    extern __shared__ Real sdata[];
+    
+    size_t tid = threadIdx.x;
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    Real ke_local = 0.0;
+    if (i < n) {
+        Real v2 = vx[i]*vx[i] + vy[i]*vy[i] + vz[i]*vz[i];
+        ke_local = 0.5 * mass[i] * v2;
+    }
+    
+    sdata[tid] = ke_local;
+    __syncthreads();
+    
+    // Block-level reduction
+    for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        atomicAdd(kinetic_energy, sdata[0]);
+    }
+}
+
+// ForceCalculatorCUDA class implementation
+
+ForceCalculatorCUDA::ForceCalculatorCUDA() :
+    d_x(nullptr), d_y(nullptr), d_z(nullptr),
+    d_fx(nullptr), d_fy(nullptr), d_fz(nullptr),
+    d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
+    d_mass(nullptr), d_charge(nullptr), d_type(nullptr),
+    d_global_id(nullptr),
+    d_x_ref(nullptr), d_y_ref(nullptr), d_z_ref(nullptr), d_max_disp_sq(nullptr),
+    d_neighbors(nullptr), d_num_neighbors(nullptr), d_neighbor_offset(nullptr),
+    d_epsilon_mixed(nullptr), d_sigma_mixed(nullptr),
+    d_potential_energy(nullptr), d_kinetic_energy(nullptr),
+    // GPU-resident bonded topology initialization
+    num_bonds_cached(0), d_bond_atom1(nullptr), d_bond_atom2(nullptr),
+    d_bond_k(nullptr), d_bond_r0(nullptr),
+    num_angles_cached(0), d_angle_atom1(nullptr), d_angle_atom2(nullptr), d_angle_atom3(nullptr),
+    d_angle_k(nullptr), d_angle_theta0(nullptr),
+    num_dihedrals_cached(0), d_dihedral_atom1(nullptr), d_dihedral_atom2(nullptr),
+    d_dihedral_atom3(nullptr), d_dihedral_atom4(nullptr),
+    d_dihedral_k(nullptr), d_dihedral_phi0(nullptr), d_dihedral_n(nullptr),
+    allocated_particles(0), allocated_neighbors(0),
+    max_types(0),
+    device_data_initialized(false),
+    bonded_topology_on_device(false),
+    block_size(256),  // Optimal for most GPUs
+    device_id(0) {
+}
+
+ForceCalculatorCUDA::~ForceCalculatorCUDA() {
+    finalize();
+}
+
+void ForceCalculatorCUDA::initialize() {
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count <= 0) throw std::runtime_error("No CUDA device is visible");
+
+    // Map ranks by node-local rank, not MPI_COMM_WORLD rank.  World-rank modulo
+    // only works accidentally for uniform process placement across nodes.
+    MPI_Comm local_comm = MPI_COMM_NULL;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0,
+                        MPI_INFO_NULL, &local_comm);
+    int local_rank = 0;
+    MPI_Comm_rank(local_comm, &local_rank);
+    device_id = local_rank % device_count;
+    MPI_Comm_free(&local_comm);
+    CUDA_CHECK(cudaSetDevice(device_id));
+
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
+    std::cout << "[CUDA] MPI rank " << get_mpi_rank()
+              << " using local GPU " << device_id << " (" << prop.name
+              << ", cc " << prop.major << "." << prop.minor << ")\n";
+
+    // Allocate energy buffers once
+    CUDA_CHECK(cudaMalloc(&d_potential_energy, sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_kinetic_energy, sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_virial, sizeof(Real)));  // NEW: virial for pressure calculation
+
+    // Create a dedicated CUDA stream for force/energy operations
+    CUDA_CHECK(cudaStreamCreate(&force_stream));
+}
+
+void ForceCalculatorCUDA::finalize() {
+    // Free device memory
+    if (d_x) cudaFree(d_x);
+    if (d_y) cudaFree(d_y);
+    if (d_z) cudaFree(d_z);
+    if (d_fx) cudaFree(d_fx);
+    if (d_fy) cudaFree(d_fy);
+    if (d_fz) cudaFree(d_fz);
+    if (d_vx) cudaFree(d_vx);
+    if (d_vy) cudaFree(d_vy);
+    if (d_vz) cudaFree(d_vz);
+    if (d_mass) cudaFree(d_mass);
+    if (d_charge) cudaFree(d_charge);
+    if (d_type) cudaFree(d_type);
+    if (d_global_id) cudaFree(d_global_id);
+    if (d_x_ref) cudaFree(d_x_ref);
+    if (d_y_ref) cudaFree(d_y_ref);
+    if (d_z_ref) cudaFree(d_z_ref);
+    if (d_max_disp_sq) cudaFree(d_max_disp_sq);
+    if (d_neighbors) cudaFree(d_neighbors);
+    if (d_num_neighbors) cudaFree(d_num_neighbors);
+    if (d_neighbor_offset) cudaFree(d_neighbor_offset);
+    if (d_potential_energy) cudaFree(d_potential_energy);
+    if (d_kinetic_energy) cudaFree(d_kinetic_energy);
+    if (d_virial) cudaFree(d_virial);  // NEW: free virial memory
+    
+    // Free 1D arrays for mixing rules
+    if (d_epsilon_mixed) {
+        cudaFree(d_epsilon_mixed);
+        d_epsilon_mixed = nullptr;
+    }
+    if (d_sigma_mixed) {
+        cudaFree(d_sigma_mixed);
+        d_sigma_mixed = nullptr;
+    }
+    
+    // Free bonded topology device memory
+    free_bonded_topology_device();
+
+    // Cleanup Ewald/PME reciprocal-space resources
+    free_ewald_resources();
+
+    // Destroy CUDA stream if created
+    if (force_stream) {
+        cudaStreamDestroy(force_stream);
+        force_stream = nullptr;
+    }
+}
+
+// ============================================================================
+// GPU-RESIDENT BONDED TOPOLOGY MANAGEMENT
+// ============================================================================
+
+void ForceCalculatorCUDA::upload_bonded_topology_to_device(MDSystem& system) {
+    // MDSystem owns the rank-local global-ID -> owned/ghost-slot mapping.
+    free_bonded_topology_device();
+    Topology& topology = system.get_topology();
+
+    std::vector<size_t> h_b1, h_b2;
+    std::vector<Real> h_bk, h_br0;
+    for (const auto& b : system.get_local_bonds()) {
+        const BondType& t = topology.get_bond_type(b.type);
+        h_b1.push_back(b.atom1); h_b2.push_back(b.atom2);
+        h_bk.push_back(t.k); h_br0.push_back(t.r0);
+    }
+    num_bonds_cached = h_b1.size();
+    if (num_bonds_cached) {
+        CUDA_CHECK(cudaMalloc(&d_bond_atom1, num_bonds_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_bond_atom2, num_bonds_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_bond_k, num_bonds_cached * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_bond_r0, num_bonds_cached * sizeof(Real)));
+        CUDA_CHECK(cudaMemcpy(d_bond_atom1, h_b1.data(), num_bonds_cached*sizeof(size_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bond_atom2, h_b2.data(), num_bonds_cached*sizeof(size_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bond_k, h_bk.data(), num_bonds_cached*sizeof(Real), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bond_r0, h_br0.data(), num_bonds_cached*sizeof(Real), cudaMemcpyHostToDevice));
+    }
+
+    std::vector<size_t> h_a1, h_a2, h_a3;
+    std::vector<Real> h_ak, h_at0;
+    for (const auto& a : system.get_local_angles()) {
+        const AngleType& t = topology.get_angle_type(a.type);
+        h_a1.push_back(a.atom1); h_a2.push_back(a.atom2); h_a3.push_back(a.atom3);
+        h_ak.push_back(t.k); h_at0.push_back(t.theta0);
+    }
+    num_angles_cached = h_a1.size();
+    if (num_angles_cached) {
+        CUDA_CHECK(cudaMalloc(&d_angle_atom1, num_angles_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_angle_atom2, num_angles_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_angle_atom3, num_angles_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_angle_k, num_angles_cached * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_angle_theta0, num_angles_cached * sizeof(Real)));
+        CUDA_CHECK(cudaMemcpy(d_angle_atom1,h_a1.data(),num_angles_cached*sizeof(size_t),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_angle_atom2,h_a2.data(),num_angles_cached*sizeof(size_t),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_angle_atom3,h_a3.data(),num_angles_cached*sizeof(size_t),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_angle_k,h_ak.data(),num_angles_cached*sizeof(Real),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_angle_theta0,h_at0.data(),num_angles_cached*sizeof(Real),cudaMemcpyHostToDevice));
+    }
+
+    std::vector<size_t> h_d1,h_d2,h_d3,h_d4;
+    std::vector<Real> h_dk,h_dp0; std::vector<int> h_dn;
+    for (const auto& d : system.get_local_dihedrals()) {
+        const DihedralType& t = topology.get_dihedral_type(d.type);
+        h_d1.push_back(d.atom1); h_d2.push_back(d.atom2);
+        h_d3.push_back(d.atom3); h_d4.push_back(d.atom4);
+        h_dk.push_back(t.k); h_dp0.push_back(t.phi0); h_dn.push_back(t.n);
+    }
+    num_dihedrals_cached = h_d1.size();
+    if (num_dihedrals_cached) {
+        CUDA_CHECK(cudaMalloc(&d_dihedral_atom1, num_dihedrals_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_dihedral_atom2, num_dihedrals_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_dihedral_atom3, num_dihedrals_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_dihedral_atom4, num_dihedrals_cached * sizeof(size_t)));
+        CUDA_CHECK(cudaMalloc(&d_dihedral_k, num_dihedrals_cached * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_dihedral_phi0, num_dihedrals_cached * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_dihedral_n, num_dihedrals_cached * sizeof(int)));
+        
+        CUDA_CHECK(cudaMemcpy(d_dihedral_atom1,h_d1.data(),num_dihedrals_cached*sizeof(size_t),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_dihedral_atom2,h_d2.data(),num_dihedrals_cached*sizeof(size_t),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_dihedral_atom3,h_d3.data(),num_dihedrals_cached*sizeof(size_t),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_dihedral_atom4,h_d4.data(),num_dihedrals_cached*sizeof(size_t),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_dihedral_k,h_dk.data(),num_dihedrals_cached*sizeof(Real),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_dihedral_phi0,h_dp0.data(),num_dihedrals_cached*sizeof(Real),cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_dihedral_n,h_dn.data(),num_dihedrals_cached*sizeof(int),cudaMemcpyHostToDevice));
+    }
+    bonded_topology_on_device = true;
+}
+
+void ForceCalculatorCUDA::refresh_bonded_topology_on_device(MDSystem& system) {
+    if (!device_data_initialized) return;
+
+    ParticleData& particles = system.get_particles();
+    const size_t total_count = system.get_total_particles();
+    const size_t local_count = system.get_local_particles();
+    if (particles.global_id.size() < total_count) particles.global_id.resize(total_count);
+
+    std::vector<int> current_ids(total_count);
+    if (total_count != 0) {
+        CUDA_CHECK(cudaMemcpyAsync(current_ids.data(), d_global_id,
+                                   total_count * sizeof(int),
+                                   cudaMemcpyDeviceToHost, force_stream));
+        CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    }
+    if (local_count == bonded_layout_local_count_ && current_ids == bonded_layout_global_ids_) {
+        return;
+    }
+
+    std::copy(current_ids.begin(), current_ids.end(), particles.global_id.begin());
+    system.refresh_local_bonded_topology();
+    upload_bonded_topology_to_device(system);
+    bonded_layout_global_ids_ = std::move(current_ids);
+    bonded_layout_local_count_ = local_count;
+}
+
+void ForceCalculatorCUDA::free_bonded_topology_device() {
+    // Free bond topology
+    if (d_bond_atom1) { cudaFree(d_bond_atom1); d_bond_atom1 = nullptr; }
+    if (d_bond_atom2) { cudaFree(d_bond_atom2); d_bond_atom2 = nullptr; }
+    if (d_bond_k) { cudaFree(d_bond_k); d_bond_k = nullptr; }
+    if (d_bond_r0) { cudaFree(d_bond_r0); d_bond_r0 = nullptr; }
+    
+    // Free angle topology
+    if (d_angle_atom1) { cudaFree(d_angle_atom1); d_angle_atom1 = nullptr; }
+    if (d_angle_atom2) { cudaFree(d_angle_atom2); d_angle_atom2 = nullptr; }
+    if (d_angle_atom3) { cudaFree(d_angle_atom3); d_angle_atom3 = nullptr; }
+    if (d_angle_k) { cudaFree(d_angle_k); d_angle_k = nullptr; }
+    if (d_angle_theta0) { cudaFree(d_angle_theta0); d_angle_theta0 = nullptr; }
+    
+    // Free dihedral topology
+    if (d_dihedral_atom1) { cudaFree(d_dihedral_atom1); d_dihedral_atom1 = nullptr; }
+    if (d_dihedral_atom2) { cudaFree(d_dihedral_atom2); d_dihedral_atom2 = nullptr; }
+    if (d_dihedral_atom3) { cudaFree(d_dihedral_atom3); d_dihedral_atom3 = nullptr; }
+    if (d_dihedral_atom4) { cudaFree(d_dihedral_atom4); d_dihedral_atom4 = nullptr; }
+    if (d_dihedral_k) { cudaFree(d_dihedral_k); d_dihedral_k = nullptr; }
+    if (d_dihedral_phi0) { cudaFree(d_dihedral_phi0); d_dihedral_phi0 = nullptr; }
+    if (d_dihedral_n) { cudaFree(d_dihedral_n); d_dihedral_n = nullptr; }
+    
+    num_bonds_cached = 0;
+    num_angles_cached = 0;
+    num_dihedrals_cached = 0;
+    bonded_topology_on_device = false;
+}
+
+// ============================================================================
+
+dsdecomp::ParticleView ForceCalculatorCUDA::particle_info_view(size_t count) {
+    if (!device_data_initialized || count > allocated_particles) {
+        throw std::runtime_error("CUDA particle view requested outside allocated device storage");
+    }
+    dsdecomp::ParticleView view;
+    view.memory_space = dsdecomp::MemorySpace::CudaDevice;
+    view.count = count;
+    view.x=d_x; view.y=d_y; view.z=d_z;
+    view.vx=d_vx; view.vy=d_vy; view.vz=d_vz;
+    view.fx=d_fx; view.fy=d_fy; view.fz=d_fz;
+    view.mass=d_mass; view.charge=d_charge;
+    view.type=d_type; view.global_id=d_global_id;
+    return view;
+}
+
+bool ForceCalculatorCUDA::ensure_device_particle_capacity(size_t required,
+                                                           size_t preserve_count) {
+    if (required <= allocated_particles) return false;
+    if (!device_data_initialized) {
+        throw std::runtime_error("cannot grow CUDA particle storage before initial upload");
+    }
+    preserve_count = std::min(preserve_count, allocated_particles);
+    const size_t new_capacity = std::max(required,
+        std::max<size_t>(64, allocated_particles + allocated_particles/2));
+
+    auto grow_real = [&](Real*& pointer, bool preserve) {
+        Real* replacement = nullptr;
+        CUDA_CHECK(cudaMalloc(&replacement, new_capacity*sizeof(Real)));
+        if (preserve && preserve_count) {
+            CUDA_CHECK(cudaMemcpyAsync(replacement, pointer,
+                preserve_count*sizeof(Real), cudaMemcpyDeviceToDevice, force_stream));
+            CUDA_CHECK(cudaStreamSynchronize(force_stream));
+        }
+        if (pointer) CUDA_CHECK(cudaFree(pointer));
+        pointer = replacement;
+    };
+    auto grow_int = [&](int*& pointer, bool preserve) {
+        int* replacement = nullptr;
+        CUDA_CHECK(cudaMalloc(&replacement, new_capacity*sizeof(int)));
+        if (preserve && preserve_count) {
+            CUDA_CHECK(cudaMemcpyAsync(replacement, pointer,
+                preserve_count*sizeof(int), cudaMemcpyDeviceToDevice, force_stream));
+            CUDA_CHECK(cudaStreamSynchronize(force_stream));
+        }
+        if (pointer) CUDA_CHECK(cudaFree(pointer));
+        pointer = replacement;
+    };
+
+    grow_real(d_x,true); grow_real(d_y,true); grow_real(d_z,true);
+    grow_real(d_vx,true); grow_real(d_vy,true); grow_real(d_vz,true);
+    grow_real(d_fx,true); grow_real(d_fy,true); grow_real(d_fz,true);
+    grow_real(d_mass,true); grow_real(d_charge,true);
+    grow_int(d_type,true); grow_int(d_global_id,true);
+    grow_real(d_x_ref,true); grow_real(d_y_ref,true); grow_real(d_z_ref,true);
+    grow_int(d_num_neighbors,false); grow_int(d_neighbor_offset,false);
+    CUDA_CHECK(cudaMemsetAsync(d_num_neighbors,0,new_capacity*sizeof(int),force_stream));
+    CUDA_CHECK(cudaMemsetAsync(d_neighbor_offset,0,new_capacity*sizeof(int),force_stream));
+    allocated_particles = new_capacity;
+    return true;
+}
+
+dsdecomp::StorageResizeResult ForceCalculatorCUDA::resize_particle_info(
+    size_t required, size_t preserve_count) {
+    const bool reallocated =
+        ensure_device_particle_capacity(required, preserve_count);
+    return {particle_info_view(required), reallocated};
+}
+
+// ============================================================================
+
+void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles, size_t max_neighbors) {
+    // Safety checks
+    if (num_particles == 0) {
+        if (is_rank_zero()) {
+            std::cerr << "WARNING: allocate_device_memory called with num_particles=0" << std::endl;
+        }
+        return;
+    }
+    
+    if (max_neighbors > 10000) {
+        if (is_rank_zero()) {
+            std::cerr << "WARNING: allocate_device_memory: max_neighbors=" << max_neighbors 
+                      << " seems too large, capping at 2000" << std::endl;
+        }
+        max_neighbors = 2000;
+    }
+    
+    if (num_particles > allocated_particles) {
+        // Free old memory
+        if (d_x) cudaFree(d_x);
+        if (d_y) cudaFree(d_y);
+        if (d_z) cudaFree(d_z);
+        if (d_fx) cudaFree(d_fx);
+        if (d_fy) cudaFree(d_fy);
+        if (d_fz) cudaFree(d_fz);
+        if (d_vx) cudaFree(d_vx);
+        if (d_vy) cudaFree(d_vy);
+        if (d_vz) cudaFree(d_vz);
+        if (d_mass) cudaFree(d_mass);
+        if (d_charge) cudaFree(d_charge);
+        if (d_type) cudaFree(d_type);
+        if (d_global_id) cudaFree(d_global_id);
+        if (d_num_neighbors) cudaFree(d_num_neighbors);
+        if (d_neighbor_offset) cudaFree(d_neighbor_offset);
+        if (d_x_ref) cudaFree(d_x_ref);
+        if (d_y_ref) cudaFree(d_y_ref);
+        if (d_z_ref) cudaFree(d_z_ref);
+        
+        // Allocate new memory
+        CUDA_CHECK(cudaMalloc(&d_x, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_y, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_z, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_fx, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_fy, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_fz, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_vx, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_vy, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_vz, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_mass, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_charge, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_type, num_particles * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_global_id, num_particles * sizeof(int)));  // int, not size_t
+        CUDA_CHECK(cudaMalloc(&d_num_neighbors, num_particles * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_neighbor_offset, num_particles * sizeof(int)));
+        
+        // Initialize neighbor list arrays to zero (CRITICAL FIX)
+        CUDA_CHECK(cudaMemset(d_num_neighbors, 0, num_particles * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_neighbor_offset, 0, num_particles * sizeof(int)));
+        
+        // Allocate displacement tracking arrays
+        CUDA_CHECK(cudaMalloc(&d_x_ref, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_y_ref, num_particles * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(&d_z_ref, num_particles * sizeof(Real)));
+        
+        allocated_particles = num_particles;
+    }
+    
+    // Allocate scalar for max displacement (if not already allocated)
+    if (!d_max_disp_sq) {
+        CUDA_CHECK(cudaMalloc(&d_max_disp_sq, sizeof(Real)));
+    }
+    
+    // Check for overflow in neighbor allocation
+    size_t total_neighbors = num_particles * max_neighbors;
+    if (total_neighbors / num_particles != max_neighbors) {
+        // Overflow detected
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: Overflow in neighbor list allocation: " 
+                      << num_particles << " * " << max_neighbors << std::endl;
+        }
+        throw std::runtime_error("Neighbor list allocation overflow");
+    }
+    
+    if (total_neighbors > allocated_neighbors) {
+        if (d_neighbors) cudaFree(d_neighbors);
+        CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors * sizeof(int)));
+        allocated_neighbors = total_neighbors;
+    }
+}
+
+void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
+    ParticleData& particles = system.get_particles();
+    size_t num_particles = system.get_num_particles();
+    size_t local_particles = system.get_local_particles();
+    
+    // Comprehensive safety check: verify ALL arrays have sufficient size
+    size_t min_size = num_particles;
+    min_size = std::min(min_size, particles.x.size());
+    min_size = std::min(min_size, particles.y.size());
+    min_size = std::min(min_size, particles.z.size());
+    min_size = std::min(min_size, particles.vx.size());
+    min_size = std::min(min_size, particles.vy.size());
+    min_size = std::min(min_size, particles.vz.size());
+    min_size = std::min(min_size, particles.mass.size());
+    min_size = std::min(min_size, particles.type.size());
+    min_size = std::min(min_size, particles.global_id.size());
+    
+    if (min_size < num_particles) {
+        if (is_rank_zero()) {
+            std::cerr << "WARNING: initial_upload_to_device: array size mismatch. "
+                      << "num_particles=" << num_particles 
+                      << " but min_array_size=" << min_size << std::endl;
+            std::cerr << "  x:" << particles.x.size()
+                      << " y:" << particles.y.size()
+                      << " z:" << particles.z.size()
+                      << " vx:" << particles.vx.size()
+                      << " mass:" << particles.mass.size()
+                      << " type:" << particles.type.size()
+                      << " global_id:" << particles.global_id.size() << std::endl;
+        }
+        // Use actual minimum size to avoid segfault
+        num_particles = min_size;
+    }
+    
+    if (num_particles == 0) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: initial_upload_to_device: num_particles=0 after safety check" << std::endl;
+        }
+        return;
+    }
+    
+    // Estimate max neighbors based on density and neighbor list cutoff (includes skin)
+    SimulationBox& box = system.get_box();
+    Real volume = box.lx * box.ly * box.lz;
+    Real density = static_cast<Real>(num_particles) / volume;
+    
+    // Get actual neighbor list cutoff (includes skin distance)
+    NeighborList& nlist = system.get_neighbor_list();
+    Real effective_cutoff = nlist.cutoff; // This includes skin
+    
+    Real cutoff_volume = (4.0 / 3.0) * M_PI * effective_cutoff * effective_cutoff * effective_cutoff;
+    size_t estimated_max_neighbors = static_cast<size_t>(density * cutoff_volume * 2.0); // 2x safety factor
+    
+    // Ensure reasonable bounds (minimum 100, maximum 1000 to avoid excessive initial allocation)
+    estimated_max_neighbors = std::max(size_t(100), std::min(size_t(1000), estimated_max_neighbors));
+    
+    
+    // Allocate device memory if needed
+    allocate_device_memory(num_particles, estimated_max_neighbors);
+    
+    // Upload all particle state data (positions, velocities, masses, types, charges)
+    CUDA_CHECK(cudaMemcpyAsync(d_x, particles.x.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_y, particles.y.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_z, particles.z.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_vx, particles.vx.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_vy, particles.vy.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_vz, particles.vz.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    
+    // Upload particle properties (masses, types, charges) - these are typically constant
+    CUDA_CHECK(cudaMemcpyAsync(d_mass, particles.mass.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_type, particles.type.data(), num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_global_id, particles.global_id.data(), num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));  // int, not size_t
+
+    // ParticleData is already global-ID aware after decomposition; indexing the
+    // global topology by a local slot would assign another atom's charge.
+    CUDA_CHECK(cudaMemcpyAsync(d_charge, particles.charge.data(),
+                               num_particles * sizeof(Real),
+                               cudaMemcpyHostToDevice, force_stream));
+    
+    // Upload force field parameters (mixing rules) - these are constant
+    ForceFieldParams& params = system.get_ff_params();
+    if (!d_epsilon_mixed && !params.epsilon_mixed.empty()) {
+        max_types = static_cast<int>(params.epsilon_mixed.size());
+        size_t total_params = static_cast<size_t>(max_types) * static_cast<size_t>(max_types);
+
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_epsilon_mixed), total_params * sizeof(Real)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_sigma_mixed), total_params * sizeof(Real)));
+
+        std::vector<Real> h_epsilon(total_params);
+        std::vector<Real> h_sigma(total_params);
+        for (int i = 0; i < max_types; i++) {
+            for (int j = 0; j < max_types; j++) {
+                size_t idx = static_cast<size_t>(i) * static_cast<size_t>(max_types) + static_cast<size_t>(j);
+                h_epsilon[idx] = params.epsilon_mixed[i][j];
+                h_sigma[idx] = params.sigma_mixed[i][j];
+            }
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(d_epsilon_mixed, h_epsilon.data(),
+                             total_params * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_sigma_mixed, h_sigma.data(),
+                             total_params * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    }
+    
+    // Synchronize to ensure all uploads complete
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    
+    // Upload bonded topology to GPU (ONCE - GPU-resident strategy)
+    upload_bonded_topology_to_device(system);
+    
+    // Initialize reference positions for displacement tracking (for Verlet list rebuild check)
+    size_t num_local_particles = system.get_local_particles();
+    if (d_x_ref && d_y_ref && d_z_ref) {
+        CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, num_local_particles * sizeof(Real), 
+                             cudaMemcpyDeviceToDevice, force_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_y_ref, d_y, num_local_particles * sizeof(Real), 
+                             cudaMemcpyDeviceToDevice, force_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_z_ref, d_z, num_local_particles * sizeof(Real), 
+                             cudaMemcpyDeviceToDevice, force_stream));
+        CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    }
+    
+    device_data_initialized = true;
+    
+}
+
+void ForceCalculatorCUDA::update_neighbor_list_on_device(MDSystem& system) {
+    size_t num_particles = system.get_num_particles();
+    
+    // Only update neighbor list data on device
+    NeighborList& nlist = system.get_neighbor_list();
+    
+    // Check if neighbor list size exceeds allocated memory and reallocate if needed
+    if (!nlist.neighbors.empty()) {
+        size_t total_neighbors_needed = nlist.neighbors.size();
+        if (total_neighbors_needed > allocated_neighbors) {
+            if (is_rank_zero()) {
+                std::cout << "Reallocating neighbor list memory: " << allocated_neighbors 
+                          << " -> " << total_neighbors_needed << " neighbors" << std::endl;
+            }
+            if (d_neighbors) cudaFree(d_neighbors);
+            CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors_needed * sizeof(int)));
+            allocated_neighbors = total_neighbors_needed;
+        }
+        
+        CUDA_CHECK(cudaMemcpyAsync(d_neighbors, nlist.neighbors.data(),
+                             nlist.neighbors.size() * sizeof(int), cudaMemcpyHostToDevice, force_stream));
+    }
+    if (!nlist.num_neighbors.empty()) {
+        CUDA_CHECK(cudaMemcpyAsync(d_num_neighbors, nlist.num_neighbors.data(),
+                             num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));
+    }
+    if (!nlist.neighbor_offset.empty()) {
+        CUDA_CHECK(cudaMemcpyAsync(d_neighbor_offset, nlist.neighbor_offset.data(),
+                             num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));
+    }
+    
+    // CRITICAL: Synchronize to ensure neighbor list data is on GPU before it's used
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+extern "C" void launch_cuda_neighbor_list_build(
+    const Real* d_x, const Real* d_y, const Real* d_z,
+    int* d_neighbor_list,
+    int* d_num_neighbors,
+    int* d_neighbor_offset,
+    int n_local, int n_total,
+    Real cutoff, Real verlet_skin,
+    Real lx, Real ly, Real lz,
+    bool periodic_x, bool periodic_y, bool periodic_z,
+    int max_neighbors_per_particle,
+    cudaStream_t stream);
+
+void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
+    if (!device_data_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: GPU data not initialized. Call initial_upload_to_device() first." << std::endl;
+        }
+        return;
+    }
+
+    size_t num_particles = system.get_num_particles();
+    size_t local_particles = system.get_local_particles();
+    if (local_particles == 0 || num_particles == 0) {
+        return;
+    }
+
+    SimulationBox& box = system.get_box();
+    NeighborList& nlist = system.get_neighbor_list();
+    
+    // nlist.cutoff already stores (physical_cutoff + verlet_skin) per neighbor_list.cpp
+    Real search_radius = nlist.cutoff; 
+    if (!(search_radius > 0.0)) {
+        // Recover from missing host-side neighbor metadata in GPU-first flows.
+        Real skin = (nlist.skin_distance > 0.0) ? nlist.skin_distance : 2.0;
+        search_radius = system.get_physical_cutoff() + skin;
+        nlist.skin_distance = skin;
+        nlist.cutoff = search_radius;
+        if (is_rank_zero()) {
+            std::cerr << "[CUDA] WARNING: invalid neighbor cutoff metadata; using fallback cutoff="
+                      << search_radius << " (physical+skin)." << std::endl;
+        }
+    }
+    
+    // Check if we need to reallocate neighbor list memory
+    // The kernel needs a fixed max neighbors per particle for the array structure
+    // This is a limitation of the current simple kernel
+    const int max_neighbors_per_particle = 1024; // Increased from 512 to handle dense systems
+    
+    size_t total_neighbors_needed = (size_t)local_particles * max_neighbors_per_particle;
+    
+    // Safety: check GPU memory before allocating (1M * 1024 * 4B = ~4GB, may exceed VRAM)
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    size_t needed_bytes = total_neighbors_needed * sizeof(int);
+    if (needed_bytes > free_mem * 8 / 10) { // Use at most 80% of free VRAM
+        if (is_rank_zero()) {
+            std::cerr << "WARNING: neighbor list would need " << needed_bytes / (1024*1024) 
+                      << " MB but only " << free_mem / (1024*1024) 
+                      << " MB free. Reducing max_neighbors_per_particle." << std::endl;
+        }
+        // Reduce max neighbors to fit in available memory (leave 20% headroom)
+        total_neighbors_needed = (free_mem * 8 / 10) / sizeof(int);
+    }
+
+    if (total_neighbors_needed > allocated_neighbors) {
+        if (d_neighbors) cudaFree(d_neighbors);
+        CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors_needed * sizeof(int)));
+        allocated_neighbors = total_neighbors_needed;
+    }
+    
+    // Compute actual max_neighbors_per_particle based on what was allocated
+    int actual_max_neighbors = (int)(allocated_neighbors / local_particles);
+    if (actual_max_neighbors < 1) {
+        actual_max_neighbors = 1;
+    }
+    
+    // Launch the neighbor list build kernel
+    launch_cuda_neighbor_list_build(
+        d_x, d_y, d_z,
+        d_neighbors, d_num_neighbors, d_neighbor_offset,
+        local_particles, num_particles,
+        search_radius, 0.0, // skin is already in search_radius
+        box.lx, box.ly, box.lz,
+        box.periodic_x, box.periodic_y, box.periodic_z,
+        actual_max_neighbors,
+        force_stream
+    );
+    
+    // Save reference positions for displacement tracking (LOCAL particles only)
+    CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, local_particles * sizeof(Real), 
+                               cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_y_ref, d_y, local_particles * sizeof(Real), 
+                               cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_z_ref, d_z, local_particles * sizeof(Real), 
+                               cudaMemcpyDeviceToDevice, force_stream));
+    
+    // Synchronize to ensure list is built before force calculation
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+void ForceCalculatorCUDA::download_from_device(MDSystem& system) {
+    if (!device_data_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "WARNING: download_from_device called before GPU data initialization; skipping." << std::endl;
+        }
+        return;
+    }
+
+    ParticleData& particles = system.get_particles();
+    size_t num_particles = system.get_num_particles();
+
+    if (num_particles == 0) {
+        return;
+    }
+    
+    // CRITICAL FIX: Ensure all GPU operations are complete before downloading
+    // This is especially important when output_freq > 1, as multiple steps
+    // of computation may have occurred since the last download
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    
+    // Download only requested data (positions, velocities, forces)
+    CUDA_CHECK(cudaMemcpyAsync(particles.x.data(), d_x, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.y.data(), d_y, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.z.data(), d_z, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.vx.data(), d_vx, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.vy.data(), d_vy, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.vz.data(), d_vz, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.fx.data(), d_fx, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.fy.data(), d_fy, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.fz.data(), d_fz, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.mass.data(), d_mass, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.charge.data(), d_charge, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.type.data(), d_type, num_particles * sizeof(int), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.global_id.data(), d_global_id, num_particles * sizeof(int), cudaMemcpyDeviceToHost, force_stream));
+    
+    // Download energies
+    Real h_potential_energy = 0.0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_potential_energy, d_potential_energy, sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
+    
+    // Synchronize to ensure all downloads complete
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    last_potential_energy = h_potential_energy;
+}
+
+// NEW: Update reference positions on device after neighbor list rebuild
+// This is critical for GPU-resident architecture to track particle displacements
+// without copying data to host
+void ForceCalculatorCUDA::update_reference_positions_on_device(size_t num_local_particles) {
+    if (!device_data_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: GPU data not initialized. Cannot update reference positions." << std::endl;
+        }
+        return;
+    }
+    
+    // Copy current positions to reference positions (Device-to-Device, no host involved)
+    // This resets the displacement tracking for the next neighbor list rebuild check
+    CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, num_local_particles * sizeof(Real), 
+                               cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_y_ref, d_y, num_local_particles * sizeof(Real), 
+                               cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_z_ref, d_z, num_local_particles * sizeof(Real), 
+                               cudaMemcpyDeviceToDevice, force_stream));
+    
+    // Synchronize to ensure reference positions are updated before next step
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+// NEW: Upload forces from host to device (for Python/ML force integration)
+void ForceCalculatorCUDA::upload_forces_to_device(const ParticleData& particles, size_t num_particles) {
+    if (!device_data_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: GPU data not initialized. Call initial_upload_to_device() first." << std::endl;
+        }
+        return;
+    }
+    
+    // Validate sizes
+    if (particles.fx.size() < num_particles || 
+        particles.fy.size() < num_particles || 
+        particles.fz.size() < num_particles) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: Force array size mismatch in upload_forces_to_device" << std::endl;
+        }
+        return;
+    }
+    
+    // Upload force arrays from host to device
+    CUDA_CHECK(cudaMemcpyAsync(d_fx, particles.fx.data(), num_particles * sizeof(Real), 
+                               cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_fy, particles.fy.data(), num_particles * sizeof(Real), 
+                               cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_fz, particles.fz.data(), num_particles * sizeof(Real), 
+                               cudaMemcpyHostToDevice, force_stream));
+    
+    // Synchronize to ensure upload completes before force is used in integrator
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MLP-efficient helpers: positions D→H  and  forces H→D
+// These use the existing force_stream so no extra synchronization is required
+// between the integration kernel and the ML inference call.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void ForceCalculatorCUDA::download_positions_for_ml(ParticleData& particles,
+                                                     size_t num_particles) {
+    if (!device_data_initialized) return;
+
+    // Ensure the integration kernel has finished writing d_x/y/z
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(particles.x.data(), d_x,
+                               num_particles * sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.y.data(), d_y,
+                               num_particles * sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.z.data(), d_z,
+                               num_particles * sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+void ForceCalculatorCUDA::upload_forces_from_ml(const ParticleData& particles,
+                                                  size_t num_particles) {
+    if (!device_data_initialized) return;
+
+    CUDA_CHECK(cudaMemcpyAsync(d_fx, particles.fx.data(),
+                               num_particles * sizeof(Real),
+                               cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_fy, particles.fy.data(),
+                               num_particles * sizeof(Real),
+                               cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_fz, particles.fz.data(),
+                               num_particles * sizeof(Real),
+                               cudaMemcpyHostToDevice, force_stream));
+
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+void ForceCalculatorCUDA::download_forces_for_ml(ParticleData& particles,
+                                                  size_t num_particles) {
+    if (!device_data_initialized) return;
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.fx.data(), d_fx, num_particles * sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.fy.data(), d_fy, num_particles * sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(particles.fz.data(), d_fz, num_particles * sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+// Register host position & force vectors as CUDA pinned (page-locked) memory.
+// DMA engines can then transfer directly without an intermediate staging buffer,
+// giving ~2× bandwidth for small-to-medium systems.
+void ForceCalculatorCUDA::register_ml_pinned_buffers(ParticleData& particles,
+                                                       size_t num_particles) {
+    if (ml_buffers_pinned) return;  // already done
+
+    size_t bytes = num_particles * sizeof(Real);
+    #define PIN(ptr) do { \
+        cudaError_t e = cudaHostRegister((ptr), bytes, cudaHostRegisterDefault); \
+        if (e != cudaSuccess) \
+            std::cerr << "[CUDA] cudaHostRegister failed: " \
+                      << cudaGetErrorString(e) << " - falling back to pageable transfers\n"; \
+    } while(0)
+
+    PIN(particles.x.data());
+    PIN(particles.y.data());
+    PIN(particles.z.data());
+    PIN(particles.fx.data());
+    PIN(particles.fy.data());
+    PIN(particles.fz.data());
+    #undef PIN
+
+    ml_buffers_pinned = true;
+}
+
+void ForceCalculatorCUDA::unregister_ml_pinned_buffers(ParticleData& particles) {
+    if (!ml_buffers_pinned) return;
+
+    cudaHostUnregister(particles.x.data());
+    cudaHostUnregister(particles.y.data());
+    cudaHostUnregister(particles.z.data());
+    cudaHostUnregister(particles.fx.data());
+    cudaHostUnregister(particles.fy.data());
+    cudaHostUnregister(particles.fz.data());
+
+    ml_buffers_pinned = false;
+}
+
+void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
+    size_t num_particles = system.get_num_particles();
+    size_t local_particles = system.get_local_particles();
+    
+    // GPU-resident architecture: NO per-step Host→Device copy
+    // Data should already be on GPU from initial_upload_to_device()
+    if (!device_data_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: GPU data not initialized. Call initial_upload_to_device() first." << std::endl;
+        }
+        return;
+    }
+
+    // Clear forces on GPU
+    int num_blocks = (num_particles + block_size - 1) / block_size;
+    clear_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(d_fx, d_fy, d_fz, num_particles);
+
+    // Reset energies and virial on GPU
+    CUDA_CHECK(cudaMemsetAsync(d_potential_energy, 0, sizeof(Real), force_stream));
+    CUDA_CHECK(cudaMemsetAsync(d_virial, 0, sizeof(Real), force_stream));  // NEW: reset virial
+    
+    // Get force field configuration
+    ForceManager& force_manager = system.get_force_manager();
+    const auto& force_config = force_manager.get_config();
+    SimulationBox& box = system.get_box();
+    
+    // Box parameters for periodic boundary conditions
+    Real box_x = box.lx;
+    Real box_y = box.ly;
+    Real box_z = box.lz;
+    Real inv_box_x = 1.0 / box_x;
+    Real inv_box_y = 1.0 / box_y;
+    Real inv_box_z = 1.0 / box_z;
+    
+    Real physical_cutoff = system.get_physical_cutoff();
+    Real cutoff_sq = physical_cutoff * physical_cutoff;
+    
+    // Launch kernels based on configuration
+    num_blocks = (local_particles + block_size - 1) / block_size;
+    
+    if (builtin_forces_enabled_ && force_config.enable_bonds) {
+        compute_bond_forces(system);
+    }
+    
+    if (builtin_forces_enabled_ && force_config.enable_angles) {
+        compute_angle_forces(system);
+    }
+    
+    if (builtin_forces_enabled_ && force_config.enable_dihedrals) {
+        compute_dihedral_forces(system);
+    }
+
+    // LibTorch MLIP is a force component, not an exclusive replacement.
+    // Built-in contributions above/below and MLIP forces therefore accumulate.
+    if (mlip_runtime_enabled_) {
+        compute_mlip_runtime_forces(system);
+    }
+
+    if (builtin_forces_enabled_ && force_config.enable_lennard_jones) {
+        compute_lj_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_fx, d_fy, d_fz,
+            d_type, d_global_id,
+            d_neighbors, d_num_neighbors, d_neighbor_offset,
+            d_epsilon_mixed, d_sigma_mixed,
+            d_potential_energy,
+            d_virial,  // NEW: pass virial pointer
+            box_x, box_y, box_z,
+            inv_box_x, inv_box_y, inv_box_z,
+            local_particles, num_particles,
+            max_types,
+            cutoff_sq
+        );
+    }
+    
+    // Electrostatic forces: full Ewald summation (real-space erfc-screened
+    // neighbor sum + reciprocal-space PME grid + self-energy correction).
+    if (builtin_forces_enabled_ && force_config.enable_coulomb) {
+        compute_electrostatic_forces_ewald(system);
+    }
+
+    // GPU-resident: NO automatic download
+    // Forces remain on GPU for integrator to use
+    // Only download energies and virial for reporting/barostat
+    Real h_potential_energy = 0.0;
+    Real h_virial = 0.0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_potential_energy, d_potential_energy, sizeof(Real), 
+                         cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(&h_virial, d_virial, sizeof(Real), 
+                         cudaMemcpyDeviceToHost, force_stream));  // NEW: download virial
+    
+    // Single synchronization point - wait for both kernel and memcpy to complete
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    last_potential_energy = h_potential_energy;
+    last_virial = h_virial;  // NEW: store virial
+    
+    // Keep virial rank-local: MDSimulation performs the collective at the point
+    // where pressure is needed.  Returning a global virial here caused a second
+    // Allreduce in the barostat and multiplied it by the MPI world size.
+    Real global_potential_energy = 0.0;
+    MPI_Allreduce(&last_potential_energy, &global_potential_energy,
+                  1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    last_potential_energy = global_potential_energy;
+}
+
+void ForceCalculatorCUDA::compute_lj_forces(MDSystem& system) {
+    // Already handled in compute_forces
+}
+
+void ForceCalculatorCUDA::compute_bond_forces(MDSystem& system) {
+    // GPU-resident strategy: topology is already on device, no malloc/free per step
+    if (num_bonds_cached == 0) return;  // No bonds
+    
+    size_t local_particles = system.get_local_particles();
+    SimulationBox& box = system.get_box();
+    
+    // Launch kernel using cached device pointers (NO malloc/copy/free!)
+    int num_blocks = (num_bonds_cached + block_size - 1) / block_size;
+    compute_bond_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+        d_x, d_y, d_z, d_fx, d_fy, d_fz,
+        d_global_id,  // NEW: for ownership rule
+        d_bond_atom1, d_bond_atom2, d_bond_k, d_bond_r0,
+        num_bonds_cached, d_potential_energy,
+        box.lx, box.ly, box.lz,
+        1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+        local_particles
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ForceCalculatorCUDA::compute_angle_forces(MDSystem& system) {
+    // GPU-resident strategy: topology is already on device
+    if (num_angles_cached == 0) return;  // No angles
+    
+    size_t local_particles = system.get_local_particles();
+    SimulationBox& box = system.get_box();
+    
+    // Launch kernel using cached device pointers (NO malloc/copy/free!)
+    int num_blocks = (num_angles_cached + block_size - 1) / block_size;
+    compute_angle_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+        d_x, d_y, d_z, d_fx, d_fy, d_fz,
+        d_global_id,  // NEW: for ownership rule
+        d_angle_atom1, d_angle_atom2, d_angle_atom3, 
+        d_angle_k, d_angle_theta0,
+        num_angles_cached, d_potential_energy,
+        box.lx, box.ly, box.lz,
+        1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+        local_particles
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ForceCalculatorCUDA::compute_dihedral_forces(MDSystem& system) {
+    // GPU-resident strategy: topology is already on device
+    // Now with FULL CUDA implementation (no longer skipped!)
+    if (num_dihedrals_cached == 0) return;  // No dihedrals
+    
+    size_t local_particles = system.get_local_particles();
+    SimulationBox& box = system.get_box();
+    
+    // Launch kernel using cached device pointers
+    int num_blocks = (num_dihedrals_cached + block_size - 1) / block_size;
+    compute_dihedral_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+        d_x, d_y, d_z, d_fx, d_fy, d_fz,
+        d_global_id,  // for ownership rule
+        d_dihedral_atom1, d_dihedral_atom2, d_dihedral_atom3, d_dihedral_atom4,
+        d_dihedral_k, d_dihedral_phi0, d_dihedral_n,
+        num_dihedrals_cached, d_potential_energy,
+        box.lx, box.ly, box.lz,
+        1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+        local_particles
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
+    size_t local_particles = system.get_local_particles();
+
+    // GPU-resident: velocities and masses already on device
+    if (!device_data_initialized) {
+        // Self-heal startup ordering issues by uploading once on first KE request.
+        initial_upload_to_device(system);
+        if (!device_data_initialized) {
+            if (is_rank_zero()) {
+                std::cerr << "ERROR: GPU data not initialized for KE calculation." << std::endl;
+            }
+            return;
+        }
+    }
+
+    if (local_particles == 0) {
+        last_kinetic_energy = 0.0;
+        Real local_ke = 0.0;
+        Real global_ke = 0.0;
+        MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        last_kinetic_energy = global_ke;
+        return;
+    }
+
+    // Reset kinetic energy on GPU
+    CUDA_CHECK(cudaMemsetAsync(d_kinetic_energy, 0, sizeof(Real), force_stream));
+
+    // Launch kernel with shared memory
+    int num_blocks = (local_particles + block_size - 1) / block_size;
+    size_t shared_mem_size = block_size * sizeof(Real);
+
+    calculate_kinetic_energy_kernel<<<num_blocks, block_size, shared_mem_size, force_stream>>>(
+        d_vx, d_vy, d_vz, d_mass, d_kinetic_energy, local_particles
+    );
+
+    // Download result to host
+    Real h_kinetic_energy = 0.0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_kinetic_energy, d_kinetic_energy, sizeof(Real), 
+                         cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    
+    last_kinetic_energy = h_kinetic_energy;
+
+    // MPI reduction for kinetic energy
+    Real local_ke = last_kinetic_energy;
+    Real global_ke = 0.0;
+    MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    last_kinetic_energy = global_ke;
+}
+
+void ForceCalculatorCUDA::integrate_on_device(MDSystem& system, Real dt, const std::string& integrator_type) {
+    if (!device_data_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: GPU data not initialized for integration." << std::endl;
+        }
+        return;
+    }
+    
+    size_t local_particles = system.get_local_particles();
+    SimulationBox& box = system.get_box();
+    
+    // Call appropriate integrator kernel based on type
+    if (integrator_type == "verlet" || integrator_type == "velocity_verlet") {
+        // Velocity Verlet Step 1: position update + half-step velocity update
+        launch_vv_step1_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
+                              d_fx, d_fy, d_fz, d_mass, dt, local_particles,
+                              box.lx, box.ly, box.lz,
+                              box.periodic_x, box.periodic_y, box.periodic_z);
+    } else if (integrator_type == "leap_frog" || integrator_type == "leapfrog") {
+        // Leap-frog: position update using half-step-ahead velocities
+        launch_leap_frog_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
+                               d_fx, d_fy, d_fz, d_mass, dt, local_particles,
+                               box.lx, box.ly, box.lz,
+                               box.periodic_x, box.periodic_y, box.periodic_z,
+                               false);  // false = not first step
+    } else {
+        if (is_rank_zero()) {
+            std::cerr << "WARNING: Unknown integrator type '" << integrator_type 
+                      << "', defaulting to velocity verlet" << std::endl;
+        }
+        launch_vv_step1_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
+                              d_fx, d_fy, d_fz, d_mass, dt, local_particles,
+                              box.lx, box.ly, box.lz,
+                              box.periodic_x, box.periodic_y, box.periodic_z);
+    }
+}
+
+void ForceCalculatorCUDA::complete_velocity_update_on_device(MDSystem& system, Real dt, const std::string& integrator_type) {
+    if (!device_data_initialized) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: GPU data not initialized for velocity update." << std::endl;
+        }
+        return;
+    }
+    
+    size_t local_particles = system.get_local_particles();
+    
+    // Call appropriate velocity update kernel based on type
+    if (integrator_type == "verlet" || integrator_type == "velocity_verlet") {
+        // Velocity Verlet Step 2: second half-step velocity update
+        launch_vv_step2_kernel(d_vx, d_vy, d_vz, d_fx, d_fy, d_fz,
+                              d_mass, dt, local_particles);
+    } else if (integrator_type == "leap_frog" || integrator_type == "leapfrog") {
+        // Leap-frog: full timestep velocity update
+        launch_leap_frog_velocity_update_kernel(d_vx, d_vy, d_vz,
+                                               d_fx, d_fy, d_fz,
+                                               d_mass, dt, local_particles);
+    } else {
+        if (is_rank_zero()) {
+            std::cerr << "WARNING: Unknown integrator type '" << integrator_type 
+                      << "', defaulting to velocity verlet" << std::endl;
+        }
+        launch_vv_step2_kernel(d_vx, d_vy, d_vz, d_fx, d_fy, d_fz,
+                              d_mass, dt, local_particles);
+    }
+}
+
+// ==================== GPU-resident Neighbor List Management ====================
+
+// Helper: atomic max for Real (double or float) - must be declared before use
+__device__ inline void atomicMax_real(Real* address, Real val) {
+    if constexpr (sizeof(Real) == sizeof(double)) {
+        unsigned long long* address_as_ull = reinterpret_cast<unsigned long long*>(address);
+        unsigned long long old = *address_as_ull;
+        unsigned long long assumed;
+        do {
+            assumed = old;
+            old = atomicCAS(address_as_ull, assumed,
+                            __double_as_longlong(fmax(val, __longlong_as_double(assumed))));
+        } while (assumed != old);
+    } else {
+        int* address_as_int = reinterpret_cast<int*>(address);
+        int old = *address_as_int;
+        int assumed;
+        do {
+            assumed = old;
+            old = atomicCAS(address_as_int, assumed,
+                            __float_as_int(fmaxf(static_cast<float>(val), __int_as_float(assumed))));
+        } while (assumed != old);
+    }
+}
+
+// CUDA kernel: Compute squared displacement for each particle and find maximum
+__global__ void compute_max_displacement_kernel(const Real* __restrict__ x, 
+                                                const Real* __restrict__ y, 
+                                                const Real* __restrict__ z,
+                                                const Real* __restrict__ x_ref,
+                                                const Real* __restrict__ y_ref,
+                                                const Real* __restrict__ z_ref,
+                                                Real* max_disp_sq,
+                                                Real box_x, Real box_y, Real box_z,
+                                                bool periodic_x, bool periodic_y, bool periodic_z,
+                                                size_t n) {
+    // Shared memory for block-level reduction
+    __shared__ Real s_max_disp[256];
+    
+    size_t tid = threadIdx.x;
+    size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Each thread computes displacement for its particle
+    Real local_max = 0.0;
+    if (gid < n) {
+        Real dx = x[gid] - x_ref[gid];
+        Real dy = y[gid] - y_ref[gid];
+        Real dz = z[gid] - z_ref[gid];
+
+        if (periodic_x) {
+            if (dx > 0.5 * box_x) dx -= box_x;
+            else if (dx < -0.5 * box_x) dx += box_x;
+        }
+        if (periodic_y) {
+            if (dy > 0.5 * box_y) dy -= box_y;
+            else if (dy < -0.5 * box_y) dy += box_y;
+        }
+        if (periodic_z) {
+            if (dz > 0.5 * box_z) dz -= box_z;
+            else if (dz < -0.5 * box_z) dz += box_z;
+        }
+
+        local_max = dx*dx + dy*dy + dz*dz;
+    }
+    
+    s_max_disp[tid] = local_max;
+    __syncthreads();
+    
+    // Block-level reduction to find maximum
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_max_disp[tid] = fmax(s_max_disp[tid], s_max_disp[tid + stride]);
+        }
+        __syncthreads();
+    }
+    
+    // First thread of each block writes block maximum to global memory
+    if (tid == 0) {
+        atomicMax_real(max_disp_sq, s_max_disp[0]);
+    }
+}
+
+// Compute max displacement on GPU and return to host (single scalar transfer)
+Real ForceCalculatorCUDA::compute_max_displacement_on_device(size_t num_local_particles, const SimulationBox& box) {
+    if (!device_data_initialized || !d_x || !d_x_ref) {
+        return 0.0;  // No reference positions yet
+    }
+
+    if (num_local_particles == 0) {
+        return 0.0;
+    }
+    
+    // Reset device max to zero
+    Real zero = 0.0;
+    CUDA_CHECK(cudaMemcpy(d_max_disp_sq, &zero, sizeof(Real), cudaMemcpyHostToDevice));
+    
+    // Launch kernel to compute max displacement
+    int threads = 256;
+    int blocks = (num_local_particles + threads - 1) / threads;
+    
+    compute_max_displacement_kernel<<<blocks, threads, 0, force_stream>>>(
+        d_x, d_y, d_z,
+        d_x_ref, d_y_ref, d_z_ref,
+        d_max_disp_sq,
+        box.lx, box.ly, box.lz,
+        box.periodic_x, box.periodic_y, box.periodic_z,
+        num_local_particles
+    );
+    CUDA_CHECK(cudaGetLastError());
+    
+    // CRITICAL: Synchronize stream before downloading result
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    
+    // Download single scalar (only a few bytes)
+    Real host_max_disp_sq = 0.0;
+    CUDA_CHECK(cudaMemcpy(&host_max_disp_sq, d_max_disp_sq, sizeof(Real), cudaMemcpyDeviceToHost));
+    
+    return host_max_disp_sq;
+}
+
+// Append ghost particles to device arrays (after local particles)
+void ForceCalculatorCUDA::append_ghosts_to_device(MDSystem& system, size_t previous_local_count) {
+    ParticleData& particles = system.get_particles();
+    size_t total_particles = system.get_total_particles();
+    
+    if (total_particles <= previous_local_count) {
+        // No ghosts to append
+        return;
+    }
+    
+    size_t num_ghosts = total_particles - previous_local_count;
+    
+    // Safety check: ensure device memory is large enough
+    if (total_particles > allocated_particles) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: append_ghosts_to_device: total_particles (" << total_particles 
+                      << ") exceeds allocated_particles (" << allocated_particles << ")" << std::endl;
+        }
+        // Reallocation invalidates every local device array.  Re-upload the
+        // complete local+ghost state; uploading only ghosts would leave the
+        // local prefix uninitialized.
+        initial_upload_to_device(system);
+        return;
+    }
+    
+    // Validate offset and size
+    if (previous_local_count >= particles.x.size() || 
+        previous_local_count + num_ghosts > particles.x.size()) {
+        if (is_rank_zero()) {
+            std::cerr << "ERROR: append_ghosts_to_device: Invalid offset or size. "
+                      << "local=" << previous_local_count 
+                      << " ghosts=" << num_ghosts 
+                      << " host_size=" << particles.x.size() << std::endl;
+        }
+        return;
+    }
+    
+    // Upload ONLY ghost particles (append after local particles)
+    size_t offset = previous_local_count;
+    CUDA_CHECK(cudaMemcpyAsync(d_x + offset, particles.x.data() + offset, 
+                               num_ghosts * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_y + offset, particles.y.data() + offset, 
+                               num_ghosts * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_z + offset, particles.z.data() + offset, 
+                               num_ghosts * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_type + offset, particles.type.data() + offset, 
+                               num_ghosts * sizeof(int), cudaMemcpyHostToDevice, force_stream));
+    
+    // Upload global_id for ghost particles (needed for force calculations)
+    if (d_global_id && offset < particles.global_id.size()) {
+        CUDA_CHECK(cudaMemcpyAsync(d_global_id + offset, particles.global_id.data() + offset,
+                                   num_ghosts * sizeof(int), cudaMemcpyHostToDevice, force_stream));
+    }
+    
+    // Upload charge for ghost particles if electrostatics are enabled
+    if (d_charge && offset < particles.charge.size()) {
+        CUDA_CHECK(cudaMemcpyAsync(d_charge + offset, particles.charge.data() + offset, 
+                                   num_ghosts * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
+    }
+    
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
+
+// ============================================================================
+// EWALD / PME ELECTROSTATICS
+//
+// Full Ewald summation = real-space (erfc-screened, neighbor list) +
+// reciprocal-space (B-spline charge spreading -> FFT -> Poisson solve ->
+// E-field -> inverse FFT -> force interpolation) + self-energy correction.
+// Parameters (alpha, grid size) are derived automatically from the physical
+// cutoff and box size; there is no direct-Coulomb-only fallback mode.
+//
+// TODO(ExaFMM): for multi-node runs the global 3D FFT below is the scaling
+// bottleneck (all-to-all communication). A future swap point is here: an
+// FMM-based reciprocal-space solve (e.g. ExaFMM) could replace the
+// spread/FFT/solve/interpolate sequence without touching the real-space or
+// self-energy terms.
+// ============================================================================
+
+namespace {
+// Bisection solve for the Ewald splitting parameter: find alpha such that
+// erfc(alpha * cutoff) == tolerance (standard real-space truncation error
+// criterion for Ewald/PME).
+Real ewald_solve_alpha(Real cutoff, Real tolerance) {
+    Real lo = 1e-4, hi = 10.0 / cutoff;
+    for (int iter = 0; iter < 100; ++iter) {
+        Real mid = 0.5 * (lo + hi);
+        if (erfc(mid * cutoff) > tolerance) lo = mid; else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+// Smallest N >= minimum whose prime factors are only 2, 3, 5 (efficient for
+// both cuFFT and FFTW).
+int ewald_next_good_fft_size(int minimum) {
+    if (minimum < 8) minimum = 8;
+    for (int n = minimum; ; ++n) {
+        int m = n;
+        while (m % 2 == 0) m /= 2;
+        while (m % 3 == 0) m /= 3;
+        while (m % 5 == 0) m /= 5;
+        if (m == 1) return n;
+    }
+}
+
+// B-spline structure-factor modulus |M(k)| for each of the `order` cardinal
+// B-spline knots, used to correct the Green's function for the charge
+// spreading interpolation (Essmann et al. 1995).
+std::vector<Real> ewald_compute_bspline_moduli(int grid_size_1d, int order) {
+    std::vector<Real> b_mod(grid_size_1d);
+    for (int k = 0; k < grid_size_1d; ++k) {
+        Real sum_real = 0.0, sum_imag = 0.0;
+        for (int l = 0; l < order; ++l) {
+            Real angle = 2.0 * M_PI * k * l / grid_size_1d;
+            Real weight = 0.0;
+            if (order == 4) {
+                if (l == 0) weight = 1.0/6.0;
+                else if (l == 1) weight = 2.0/3.0;
+                else if (l == 2) weight = 1.0/6.0;
+            } else if (order == 6) {
+                if (l == 0) weight = 1.0/120.0;
+                else if (l == 1) weight = 26.0/120.0;
+                else if (l == 2) weight = 66.0/120.0;
+                else if (l == 3) weight = 26.0/120.0;
+                else if (l == 4) weight = 1.0/120.0;
+            }
+            sum_real += weight * cos(angle);
+            sum_imag += weight * sin(angle);
+        }
+        Real m = sqrt(sum_real*sum_real + sum_imag*sum_imag);
+        b_mod[k] = (m < 1e-10) ? 1.0 : m;
+    }
+    return b_mod;
+}
+}  // namespace
+
+void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
+    SimulationBox& box = system.get_box();
+    const Real k_coulomb = 332.0636;  // kcal/mol*Angstrom*e^-2, same unit system as LJ/CPU
+
+    if (ewald_initialized_) {
+        // Box may change under NPT; grid size and alpha stay fixed, only the
+        // Green's-function prefactor (which depends on volume) is refreshed.
+        ewald_prefactor_ = k_coulomb * 4.0 * M_PI / (box.lx * box.ly * box.lz);
+        return;
+    }
+
+    Real cutoff = system.get_physical_cutoff();
+    ewald_alpha_ = ewald_solve_alpha(cutoff, 1e-5);
+    ewald_spline_order_ = 4;
+
+    // Grid spacing must resolve the reciprocal-space Gaussian width, which
+    // narrows as alpha grows: target alpha*h <= 0.25 (standard PME accuracy
+    // rule of thumb), capped at 1.0 Angstrom for small alpha/large boxes
+    // where that would be needlessly fine.
+    const Real target_spacing = std::min(1.0, 0.25 / ewald_alpha_);
+    ewald_grid_x_ = ewald_next_good_fft_size(static_cast<int>(ceil(box.lx / target_spacing)));
+    ewald_grid_y_ = ewald_next_good_fft_size(static_cast<int>(ceil(box.ly / target_spacing)));
+    ewald_grid_z_ = ewald_next_good_fft_size(static_cast<int>(ceil(box.lz / target_spacing)));
+
+    const size_t grid_size =
+        static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * ewald_grid_z_;
+
+    CUDA_CHECK(cudaMalloc(&d_pme_charge_grid_, grid_size * sizeof(cufftDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(&d_pme_ex_grid_,     grid_size * sizeof(cufftDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(&d_pme_ey_grid_,     grid_size * sizeof(cufftDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(&d_pme_ez_grid_,     grid_size * sizeof(cufftDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(&d_pme_force_grid_x_, grid_size * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_force_grid_y_, grid_size * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_force_grid_z_, grid_size * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_x_, ewald_grid_x_ * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_y_, ewald_grid_y_ * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_z_, ewald_grid_z_ * sizeof(Real)));
+
+    CUFFT_CHECK(cufftPlan3d(&pme_fft_plan_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, CUFFT_Z2Z));
+    CUDA_CHECK(cudaStreamCreate(&pme_stream_));
+    CUFFT_CHECK(cufftSetStream(pme_fft_plan_, pme_stream_));
+
+    std::vector<Real> bmx = ewald_compute_bspline_moduli(ewald_grid_x_, ewald_spline_order_);
+    std::vector<Real> bmy = ewald_compute_bspline_moduli(ewald_grid_y_, ewald_spline_order_);
+    std::vector<Real> bmz = ewald_compute_bspline_moduli(ewald_grid_z_, ewald_spline_order_);
+    CUDA_CHECK(cudaMemcpy(d_pme_b_spline_mod_x_, bmx.data(), bmx.size()*sizeof(Real), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pme_b_spline_mod_y_, bmy.data(), bmy.size()*sizeof(Real), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pme_b_spline_mod_z_, bmz.data(), bmz.size()*sizeof(Real), cudaMemcpyHostToDevice));
+
+    ewald_prefactor_ = k_coulomb * 4.0 * M_PI / (box.lx * box.ly * box.lz);
+    ewald_initialized_ = true;
+
+    if (is_rank_zero()) {
+        std::cout << "[Ewald/PME] grid " << ewald_grid_x_ << "x" << ewald_grid_y_ << "x" << ewald_grid_z_
+                  << ", alpha=" << ewald_alpha_ << " 1/A, spline_order=" << ewald_spline_order_
+                  << ", cutoff=" << cutoff << " A" << std::endl;
+    }
+}
+
+void ForceCalculatorCUDA::free_ewald_resources() {
+    if (d_pme_charge_grid_)   { cudaFree(d_pme_charge_grid_);   d_pme_charge_grid_ = nullptr; }
+    if (d_pme_ex_grid_)       { cudaFree(d_pme_ex_grid_);       d_pme_ex_grid_ = nullptr; }
+    if (d_pme_ey_grid_)       { cudaFree(d_pme_ey_grid_);       d_pme_ey_grid_ = nullptr; }
+    if (d_pme_ez_grid_)       { cudaFree(d_pme_ez_grid_);       d_pme_ez_grid_ = nullptr; }
+    if (d_pme_force_grid_x_)  { cudaFree(d_pme_force_grid_x_);  d_pme_force_grid_x_ = nullptr; }
+    if (d_pme_force_grid_y_)  { cudaFree(d_pme_force_grid_y_);  d_pme_force_grid_y_ = nullptr; }
+    if (d_pme_force_grid_z_)  { cudaFree(d_pme_force_grid_z_);  d_pme_force_grid_z_ = nullptr; }
+    if (d_pme_b_spline_mod_x_){ cudaFree(d_pme_b_spline_mod_x_);d_pme_b_spline_mod_x_ = nullptr; }
+    if (d_pme_b_spline_mod_y_){ cudaFree(d_pme_b_spline_mod_y_);d_pme_b_spline_mod_y_ = nullptr; }
+    if (d_pme_b_spline_mod_z_){ cudaFree(d_pme_b_spline_mod_z_);d_pme_b_spline_mod_z_ = nullptr; }
+    if (pme_fft_plan_) { cufftDestroy(pme_fft_plan_); pme_fft_plan_ = 0; }
+    if (pme_stream_)   { cudaStreamDestroy(pme_stream_); pme_stream_ = nullptr; }
+    ewald_initialized_ = false;
+}
+
+void ForceCalculatorCUDA::compute_electrostatic_forces_ewald(MDSystem& system) {
+    ensure_ewald_initialized(system);
+
+    SimulationBox& box = system.get_box();
+    size_t local_particles = system.get_local_particles();
+    size_t num_particles = system.get_num_particles();
+    Real physical_cutoff = system.get_physical_cutoff();
+    Real cutoff_sq = physical_cutoff * physical_cutoff;
+    const Real k_coulomb = 332.0636;
+
+    Real box_x = box.lx, box_y = box.ly, box_z = box.lz;
+    Real inv_box_x = 1.0/box_x, inv_box_y = 1.0/box_y, inv_box_z = 1.0/box_z;
+
+    // ---- Real-space (near-field, erfc-screened) part ----
+    int num_blocks = (local_particles + block_size - 1) / block_size;
+    compute_electrostatic_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+        d_x, d_y, d_z, d_fx, d_fy, d_fz,
+        d_charge, d_global_id,
+        d_neighbors, d_num_neighbors, d_neighbor_offset,
+        d_potential_energy, d_virial,
+        box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z,
+        local_particles, num_particles,
+        cutoff_sq, k_coulomb, ewald_alpha_
+    );
+
+    // ---- Reciprocal-space (long-range) part on pme_stream_ ----
+    const size_t grid_size =
+        static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * ewald_grid_z_;
+    int blocks_grid = (grid_size + 255) / 256;
+    // Reciprocal-space grid operations (spread/interpolate/self-energy) must
+    // use LOCAL particles only: ghosts are periodic copies of atoms owned by
+    // other MPI ranks, and including them here would double-count charge
+    // density (each rank's real-space kernel already sees its neighbors'
+    // ghosts, but the reciprocal grid is a per-rank sum of owned charges).
+    int blocks_particles = (local_particles + 255) / 256;
+
+    pme_clear_grid_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_charge_grid_, grid_size);
+    pme_spread_charges_kernel<<<blocks_particles, 256, 0, pme_stream_>>>(
+        d_x, d_y, d_z, d_charge, d_pme_charge_grid_,
+        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+        inv_box_x, inv_box_y, inv_box_z,
+        ewald_spline_order_, local_particles
+    );
+
+    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_charge_grid_, d_pme_charge_grid_, CUFFT_FORWARD));
+
+    dim3 grid_blocks((ewald_grid_x_ + 7) / 8, (ewald_grid_y_ + 7) / 8, (ewald_grid_z_ + 7) / 8);
+    dim3 threads(8, 8, 8);
+    // Poisson solve turns the charge density rho(k) into the potential
+    // Phi(k) in place, and atomically accumulates reciprocal-space energy
+    // directly into d_potential_energy (k_coulomb folded into ewald_prefactor_).
+    pme_solve_poisson_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
+        d_pme_charge_grid_,
+        d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+        d_potential_energy, ewald_prefactor_, ewald_alpha_,
+        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+        inv_box_x, inv_box_y, inv_box_z
+    );
+
+    if (d_virial) {
+        pme_reciprocal_virial_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
+            d_pme_charge_grid_,
+            d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+            d_virial, ewald_prefactor_, ewald_alpha_,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+            inv_box_x, inv_box_y, inv_box_z
+        );
+    }
+
+    // E(k) = -i*k*Phi(k), one complex grid per Cartesian component.
+    pme_compute_electric_field_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
+        d_pme_charge_grid_, d_pme_ex_grid_, d_pme_ey_grid_, d_pme_ez_grid_,
+        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, box_x, box_y, box_z
+    );
+
+    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_ex_grid_, d_pme_ex_grid_, CUFFT_INVERSE));
+    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_ey_grid_, d_pme_ey_grid_, CUFFT_INVERSE));
+    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_ez_grid_, d_pme_ez_grid_, CUFFT_INVERSE));
+
+    pme_extract_real_part_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_ex_grid_, d_pme_force_grid_x_, grid_size);
+    pme_extract_real_part_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_ey_grid_, d_pme_force_grid_y_, grid_size);
+    pme_extract_real_part_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_ez_grid_, d_pme_force_grid_z_, grid_size);
+
+    pme_interpolate_forces_kernel<<<blocks_particles, 256, 0, pme_stream_>>>(
+        d_x, d_y, d_z, d_charge,
+        d_pme_force_grid_x_, d_pme_force_grid_y_, d_pme_force_grid_z_,
+        d_fx, d_fy, d_fz,
+        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+        inv_box_x, inv_box_y, inv_box_z,
+        ewald_spline_order_, local_particles
+    );
+
+    // ---- Self-energy correction (local particles only, see note above) ----
+    pme_self_energy_kernel<<<blocks_particles, 256, 0, pme_stream_>>>(
+        d_charge, d_potential_energy, k_coulomb, ewald_alpha_, local_particles
+    );
+
+    CUDA_CHECK(cudaStreamSynchronize(pme_stream_));
+}
+
+// ============================================================================
+// C++ LibTorch MLIP support
+// ============================================================================
+
+void ForceCalculatorCUDA::pre_register_mlip_sources()
+{
+    // Delegate to bridge function which has full MLIP headers
+    mlip_bridge_register_md_sources(static_cast<void*>(this));
+}
+
+void ForceCalculatorCUDA::set_mlip_runtime(void* raw_runtime)
+{
+    mlip_runtime_raw_     = raw_runtime;
+    mlip_runtime_enabled_ = (raw_runtime != nullptr);
+    if (mlip_runtime_enabled_) {
+        pre_register_mlip_sources();
+        std::cout << "[ForceCalculatorCUDA] MlipRuntime attached (C++ GPU-resident path).\n";
+    }
+}
+
+void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
+{
+    NeighborList& nlist = system.get_neighbor_list();
+    size_t num_local   = system.get_local_particles();
+    size_t num_total   = system.get_total_particles();
+
+    // Count upper bound for half-list edges
+    int64_t E_upper = 0;
+    for (size_t i = 0; i < num_local; ++i)
+        E_upper += nlist.num_neighbors[i];
+
+    int64_t E_upper_full = E_upper * 2;
+    if (E_upper_full > cap_edges_) {
+        if (d_edge_src_)       { CUDA_CHECK(cudaFree(d_edge_src_));       d_edge_src_       = nullptr; }
+        if (d_edge_dst_)       { CUDA_CHECK(cudaFree(d_edge_dst_));       d_edge_dst_       = nullptr; }
+        if (d_edge_coo_packed_){ CUDA_CHECK(cudaFree(d_edge_coo_packed_));d_edge_coo_packed_= nullptr; }
+        cap_edges_ = static_cast<int64_t>(E_upper_full * 1.25 + 256);
+        CUDA_CHECK(cudaMalloc(&d_edge_src_,        sizeof(int32_t) * cap_edges_));
+        CUDA_CHECK(cudaMalloc(&d_edge_dst_,        sizeof(int32_t) * cap_edges_));
+        CUDA_CHECK(cudaMalloc(&d_edge_coo_packed_, sizeof(int32_t) * cap_edges_));
+    }
+
+    // Build TRUE half-list COO on host (j > i for local-local; all local-ghost)
+    std::vector<int32_t> h_src(E_upper), h_dst(E_upper);
+    int64_t e = 0;
+    for (size_t i = 0; i < num_local; ++i) {
+        int offset = nlist.neighbor_offset[i];
+        int nn     = nlist.num_neighbors[i];
+        for (int k = 0; k < nn; ++k) {
+            int32_t j = static_cast<int32_t>(nlist.neighbors[offset + k]);
+            if (j < 0 || j >= static_cast<int32_t>(num_total)) continue;
+            if (j < static_cast<int32_t>(num_local) && j <= static_cast<int32_t>(i)) continue;
+            h_src[e] = static_cast<int32_t>(i);
+            h_dst[e] = j;
+            ++e;
+        }
+    }
+    // Deduplicate
+    using Pair = std::pair<int32_t,int32_t>;
+    std::vector<Pair> pairs(e);
+    for (int64_t k = 0; k < e; ++k) pairs[k] = {h_src[k], h_dst[k]};
+    std::sort(pairs.begin(), pairs.end());
+    auto new_end = std::unique(pairs.begin(), pairs.end());
+    e = std::distance(pairs.begin(), new_end);
+    for (int64_t k = 0; k < e; ++k) { h_src[k] = pairs[k].first; h_dst[k] = pairs[k].second; }
+
+    int64_t E_half = e;
+    int64_t E_full = E_half * 2;
+    num_edges_ = E_full;
+
+    // Grow tmp buffers if needed
+    int64_t need_half = std::max(E_half, (int64_t)1);
+    if (!d_tmp_edge_src_ || need_half > cap_edges_ / 2) {
+        if (d_tmp_edge_src_) { CUDA_CHECK(cudaFree(d_tmp_edge_src_)); d_tmp_edge_src_ = nullptr; }
+        if (d_tmp_edge_dst_) { CUDA_CHECK(cudaFree(d_tmp_edge_dst_)); d_tmp_edge_dst_ = nullptr; }
+        CUDA_CHECK(cudaMalloc(&d_tmp_edge_src_, sizeof(int32_t) * need_half));
+        CUDA_CHECK(cudaMalloc(&d_tmp_edge_dst_, sizeof(int32_t) * need_half));
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(d_tmp_edge_src_, h_src.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_tmp_edge_dst_, h_dst.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
+    // Packed half-list [src|dst] for full_directed_edge_list op
+    CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_,         h_src.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_ + E_half, h_dst.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
+
+    // Expand to full directed list on GPU
+    launch_half_to_full_edges(d_tmp_edge_src_, d_tmp_edge_dst_,
+                               d_edge_src_, d_edge_dst_, E_half, force_stream);
+}
+
+void ForceCalculatorCUDA::interleave_positions_on_device(int num_total)
+{
+    if (num_total > cap_pos_interleaved_) {
+        if (d_pos_interleaved_) { CUDA_CHECK(cudaFree(d_pos_interleaved_)); d_pos_interleaved_ = nullptr; }
+        cap_pos_interleaved_ = static_cast<int>(num_total * 1.25 + 64);
+        CUDA_CHECK(cudaMalloc(&d_pos_interleaved_, sizeof(double) * cap_pos_interleaved_ * 3));
+    }
+    launch_interleave_positions(d_x, d_y, d_z, d_pos_interleaved_, num_total, force_stream);
+}
+
+void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
+{
+    if (!mlip_runtime_raw_) return;
+
+    const int num_local = static_cast<int>(system.get_local_particles());
+    const int num_ghost = static_cast<int>(system.get_ghost_count());
+    const int num_total = num_local + num_ghost;
+    num_local_cached_ = num_local;
+    num_ghost_cached_ = num_ghost;
+
+    // Grow MLIP force output buffer if needed
+    if (num_total > cap_mlip_forces_) {
+        if (d_mlip_forces_) { CUDA_CHECK(cudaFree(d_mlip_forces_)); d_mlip_forces_ = nullptr; }
+        cap_mlip_forces_ = static_cast<int>(num_total * 1.25 + 64);
+        CUDA_CHECK(cudaMalloc(&d_mlip_forces_, sizeof(double) * cap_mlip_forces_ * 3));
+    }
+    CUDA_CHECK(cudaMemsetAsync(d_mlip_forces_, 0, sizeof(double) * num_total * 3, force_stream));
+
+    // Error flag
+    if (!d_mlip_error_flag_) { CUDA_CHECK(cudaMalloc(&d_mlip_error_flag_, sizeof(int))); }
+    CUDA_CHECK(cudaMemsetAsync(d_mlip_error_flag_, 0, sizeof(int), force_stream));
+
+    // PERF FIX: only rebuild COO edge list when neighbor list changed
+    if (nlist_dirty_) {
+        build_coo_edge_list_on_device(system);
+        nlist_dirty_ = false;
+    }
+
+    // Build minimum-image edge vectors [E_full, 3] float32
+    {
+        int64_t E_full = num_edges_;
+        int64_t E_half = E_full / 2;
+        if (E_full > cap_edge_vectors_) {
+            if (d_edge_vectors_) { CUDA_CHECK(cudaFree(d_edge_vectors_)); d_edge_vectors_ = nullptr; }
+            cap_edge_vectors_ = static_cast<int64_t>(E_full * 1.25 + 256);
+            CUDA_CHECK(cudaMalloc(&d_edge_vectors_, sizeof(float) * cap_edge_vectors_ * 3));
+        }
+        if (E_half > 0) {
+            const int32_t* h_src_dev = d_edge_coo_packed_;
+            const int32_t* h_dst_dev = d_edge_coo_packed_ + E_half;
+            SimulationBox& box = system.get_box();
+            int blk = 256, grid = (int)((E_half + blk - 1) / blk);
+            k_min_image_edge_vectors<<<grid, blk, 0, force_stream>>>(
+                d_x, d_y, d_z, h_src_dev, h_dst_dev, d_edge_vectors_, E_half,
+                (float)box.lx, (float)box.ly, (float)box.lz,
+                box.periodic_x, box.periodic_y, box.periodic_z);
+        }
+    }
+
+    // Build batch [N]=0 and num_atoms [1]=N tensors
+    {
+        if (num_total > cap_batch_) {
+            if (d_batch_) { CUDA_CHECK(cudaFree(d_batch_)); d_batch_ = nullptr; }
+            cap_batch_ = static_cast<int>(num_total * 1.25 + 64);
+            CUDA_CHECK(cudaMalloc(&d_batch_, sizeof(int64_t) * cap_batch_));
+        }
+        CUDA_CHECK(cudaMemsetAsync(d_batch_, 0, sizeof(int64_t) * num_total, force_stream));
+        if (!d_num_atoms_) { CUDA_CHECK(cudaMalloc(&d_num_atoms_, sizeof(int64_t))); }
+        int64_t h_n = num_total;
+        CUDA_CHECK(cudaMemcpyAsync(d_num_atoms_, &h_n, sizeof(int64_t), cudaMemcpyHostToDevice, force_stream));
+    }
+
+    // Interleaved positions [num_total, 3]
+    interleave_positions_on_device(num_total);
+
+    // Cell and PBC arrays on device
+    SimulationBox& box = system.get_box();
+    double h_cell[9]  = { box.lx, 0, 0,  0, box.ly, 0,  0, 0, box.lz };
+    int    h_pbc[3]   = { box.periodic_x, box.periodic_y, box.periodic_z };
+    if (!d_cell_) { CUDA_CHECK(cudaMalloc(&d_cell_, sizeof(double) * 9)); }
+    if (!d_pbc_buf_) { CUDA_CHECK(cudaMalloc(&d_pbc_buf_, sizeof(int) * 3)); }
+    CUDA_CHECK(cudaMemcpyAsync(d_cell_,    h_cell, sizeof(double)*9, cudaMemcpyHostToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_pbc_buf_, h_pbc,  sizeof(int)*3,    cudaMemcpyHostToDevice, force_stream));
+
+    // ── Populate MlipInputView ────────────────────────────────────────────
+    mlip::MlipInputView in_view;
+    in_view.num_local = num_local;
+    in_view.num_ghost = num_ghost;
+    in_view.num_total = num_total;
+
+    in_view.positions.data      = d_pos_interleaved_;
+    in_view.positions.dtype     = mlip::ScalarType::Float64;
+    in_view.positions.ndim      = 2;
+    in_view.positions.shape[0]  = num_total;
+    in_view.positions.shape[1]  = 3;
+    in_view.positions.device_id = device_id;
+    in_view.positions.is_device = true;
+
+    in_view.species.data      = d_type;
+    in_view.species.dtype     = mlip::ScalarType::Int32;
+    in_view.species.ndim      = 1;
+    in_view.species.shape[0]  = num_total;
+    in_view.species.device_id = device_id;
+    in_view.species.is_device = true;
+
+    in_view.neighbors.num_edges = num_edges_;
+    in_view.neighbors.src       = d_edge_src_;
+    in_view.neighbors.dst       = d_edge_dst_;
+
+    in_view.cell.data      = d_cell_;
+    in_view.cell.dtype     = mlip::ScalarType::Float64;
+    in_view.cell.ndim      = 2;
+    in_view.cell.shape[0]  = 3;
+    in_view.cell.shape[1]  = 3;
+    in_view.cell.device_id = device_id;
+    in_view.cell.is_device = true;
+
+    in_view.pbc.data      = d_pbc_buf_;
+    in_view.pbc.dtype     = mlip::ScalarType::Int32;
+    in_view.pbc.ndim      = 1;
+    in_view.pbc.shape[0]  = 3;
+    in_view.pbc.device_id = device_id;
+    in_view.pbc.is_device = true;
+
+    in_view.stream = force_stream;
+
+    // ── Populate MlipOutputView ───────────────────────────────────────────
+    mlip::MlipOutputView out_view;
+    out_view.forces.data      = d_mlip_forces_;
+    out_view.forces.dtype     = mlip::ScalarType::Float64;
+    out_view.forces.ndim      = 2;
+    out_view.forces.shape[0]  = num_total;
+    out_view.forces.shape[1]  = 3;
+    out_view.forces.device_id = device_id;
+    out_view.forces.is_device = true;
+
+    // ── Call MlipRuntime via bridge (avoids including mlip_runtime.h in .cu) ──
+    mlip_bridge_compute(mlip_runtime_raw_, &in_view, &out_view);
+
+    // ── Scatter AoS forces back into SoA d_fx/d_fy/d_fz ─────────────────
+    launch_accumulate_forces_scaled(
+        d_mlip_forces_,
+        d_fx, d_fy, d_fz,
+        1.0, num_local, d_mlip_error_flag_, force_stream);
+
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+}
