@@ -95,7 +95,7 @@ MDSimulation                          ← Top-level orchestrator
 │   └── (python_force/ml_forces.py → MLIPAdapter subclass)
 │
 ├── mlip::MlipRuntime                 ← C++ TorchScript/LibTorch MLIP runner (force_libtorch/runtime)
-│   └── mlip::ExecutionPlan           ← per-step MLIP execution plan
+│   └── mlip::MlipExecutionPlan           ← per-step MLIP execution plan
 │
 ├── Integrator (abstract base)
 │   ├── VelocityVerletIntegrator
@@ -190,10 +190,13 @@ single_step(step)
 │     │   │       └─ ...
 │     │   └─ copy forces CPU → GPU
 │     │
-│     └─ [libtorch] mlip::MlipRuntime::compute_forces()
-│         ├─ positions → torch::Tensor (GPU), via md_data_sources-registered pointers
-│         ├─ model_.forward({inputs}) → energy, forces
-│         └─ forces used directly from the GPU buffer
+│     └─ [libtorch] mlip::MlipRuntime::compute()
+│         ├─ run_preprocessing(): device pointers from md_data_sources-registered
+│         │   resolvers → preprocess kernels (species_map, half→full edges, ...)
+│         ├─ PyTorchBackend::execute(): model.forward({inputs}) on the shared
+│         │   CUDA stream → energy, forces
+│         └─ run_postprocessing(): unit conversion + accumulate_force write
+│             directly into the MD force/energy device buffers
 │
 ├─ [5] Ghost-particle force return (for multi-rank runs)
 │     dsdecompx::Decomp::reverse_halo()
@@ -293,7 +296,7 @@ create_neighbor_list_builder()     src/neighbor_list*.cpp
 | `force_calculator_sycl.cpp` | `ForceCalculatorSYCL` | SYCL builtin force calculation |
 | `neighbor_list_kernels_optimized.cu` | kernels | Verlet-cell neighbor list GPU kernels |
 | `force_libtorch/runtime/mlip_runtime.cpp` | `mlip::MlipRuntime` | TorchScript/LibTorch model loading/inference |
-| `force_libtorch/runtime/execution_plan.cpp` | `mlip::ExecutionPlan` | Abstraction of the per-step MLIP execution plan |
+| `force_libtorch/runtime/execution_plan.cpp` | `mlip::MlipExecutionPlan` | Abstraction of the per-step MLIP execution plan |
 | `force_libtorch/binding/md_data_sources.cpp` | `mlip::register_md_sources()` | Registers MD device pointers with the MLIP operation registry (MLIP-specific, not general I/O) |
 | `force_python/python_interface.cpp` | `PythonForceInterface` (declared in `force_calculator.h`) | Python-embedded MLIP invocation |
 | `python_force/ml_forces.py` | `calculate_forces()` | Python entry point called from C++ |

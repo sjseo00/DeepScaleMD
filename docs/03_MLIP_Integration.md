@@ -2,48 +2,37 @@
 
 ## Overview
 
-DeepScaleMD provides two independent MLIP integration paths.
+DeepScaleMD provides two independent MLIP integration paths, selected by `force_calculation.mode`.
 
 | Path | Configuration | Characteristics |
 |------|------|------|
-| **C++ MLIP Runtime** | `force_calculation.mode: libtorch` | TorchScript only, GPU-resident, best performance |
-| **Python Interface** | `force_calculation.mode: python` | Supports all ASE calculators, including fairchem/MACE/NequIP |
+| **libtorch mode** | `force_calculation.mode: libtorch` | TorchScript only, fully GPU-resident, best performance |
+| **python mode** | `force_calculation.mode: python` | Supports all ASE calculators, including fairchem/MACE/NequIP |
 
 ---
 
-## Path 1: C++ MLIP Runtime (mlip_inst.md architecture)
+## libtorch mode
 
-### Design Goals
+`libtorch` mode runs a TorchScript model from C++ with no Python interpreter involved at all. What actually makes this GPU-resident and fast is a split between a one-time compilation step at startup and a per-step execution that never allocates or copies through the host.
 
-- Run TorchScript models directly in C++ without a Python interpreter
-- Keep data resident in GPU memory (eliminate GPU → CPU → GPU round trips)
-- Share the CUDA stream between DeepScaleMD and LibTorch
+### Startup: the YAML spec compiles into a fixed execution plan
 
-### Layer Structure
+`MlipRuntime::initialize()` parses `spec_file` (the `model_spec.yaml` below) once and calls `compile_execution_plan()`, which turns the declarative YAML into a concrete, reusable plan:
 
-```
-input.yaml
-  └─ force_calculation.mode: libtorch
-  └─ spec_file: examples/xxx/model_spec.yaml   ← MLIP specification YAML
-                 │
-                 ▼
-         MlipRuntime::initialize()
-                 │
-         ┌───────────────────┐
-         │  MlipModelSpec    │  — produced by the YAML parser
-         │  (parsed spec)    │
-         └───────────────────┘
-                 │
-         ┌───────────────────┐
-         │  ExecutionPlan    │  — compiles the input/output pipeline
-         │  (compiled plan)  │
-         └───────────────────┘
-                 │
-         ┌───────────────────┐
-         │  PyTorchBackend   │  — torch::jit::load() + forward()
-         │  (model engine)   │
-         └───────────────────┘
-```
+- Every entry under `inputs:`/`outputs:` is resolved to a **pointer-resolver callback** bound to a real MD device buffer (registered by the MD-side data-source bindings — `md.positions`, `md.species`, `md.neighbor_list`, `md.forces`, `md.energy`, etc.), not a name looked up again every step.
+- Each preprocessing/postprocessing op named in the YAML (`species_map`, `full_directed_edge_list`, `unit_conversion`, `accumulate_force`, ...) is resolved once to an actual device-kernel implementation.
+- Unit-conversion scale factors (e.g. eV → kcal/mol) are computed once from the `units:` block, not recomputed per step.
+- `PyTorchBackend` loads the TorchScript module (`torch::jit::load(config.model_path, device)`) at this point too.
+
+Nothing about this plan changes between MD steps; only the buffer contents and per-step particle/edge counts do.
+
+### Per step: `MlipRuntime::compute()`, entirely device-side
+
+1. **Preprocessing** (`run_preprocessing`) walks the resolved input bindings, fetches the current device pointer from each pointer-resolver, and runs its preprocessing ops (e.g. mapping MD atom types to atomic numbers via a device lookup table, converting the half neighbor list to a full directed edge list) as CUDA kernels writing into pre-sized scratch buffers. These buffers are allocated once and only grown (never shrunk or reallocated per step) when a step's particle/edge count exceeds the current capacity.
+2. **Forward pass** (`PyTorchBackend::execute`): when `share_cuda_stream: true`, the MD step's own `cudaStream_t` is wrapped in an `at::cuda::CUDAStreamGuard`, making it PyTorch's *current* stream for the duration of `model.forward(...)` — the model's internal kernels are enqueued after the preprocessing kernels on the same stream, with no explicit cross-stream synchronization needed. Autograd is deliberately left enabled here (not wrapped in a `NoGradGuard`): the supported TorchScript models differentiate the predicted energy internally via `torch.autograd.grad` to produce forces, so disabling autograd would break force computation for those models.
+3. **Postprocessing** (`run_postprocessing`) applies each output's ops (unit conversion, then `accumulate_force`) and writes the result directly into the MD force/energy device buffers that the pointer-resolvers were bound to at startup — there is no intermediate host buffer.
+
+The net effect: adding a new TorchScript model only ever means writing a new `model_spec.yaml` — no new C++ preprocessing/postprocessing code, and no host round-trip is introduced anywhere in this path.
 
 ### MLIP Specification YAML Schema
 
@@ -152,33 +141,9 @@ ForceCalculatorCUDA (GPU)
 └─ d_fx[], d_fy[], d_fz[]       ← force accumulation complete
 ```
 
-### Unit Conversion (UnitConversion)
-
-Computed at compile time in `execution_plan.cpp`:
-
-```cpp
-uc.energy_scale = e_model / e_md;          // eV → kcal/mol: × 0.04336
-uc.force_scale  = (e_model/l_model) / (e_md/l_md);
-```
-
-### Key File List
-
-| File | Role |
-|------|------|
-| `src/force_libtorch/runtime/mlip_runtime.cpp` | Runtime entry point, initialization/execution |
-| `src/force_libtorch/runtime/execution_plan.cpp` | Pipeline compilation, unit conversion |
-| `src/force_libtorch/config/yaml_parser.cpp` | MLIP specification YAML parser |
-| `src/force_libtorch/backend/pytorch_backend.cpp` | LibTorch wrapper (compiled with ABI=0) |
-| `src/force_libtorch/backend/pytorch_backend_register.cpp` | Backend auto-registration (ABI=1) |
-| `src/force_libtorch/binding/md_data_sources.cpp` | MD data source/target registration |
-| `src/force_libtorch/cuda/edge_conversion.cu` | Edge conversion CUDA kernel |
-| `src/force_libtorch/cuda/force_accumulation.cu` | Force accumulation CUDA kernel |
-| `include/force_libtorch/runtime/model_specification.h` | Specification data structure definitions |
-| `include/force_libtorch/backend/backend_interface.h` | Backend abstract interface + registry |
-
 ---
 
-## Path 2: Python Interface
+## python mode
 
 ### Design Goals
 
@@ -297,7 +262,7 @@ class MLIPAdapter:
 
 ## Path Comparison
 
-| Item | C++ MLIP Runtime | Python Interface |
+| Item | libtorch mode | python mode |
 |------|-----------------|-----------------|
 | **Supported model format** | TorchScript (.pt) | Any ASE calculator |
 | **GPU-resident** | ✅ Fully GPU-resident | ⚠️ Goes through CPU (positions) |
@@ -311,13 +276,13 @@ class MLIPAdapter:
 
 ## How to Add a New Model
 
-### C++ MLIP Runtime Path
+### libtorch mode
 
 1. Export the model to TorchScript
 2. Write a `model_spec.yaml` (input/output mapping, unit definitions)
 3. In `input.yaml`, set `spec_file: path/to/model_spec.yaml`
 
-### Python Interface Path
+### python mode
 
 1. Add an adapter class to `python_force/mlip_interface.py`:
 ```python
