@@ -4,8 +4,8 @@
  * Compiles a MlipModelSpec into a hot-path-friendly MlipExecutionPlan.
  */
 
-#include "mlip/runtime/execution_plan.h"
-#include "mlip/operations/operation_registry.h"
+#include "force_libtorch/runtime/execution_plan.h"
+#include "force_libtorch/operations/operation_registry.h"
 
 #ifdef USE_CUDA
 #  include <cuda_runtime.h>

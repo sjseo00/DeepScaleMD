@@ -1,9 +1,9 @@
 # 전체 소스코드 구동 과정
 
 > **현재 architecture:** DeepScaleMD는 Cartesian topology, halo communication,
-> migration을 standalone `dsDecomp` library에 의존한다. 아래의 legacy
+> migration을 standalone `dsDecompX` library에 의존한다. 아래의 legacy
 > `domain_decomposition.cpp/.h` 참조는 역사적 설명이다. 지원되는
-> integration은 `dsDecomp/docs/integration.md`를 참고한다.
+> integration은 `dsDecompX/docs/integration.md`를 참고한다.
 
 DeepScaleMD의 파일 구성, 클래스 계층, 함수 호출 흐름을 정리한다.
 
@@ -22,11 +22,8 @@ DeepScaleMD/
 │   ├── force_calculator_cuda.cu/.h  # GPU 내장 힘 계산
 │   ├── pme_calculator.cpp/.h   # PME 정전기 (cuFFT)
 │   ├── neighbor_list*.cpp/.cu  # 이웃 목록 관리
-│   ├── domain_decomposition.cpp/.h  # MPI 도메인 분해
+│   ├── domain_decomposition.cpp/.h  # MPI 도메인 분해 (legacy, dsDecompX로 대체됨)
 │   ├── mpi_optimizer.cpp/.h    # MPI 집합연산 최적화
-│   ├── overlap_force_calculator.cpp/.h  # MPI-GPU 오버랩
-│   ├── cuda_mpi_system.cpp/.h  # CUDA-aware MPI 통신
-│   ├── cuda_graphs_system.cpp/.h    # CUDA Graphs 재생
 │   ├── mlip_runtime.cpp/.h     # C++ TorchScript MLIP 실행기
 │   ├── python_force_interface.cpp/.h  # Python 임베딩 인터페이스
 │   ├── execution_plan.cpp/.h   # 시뮬레이션 단계 실행 계획
@@ -61,10 +58,7 @@ MDSimulation                          ← 최상위 조율자
 ├── ForceCalculator (abstract base)
 │   ├── ForceCalculatorCUDA           ← builtin LJ + PME (GPU)
 │   │   ├── NeighborListBuilder       ← Verlet-cell or Morton
-│   │   ├── PMECalculator             ← cuFFT PME
-│   │   └── CUDAGraphsSystem          ← CUDA Graphs 캡처/재생
-│   ├── OverlapForceCalculator        ← MPI 오버랩 (3 stream)
-│   │   └── ForceCalculatorCUDA       ← 내부적으로 활용
+│   │   └── PMECalculator             ← cuFFT PME
 │   └── MlipRuntime                   ← C++ TorchScript MLIP
 │
 ├── PythonForceInterface              ← Python 임베딩 (python mode)
@@ -75,8 +69,7 @@ MDSimulation                          ← 최상위 조율자
 │   ├── VerletIntegrator
 │   └── LeapFrogIntegrator
 │
-├── DomainDecomposition               ← MPI 도메인 분해
-│   └── CudaMPISystem                 ← CUDA-aware halo exchange
+├── dsDecompX                          ← 도메인 분해 + halo/migration (외부 라이브러리)
 │
 └── MPIOptimizer                      ← MPI_Iallreduce 배치
 ```
@@ -102,7 +95,7 @@ main()
        │     ├─ ForceCalculatorCUDA::initialize()  ← GPU 할당 + 커널 준비
        │     ├─ [python mode] PythonForceInterface::initialize()
        │     │     └─ Py_Initialize → import ml_forces.py
-      │     ├─ [mlip_runtime mode] MlipRuntime::initialize()
+      │     ├─ [libtorch mode] MlipRuntime::initialize()
        │     │     └─ torch::jit::load(model.pt)
        │     └─ create_neighbor_list_builder()
        │
@@ -136,8 +129,7 @@ single_step(step)
 │     → 조건 충족 시 build_neighbor_list()
 │
 ├─ [3] MPI 하로 교환 (multi-rank인 경우)
-│     domain_decomp->exchange_halo(positions)
-│     → CudaMPISystem::exchange_halo_cuda_aware()
+│     dsDecompX를 통한 halo exchange
 │     → MPI_Isend / MPI_Irecv (ghost atoms)
 │
 ├─ [4] 힘 계산
@@ -157,7 +149,7 @@ single_step(step)
 │     │   │       └─ ...
 │     │   └─ CPU → GPU 힘 복사
 │     │
-│     └─ [mlip_runtime] MlipRuntime::compute_forces()
+│     └─ [libtorch] MlipRuntime::compute_forces()
 │         ├─ positions → torch::Tensor (GPU)
 │         ├─ model_.forward({inputs}) → energy, forces
 │         └─ forces → GPU buffer 직접 사용
@@ -212,7 +204,6 @@ ForceCalculatorCUDA::initialize()  src/force_calculator_cuda.cu
   │  cudaMalloc (positions_d, forces_d, ...)
   │  cudaMemcpy H→D (초기 데이터)
   │  ConstantMemory 상수 등록 (__constant__)
-  │  [선택] CUDAGraphsSystem::capture()
   │
 PythonForceInterface::initialize()  src/python_force_interface.cpp
   │  Py_Initialize()
@@ -238,10 +229,6 @@ PythonForceInterface::initialize()  src/python_force_interface.cpp
 | `force_calculator_cuda.cu` | `ForceCalculatorCUDA` | GPU LJ, bond, angle 힘 |
 | `neighbor_list_kernels_optimized.cu` | kernels | Verlet-cell 이웃 목록 GPU 커널 |
 | `pme_calculator.cpp` | `PMECalculator` | PME 정전기 (cuFFT) |
-| `cuda_graphs_system.cpp` | `CUDAGraphsSystem` | CUDA Graphs 캡처/재생 |
-| `overlap_force_calculator.cpp` | `OverlapForceCalculator` | MPI 통신-계산 오버랩 |
-| `domain_decomposition.cpp` | `DomainDecomposition` | 3D Cartesian MPI 분해 |
-| `cuda_mpi_system.cpp` | `CudaMPISystem` | CUDA-aware halo exchange |
 | `mpi_optimizer.cpp` | `MPIOptimizer` | MPI_Iallreduce 배치 최적화 |
 | `mlip_runtime.cpp` | `MlipRuntime` | TorchScript 모델 로드/추론 |
 | `python_force_interface.cpp` | `PythonForceInterface` | Python 임베딩 MLIP 호출 |
@@ -273,7 +260,7 @@ PythonForceInterface::initialize()  src/python_force_interface.cpp
 │  neighbor_list_d[]  num_neighbors_d[]           │
 │                                                 │
 │  [builtin] LJ kernel → PME kernel               │
-│  [mlip_runtime] torch::Tensor (shared mem)      │
+│  [libtorch] torch::Tensor (shared mem)      │
 │  [python] D→H copy → Python → H→D copy          │
 └─────────────────────────────────────────────────┘
          │                         │
@@ -293,8 +280,7 @@ Rank 0                          Rank 1 ... N
   ├─ local atom 힘 계산            ├─ local atom 힘 계산
   │                               │
   ├─ halo exchange (ghost atoms)──┤  MPI_Isend/Irecv
-  │  CudaMPISystem::              │  cutoff 거리 내 경계 원자
-  │  exchange_halo_cuda_aware()   │
+  │  dsDecompX                     │  cutoff 거리 내 경계 원자
   │                               │
   ├─ 경계 힘 계산                  ├─ 경계 힘 계산
   │                               │

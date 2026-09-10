@@ -59,6 +59,7 @@ void ForceCalculatorCPU::compute_forces(MDSystem& system) {
     }
     if (force_config.enable_dihedrals) {
         compute_dihedral_forces(system);     // Torsional forces
+        compute_improper_forces(system);     // Improper torsions (same functional form)
     }
     if (force_config.enable_lennard_jones) {
         compute_lj_forces(system);           // Van der Waals forces
@@ -66,7 +67,10 @@ void ForceCalculatorCPU::compute_forces(MDSystem& system) {
     if (force_config.enable_coulomb) {
         compute_electrostatic_forces_ewald(system); // Full Ewald summation (real + reciprocal + self)
     }
-    
+    if (force_config.enable_lennard_jones || force_config.enable_coulomb) {
+        compute_special_pair_forces(system); // Scaled 1-4 nonbonded pairs
+    }
+
     // MPI-AWARE: Sum potential energy across all ranks
     // Each rank computes PE for pairs it "owns" (global_id[i] < global_id[j]),
     // so we need to sum these partial energies to get the total system PE
@@ -94,6 +98,7 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
     NeighborList& nlist = system.get_neighbor_list();
     ForceFieldParams& params = system.get_ff_params();
     SimulationBox& box = system.get_box();
+    Topology& topology = system.get_topology();
             
     // Use the existing domain decomposition system
     size_t local_particles = system.get_local_particles();
@@ -153,6 +158,8 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
             int ji = neighbor_ptr[n];
             if (ji < 0) continue;
             size_t j = static_cast<size_t>(ji);
+
+            if (topology.is_nonbonded_excluded(gid_i, pgid[j])) continue;
             
             // Half-list guarantees j > i for local-local pairs.
             // No skip check needed here.
@@ -168,16 +175,36 @@ void ForceCalculatorCPU::compute_lj_forces(MDSystem& system) {
             int type_j = ptype[j];
             Real eps = eps_row[type_j];
             Real sig = sig_row[type_j];
-            Real sig2 = sig * sig;
-            Real sig6 = sig2 * sig2 * sig2;
-            
             Real r2inv = 1.0 / r2;
-            Real r6inv = r2inv * r2inv * r2inv;
-            Real sig6_r6   = sig6 * r6inv;
-            Real sig12_r12 = sig6_r6 * sig6_r6;
-            
-            Real force_mag = 24.0 * eps * r2inv * (2.0 * sig12_r12 - sig6_r6);
-            Real pe_pair   = 4.0 * eps * (sig12_r12 - sig6_r6);
+            Real attractive;
+            Real repulsive;
+            if (params.mie_repulsive_exponent == 12) {
+                const Real sig2 = sig * sig;
+                const Real sig6 = sig2 * sig2 * sig2;
+                attractive = sig6 * r2inv * r2inv * r2inv;
+                repulsive = attractive * attractive;
+            } else {
+                const Real sig_r = sig * std::sqrt(r2inv);
+                const Real sig3_r3 = sig_r * sig_r * sig_r;
+                attractive = sig3_r3 * sig3_r3;
+                repulsive = attractive * sig3_r3; // SPICA Mie(9,6)
+            }
+            Real force_mag = params.mie_prefactor * eps * r2inv *
+                (params.mie_repulsive_exponent * repulsive -
+                 params.mie_attractive_exponent * attractive);
+            Real pe_pair = params.mie_prefactor * eps * (repulsive - attractive);
+            if (params.lj_switch_distance > 0.0 &&
+                r2 > params.lj_switch_distance * params.lj_switch_distance) {
+                const Real switch_sq = params.lj_switch_distance * params.lj_switch_distance;
+                const Real cutoff_delta = cutoff_sq - switch_sq;
+                const Real a = cutoff_sq - r2;
+                const Real b = cutoff_sq + 2.0 * r2 - 3.0 * switch_sq;
+                const Real denom = cutoff_delta * cutoff_delta * cutoff_delta;
+                const Real switch_value = a * a * b / denom;
+                const Real force_correction = 12.0 * pe_pair * a * (r2 - switch_sq) / denom;
+                force_mag = switch_value * force_mag + force_correction;
+                pe_pair *= switch_value;
+            }
             // Virial FIX: W = r·F = r²*force_mag (no sqrt, correct formula)
             Real virial_pair = r2 * force_mag;
 
@@ -254,6 +281,7 @@ void ForceCalculatorCPU::compute_electrostatic_forces_real_space(MDSystem& syste
     ParticleData& particles = system.get_particles();
     NeighborList& nlist = system.get_neighbor_list();
     SimulationBox& box = system.get_box();
+    Topology& topology = system.get_topology();
 
     size_t local_particles = system.get_local_particles();
     size_t total_particles = system.get_num_particles();
@@ -284,6 +312,8 @@ void ForceCalculatorCPU::compute_electrostatic_forces_real_space(MDSystem& syste
 
             size_t j = nlist.neighbors[n_idx];
             if (j >= total_particles) continue;
+            const bool excluded = topology.is_nonbonded_excluded(
+                gid_i, particles.global_id[j]);
 
             Real qj = particles.charge[j];
             if (std::abs(qj) < 1e-10) continue; // Skip neutral particles
@@ -300,11 +330,24 @@ void ForceCalculatorCPU::compute_electrostatic_forces_real_space(MDSystem& syste
             if (r2 < cutoff_sq && r2 > 0.36) { // Minimum distance ~0.6 Å to avoid overlaps
                 Real r = std::sqrt(r2);
                 Real qq = k_coulomb * qi * qj;
-                Real erfc_ar = std::erfc(alpha * r);
+                Real erf_ar = std::erf(alpha * r);
+                Real erfc_ar = 1.0 - erf_ar;
                 Real exp_term = std::exp(-alpha * alpha * r2);
-                Real u_pair = qq * erfc_ar / r;
-                // F/r = qq * [erfc(a r)/r^3 + (2a/sqrt(pi)) exp(-a^2 r^2)/r^2]
-                Real force_mag = qq * (erfc_ar / (r2 * r) + two_alpha_over_sqrt_pi * exp_term / r2);
+                // PME reciprocal space contains the erf(alpha*r)/r part for
+                // every charged pair.  For an excluded pair, add its negative
+                // here so real + reciprocal is exactly zero.  Normal pairs
+                // receive the usual erfc real-space contribution.
+                Real u_pair;
+                Real force_mag;
+                if (excluded) {
+                    u_pair = -qq * erf_ar / r;
+                    force_mag = -qq * (erf_ar / (r2 * r) -
+                        two_alpha_over_sqrt_pi * exp_term / r2);
+                } else {
+                    u_pair = qq * erfc_ar / r;
+                    force_mag = qq * (erfc_ar / (r2 * r) +
+                        two_alpha_over_sqrt_pi * exp_term / r2);
+                }
 
                 Real fx = force_mag * dx;
                 Real fy = force_mag * dy;
@@ -804,6 +847,7 @@ void ForceCalculatorCPU::compute_bond_forces(MDSystem& system) {
         // Harmonic bond potential: V = 0.5 * k * (r - r0)^2
         // Force: F = -k * (r - r0) * r_hat
         Real dr = r - r0;
+        last_potential_energy += 0.5 * k_bond * dr * dr;
         Real force_mag = -k_bond * dr / r;
         
         Real fx = force_mag * dx;
@@ -870,14 +914,19 @@ void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
         Real k_angle = angle_type.k;         // Force constant
         Real theta0 = angle_type.theta0;     // Equilibrium angle
         Real dtheta = theta - theta0;
-        
+        // Harmonic angle potential: V = 0.5 * k * (theta - theta0)^2
+        last_potential_energy += 0.5 * k_angle * dtheta * dtheta;
+
         if (std::abs(dtheta) < 1e-10) continue; // No force if at equilibrium
         
         // Use more numerically stable force calculation
         Real sin_theta = std::sqrt(1.0 - cos_theta * cos_theta);
         if (sin_theta < 1e-10) continue; // Avoid division by zero
         
-        Real force_constant = -k_angle * dtheta / sin_theta;
+        // -dV/dtheta times dtheta/dr.  The vector expressions below are
+        // (v_hat - cos(theta) u_hat)/r, i.e. the negative angular gradient,
+        // so the scalar coefficient must be positive here.
+        Real force_constant = k_angle * dtheta / sin_theta;
         
         // Force calculation (simplified - this is a complex derivation)
         Real r_ij_inv = 1.0 / r_ij;
@@ -912,113 +961,234 @@ void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
 }
 
 void ForceCalculatorCPU::compute_dihedral_forces(MDSystem& system) {
+    compute_torsion_forces(system, system.get_local_dihedrals());
+}
+
+void ForceCalculatorCPU::compute_improper_forces(MDSystem& system) {
+    compute_torsion_forces(system, system.get_local_impropers());
+}
+
+void ForceCalculatorCPU::compute_torsion_forces(MDSystem& system,
+                                                 const std::vector<MDSystem::LocalDihedral>& dihedrals) {
     ParticleData& particles = system.get_particles();
     Topology& topology = system.get_topology();
-    
-    // Check if we have dihedrals
-    const auto& dihedrals = system.get_local_dihedrals();
+
     if (dihedrals.empty()) {
-        return; // No dihedrals defined
+        return; // No torsions of this kind defined
     }
-    
+
+    SimulationBox& box = system.get_box();
+
     for (const auto& dihedral : dihedrals) {
         size_t i = dihedral.atom1;
         size_t j = dihedral.atom2;
         size_t k = dihedral.atom3;
         size_t l = dihedral.atom4;
-        
-        if (i >= particles.x.size() || j >= particles.x.size() || 
+
+        if (i >= particles.x.size() || j >= particles.x.size() ||
             k >= particles.x.size() || l >= particles.x.size()) continue;
-        
+
         // Vectors for dihedral calculation
         Real dx_ij = particles.x[i] - particles.x[j];
         Real dy_ij = particles.y[i] - particles.y[j];
         Real dz_ij = particles.z[i] - particles.z[j];
-        
+
         Real dx_jk = particles.x[j] - particles.x[k];
         Real dy_jk = particles.y[j] - particles.y[k];
         Real dz_jk = particles.z[j] - particles.z[k];
-        
+
         Real dx_kl = particles.x[k] - particles.x[l];
         Real dy_kl = particles.y[k] - particles.y[l];
         Real dz_kl = particles.z[k] - particles.z[l];
-        
+
         // Apply periodic boundary conditions
-        SimulationBox& box = system.get_box();
         box.apply_minimum_image(dx_ij, dy_ij, dz_ij);
         box.apply_minimum_image(dx_jk, dy_jk, dz_jk);
         box.apply_minimum_image(dx_kl, dy_kl, dz_kl);
-        
-        // Cross products for plane normals
+
+        // Cross products for plane normals -- kept UNNORMALIZED, the exact
+        // analytical force formula below needs the raw vectors and |.|^2.
         Real n1_x = dy_ij * dz_jk - dz_ij * dy_jk;  // ij x jk
         Real n1_y = dz_ij * dx_jk - dx_ij * dz_jk;
         Real n1_z = dx_ij * dy_jk - dy_ij * dx_jk;
-        
-        Real n2_x = dy_jk * dz_kl - dz_jk * dy_kl;  // jk x kl  
+
+        Real n2_x = dy_jk * dz_kl - dz_jk * dy_kl;  // jk x kl
         Real n2_y = dz_jk * dx_kl - dx_jk * dz_kl;
         Real n2_z = dx_jk * dy_kl - dy_jk * dx_kl;
-        
-        Real n1_mag = std::sqrt(n1_x*n1_x + n1_y*n1_y + n1_z*n1_z);
-        Real n2_mag = std::sqrt(n2_x*n2_x + n2_y*n2_y + n2_z*n2_z);
-        
-        if (n1_mag < 1e-10 || n2_mag < 1e-10) continue; // Avoid division by zero
-        
-        // Normalize
-        n1_x /= n1_mag; n1_y /= n1_mag; n1_z /= n1_mag;
-        n2_x /= n2_mag; n2_y /= n2_mag; n2_z /= n2_mag;
-        
-        // Calculate dihedral angle
-        Real cos_phi = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
-        
-        // Clamp to avoid numerical issues
-        if (cos_phi > 1.0) cos_phi = 1.0;
-        if (cos_phi < -1.0) cos_phi = -1.0;
-        
-        // Determine sign of angle
-        Real jk_mag = std::sqrt(dx_jk*dx_jk + dy_jk*dy_jk + dz_jk*dz_jk);
-        if (jk_mag < 1e-10) continue;
-        
-        Real jk_x = dx_jk / jk_mag;
-        Real jk_y = dy_jk / jk_mag; 
-        Real jk_z = dz_jk / jk_mag;
-        
-        Real triple_product = (n1_y * n2_z - n1_z * n2_y) * jk_x +
-                             (n1_z * n2_x - n1_x * n2_z) * jk_y +
-                             (n1_x * n2_y - n1_y * n2_x) * jk_z;
-        
-        Real phi = std::atan2(triple_product, cos_phi);
-        
+
+        Real n1_sq = n1_x*n1_x + n1_y*n1_y + n1_z*n1_z;
+        Real n2_sq = n2_x*n2_x + n2_y*n2_y + n2_z*n2_z;
+        Real jk_sq = dx_jk*dx_jk + dy_jk*dy_jk + dz_jk*dz_jk;
+
+        if (n1_sq < 1e-20 || n2_sq < 1e-20 || jk_sq < 1e-20) continue; // Degenerate geometry
+
+        Real jk_mag = std::sqrt(jk_sq);
+
+        // Dihedral angle via atan2(sin, cos) computed directly from the
+        // unnormalized cross products (equivalent to normalizing first, but
+        // avoids the extra sqrt/division and keeps n1/n2 intact for the
+        // force formula below).
+        Real cos_phi_num = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
+        Real sin_phi_num = (n1_y*n2_z - n1_z*n2_y) * dx_jk +
+                            (n1_z*n2_x - n1_x*n2_z) * dy_jk +
+                            (n1_x*n2_y - n1_y*n2_x) * dz_jk;
+        Real phi = std::atan2(sin_phi_num, cos_phi_num * jk_mag);
+
         // Get dihedral parameters from topology
         const DihedralType& dihedral_type = topology.get_dihedral_type(dihedral.type);
         Real k_dihedral = dihedral_type.k;
         Real phi0 = dihedral_type.phi0;  // Phase shift
         int n = dihedral_type.n;         // Multiplicity
-        
-        // CHARMM-style dihedral potential: V = k * (1 + cos(n*phi - phi0))
-        Real dphi = n * phi - phi0;
-        Real force_magnitude = -k_dihedral * n * std::sin(dphi);
-        
-        // Force calculation is very complex for dihedrals
-        // This is a simplified implementation
-        // In practice, you would need the full analytical derivatives
-        
-        // For now, apply a simplified force proportional to the gradient
-        Real force_scale = force_magnitude / (n1_mag * n2_mag);
-        
-        // Simplified force distribution (not fully accurate)
-        particles.fx[i] += force_scale * n1_x * 0.25;
-        particles.fy[i] += force_scale * n1_y * 0.25;
-        particles.fz[i] += force_scale * n1_z * 0.25;
-        particles.fx[j] -= force_scale * (n1_x + n2_x) * 0.25;
-        particles.fy[j] -= force_scale * (n1_y + n2_y) * 0.25;
-        particles.fz[j] -= force_scale * (n1_z + n2_z) * 0.25;
-        particles.fx[k] += force_scale * (n1_x + n2_x) * 0.25;
-        particles.fy[k] += force_scale * (n1_y + n2_y) * 0.25;
-        particles.fz[k] += force_scale * (n1_z + n2_z) * 0.25;
-        particles.fx[l] -= force_scale * n2_x * 0.25;
-        particles.fy[l] -= force_scale * n2_y * 0.25;
-        particles.fz[l] -= force_scale * n2_z * 0.25;
+
+        Real dVdphi;
+        if (n == 0) {
+            // CHARMM harmonic improper: V = Kpsi*(phi-phi0)^2. Keep the
+            // angular displacement on the principal branch.
+            Real dphi = std::remainder(phi - phi0, 2.0 * M_PI);
+            last_potential_energy += k_dihedral * dphi * dphi;
+            dVdphi = 2.0 * k_dihedral * dphi;
+        } else {
+            // CHARMM-style periodic torsion: V = k*(1+cos(n*phi-phi0)).
+            Real dphi = n * phi - phi0;
+            last_potential_energy += k_dihedral * (1.0 + std::cos(dphi));
+            dVdphi = -k_dihedral * n * std::sin(dphi);
+        }
+
+        // Exact analytical gradient (Blondel-Karplus / Bekker formula),
+        // momentum- and torque-conserving by construction. Using the
+        // standard notation r_ij, r_kj = -dx_jk, r_kl, m = r_ij x r_kj,
+        // n_std = r_kj x r_kl (note m = -n1, n_std = -n2 for the ij x jk /
+        // jk x kl cross products already computed above), the textbook
+        // With the signed angle convention used by atan2 above, dphi/dr_i
+        // points along +n1 and dphi/dr_l along -n2. Force is -dV/dphi times
+        // that gradient.
+        Real fi_scale = -dVdphi * jk_mag / n1_sq;
+        Real fl_scale =  dVdphi * jk_mag / n2_sq;
+
+        Real fix = fi_scale * n1_x, fiy = fi_scale * n1_y, fiz = fi_scale * n1_z;
+        Real flx = fl_scale * n2_x, fly = fl_scale * n2_y, flz = fl_scale * n2_z;
+
+        // p, q are the fractional projections of r_ij and r_kl onto r_kj
+        // (= -dx_jk here, but the sign cancels in the dot-product ratio).
+        Real p = -(dx_ij*dx_jk + dy_ij*dy_jk + dz_ij*dz_jk) / jk_sq;
+        Real q = -(dx_kl*dx_jk + dy_kl*dy_jk + dz_kl*dz_jk) / jk_sq;
+
+        Real fjx = (p - 1.0) * fix - q * flx;
+        Real fjy = (p - 1.0) * fiy - q * fly;
+        Real fjz = (p - 1.0) * fiz - q * flz;
+
+        Real fkx = -p * fix + (q - 1.0) * flx;
+        Real fky = -p * fiy + (q - 1.0) * fly;
+        Real fkz = -p * fiz + (q - 1.0) * flz;
+
+        particles.fx[i] += fix; particles.fy[i] += fiy; particles.fz[i] += fiz;
+        particles.fx[j] += fjx; particles.fy[j] += fjy; particles.fz[j] += fjz;
+        particles.fx[k] += fkx; particles.fy[k] += fky; particles.fz[k] += fkz;
+        particles.fx[l] += flx; particles.fy[l] += fly; particles.fz[l] += flz;
     }
+}
+
+void ForceCalculatorCPU::compute_special_pair_forces(MDSystem& system) {
+    ParticleData& particles = system.get_particles();
+    ForceFieldParams& params = system.get_ff_params();
+    SimulationBox& box = system.get_box();
+
+    const auto& pairs = system.get_local_special_pairs();
+    if (pairs.empty()) {
+        return; // No special pairs defined
+    }
+
+    const ForceManager& force_manager = system.get_force_manager();
+    const auto& force_config = force_manager.get_config();
+    const bool do_lj = force_config.enable_lennard_jones;
+    const bool do_coulomb = force_config.enable_coulomb;
+    if (!do_lj && !do_coulomb) {
+        return;
+    }
+
+    // Direct, unscreened LJ + Coulomb -- never subject to the normal
+    // neighbor-list cutoff. Requires the pair to also be listed in
+    // [exclusions] so the main pairwise loops skip it. Under Ewald/PME, the
+    // reciprocal-space sum includes the erf(alpha*r)/r term unconditionally
+    // for every charged pair, and compute_electrostatic_forces_real_space()
+    // subtracts that same term for excluded pairs, so the net Coulomb
+    // contribution from those two routines is exactly zero here -- only the
+    // scaled direct term added below survives.
+    const Real k_coulomb = 332.0636; // kcal/mol*Angstrom / e^2 (matches the Ewald real-space routine)
+    Real local_pe = 0.0;
+    Real local_virial = 0.0;
+
+    for (const auto& pair : pairs) {
+        size_t i = pair.atom1;
+        size_t j = pair.atom2;
+        if (i >= particles.x.size() || j >= particles.x.size()) continue;
+
+        Real dx = particles.x[i] - particles.x[j];
+        Real dy = particles.y[i] - particles.y[j];
+        Real dz = particles.z[i] - particles.z[j];
+        box.apply_minimum_image(dx, dy, dz);
+        Real r2 = dx*dx + dy*dy + dz*dz;
+        if (r2 < 1e-10) continue; // Avoid division by zero
+
+        Real force_mag = 0.0;
+
+        if (do_lj) {
+            int type_i = particles.type[i];
+            int type_j = particles.type[j];
+            Real sigma = pair.sigma >= 0.0 ? pair.sigma : params.sigma_mixed[type_i][type_j];
+            Real epsilon = pair.epsilon >= 0.0 ? pair.epsilon : params.epsilon_mixed[type_i][type_j];
+            if (epsilon != 0.0) {
+                Real r2inv = 1.0 / r2;
+                Real attractive;
+                Real repulsive;
+                if (params.mie_repulsive_exponent == 12) {
+                    const Real sig2 = sigma * sigma;
+                    const Real sig6 = sig2 * sig2 * sig2;
+                    attractive = sig6 * r2inv * r2inv * r2inv;
+                    repulsive = attractive * attractive;
+                } else {
+                    const Real sig_r = sigma * std::sqrt(r2inv);
+                    const Real sig3_r3 = sig_r * sig_r * sig_r;
+                    attractive = sig3_r3 * sig3_r3;
+                    repulsive = attractive * sig3_r3;
+                }
+                force_mag += params.mie_prefactor * epsilon * r2inv *
+                    (params.mie_repulsive_exponent * repulsive -
+                     params.mie_attractive_exponent * attractive) * pair.lj_scale;
+                local_pe += params.mie_prefactor * epsilon *
+                    (repulsive - attractive) * pair.lj_scale;
+            }
+        }
+
+        if (do_coulomb) {
+            Real qi = particles.charge[i];
+            Real qj = particles.charge[j];
+            if (qi != 0.0 && qj != 0.0) {
+                Real r = std::sqrt(r2);
+                Real qq = k_coulomb * qi * qj * pair.coulomb_scale;
+                force_mag += qq / (r2 * r);
+                local_pe += qq / r;
+            }
+        }
+
+        if (force_mag == 0.0) continue;
+
+        local_virial += r2 * force_mag; // W = r.F = r^2 * force_mag
+
+        Real fx = force_mag * dx;
+        Real fy = force_mag * dy;
+        Real fz = force_mag * dz;
+
+        particles.fx[i] += fx;
+        particles.fy[i] += fy;
+        particles.fz[i] += fz;
+        particles.fx[j] -= fx;
+        particles.fy[j] -= fy;
+        particles.fz[j] -= fz;
+    }
+
+    last_potential_energy += local_pe;
+    last_virial += local_virial;
 }
 
 void ForceCalculatorCPU::calculate_kinetic_energy(MDSystem& system) {

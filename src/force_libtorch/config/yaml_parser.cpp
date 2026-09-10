@@ -5,7 +5,7 @@
  * Strict schema validation — unknown keys throw, missing required keys throw.
  */
 
-#include "mlip/config/yaml_parser.h"
+#include "force_libtorch/config/yaml_parser.h"
 #include <yaml-cpp/yaml.h>
 #include <fstream>
 #include <sstream>

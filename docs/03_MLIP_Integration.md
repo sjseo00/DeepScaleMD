@@ -6,7 +6,7 @@ DeepScaleMD는 두 가지 독립적인 MLIP 연동 경로를 제공한다.
 
 | 경로 | 설정 | 특징 |
 |------|------|------|
-| **C++ MLIP Runtime** | `force_calculation.mode: mlip_runtime` | TorchScript 전용, GPU-resident, 최고 성능 |
+| **C++ MLIP Runtime** | `force_calculation.mode: libtorch` | TorchScript 전용, GPU-resident, 최고 성능 |
 | **Python Interface** | `force_calculation.mode: python` | fairchem/MACE/NequIP 등 모든 ASE 계산기 지원 |
 
 ---
@@ -23,7 +23,7 @@ DeepScaleMD는 두 가지 독립적인 MLIP 연동 경로를 제공한다.
 
 ```
 input.yaml
-  └─ force_calculation.mode: mlip_runtime
+  └─ force_calculation.mode: libtorch
   └─ spec_file: examples/xxx/model_spec.yaml   ← MLIP 명세 YAML
                  │
                  ▼
@@ -165,16 +165,16 @@ uc.force_scale  = (e_model/l_model) / (e_md/l_md);
 
 | 파일 | 역할 |
 |------|------|
-| `src/mlip/runtime/mlip_runtime.cpp` | 런타임 진입점, 초기화/실행 |
-| `src/mlip/runtime/execution_plan.cpp` | 파이프라인 컴파일, 단위 변환 |
-| `src/mlip/config/yaml_parser.cpp` | MLIP 명세 YAML 파서 |
-| `src/mlip/backend/pytorch_backend.cpp` | LibTorch 래퍼 (ABI=0으로 컴파일) |
-| `src/mlip/backend/pytorch_backend_register.cpp` | 백엔드 자동 등록 (ABI=1) |
-| `src/mlip/binding/md_data_sources.cpp` | MD 데이터 소스/타겟 등록 |
-| `src/potential/mlip/cuda/edge_conversion.cu` | 엣지 변환 CUDA 커널 |
-| `src/potential/mlip/cuda/force_accumulation.cu` | 힘 누적 CUDA 커널 |
-| `include/mlip/runtime/model_specification.h` | 명세 데이터 구조 정의 |
-| `include/mlip/backend/backend_interface.h` | 백엔드 추상 인터페이스 + 레지스트리 |
+| `src/force_libtorch/runtime/mlip_runtime.cpp` | 런타임 진입점, 초기화/실행 |
+| `src/force_libtorch/runtime/execution_plan.cpp` | 파이프라인 컴파일, 단위 변환 |
+| `src/force_libtorch/config/yaml_parser.cpp` | MLIP 명세 YAML 파서 |
+| `src/force_libtorch/backend/pytorch_backend.cpp` | LibTorch 래퍼 (ABI=0으로 컴파일) |
+| `src/force_libtorch/backend/pytorch_backend_register.cpp` | 백엔드 자동 등록 (ABI=1) |
+| `src/force_libtorch/binding/md_data_sources.cpp` | MD 데이터 소스/타겟 등록 |
+| `src/force_libtorch/cuda/edge_conversion.cu` | 엣지 변환 CUDA 커널 |
+| `src/force_libtorch/cuda/force_accumulation.cu` | 힘 누적 CUDA 커널 |
+| `include/force_libtorch/runtime/model_specification.h` | 명세 데이터 구조 정의 |
+| `include/force_libtorch/backend/backend_interface.h` | 백엔드 추상 인터페이스 + 레지스트리 |
 
 ---
 
@@ -214,7 +214,7 @@ bin/md_simulation_cuda  (C++)
 ### Python-C++ 인터페이스 데이터 전달
 
 ```cpp
-// src/python_interface.cpp
+// src/force_python/python_interface.cpp
 // 위치: NumPy 배열로 공유 (복사 없음)
 npy_intp pos_dims[2] = {n_particles, 3};
 PyObject* py_positions = PyArray_SimpleNewFromData(

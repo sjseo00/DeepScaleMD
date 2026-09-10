@@ -2,6 +2,7 @@
 #define FORCE_CALCULATOR_CPU_H
 
 #include "force_calculator.h"
+#include "md_system.h"
 #include <vector>
 #include <fftw3.h>
 
@@ -19,7 +20,15 @@ private:
     void compute_bond_forces(MDSystem& system);
     void compute_angle_forces(MDSystem& system);
     void compute_dihedral_forces(MDSystem& system);
+    void compute_improper_forces(MDSystem& system);
+    // Shared by compute_dihedral_forces/compute_improper_forces: propers and
+    // impropers use the identical periodic-torsion functional form and
+    // analytical gradient, just over different atom-quadruple lists.
+    void compute_torsion_forces(MDSystem& system, const std::vector<MDSystem::LocalDihedral>& torsions);
     void compute_lj_forces(MDSystem& system);
+    // Scaled 1-4 (or FF-specific) nonbonded pairs re-added on top of
+    // [exclusions]; see Topology::SpecialPair for the exact semantics.
+    void compute_special_pair_forces(MDSystem& system);
 
     // Real-space (erfc-screened) half of the Ewald sum, evaluated over the
     // existing neighbor list.

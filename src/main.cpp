@@ -6,7 +6,9 @@
 #include <iomanip>
 #include <string>
 #include <cstring>
+#include <cstdlib>
 #include <mpi.h>
+#include <omp.h>
 
 // Helper function to parse command line arguments
 void parse_arguments(int argc, char* argv[], std::string& config_file) {
@@ -38,6 +40,18 @@ int main(int argc, char* argv[]) {
     
     // Initialize MPI utilities with cached rank and size
     initialize_mpi_utils();
+
+    // Each MPI rank initializes its own OpenMP runtime independently. With
+    // OMP_NUM_THREADS unset, the OpenMP default is "one thread per visible
+    // logical core" -- per rank. Under `mpirun -np N`, that oversubscribes
+    // the machine N-fold (every rank tries to use every core) since nothing
+    // here partitions cores across ranks. Default to a single OpenMP thread
+    // per rank instead; a user who wants intra-rank threading sets
+    // OMP_NUM_THREADS explicitly (and is assumed to have sized it correctly
+    // for the rank count and core count themselves).
+    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        omp_set_num_threads(1);
+    }
 
     if (is_rank_zero()) {
         std::cout << "=== MD Simulation Starting ===" << std::endl;

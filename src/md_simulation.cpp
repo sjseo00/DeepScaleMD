@@ -1,11 +1,13 @@
 #include "md_simulation.h"
 #include "neighbor_list.h"
 #include "force_calculator_cuda.h"
+#include "constraint_solver.h"
 #include "thermostat.h"
 #include "barostat.h"
 #include "halo_backend.h"
 #include "comm_backend.h"
 #include "simulation_backend_factory.h"
+#include <mpi.h>
 #include <iostream>
 #include <fstream>
 #include <chrono>
@@ -13,13 +15,18 @@
 #include <sstream>
 #include <cmath>
 #include <limits>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <cctype>
+#include <array>
 #include <set>
+#include <filesystem>
+#include <algorithm>
 
 // ── C++ MLIP Runtime (mlip_inst.md architecture) ────────────────────────────
-#include "mlip/runtime/mlip_runtime.h"
-#include "mlip/mlip_types.h"
+#include "force_libtorch/runtime/mlip_runtime.h"
+#include "force_libtorch/mlip_types.h"
 // MlipExecutionContext is in the global namespace (defined in mlip_types.h)
 // MlipRuntime is in namespace mlip
 using namespace mlip;
@@ -38,6 +45,15 @@ bool env_flag_enabled(const char* name) {
     return (value != nullptr) && (std::string(value) == "1");
 }
 
+// Writes one Fortran-unformatted record (4-byte length, payload, matching
+// 4-byte length trailer) -- the wrapping every field/array uses in the
+// classic CHARMM/NAMD DCD binary trajectory format.
+void dcd_write_record(std::ofstream& f, const char* data, int32_t nbytes) {
+    f.write(reinterpret_cast<const char*>(&nbytes), sizeof(int32_t));
+    f.write(data, nbytes);
+    f.write(reinterpret_cast<const char*>(&nbytes), sizeof(int32_t));
+}
+
 std::string trim_copy(const std::string& input) {
     size_t start = input.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) {
@@ -53,8 +69,6 @@ std::set<std::string> parse_force_components(const std::string& value) {
     std::string component;
     while (std::getline(stream, component, ',')) {
         component = trim_copy(component);
-        // Transitional spelling for existing input files.
-        if (component == "mlip_runtime") component = "libtorch";
         if (!component.empty()) result.insert(component);
     }
     return result;
@@ -66,6 +80,31 @@ std::string uppercase_copy(std::string s) {
     }
     return s;
 }
+
+std::map<std::string, std::string> read_dsmd_input_manifest(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file) throw std::runtime_error("Cannot open dsMD_input manifest: " + filename);
+    std::map<std::string, std::string> values;
+    std::string line;
+    while (std::getline(file, line)) {
+        const size_t comment = line.find('#');
+        if (comment != std::string::npos) line.erase(comment);
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = trim_copy(line.substr(0, colon));
+        std::string value = trim_copy(line.substr(colon + 1));
+        if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"') ||
+                                  (value.front() == '\'' && value.back() == '\''))) {
+            value = value.substr(1, value.size() - 2);
+        }
+        if (!key.empty() && !value.empty()) values[key] = value;
+    }
+    if (values["schema_version"] != "1")
+        throw std::runtime_error("dsMD_input manifest schema_version must be 1");
+    if (values["format"] != "dsMD_input")
+        throw std::runtime_error("dsMD_input manifest format must be dsMD_input");
+    return values;
+}
 }  // namespace
 
 
@@ -75,11 +114,13 @@ MDSimulation::MDSimulation() :
     mlip_spec_file_(""),
     coordinate_file(""),
     topology_file(""),
+    parameter_file(""),
     target_temperature(0.0),
     output_prefix("md_output"),
     trajectory_output_freq(100),
     energy_output_freq(10),
     cutoff_distance(12.0),
+    lj_switch_distance(-1.0),
     neighbor_list_type_str("verlet_cell_list"),
     neighbor_list_tile_size(256),
     neighbor_list_update_freq(10),  // Default update frequency: every 10 steps
@@ -166,7 +207,7 @@ void MDSimulation::initialize(const std::string& config_file) {
     // Load topology file from configuration and assign properties to particles
     // MUST be done BEFORE velocity initialization to ensure masses are set
     if (!topology_file.empty()) {
-        system->load_topology(topology_file);
+        system->load_topology(topology_file, parameter_file);
         // Set up force field parameters after topology is loaded
         system->setup_force_field_params();
         
@@ -358,6 +399,37 @@ void MDSimulation::initialize(const std::string& config_file) {
     initialize_integrator();
     initialize_thermostat();
     initialize_barostat();
+
+    // ── Constraints (SHAKE/RATTLE) ──────────────────────────────────────────
+    // velocity_verlet only. CPU uses ConstraintSolver; CUDA uses the
+    // GPU-resident kernels in ForceCalculatorCUDA (apply_shake_on_device /
+    // apply_rattle_on_device). See include/constraint_solver.h for the
+    // derivation both paths implement.
+    if (!system->get_topology().get_constraints().empty()) {
+        bool is_velocity_verlet = dynamic_cast<VelocityVerletIntegrator*>(integrator.get()) != nullptr;
+#ifdef USE_CUDA
+        is_velocity_verlet = is_velocity_verlet ||
+            dynamic_cast<VelocityVerletIntegratorCUDA*>(integrator.get()) != nullptr;
+#endif
+        if (!is_velocity_verlet) {
+            throw std::runtime_error(
+                "[Constraints] SHAKE/RATTLE are only implemented for the velocity_verlet integrator.");
+        }
+        constraints_enabled_ = true;
+        if (!cuda_calc_cached_) {
+            constraint_solver_ = std::make_unique<ConstraintSolver>();
+        }
+        if (system->get_rank() == 0) {
+            std::cout << "[Constraints] SHAKE/RATTLE enabled ("
+                      << (cuda_calc_cached_ ? "CUDA" : "CPU") << ") for "
+                      << system->get_topology().get_constraints().size()
+                      << " constraint(s)" << std::endl;
+        }
+    }
+
+    // Collective: opens the DCD/ADIOS2 files (if requested) now that domain
+    // decomposition has established local particle counts.
+    initialize_trajectory_writers();
 }
 
 bool MDSimulation::is_using_cuda_backend() const {
@@ -428,6 +500,18 @@ void MDSimulation::prepare_first_step() {
         cuda_calc->initial_upload_to_device(*system);
 #endif
     }
+
+    // Velocity Verlet requires F(r(t)) before its first half-kick.  Building
+    // only the device buffers/kinetic energy here leaves the initial force at
+    // zero, reports a false PE=0 at step 0, and advances the first step with
+    // the wrong acceleration.
+    double neighbor_time = 0.0;
+    double comm_time = 0.0;
+    double migrate_time = 0.0;
+    handle_neighbor_phase(neighbor_time, comm_time, migrate_time);
+
+    double force_time = 0.0;
+    handle_force_phase(cuda_calc, force_time);
     
     // Calculate initial kinetic energy after velocity initialization
     // GPU-resident mode: KE calculated on GPU
@@ -441,17 +525,51 @@ void MDSimulation::handle_integrate1_phase(ForceCalculatorCUDA* cuda_calc, doubl
     integrate1_time = measure_seconds([&]() {
         if (cuda_calc) {
 #ifdef USE_CUDA
+            if (constraints_enabled_) {
+                cuda_calc->snapshot_constraint_positions(*system);
+            }
             cuda_calc->integrate_on_device(*system, dt, integrator_type);
+            if (constraints_enabled_) {
+                if (!cuda_calc->apply_shake_on_device(*system, dt)) {
+                    throw std::runtime_error(
+                        "[Constraints] CUDA SHAKE did not converge; reduce the timestep or check the constraint geometry.");
+                }
+            }
             return;
 #else
 #endif
         }
+        if (constraints_enabled_) {
+            ParticleData& particles = system->get_particles();
+            // A constraint's non-owning atom can be a ghost slot (index >=
+            // local_particles), exactly like bonds -- size/copy the FULL
+            // SoA (locals+ghosts), not just the local prefix, or apply_shake
+            // reads out of bounds for any constraint spanning into a ghost.
+            const size_t n = particles.x.size();
+            constraint_pre_step_x_.resize(n);
+            constraint_pre_step_y_.resize(n);
+            constraint_pre_step_z_.resize(n);
+            std::copy(particles.x.begin(), particles.x.begin() + n, constraint_pre_step_x_.begin());
+            std::copy(particles.y.begin(), particles.y.begin() + n, constraint_pre_step_y_.begin());
+            std::copy(particles.z.begin(), particles.z.begin() + n, constraint_pre_step_z_.begin());
+        }
         integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+        if (constraints_enabled_) {
+            if (!constraint_solver_->apply_shake(*system, dt,
+                    constraint_pre_step_x_, constraint_pre_step_y_, constraint_pre_step_z_)) {
+                throw std::runtime_error(
+                    "[Constraints] CPU SHAKE did not converge; reduce the timestep or check the constraint geometry.");
+            }
+        }
     });
 }
 
 void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_time, double& migrate_time) {
-    bool should_rebuild = (current_step % neighbor_list_update_freq == 0);
+    // prepare_first_step() performs build zero. Avoid rebuilding the same list
+    // immediately in the first call to single_step() while current_step is
+    // still zero.
+    bool should_rebuild = (neighbor_list_builds == 0) ||
+        (current_step > 0 && current_step % neighbor_list_update_freq == 0);
     migrate_time = 0.0;
 
     if (neighbor_rebuild_forced) {
@@ -475,7 +593,7 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
 
         if (cuda_calc && !gpu_direct_halo_done) {
             throw std::runtime_error(
-                "CUDA execution requires the dsDecomp GPU-resident halo backend; "
+                "CUDA execution requires the dsDecompX GPU-resident halo backend; "
                 "host ParticleData fallback is disabled");
         }
 
@@ -520,6 +638,13 @@ void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml) {
         zero_forces();
     }
 
+    // Python's additive-force ABI returns forces only (no energy), so its PE
+    // contribution is pulled separately via get_last_energy() and folded into
+    // cached_potential_energy below -- otherwise a pure-python run would
+    // report whatever force_calc's (disabled) builtin/LibTorch PE happens to
+    // hold, typically zero, instead of the MLIP model's actual energy.
+    Real python_potential_energy = 0.0;
+
     if (enable_python_forces_ && python_interface) {
         SimulationBox& box = system->get_box();
 
@@ -537,6 +662,7 @@ void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml) {
             system->get_neighbor_list(),
             box.lx, box.ly, box.lz,
             box.periodic_x, box.periodic_y, box.periodic_z);
+        python_potential_energy = static_cast<Real>(python_interface->get_last_energy());
 
         if (cuda_calc) {
 #ifdef USE_CUDA
@@ -544,9 +670,10 @@ void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml) {
                 system->get_particles(), system->get_num_particles());
 #endif
         }
-
-        cached_potential_energy = force_calc ? force_calc->get_potential_energy() : 0.0;
     }
+
+    cached_potential_energy =
+        (force_calc ? force_calc->get_potential_energy() : 0.0) + python_potential_energy;
 }
 
 void MDSimulation::reverse_halo_for_bonded_if_needed() {
@@ -610,11 +737,23 @@ void MDSimulation::handle_integrate2_phase(ForceCalculatorCUDA* cuda_calc, doubl
         if (cuda_calc) {
 #ifdef USE_CUDA
             cuda_calc->complete_velocity_update_on_device(*system, dt, integrator_type);
+            if (constraints_enabled_) {
+                if (!cuda_calc->apply_rattle_on_device(*system)) {
+                    throw std::runtime_error(
+                        "[Constraints] CUDA RATTLE did not converge; reduce the timestep or check the constraint geometry.");
+                }
+            }
             return;
 #else
 #endif
         }
         integrator->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
+        if (constraints_enabled_) {
+            if (!constraint_solver_->apply_rattle(*system)) {
+                throw std::runtime_error(
+                    "[Constraints] CPU RATTLE did not converge; reduce the timestep or check the constraint geometry.");
+            }
+        }
     });
 }
 
@@ -789,12 +928,196 @@ void MDSimulation::zero_forces() {
     // Ghost particle forces will be overwritten during force calculation
     ParticleData& particles = system->get_particles();
     size_t local_count = system->get_local_particles();
-    
+
     for (size_t i = 0; i < local_count; i++) {
         particles.fx[i] = 0.0;
         particles.fy[i] = 0.0;
         particles.fz[i] = 0.0;
     }
+}
+
+void MDSimulation::zero_velocities() {
+    ParticleData& particles = system->get_particles();
+    size_t n = particles.vx.size();
+
+    for (size_t i = 0; i < n; i++) {
+        particles.vx[i] = 0.0;
+        particles.vy[i] = 0.0;
+        particles.vz[i] = 0.0;
+    }
+}
+
+void MDSimulation::compute_fire_reduction_cpu(Real& power, Real& f_norm_sq,
+                                              Real& v_norm_sq, Real& f_max_sq) const {
+    const ParticleData& particles = system->get_particles();
+    const size_t n = system->get_local_particles();
+
+    power = 0.0; f_norm_sq = 0.0; v_norm_sq = 0.0; f_max_sq = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const Real fx = particles.fx[i], fy = particles.fy[i], fz = particles.fz[i];
+        const Real vx = particles.vx[i], vy = particles.vy[i], vz = particles.vz[i];
+        power += fx * vx + fy * vy + fz * vz;
+        const Real f2 = fx * fx + fy * fy + fz * fz;
+        f_norm_sq += f2;
+        v_norm_sq += vx * vx + vy * vy + vz * vz;
+        f_max_sq = std::max(f_max_sq, f2);
+    }
+}
+
+void MDSimulation::apply_fire_update_cpu(const FireMinimizer::StepParams& params) {
+    ParticleData& particles = system->get_particles();
+    const SimulationBox& box = system->get_box();
+    const size_t n = system->get_local_particles();
+    const Real f_norm_inv = (params.mix_velocity && params.f_norm > 0.0)
+        ? (1.0 / params.f_norm) : 0.0;
+
+    for (size_t i = 0; i < n; i++) {
+        Real vx = particles.vx[i], vy = particles.vy[i], vz = particles.vz[i];
+
+        if (params.reset_velocity) {
+            vx = vy = vz = 0.0;
+        } else if (params.mix_velocity) {
+            const Real fhx = particles.fx[i] * f_norm_inv;
+            const Real fhy = particles.fy[i] * f_norm_inv;
+            const Real fhz = particles.fz[i] * f_norm_inv;
+            vx = (1.0 - params.alpha) * vx + params.alpha * params.v_norm * fhx;
+            vy = (1.0 - params.alpha) * vy + params.alpha * params.v_norm * fhy;
+            vz = (1.0 - params.alpha) * vz + params.alpha * params.v_norm * fhz;
+        }
+
+        const Real inv_m = 1.0 / particles.mass[i];
+        vx += params.dt * particles.fx[i] * inv_m * FORCE_TO_ACCEL;
+        vy += params.dt * particles.fy[i] * inv_m * FORCE_TO_ACCEL;
+        vz += params.dt * particles.fz[i] * inv_m * FORCE_TO_ACCEL;
+
+        particles.vx[i] = vx;
+        particles.vy[i] = vy;
+        particles.vz[i] = vz;
+        particles.x[i] += params.dt * vx;
+        particles.y[i] += params.dt * vy;
+        particles.z[i] += params.dt * vz;
+        box.apply_pbc(particles.x[i], particles.y[i], particles.z[i]);
+    }
+}
+
+void MDSimulation::run_energy_minimization() {
+    if (minimizer_type_.empty() || minimizer_type_ == "none") {
+        return;
+    }
+    if (minimizer_type_ != "fire") {
+        throw std::runtime_error(
+            "Unknown minimizer type: '" + minimizer_type_ + "' (supported: none, fire)");
+    }
+
+    FireConfig cfg;
+    cfg.max_steps = minimizer_max_steps_;
+    cfg.force_tolerance = minimizer_force_tolerance_;
+    cfg.dt_start = (minimizer_dt_start_ > 0.0) ? minimizer_dt_start_ : (dt > 0.0 ? dt : 0.5);
+    cfg.dt_max = (minimizer_dt_max_ > 0.0) ? minimizer_dt_max_ : (cfg.dt_start * 4.0);
+    FireMinimizer fire(cfg);
+
+    ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
+
+    if (system->get_rank() == 0) {
+        std::cout << "Starting FIRE energy minimization (max_steps=" << cfg.max_steps
+                  << ", force_tolerance=" << cfg.force_tolerance << " kcal/mol/A)" << std::endl;
+    }
+
+    // FIRE starts from rest: the Maxwell-Boltzmann velocities initialize()
+    // already seeded for the MD run would otherwise bias the first few
+    // iterations, so this pseudo-dynamics optimizer gets its own v(0)=0.
+    zero_velocities();
+
+    if (cuda_calc) {
+#ifdef USE_CUDA
+        cuda_calc->initial_upload_to_device(*system);
+#endif
+    }
+
+    double neighbor_time = 0.0, comm_time = 0.0, migrate_time = 0.0, force_time = 0.0;
+    neighbor_rebuild_forced = true;
+    handle_neighbor_phase(neighbor_time, comm_time, migrate_time);
+    handle_force_phase(cuda_calc, force_time);
+
+    int iter = 0;
+    bool converged = false;
+    for (; iter < cfg.max_steps; ++iter) {
+        Real local_power = 0.0, local_f2 = 0.0, local_v2 = 0.0, local_fmax2 = 0.0;
+
+        if (cuda_calc) {
+#ifdef USE_CUDA
+            const auto local = cuda_calc->compute_fire_reduction_on_device(
+                system->get_local_particles());
+            local_power = local.power;
+            local_f2 = local.f_norm_sq;
+            local_v2 = local.v_norm_sq;
+            local_fmax2 = local.f_max_sq;
+#endif
+        } else {
+            compute_fire_reduction_cpu(local_power, local_f2, local_v2, local_fmax2);
+        }
+
+        const Real global_power = comm_backend_->sum_reduce(local_power);
+        const Real global_f_norm = std::sqrt(std::max<Real>(comm_backend_->sum_reduce(local_f2), 0.0));
+        const Real global_v_norm = std::sqrt(std::max<Real>(comm_backend_->sum_reduce(local_v2), 0.0));
+        const Real fmax = std::sqrt(std::max<Real>(comm_backend_->max_reduce(local_fmax2), 0.0));
+
+        if (system->get_rank() == 0 && (iter % minimizer_output_freq_ == 0)) {
+            std::cout << "[minimize] step " << iter << "  PE=" << cached_potential_energy
+                      << "  Fmax=" << fmax << std::endl;
+        }
+
+        if (fmax < cfg.force_tolerance) {
+            converged = true;
+            break;
+        }
+
+        const FireMinimizer::StepParams params =
+            fire.advance(global_power, global_f_norm, global_v_norm);
+
+        if (cuda_calc) {
+#ifdef USE_CUDA
+            cuda_calc->apply_fire_update_on_device(
+                system->get_local_particles(), system->get_box(),
+                params.reset_velocity, params.mix_velocity,
+                params.alpha, params.v_norm, params.f_norm, params.dt);
+#endif
+        } else {
+            apply_fire_update_cpu(params);
+        }
+
+        // Positions moved: force a full neighbor/halo refresh before the next
+        // force evaluation. FIRE's step size is adaptive and can be large
+        // early on, so there is no cheap displacement-based skip here like
+        // in the main MD loop.
+        neighbor_rebuild_forced = true;
+        handle_neighbor_phase(neighbor_time, comm_time, migrate_time);
+        handle_force_phase(cuda_calc, force_time);
+    }
+
+    if (system->get_rank() == 0) {
+        std::cout << "[minimize] " << (converged ? "converged" : "stopped at max_steps")
+                  << " after " << iter << " step(s), PE=" << cached_potential_energy
+                  << std::endl;
+    }
+
+    if (cuda_calc) {
+#ifdef USE_CUDA
+        // Sync the host mirror with the minimized (device-resident) geometry
+        // BEFORE clearing velocities -- download_from_device() would otherwise
+        // bring FIRE's leftover pseudo-velocities back onto the host.
+        cuda_calc->download_from_device(*system);
+#endif
+    }
+
+    // FIRE's velocities are optimizer state, not physical thermal velocities.
+    // Generate a fresh Maxwell distribution over the current post-migration
+    // MPI ownership and scale it globally to target_temperature.
+    system->initialize_distributed_velocities(target_temperature);
+
+    // Force prepare_first_step() to rebuild the neighbor list and recompute
+    // F(x) at the minimized (or max_steps-truncated) geometry.
+    neighbor_rebuild_forced = true;
 }
 
 
@@ -818,7 +1141,13 @@ void MDSimulation::run() {
     // Reset state flags
     current_step = 0;
     neighbor_rebuild_forced = false;
-    
+
+    // Optional energy minimization runs once before the MD loop, then restores
+    // a physical velocity distribution at target_temperature. It leaves
+    // neighbor_rebuild_forced set so prepare_first_step() rebuilds against the
+    // relaxed geometry.
+    run_energy_minimization();
+
     // Prepare initial forces at t=0 before starting MD loop
     prepare_first_step();
 
@@ -866,7 +1195,8 @@ bool MDSimulation::should_output_step(int step) const {
 }
 
 bool MDSimulation::needs_ke_update_for_step(int step) const {
-    return should_output_step(step) || (step == total_steps);
+    return should_output_step(step) || should_write_trajectory_step(step) ||
+           (step == total_steps);
 }
 
 bool MDSimulation::should_write_trajectory_step(int step) const {
@@ -884,37 +1214,30 @@ bool MDSimulation::should_print_timing_for_step(int step) const {
 }
 
 void MDSimulation::handle_step_output(int step) {
-    if (!should_output_step(step)) {
+    const bool emit_text = should_output_step(step);
+    const bool write_frame = should_write_trajectory_step(step);
+    if (!emit_text && !write_frame) {
         return;
     }
 
-    if (should_print_timing_for_step(step) && !timing_every_step) {
+    if (emit_text && should_print_timing_for_step(step) && !timing_every_step) {
         print_step_timing(step);
     }
 
     // OPTIMIZATION: Removed MPI_Barrier before output.
     // The MPI_Allreduce calls in calculate_*_energy already synchronize enough.
-    output_results(step);
+    output_results(step, emit_text);
 }
 
 void MDSimulation::compute_output_energies(const ParticleData& particles, OutputMetrics& metrics) {
     if (force_calc) {
         metrics.total_ke = force_calc->get_kinetic_energy() * mvv2e;
-
-        if (enable_python_forces_ && !enable_builtin_forces_ && !enable_libtorch_forces_) {
-            metrics.total_pe = cached_potential_energy;
-        } else if (enable_builtin_forces_) {
-            // Always report the force calculator's own accumulated PE. It
-            // already sums every enabled contribution (bonds/angles/
-            // dihedrals/LJ/electrostatics) consistently for CPU, SYCL and
-            // CUDA. The previous CPU/SYCL branch called calculate_potential_energy(),
-            // a separate LJ-only re-implementation that silently ignored
-            // bonded and electrostatic energy -- see force_calc for the
-            // authoritative computation.
-            metrics.total_pe = force_calc->get_potential_energy();
-        } else {
-            metrics.total_pe = force_calc->get_potential_energy();
-        }
+        // cached_potential_energy is kept current every step in
+        // compute_forces_with_mode(): force_calc's own accumulated PE (which
+        // already sums bonds/angles/dihedrals/LJ/electrostatics/LibTorch
+        // consistently for CPU, SYCL and CUDA) plus the Python MLIP
+        // contribution, if enabled.
+        metrics.total_pe = cached_potential_energy;
         return;
     }
 
@@ -983,10 +1306,6 @@ void MDSimulation::emit_rank0_output(int step, const OutputMetrics& metrics) {
     }
 
     std::cout << format_output_line(step, metrics) << std::endl;
-
-    if (should_write_trajectory_step(step)) {
-        write_trajectory(step);
-    }
 }
 
 void MDSimulation::sync_output_state_to_host_if_needed() {
@@ -1044,7 +1363,7 @@ std::string MDSimulation::format_output_line(int step, const OutputMetrics& metr
     return output_line.str();
 }
 
-void MDSimulation::output_results(int step) {
+void MDSimulation::output_results(int step, bool emit_text) {
     double output_time = measure_seconds([&]() {
         sync_output_state_to_host_if_needed();
 
@@ -1055,7 +1374,16 @@ void MDSimulation::output_results(int step) {
         compute_output_force_speed_stats(particles, metrics);
         compute_output_thermodynamics(particles, metrics);
 
-        emit_rank0_output(step, metrics);
+        if (emit_text) {
+            emit_rank0_output(step, metrics);
+        }
+
+        // Collective: every rank must call this (MPI_Gatherv for the serial
+        // formats, ADIOS2 Put/BeginStep/EndStep for bp) -- it cannot live
+        // inside emit_rank0_output(), which returns early on rank != 0.
+        if (should_write_trajectory_step(step)) {
+            write_trajectory(step);
+        }
     });
 
     last_timing.io_ms = output_time * 1000.0;
@@ -1087,7 +1415,11 @@ void MDSimulation::finalize() {
     if (neighbor_builder) {
         neighbor_builder->finalize();
     }
-    
+
+    // Collective: patches the DCD NSET header and closes the ADIOS2 engine
+    // (Engine::Close() is collective across all writing ranks).
+    finalize_trajectory_writers();
+
     if (system->get_rank() == 0) {
         std::cout << "MD simulation finalized" << std::endl;
     }
@@ -1106,6 +1438,7 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     bool found_target_temperature = false;
     bool found_timestep = false;
     bool found_total_steps = false;
+    std::string input_system;
     
     std::string line;
     std::string current_section = "";
@@ -1121,6 +1454,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         // Skip empty lines after comment removal
         if (line.empty()) continue;
         
+        // Preserve indentation before trimming. A non-indented key/value
+        // after a mapping section closes that section.
+        const bool is_indented = !line.empty() && (line[0] == ' ' || line[0] == '\t');
+
         // Check for YAML section headers BEFORE trimming
         // A section header is a non-indented line ending with ':'  (no value after ':')
         bool is_section_header = false;
@@ -1148,6 +1485,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         
         // Skip section header lines (they have no value to parse)
         if (is_section_header) continue;
+
+        if (!is_indented) {
+            current_section.clear();
+        }
         
         // Parse key-value pairs
         size_t colon_pos = line.find(':');
@@ -1199,6 +1540,20 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             } else if (key == "spec_file" || key == "mlip_spec_file") {
                 mlip_spec_file_ = value;
             }
+        } else if (current_section == "minimize") {
+            if (key == "method") {
+                minimizer_type_ = value;
+            } else if (key == "max_steps") {
+                minimizer_max_steps_ = std::stoi(value);
+            } else if (key == "force_tolerance") {
+                minimizer_force_tolerance_ = std::stod(value);
+            } else if (key == "dt_start") {
+                minimizer_dt_start_ = std::stod(value);
+            } else if (key == "dt_max") {
+                minimizer_dt_max_ = std::stod(value);
+            } else if (key == "output_freq") {
+                minimizer_output_freq_ = std::stoi(value);
+            }
         } else if (current_section == "mlip_config" || current_section == "mace_config") {
             // mlip_config  — unified section name (mace_config kept for backward compat)
             if (key == "model_path") {
@@ -1216,11 +1571,15 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                 // are forwarded as extra kwargs to initialize_ml_forcefield_generic().
                 mlip_extra_kwargs[key] = value;
             }
+        } else if (key == "input_system") {
+            input_system = value;
         } else if (key == "coordinate_file") {
             coordinate_file = value;
             found_coordinate_file = true;
         } else if (key == "topology_file") {
             topology_file = value;
+        } else if (key == "parameter_file") {
+            parameter_file = value;
         } else if (key == "target_temperature") {
             target_temperature = std::stod(value);
             found_target_temperature = true;
@@ -1250,6 +1609,8 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             cutoff_distance = std::stod(value);
         } else if (key == "cutoff") {
             cutoff_distance = std::stod(value);
+        } else if (key == "lj_switch_distance" || key == "switchdist") {
+            lj_switch_distance = std::stod(value);
         } else if (key == "neighbor_list_type") {
             neighbor_list_type_str = value;
         } else if (key == "neighbor_list_update_freq") {
@@ -1293,9 +1654,27 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         }
     }
     
+    if (!input_system.empty()) {
+        const auto manifest = read_dsmd_input_manifest(input_system);
+        const std::filesystem::path base =
+            std::filesystem::absolute(std::filesystem::path(input_system)).parent_path();
+        auto resolve = [&](const char* key) -> std::string {
+            auto it = manifest.find(key);
+            if (it == manifest.end()) return "";
+            const std::filesystem::path path(it->second);
+            return (path.is_absolute() ? path : base / path).lexically_normal().string();
+        };
+        if (coordinate_file.empty()) coordinate_file = resolve("coordinate_file");
+        if (topology_file.empty()) topology_file = resolve("topology_file");
+        if (parameter_file.empty()) parameter_file = resolve("parameter_file");
+        found_coordinate_file = !coordinate_file.empty();
+    }
+
     // Validate required parameters
     std::vector<std::string> missing_params;
     if (!found_coordinate_file) missing_params.push_back("coordinate_file");
+    if (!input_system.empty() && topology_file.empty()) missing_params.push_back("topology_file");
+    if (!input_system.empty() && parameter_file.empty()) missing_params.push_back("parameter_file");
     if (!found_target_temperature) missing_params.push_back("target_temperature");
     if (!found_timestep) missing_params.push_back("timestep");
     if (!found_total_steps) missing_params.push_back("total_steps");
@@ -1310,8 +1689,7 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     }
     
     // Parse force components.  `mode` accepts a comma-separated set, e.g.
-    // "builtin, python, libtorch".  The legacy `mlip_runtime` token remains
-    // an input-compatible alias for `libtorch`.
+    // "builtin, python, libtorch".
     force_calculation_mode = trim_copy(force_calculation_mode);
     const auto force_components = parse_force_components(force_calculation_mode);
     for (const auto& component : force_components) {
@@ -1330,6 +1708,28 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     enable_python_forces_   = force_components.count("python") != 0;
     enable_libtorch_forces_ = force_components.count("libtorch") != 0;
 
+    // Parse trajectory_format.  Accepts a comma-separated set, e.g.
+    // "xyz, dcd, bp". "both" is a legacy alias for "xyz, dump".
+    {
+        std::string normalized = trajectory_format;
+        if (trim_copy(normalized) == "both") normalized = "xyz,dump";
+        trajectory_formats_ = parse_force_components(normalized);
+        for (const auto& fmt : trajectory_formats_) {
+            if (fmt != "xyz" && fmt != "dump" && fmt != "dcd" && fmt != "bp") {
+                throw std::runtime_error(
+                    "Invalid trajectory_format component: '" + fmt
+                    + "'. Supported components are: xyz, dump, dcd, bp (or legacy 'both')");
+            }
+        }
+#ifndef USE_ADIOS2
+        if (trajectory_formats_.count("bp")) {
+            throw std::runtime_error(
+                "trajectory_format 'bp' requires a build with ADIOS2 enabled "
+                "(-DENABLE_ADIOS2=ON at CMake configure time).");
+        }
+#endif
+    }
+
     // Validate parameter values
     if (dt <= 0) {
         throw std::runtime_error("Invalid timestep: must be positive");
@@ -1343,28 +1743,65 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     if (thermostat_type != "none" && !thermostat_type.empty() && tau_t <= 0.0) {
         throw std::runtime_error("Invalid thermostat damping time: must be positive");
     }
+    if (minimizer_type_ != "none" && !minimizer_type_.empty()) {
+        if (minimizer_type_ != "fire") {
+            throw std::runtime_error(
+                "Invalid minimize.method: '" + minimizer_type_ + "' (supported: none, fire)");
+        }
+        if (minimizer_max_steps_ <= 0) {
+            throw std::runtime_error("Invalid minimize.max_steps: must be positive");
+        }
+        if (minimizer_force_tolerance_ <= 0.0) {
+            throw std::runtime_error("Invalid minimize.force_tolerance: must be positive");
+        }
+    }
     if (neighbor_list_update_freq <= 0) {
         throw std::runtime_error("Invalid neighbor_list_update_freq: must be positive");
+    }
+    if (lj_switch_distance >= 0.0 &&
+        (lj_switch_distance <= 0.0 || lj_switch_distance >= cutoff_distance)) {
+        throw std::runtime_error("Invalid lj_switch_distance: must be positive and smaller than cutoff_distance");
     }
     
     // Set the physical cutoff in the system for force calculations
     system->set_physical_cutoff(cutoff_distance);
     system->set_verlet_skin(verlet_skin);
+    system->get_ff_params().lj_switch_distance = lj_switch_distance;
     rebuild_output_info_items_cache();
     if (system->get_rank() == 0) {
         std::cout << "Configuration loaded successfully:" << std::endl;
         std::cout << "  Coordinate file: " << coordinate_file << std::endl;
+        if (!parameter_file.empty()) {
+            std::cout << "  Parameter file: " << parameter_file << std::endl;
+        }
         std::cout << "  Target temperature: " << target_temperature << " K" << std::endl;
         std::cout << "  Timestep: " << dt << " fs" << std::endl;
         std::cout << "  Total steps: " << total_steps << std::endl;
         std::cout << "  Integrator: " << integrator_type << std::endl;
         std::cout << "  Thermostat: " << thermostat_type << std::endl;
         std::cout << "  Barostat: " << barostat_type << std::endl;
+        if (minimizer_type_ != "none" && !minimizer_type_.empty()) {
+            std::cout << "  Minimizer: " << minimizer_type_
+                      << " (max_steps=" << minimizer_max_steps_
+                      << ", force_tolerance=" << minimizer_force_tolerance_
+                      << " kcal/mol/A)" << std::endl;
+        }
+        {
+            std::string fmt_list;
+            for (const auto& fmt : trajectory_formats_) {
+                if (!fmt_list.empty()) fmt_list += ", ";
+                fmt_list += fmt;
+            }
+            std::cout << "  Trajectory formats: " << fmt_list << std::endl;
+        }
         std::cout << "  Box size: " << system->get_box().lx << " x " << system->get_box().ly << " x " << system->get_box().lz << std::endl;
         std::cout << "  Periodic BC: " << (system->get_box().periodic_x ? "T" : "F") 
                   << " " << (system->get_box().periodic_y ? "T" : "F") 
                   << " " << (system->get_box().periodic_z ? "T" : "F") << std::endl;
         std::cout << "  Cutoff distance: " << cutoff_distance << std::endl;
+        if (lj_switch_distance > 0.0) {
+            std::cout << "  LJ switch distance: " << lj_switch_distance << std::endl;
+        }
         std::cout << "  Neighbor list type: " << neighbor_list_type_str << std::endl;
         std::cout << "  Neighbor list update frequency: " << neighbor_list_update_freq << " steps" << std::endl;
         std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
@@ -1602,128 +2039,474 @@ void MDSimulation::check_energy_stability() {
 }
 
 // Trajectory output functions
+// Collective: gathers every rank's LOCAL (owned, non-ghost) particles onto
+// rank 0 via MPI_Gatherv, reordered by global_id. Every rank owns a
+// spatially-determined, non-contiguous subset of global ids that also
+// changes over time as dsDecompX migrates particles, so the gather order
+// (by MPI rank) must be un-scrambled back into atom-index order here --
+// otherwise the same atom would land in a different row of the output file
+// on every frame. Must be called by every rank (it is a collective MPI
+// operation); only rank 0's `frame` is populated.
+void MDSimulation::gather_particles_for_serial_output(SerialTrajectoryFrame& frame) const {
+    const int rank = system->get_rank();
+    const int size = system->get_size();
+    const size_t local_n = system->get_local_particles();
+    ParticleData& particles = system->get_particles();
+    const bool need_v = trajectory_include_velocities;
+    const bool need_f = trajectory_include_forces;
+
+    if (size == 1) {
+        frame.x.resize(local_n); frame.y.resize(local_n); frame.z.resize(local_n);
+        frame.type.resize(local_n); frame.element.resize(local_n);
+        if (need_v) { frame.vx.resize(local_n); frame.vy.resize(local_n); frame.vz.resize(local_n); }
+        if (need_f) { frame.fx.resize(local_n); frame.fy.resize(local_n); frame.fz.resize(local_n); }
+        for (size_t k = 0; k < local_n; ++k) {
+            const size_t gid = static_cast<size_t>(particles.global_id[k]);
+            if (gid >= local_n) {
+                throw std::runtime_error("Invalid global_id while gathering serial trajectory output");
+            }
+            frame.x[gid] = particles.x[k]; frame.y[gid] = particles.y[k]; frame.z[gid] = particles.z[k];
+            frame.type[gid] = particles.type[k];
+            frame.element[gid] = system->has_topology()
+                ? system->get_topology().get_atom_element(static_cast<int>(gid)) : "C";
+            if (need_v) { frame.vx[gid] = particles.vx[k]; frame.vy[gid] = particles.vy[k]; frame.vz[gid] = particles.vz[k]; }
+            if (need_f) { frame.fx[gid] = particles.fx[k]; frame.fy[gid] = particles.fy[k]; frame.fz[gid] = particles.fz[k]; }
+        }
+        return;
+    }
+
+    const int local_count = static_cast<int>(local_n);
+    std::vector<int> counts, displs;
+    int total = 0;
+    if (rank == 0) counts.resize(size);
+    MPI_Gather(&local_count, 1, MPI_INT, rank == 0 ? counts.data() : nullptr, 1, MPI_INT,
+               0, MPI_COMM_WORLD);
+    if (rank == 0) {
+        displs.resize(size);
+        for (int r = 0; r < size; ++r) { displs[r] = total; total += counts[r]; }
+    }
+
+    std::vector<int> local_gid(particles.global_id.begin(), particles.global_id.begin() + local_n);
+    std::vector<int> local_type(particles.type.begin(), particles.type.begin() + local_n);
+    std::vector<int> gathered_gid(rank == 0 ? total : 0);
+    std::vector<int> gathered_type(rank == 0 ? total : 0);
+    MPI_Gatherv(local_gid.data(), local_count, MPI_INT,
+                rank == 0 ? gathered_gid.data() : nullptr,
+                rank == 0 ? counts.data() : nullptr, rank == 0 ? displs.data() : nullptr,
+                MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_type.data(), local_count, MPI_INT,
+                rank == 0 ? gathered_type.data() : nullptr,
+                rank == 0 ? counts.data() : nullptr, rank == 0 ? displs.data() : nullptr,
+                MPI_INT, 0, MPI_COMM_WORLD);
+
+    // MPI_DOUBLE assumes Real == double, true everywhere in this codebase.
+    auto gather_field = [&](const Real* local_ptr, std::vector<Real>& scratch) {
+        scratch.resize(rank == 0 ? total : 0);
+        MPI_Gatherv(local_ptr, local_count, MPI_DOUBLE,
+                    rank == 0 ? scratch.data() : nullptr,
+                    rank == 0 ? counts.data() : nullptr, rank == 0 ? displs.data() : nullptr,
+                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    };
+
+    std::vector<Real> tmp_x, tmp_y, tmp_z;
+    gather_field(particles.x.data(), tmp_x);
+    gather_field(particles.y.data(), tmp_y);
+    gather_field(particles.z.data(), tmp_z);
+
+    std::vector<Real> tmp_vx, tmp_vy, tmp_vz, tmp_fx, tmp_fy, tmp_fz;
+    if (need_v) {
+        gather_field(particles.vx.data(), tmp_vx);
+        gather_field(particles.vy.data(), tmp_vy);
+        gather_field(particles.vz.data(), tmp_vz);
+    }
+    if (need_f) {
+        gather_field(particles.fx.data(), tmp_fx);
+        gather_field(particles.fy.data(), tmp_fy);
+        gather_field(particles.fz.data(), tmp_fz);
+    }
+
+    if (rank != 0) return;
+
+    frame.x.resize(total); frame.y.resize(total); frame.z.resize(total);
+    frame.type.resize(total); frame.element.resize(total);
+    if (need_v) { frame.vx.resize(total); frame.vy.resize(total); frame.vz.resize(total); }
+    if (need_f) { frame.fx.resize(total); frame.fy.resize(total); frame.fz.resize(total); }
+
+    for (int k = 0; k < total; ++k) {
+        const int gid = gathered_gid[k];
+        if (gid < 0 || gid >= total) {
+            throw std::runtime_error("Invalid global_id while gathering serial trajectory output");
+        }
+        frame.x[gid] = tmp_x[k]; frame.y[gid] = tmp_y[k]; frame.z[gid] = tmp_z[k];
+        frame.type[gid] = gathered_type[k];
+        if (need_v) { frame.vx[gid] = tmp_vx[k]; frame.vy[gid] = tmp_vy[k]; frame.vz[gid] = tmp_vz[k]; }
+        if (need_f) { frame.fx[gid] = tmp_fx[k]; frame.fy[gid] = tmp_fy[k]; frame.fz[gid] = tmp_fz[k]; }
+    }
+    for (int gid = 0; gid < total; ++gid) {
+        frame.element[gid] = system->has_topology()
+            ? system->get_topology().get_atom_element(gid) : "C";
+    }
+}
+
+// Collective: called by every rank (via output_results()), because both the
+// serial-format gather above and the ADIOS2 BP writer below need every
+// rank's participation.
 void MDSimulation::write_trajectory(int step) {
-    if (trajectory_format == "xyz") {
-        write_xyz_trajectory(step);
-    } else if (trajectory_format == "dump") {
-        write_lammps_dump(step);
-    } else if (trajectory_format == "both") {
-        write_xyz_trajectory(step);
-        write_lammps_dump(step);
+    if (trajectory_formats_.empty()) return;
+
+    const bool need_serial = trajectory_formats_.count("xyz") || trajectory_formats_.count("dump")
+        || trajectory_formats_.count("dcd");
+
+    if (need_serial) {
+        SerialTrajectoryFrame frame;
+        gather_particles_for_serial_output(frame);
+
+        if (system->get_rank() == 0) {
+            if (trajectory_formats_.count("xyz"))  write_xyz_trajectory(step, frame);
+            if (trajectory_formats_.count("dump")) write_lammps_dump(step, frame);
+            if (trajectory_formats_.count("dcd"))  write_dcd_frame(step, frame);
+        }
     }
+
+#ifdef USE_ADIOS2
+    if (trajectory_formats_.count("bp")) {
+        write_adios2_frame(step);
+    }
+#endif
 }
 
-void MDSimulation::write_xyz_trajectory(int step) {
-    if (system->get_rank() == 0) {
-        std::string filename = output_prefix + "_" + std::to_string(step) + ".xyz";
-        std::ofstream traj_file(filename);
-        
-        if (!traj_file.is_open()) {
-            std::cerr << "Warning: Cannot open trajectory file " << filename << std::endl;
-            return;
-        }
-        
-        ParticleData& particles = system->get_particles();
-        
-        // XYZ format header
-        traj_file << particles.num_particles << "\n";
-        traj_file << "Step " << step << " Time " << std::fixed << std::setprecision(3) 
-                  << step * dt << " fs";
-        
-        // Add energy information to comment line
-        if (force_calc) {
-            Real ke = force_calc->get_kinetic_energy();
-            Real pe = force_calc->get_potential_energy();
-            traj_file << " KE=" << std::setprecision(6) << ke 
-                      << " PE=" << pe << " Total=" << (ke + pe);
-        }
-        traj_file << "\n";
-        
-        // Particle coordinates
-        for (size_t i = 0; i < particles.num_particles; i++) {
-            // Use atom type or default to "C"
-            std::string atom_type = "C";  // Could be enhanced to read from topology
-            
-            traj_file << atom_type << " " 
-                      << std::fixed << std::setprecision(6) 
-                      << particles.x[i] << " " 
-                      << particles.y[i] << " " 
-                      << particles.z[i];
-            
-            // Optionally include velocities and forces
-            if (trajectory_include_velocities) {
-                traj_file << " " << particles.vx[i] << " " 
-                          << particles.vy[i] << " " << particles.vz[i];
-            }
-            
-            if (trajectory_include_forces) {
-                traj_file << " " << particles.fx[i] << " " 
-                          << particles.fy[i] << " " << particles.fz[i];
-            }
-            
-            traj_file << "\n";
-        }
-        
-        traj_file.close();
-    }
-}
+void MDSimulation::write_xyz_trajectory(int step, const SerialTrajectoryFrame& frame) {
+    std::string filename = output_prefix + "_" + std::to_string(step) + ".xyz";
+    std::ofstream traj_file(filename);
 
-void MDSimulation::write_lammps_dump(int step) {
-    if (system->get_rank() == 0) {
-        std::string filename = output_prefix + "_dump." + std::to_string(step);
-        std::ofstream dump_file(filename);
-        
-        if (!dump_file.is_open()) {
-            std::cerr << "Warning: Cannot open dump file " << filename << std::endl;
-            return;
-        }
-        
-        ParticleData& particles = system->get_particles();
-        SimulationBox& box = system->get_box();
-        
-        // LAMMPS dump format header
-        dump_file << "ITEM: TIMESTEP\n" << step << "\n";
-        dump_file << "ITEM: NUMBER OF ATOMS\n" << particles.num_particles << "\n";
-        
-        // Box bounds (assuming orthorhombic box)
-        dump_file << "ITEM: BOX BOUNDS pp pp pp\n";
-        dump_file << "0.0 " << std::fixed << std::setprecision(6) << box.lx << "\n";
-        dump_file << "0.0 " << box.ly << "\n";
-        dump_file << "0.0 " << box.lz << "\n";
-        
-        // Atom data header
-        dump_file << "ITEM: ATOMS id type x y z";
+    if (!traj_file.is_open()) {
+        std::cerr << "Warning: Cannot open trajectory file " << filename << std::endl;
+        return;
+    }
+
+    const size_t n = frame.x.size();
+
+    // XYZ format header
+    traj_file << n << "\n";
+    traj_file << "Step " << step << " Time " << std::fixed << std::setprecision(3)
+              << step * dt << " fs";
+
+    // Add energy information to comment line
+    if (force_calc) {
+        Real ke = force_calc->get_kinetic_energy() * mvv2e;
+        Real pe = cached_potential_energy;
+        traj_file << " KE=" << std::setprecision(6) << ke
+                  << " PE=" << pe << " Total=" << (ke + pe);
+    }
+    traj_file << "\n";
+
+    // Particle coordinates
+    for (size_t i = 0; i < n; i++) {
+        traj_file << frame.element[i] << " "
+                  << std::fixed << std::setprecision(6)
+                  << frame.x[i] << " "
+                  << frame.y[i] << " "
+                  << frame.z[i];
+
+        // Optionally include velocities and forces
         if (trajectory_include_velocities) {
-            dump_file << " vx vy vz";
+            traj_file << " " << frame.vx[i] << " "
+                      << frame.vy[i] << " " << frame.vz[i];
         }
+
         if (trajectory_include_forces) {
-            dump_file << " fx fy fz";
+            traj_file << " " << frame.fx[i] << " "
+                      << frame.fy[i] << " " << frame.fz[i];
         }
+
+        traj_file << "\n";
+    }
+
+    traj_file.close();
+}
+
+void MDSimulation::write_lammps_dump(int step, const SerialTrajectoryFrame& frame) {
+    std::string filename = output_prefix + "_dump." + std::to_string(step);
+    std::ofstream dump_file(filename);
+
+    if (!dump_file.is_open()) {
+        std::cerr << "Warning: Cannot open dump file " << filename << std::endl;
+        return;
+    }
+
+    const size_t n = frame.x.size();
+    SimulationBox& box = system->get_box();
+
+    // LAMMPS dump format header
+    dump_file << "ITEM: TIMESTEP\n" << step << "\n";
+    dump_file << "ITEM: NUMBER OF ATOMS\n" << n << "\n";
+
+    // Box bounds (assuming orthorhombic box)
+    dump_file << "ITEM: BOX BOUNDS pp pp pp\n";
+    dump_file << "0.0 " << std::fixed << std::setprecision(6) << box.lx << "\n";
+    dump_file << "0.0 " << box.ly << "\n";
+    dump_file << "0.0 " << box.lz << "\n";
+
+    // Atom data header
+    dump_file << "ITEM: ATOMS id type x y z";
+    if (trajectory_include_velocities) {
+        dump_file << " vx vy vz";
+    }
+    if (trajectory_include_forces) {
+        dump_file << " fx fy fz";
+    }
+    dump_file << "\n";
+
+    // Atom data
+    for (size_t i = 0; i < n; i++) {
+        dump_file << (i + 1) << " " << frame.type[i] << " "
+                  << std::fixed << std::setprecision(6)
+                  << frame.x[i] << " "
+                  << frame.y[i] << " "
+                  << frame.z[i];
+
+        if (trajectory_include_velocities) {
+            dump_file << " " << frame.vx[i] << " "
+                      << frame.vy[i] << " " << frame.vz[i];
+        }
+
+        if (trajectory_include_forces) {
+            dump_file << " " << frame.fx[i] << " "
+                      << frame.fy[i] << " " << frame.fz[i];
+        }
+
         dump_file << "\n";
-        
-        // Atom data
-        for (size_t i = 0; i < particles.num_particles; i++) {
-            dump_file << (i + 1) << " " << particles.type[i] << " "
-                      << std::fixed << std::setprecision(6)
-                      << particles.x[i] << " " 
-                      << particles.y[i] << " " 
-                      << particles.z[i];
-            
-            if (trajectory_include_velocities) {
-                dump_file << " " << particles.vx[i] << " " 
-                          << particles.vy[i] << " " << particles.vz[i];
-            }
-            
-            if (trajectory_include_forces) {
-                dump_file << " " << particles.fx[i] << " " 
-                          << particles.fy[i] << " " << particles.fz[i];
-            }
-            
-            dump_file << "\n";
+    }
+
+    dump_file.close();
+}
+
+// CHARMM-format DCD header (content length 84 bytes, matching the layout
+// used by VMD's dcdplugin.c / CHARMM / NAMD -- the reference implementation
+// most DCD readers/writers mirror). After the 4-byte "CORD" tag, ICNTRL(1..20)
+// as 32-bit ints:
+//   1 NSET (frame count; written as 0 here and patched by
+//     finalize_trajectory_writers() once the true count is known),
+//   2 ISTART, 3 NSAVC, 4 NSTEP (cosmetic), 5-8 unused,
+//   9 NAMNF (fixed atoms, unsupported here so 0),
+//   10 DELTA (timestep, as a float32 bit pattern, in AKMA time units:
+//      1 AKMA = 48.888211 fs),
+//   11 with-unit-cell flag (1: a 6-double cell record precedes coordinates
+//      in every frame), 12-19 unused, 20 VERSION (24 = "charmm format",
+//      which is what tells readers DELTA is float32 rather than float64).
+void MDSimulation::write_dcd_header(int32_t natom_global) {
+    const int32_t reclen1 = 84;
+    dcd_file_.write(reinterpret_cast<const char*>(&reclen1), 4);
+    dcd_file_.write("CORD", 4);
+
+    int32_t icntrl[20] = {0};
+    icntrl[2] = std::max(1, trajectory_output_freq);  // NSAVC
+    icntrl[3] = total_steps;                          // NSTEP (cosmetic)
+    const float delta_akma = static_cast<float>(dt / 48.888211);
+    std::memcpy(&icntrl[9], &delta_akma, sizeof(float));
+    icntrl[10] = 1;                                   // unit cell record present
+    icntrl[19] = 24;                                  // VERSION (charmm format)
+
+    dcd_nset_patch_pos_ = dcd_file_.tellp();  // icntrl[0] == NSET, patched at close
+    dcd_file_.write(reinterpret_cast<const char*>(icntrl), sizeof(icntrl));
+    dcd_file_.write(reinterpret_cast<const char*>(&reclen1), 4);
+
+    // Title record (1 line, 80 chars).
+    std::string title = "Created by DeepScaleMD";
+    title.resize(80, ' ');
+    const int32_t ntitle = 1;
+    const int32_t title_reclen = static_cast<int32_t>(sizeof(int32_t) + 80);
+    dcd_file_.write(reinterpret_cast<const char*>(&title_reclen), 4);
+    dcd_file_.write(reinterpret_cast<const char*>(&ntitle), 4);
+    dcd_file_.write(title.data(), 80);
+    dcd_file_.write(reinterpret_cast<const char*>(&title_reclen), 4);
+
+    // NATOM record.
+    dcd_write_record(dcd_file_, reinterpret_cast<const char*>(&natom_global),
+                      static_cast<int32_t>(sizeof(int32_t)));
+}
+
+// DCD is a positions-only format by convention (readers assume the per-frame
+// records are X/Y/Z); trajectory_include_velocities/forces have no effect
+// here -- use xyz or bp for velocity/force output.
+void MDSimulation::write_dcd_frame(int step, const SerialTrajectoryFrame& frame) {
+    (void)step;
+    if (!dcd_file_.is_open()) return;
+
+    const SimulationBox& box = system->get_box();
+    // Unit cell record: {A, gamma, B, beta, alpha, C}. Angles are stored as
+    // their cosine (0.0 == 90 degrees) -- the convention both legacy and
+    // modern DCD readers interpret correctly for an orthorhombic box
+    // (DeepScaleMD has no triclinic tilt).
+    double cell[6] = {box.lx, 0.0, box.ly, 0.0, 0.0, box.lz};
+    dcd_write_record(dcd_file_, reinterpret_cast<const char*>(cell), static_cast<int32_t>(sizeof(cell)));
+
+    const int32_t n = static_cast<int32_t>(frame.x.size());
+    std::vector<float> buf(n);
+
+    for (int32_t i = 0; i < n; ++i) buf[i] = static_cast<float>(frame.x[i]);
+    dcd_write_record(dcd_file_, reinterpret_cast<const char*>(buf.data()), n * static_cast<int32_t>(sizeof(float)));
+    for (int32_t i = 0; i < n; ++i) buf[i] = static_cast<float>(frame.y[i]);
+    dcd_write_record(dcd_file_, reinterpret_cast<const char*>(buf.data()), n * static_cast<int32_t>(sizeof(float)));
+    for (int32_t i = 0; i < n; ++i) buf[i] = static_cast<float>(frame.z[i]);
+    dcd_write_record(dcd_file_, reinterpret_cast<const char*>(buf.data()), n * static_cast<int32_t>(sizeof(float)));
+
+    ++dcd_frames_written_;
+}
+
+void MDSimulation::initialize_trajectory_writers() {
+    if (trajectory_formats_.empty()) return;
+
+    if (trajectory_formats_.count("dcd") || trajectory_formats_.count("bp")) {
+        // Global atom count is constant for the run; every rank must take
+        // part in this reduce even though only rank 0 (DCD) or the ADIOS2
+        // attribute (all ranks, but from identical data) consume it.
+        int local_n = static_cast<int>(system->get_local_particles());
+        int global_n = 0;
+        MPI_Allreduce(&local_n, &global_n, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        trajectory_natoms_global_cached_ = global_n;
+    }
+
+    if (trajectory_formats_.count("dcd") && system->get_rank() == 0) {
+        const std::string filename = output_prefix + ".dcd";
+        dcd_file_.open(filename, std::ios::binary | std::ios::trunc);
+        if (!dcd_file_.is_open()) {
+            throw std::runtime_error("Cannot open DCD trajectory file: " + filename);
         }
-        
-        dump_file.close();
+        write_dcd_header(trajectory_natoms_global_cached_);
+        dcd_frames_written_ = 0;
+    }
+
+#ifdef USE_ADIOS2
+    if (trajectory_formats_.count("bp")) {
+        initialize_adios2_writer();
+    }
+#endif
+
+    trajectory_writers_initialized_ = true;
+}
+
+void MDSimulation::finalize_trajectory_writers() {
+    if (!trajectory_writers_initialized_) return;
+
+    if (dcd_file_.is_open()) {
+        // Patch NSET now that the true frame count is known -- the standard
+        // way MD codes finalize an incrementally written DCD file without
+        // knowing the frame count up front (NAMD/CHARMM do the same).
+        dcd_file_.seekp(dcd_nset_patch_pos_);
+        const int32_t nset = dcd_frames_written_;
+        dcd_file_.write(reinterpret_cast<const char*>(&nset), sizeof(nset));
+        dcd_file_.close();
+    }
+
+#ifdef USE_ADIOS2
+    if (trajectory_formats_.count("bp")) {
+        finalize_adios2_writer();
+    }
+#endif
+}
+
+#ifdef USE_ADIOS2
+// ==================== ADIOS2 BP parallel trajectory writer ====================
+// Genuinely parallel: every rank writes only the particles it currently owns
+// as an independent "local array" block (Shape left empty -- ADIOS2's local
+// array/local value idiom), tagged with global_id. There is no gather, no
+// rank-0 funnel, and no cross-rank collective metadata step per array (the
+// BP5 engine's aggregator-based writers merge per-rank blocks into the
+// dataset without a global lock/hyperslab-style coordination step). Reading
+// back a consistent global-order trajectory means sorting each step's blocks
+// by their global_id array -- ordinary domain-decomposed-code practice for
+// ADIOS2, not something DeepScaleMD needs to resolve at write time.
+//
+// Local block sizes (this rank's particle count) can change every step under
+// migration, so the Count of every local array is refreshed via
+// SetSelection() immediately before each Put() rather than fixed once at
+// DefineVariable() time.
+void MDSimulation::initialize_adios2_writer() {
+    adios2_instance_ = adios2::ADIOS(MPI_COMM_WORLD);
+    adios2_io_ = adios2_instance_.DeclareIO("DeepScaleMD_Trajectory");
+    adios2_io_.SetEngine("BP5");
+
+    const size_t local_n = system->get_local_particles();
+
+    adios2_var_global_id_ = adios2_io_.DefineVariable<int>("global_id", {}, {}, {local_n});
+    adios2_var_x_ = adios2_io_.DefineVariable<Real>("x", {}, {}, {local_n});
+    adios2_var_y_ = adios2_io_.DefineVariable<Real>("y", {}, {}, {local_n});
+    adios2_var_z_ = adios2_io_.DefineVariable<Real>("z", {}, {}, {local_n});
+    if (trajectory_include_velocities) {
+        adios2_var_vx_ = adios2_io_.DefineVariable<Real>("vx", {}, {}, {local_n});
+        adios2_var_vy_ = adios2_io_.DefineVariable<Real>("vy", {}, {}, {local_n});
+        adios2_var_vz_ = adios2_io_.DefineVariable<Real>("vz", {}, {}, {local_n});
+    }
+    if (trajectory_include_forces) {
+        adios2_var_fx_ = adios2_io_.DefineVariable<Real>("fx", {}, {}, {local_n});
+        adios2_var_fy_ = adios2_io_.DefineVariable<Real>("fy", {}, {}, {local_n});
+        adios2_var_fz_ = adios2_io_.DefineVariable<Real>("fz", {}, {}, {local_n});
+    }
+
+    // "Local value" scalars (no shape): every rank provides its own copy
+    // each step. box/step/time are tiny and identical across ranks -- the
+    // redundancy costs nothing at BP's typical particle-array data volumes,
+    // and avoids any ambiguity around single-writer global-scalar semantics.
+    adios2_var_step_ = adios2_io_.DefineVariable<int>("step");
+    adios2_var_time_ = adios2_io_.DefineVariable<Real>("time_fs");
+    adios2_var_box_ = adios2_io_.DefineVariable<Real>("box", {}, {}, {3});
+
+    adios2_io_.DefineAttribute<int>("natoms_global", trajectory_natoms_global_cached_);
+
+    adios2_engine_ = adios2_io_.Open(output_prefix + ".bp", adios2::Mode::Write);
+    adios2_active_ = true;
+}
+
+void MDSimulation::write_adios2_frame(int step) {
+    const size_t local_n = system->get_local_particles();
+    ParticleData& particles = system->get_particles();
+
+    adios2_engine_.BeginStep();
+
+    adios2_var_global_id_.SetSelection({{}, {local_n}});
+    adios2_engine_.Put(adios2_var_global_id_, particles.global_id.data());
+
+    adios2_var_x_.SetSelection({{}, {local_n}});
+    adios2_engine_.Put(adios2_var_x_, particles.x.data());
+    adios2_var_y_.SetSelection({{}, {local_n}});
+    adios2_engine_.Put(adios2_var_y_, particles.y.data());
+    adios2_var_z_.SetSelection({{}, {local_n}});
+    adios2_engine_.Put(adios2_var_z_, particles.z.data());
+
+    if (trajectory_include_velocities) {
+        adios2_var_vx_.SetSelection({{}, {local_n}});
+        adios2_engine_.Put(adios2_var_vx_, particles.vx.data());
+        adios2_var_vy_.SetSelection({{}, {local_n}});
+        adios2_engine_.Put(adios2_var_vy_, particles.vy.data());
+        adios2_var_vz_.SetSelection({{}, {local_n}});
+        adios2_engine_.Put(adios2_var_vz_, particles.vz.data());
+    }
+    if (trajectory_include_forces) {
+        adios2_var_fx_.SetSelection({{}, {local_n}});
+        adios2_engine_.Put(adios2_var_fx_, particles.fx.data());
+        adios2_var_fy_.SetSelection({{}, {local_n}});
+        adios2_engine_.Put(adios2_var_fy_, particles.fy.data());
+        adios2_var_fz_.SetSelection({{}, {local_n}});
+        adios2_engine_.Put(adios2_var_fz_, particles.fz.data());
+    }
+
+    adios2_engine_.Put(adios2_var_step_, step);
+    adios2_engine_.Put(adios2_var_time_, static_cast<Real>(step) * dt);
+
+    std::array<Real, 3> box_vals = {system->get_box().lx, system->get_box().ly, system->get_box().lz};
+    adios2_var_box_.SetSelection({{}, {3}});
+    adios2_engine_.Put(adios2_var_box_, box_vals.data());
+
+    adios2_engine_.EndStep();
+}
+
+void MDSimulation::finalize_adios2_writer() {
+    if (adios2_active_) {
+        adios2_engine_.Close();
+        adios2_active_ = false;
     }
 }
+#endif // USE_ADIOS2
 
 // print_timing_breakdown() is now defined in timing_breakdown.cpp

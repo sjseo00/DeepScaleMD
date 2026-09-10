@@ -10,8 +10,8 @@
  * singleton initialisation and heap corruption.
  */
 
-#include "mlip/operations/operation_registry.h"
-#include "mlip/backend/backend_interface.h"
+#include "force_libtorch/operations/operation_registry.h"
+#include "force_libtorch/backend/backend_interface.h"
 
 namespace mlip {
 

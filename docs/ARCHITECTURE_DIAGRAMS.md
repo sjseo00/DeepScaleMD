@@ -38,7 +38,7 @@ graph TB
         CPU["ForceCalculatorCPU\n(OpenMP)"]
         GPU["ForceCalculatorCUDA\n(CUDA Kernels)"]
         PME["PMECalculator\n(Long-range Electrostatics)"]
-        ML["ForceCalculatorML\n(MACE Python)"]
+        PY["PythonForceInterface\n(MLIP via Python, additive)"]
     end
 
     subgraph NBLIST["🔍 Neighbor List (neighbor_list.cpp)"]
@@ -80,8 +80,8 @@ graph TB
     FORCES --> FM
     FM --> CPU
     FM --> GPU
-    FM --> ML
     GPU --> PME
+    CORE --> PY
 
     NBLIST --> VERLET
     NBLIST --> MORTON

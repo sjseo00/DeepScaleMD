@@ -1086,6 +1086,23 @@ def compute_forces(positions: np.ndarray, atom_types: np.ndarray,
         return np.zeros_like(positions, dtype=np.float64)
 
 
+def get_last_energy() -> float:
+    """
+    Potential energy (kcal/mol) from the most recent compute_forces() call.
+
+    Reuses the ASE calculator's cached result from the get_forces() call
+    inside compute_forces() -- every adapter here uses a standard ASE
+    Calculator subclass, which computes energy and forces together in one
+    forward pass, so this does not trigger a second model inference.
+    """
+    if _active_adapter is None or _active_adapter._atoms is None:
+        return 0.0
+    try:
+        return float(_active_adapter._atoms.get_potential_energy()) * EV_TO_KCAL_PER_MOL
+    except Exception:
+        return 0.0
+
+
 def get_active_adapter() -> Optional[MLIPAdapter]:
     """Return the currently active adapter (for testing / introspection)."""
     return _active_adapter

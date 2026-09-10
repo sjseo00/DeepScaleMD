@@ -8,8 +8,8 @@
  * We bridge the ABI boundary via a C-linkage factory function.
  */
 
-#include "mlip/mlip_types.h"
-#include "mlip/backend/backend_interface.h"
+#include "force_libtorch/mlip_types.h"
+#include "force_libtorch/backend/backend_interface.h"
 #include <memory>
 
 // C-linkage factory defined in pytorch_backend.cpp (compiled with ABI=0).

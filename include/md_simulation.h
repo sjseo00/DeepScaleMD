@@ -7,15 +7,24 @@
 #include "thermostat.h"
 #include "barostat.h"
 #include "neighbor_list.h"
+#include "minimizer.h"
+#include <cstdint>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
+
+#ifdef USE_ADIOS2
+#include <adios2.h>
+#endif
 
 // Forward-declare MlipRuntime so MD core does NOT need mlip headers
 namespace mlip { class MlipRuntime; }
 class HaloBackend;
 class CommBackend;
 class ForceCalculatorCUDA;
+class ConstraintSolver;
 
 class MDSimulation {
 private:
@@ -46,15 +55,23 @@ private:
     // ── LibTorch MLIP runtime ─────────────────────────────────────────────
     std::unique_ptr<mlip::MlipRuntime> mlip_runtime_;
     std::string mlip_spec_file_;    // path to per-model YAML spec (full schema)
-    
+
+    // ── SHAKE/RATTLE constraints (CPU + velocity_verlet only; see
+    // include/constraint_solver.h) ──────────────────────────────────────────
+    std::unique_ptr<ConstraintSolver> constraint_solver_;
+    bool constraints_enabled_ = false;
+    std::vector<Real> constraint_pre_step_x_, constraint_pre_step_y_, constraint_pre_step_z_;
+
     // Configuration variables
     std::string coordinate_file;
     std::string topology_file;
+    std::string parameter_file;
     Real target_temperature;
     std::string output_prefix;
     int trajectory_output_freq;
     int energy_output_freq;
     Real cutoff_distance;
+    Real lj_switch_distance;
     std::string neighbor_list_type_str;
     int neighbor_list_tile_size;
     int neighbor_list_update_freq;  // Added neighbor list update frequency
@@ -83,17 +100,67 @@ private:
     std::string barostat_type;
     Real target_pressure;
     Real tau_p;
-    
+
+    // ── Energy minimization (runs once, before the MD loop) ─────────────────
+    std::string minimizer_type_ = "none";     // none | fire
+    int minimizer_max_steps_ = 1000;
+    Real minimizer_force_tolerance_ = 1.0;    // kcal/mol/Angstrom, global max |F_i|
+    Real minimizer_dt_start_ = 0.0;           // fs; <=0 means "derive from timestep"
+    Real minimizer_dt_max_ = 0.0;             // fs; <=0 means "derive from dt_start"
+    int minimizer_output_freq_ = 10;          // print progress every N minimizer steps
+
     // Output control variables
     int output_freq;                    // General output frequency
     std::string output_info;            // What information to output (comma-separated)
     std::vector<OutputField> output_fields_cache;
     
     // Trajectory output settings
-    std::string trajectory_format;      // "xyz", "dump", or "both"
+    std::string trajectory_format;      // raw config string, kept for logging
+    std::set<std::string> trajectory_formats_;  // parsed: any of xyz, dump, dcd, bp
     bool trajectory_include_velocities; // Include velocities in output
     bool trajectory_include_forces;     // Include forces in output
-    
+
+    // ── DCD writer state (single continuously-appended file; CHARMM/NAMD
+    // binary trajectory format) ─────────────────────────────────────────────
+    std::ofstream dcd_file_;
+    std::streampos dcd_nset_patch_pos_;  // byte offset of the NSET header field
+    int dcd_frames_written_ = 0;
+
+    // Global atom count, constant for the whole run (no particle creation/
+    // destruction). Computed once in initialize_trajectory_writers() via a
+    // single MPI_Allreduce and reused by the DCD NATOM record and the
+    // ADIOS2 "natoms_global" attribute.
+    int trajectory_natoms_global_cached_ = 0;
+
+    // ── ADIOS2 BP writer state (genuinely parallel: every rank writes its
+    // own local particles as an independent local-array block, tagged with
+    // global_id so a reader can reassemble global order) ───────────────────
+#ifdef USE_ADIOS2
+    adios2::ADIOS adios2_instance_;
+    adios2::IO adios2_io_;
+    adios2::Engine adios2_engine_;
+    adios2::Variable<int> adios2_var_global_id_;
+    adios2::Variable<Real> adios2_var_x_, adios2_var_y_, adios2_var_z_;
+    adios2::Variable<Real> adios2_var_vx_, adios2_var_vy_, adios2_var_vz_;
+    adios2::Variable<Real> adios2_var_fx_, adios2_var_fy_, adios2_var_fz_;
+    adios2::Variable<int> adios2_var_step_;
+    adios2::Variable<Real> adios2_var_time_;
+    adios2::Variable<Real> adios2_var_box_;
+    bool adios2_active_ = false;
+#endif
+    bool trajectory_writers_initialized_ = false;
+
+    // Gathered, global_id-ordered snapshot used by the single-file serial
+    // writers (xyz/dump/dcd). Populated on every rank by an MPI_Gatherv (the
+    // collective must run on all ranks); only rank 0's contents are valid.
+    struct SerialTrajectoryFrame {
+        std::vector<Real> x, y, z;
+        std::vector<Real> vx, vy, vz;
+        std::vector<Real> fx, fy, fz;
+        std::vector<int> type;
+        std::vector<std::string> element;
+    };
+
     int current_step;
     int total_steps;
     Real dt;
@@ -161,7 +228,7 @@ public:
     void finalize();
     
     void single_step();
-    void output_results(int step);
+    void output_results(int step, bool emit_text = true);
     void force_neighbor_rebuild() { neighbor_rebuild_forced = true; }  // Force rebuild (e.g., after barostat)
     
     // Getters
@@ -210,11 +277,32 @@ private:
     void reverse_halo_for_bonded_if_needed();
     void check_energy_stability();      // Check for energy drift and instabilities
     void zero_forces();                 // Zero all forces (local + ghost particles)
-    
-    // Trajectory output functions
+    void zero_velocities();             // Zero all velocities (local + ghost particles)
+
+    // ── Energy minimization (FIRE) ──────────────────────────────────────────
+    void run_energy_minimization();
+    void compute_fire_reduction_cpu(Real& power, Real& f_norm_sq,
+                                    Real& v_norm_sq, Real& f_max_sq) const;
+    void apply_fire_update_cpu(const FireMinimizer::StepParams& params);
+
+    // Trajectory output functions. write_trajectory() is collective (called
+    // by every rank, via output_results()) because gathering for the serial
+    // formats and the ADIOS2 BP writer both require every rank to
+    // participate; only the per-format file writers below are rank-0-only.
     void write_trajectory(int step);
-    void write_xyz_trajectory(int step);
-    void write_lammps_dump(int step);
+    void gather_particles_for_serial_output(SerialTrajectoryFrame& frame) const;
+    void write_xyz_trajectory(int step, const SerialTrajectoryFrame& frame);
+    void write_lammps_dump(int step, const SerialTrajectoryFrame& frame);
+    void write_dcd_frame(int step, const SerialTrajectoryFrame& frame);
+    void initialize_trajectory_writers();
+    void finalize_trajectory_writers();
+    void write_dcd_header(int32_t natom_global);
+
+#ifdef USE_ADIOS2
+    void initialize_adios2_writer();
+    void write_adios2_frame(int step);
+    void finalize_adios2_writer();
+#endif
 };
 
 #endif // MD_SIMULATION_H

@@ -39,7 +39,7 @@ class SimulationBox;
  * - Texture memory for force field parameters (optional)
  */
 class ForceCalculatorCUDA : public ForceCalculator,
-                            public dsdecomp::ParticleInfo::Provider {
+                            public dsdecompx::ParticleInfo::Provider {
 public:
 #ifdef USE_CUDA
     ForceCalculatorCUDA();
@@ -57,18 +57,46 @@ public:
     void update_neighbor_list_on_device(MDSystem& system); // Only update neighbor list
     void build_neighbor_list_on_device(MDSystem& system); // Build neighbor list directly on GPU
     // Rebuild global-ID -> current owned/ghost-slot bonded lists after a
-    // dsDecomp halo or migration changes the device particle layout.
+    // dsDecompX halo or migration changes the device particle layout.
     void refresh_bonded_topology_on_device(MDSystem& system);
     
     // GPU-resident integrator support
     void integrate_on_device(MDSystem& system, Real dt, const std::string& integrator_type);
     void complete_velocity_update_on_device(MDSystem& system, Real dt, const std::string& integrator_type);
-    
+
+    // ── SHAKE/RATTLE constraints (GPU-resident) ────────────────────────────
+    // Call snapshot_constraint_positions() BEFORE integrate_on_device() (it
+    // captures r(t) for SHAKE's fixed reference direction), apply_shake_on_device()
+    // right after it, and apply_rattle_on_device() right after
+    // complete_velocity_update_on_device(). velocity_verlet only; see
+    // include/constraint_solver.h for the CPU-side derivation this mirrors.
+    void snapshot_constraint_positions(MDSystem& system);
+    bool apply_shake_on_device(MDSystem& system, Real dt,
+                                int max_iterations = 500, Real position_tolerance = 1e-8);
+    bool apply_rattle_on_device(MDSystem& system,
+                                 int max_iterations = 500, Real velocity_tolerance = 1e-8);
+
     // GPU-resident neighbor list management
     Real compute_max_displacement_on_device(size_t num_local_particles, const SimulationBox& box);
     void append_ghosts_to_device(MDSystem& system, size_t previous_local_count);
     void update_reference_positions_on_device(size_t num_local_particles);  // NEW: Update reference positions after neighbor list rebuild
-    
+
+    // ── FIRE energy minimizer (GPU-resident) ────────────────────────────────
+    // See include/minimizer.h for the algorithm this drives. Both methods
+    // operate on LOCAL particles only (ghosts are excluded from the sums, and
+    // never get their position/velocity mutated here) and never touch the
+    // host mirror -- x/v stay device-resident for the whole minimization.
+    struct FireReduction {
+        Real power = 0.0;      // sum_i F_i . v_i
+        Real f_norm_sq = 0.0;  // sum_i F_i . F_i
+        Real v_norm_sq = 0.0;  // sum_i v_i . v_i
+        Real f_max_sq = 0.0;   // max_i (F_i . F_i)
+    };
+    FireReduction compute_fire_reduction_on_device(size_t local_particles);
+    void apply_fire_update_on_device(size_t local_particles, const SimulationBox& box,
+                                     bool reset_velocity, bool mix_velocity,
+                                     Real alpha, Real v_norm, Real f_norm, Real dt);
+
     // Device pointer accessors for GPU-resident thermostat/barostat/integrator
     Real* get_device_x() { return d_x; }
     Real* get_device_y() { return d_y; }
@@ -83,13 +111,13 @@ public:
     cudaStream_t get_force_stream() const { return force_stream; }
     int get_device_id() const { return device_id; }
 
-    // Non-owning views used by the DeepScaleMD -> dsDecomp CUDA adapter.
+    // Non-owning views used by the DeepScaleMD -> dsDecompX CUDA adapter.
     // No host copy is performed when constructing or consuming these views.
-    dsdecomp::ParticleView particle_info_view(size_t count) override;
+    dsdecompx::ParticleView particle_info_view(size_t count) override;
     // Grows the SoA allocation while preserving the requested owned prefix.
     // Returns true when pointers changed and dependent GPU layouts must rebuild.
     bool ensure_device_particle_capacity(size_t required, size_t preserve_count);
-    dsdecomp::StorageResizeResult resize_particle_info(
+    dsdecompx::StorageResizeResult resize_particle_info(
         size_t required, size_t preserve_count) override;
     
     // NEW: Force accessors for complete GPU-resident pipeline
@@ -148,6 +176,9 @@ protected:
     void compute_bond_forces(MDSystem& system);
     void compute_angle_forces(MDSystem& system);
     void compute_dihedral_forces(MDSystem& system);
+    void compute_improper_forces(MDSystem& system);
+    // Scaled 1-4 (or FF-specific) nonbonded pairs; see Topology::SpecialPair.
+    void compute_special_pair_forces(MDSystem& system);
 
     // MLIP COO edge-list and position helpers (mlip_runtime path)
     void build_coo_edge_list_on_device(MDSystem& system);
@@ -180,6 +211,7 @@ protected:
     Real* d_y_ref;
     Real* d_z_ref;
     Real* d_max_disp_sq;    // Device scalar for max displacement squared
+    Real* d_fire_reduce_;   // [power, f_norm_sq, v_norm_sq, f_max_sq], lazily allocated
 
     // Device memory for neighbor list
     int* d_neighbors;       // Neighbor list
@@ -189,6 +221,8 @@ protected:
     // Device memory for force field parameters
     Real* d_epsilon_mixed; // LJ epsilon mixing rules (1D row-major array)
     Real* d_sigma_mixed;   // LJ sigma mixing rules (1D row-major array)
+    unsigned long long* d_exclusion_keys; // sorted global atom-pair keys
+    size_t num_exclusions;
 
     // Device memory for energies
     Real* d_potential_energy;
@@ -223,8 +257,44 @@ protected:
     Real*   d_dihedral_k;
     Real*   d_dihedral_phi0;
     int*    d_dihedral_n;
+
+    // Improper torsion topology (same shape/kernel as dihedrals above)
+    size_t num_impropers_cached;
+    size_t* d_improper_atom1;
+    size_t* d_improper_atom2;
+    size_t* d_improper_atom3;
+    size_t* d_improper_atom4;
+    Real*   d_improper_k;
+    Real*   d_improper_phi0;
+    int*    d_improper_n;
+
+    // Scaled 1-4 (special) nonbonded pairs
+    size_t num_special_pairs_cached;
+    size_t* d_special_pair_atom1;
+    size_t* d_special_pair_atom2;
+    Real*   d_special_pair_lj_scale;
+    Real*   d_special_pair_coulomb_scale;
+    Real*   d_special_pair_sigma;
+    Real*   d_special_pair_epsilon;
+
+    // SHAKE/RATTLE distance constraints
+    size_t num_constraints_cached;
+    size_t* d_constraint_atom1;
+    size_t* d_constraint_atom2;
+    Real*   d_constraint_distance;
+
+    // Per-step SHAKE reference positions r(t): self-managed capacity (grown
+    // lazily to the current local+ghost particle count), separate from the
+    // shared particle-array growth path since this scratch space is only
+    // needed when constraints are active.
+    size_t constraint_scratch_capacity_;
+    Real* d_constraint_pre_x_;
+    Real* d_constraint_pre_y_;
+    Real* d_constraint_pre_z_;
+    Real* d_constraint_max_error_; // single device scalar, reused every iteration
+    void ensure_constraint_scratch_capacity(size_t n);
     // ========================================
-    
+
     // Memory allocation tracking
     size_t allocated_particles;
     size_t allocated_neighbors;
@@ -347,11 +417,11 @@ protected:
     void calculate_kinetic_energy(MDSystem&) override {
         throw std::runtime_error("CUDA backend not available (compiled without USE_CUDA)");
     }
-    dsdecomp::StorageResizeResult resize_particle_info(
+    dsdecompx::StorageResizeResult resize_particle_info(
         size_t, size_t) override {
         throw std::runtime_error("CUDA backend not available (compiled without USE_CUDA)");
     }
-    dsdecomp::ParticleView particle_info_view(size_t) override {
+    dsdecompx::ParticleView particle_info_view(size_t) override {
         throw std::runtime_error("CUDA backend not available (compiled without USE_CUDA)");
     }
 #endif

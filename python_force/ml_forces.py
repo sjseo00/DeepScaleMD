@@ -182,6 +182,13 @@ _ase_calculator = None
 _atoms_cache = None
 _user_pt_provider = None
 
+# Potential energy (kcal/mol) from the most recent compute_ml_forces() /
+# compute_force() call.  Read by C++ via get_last_energy() right after the
+# forces callback returns, so the reported PE actually reflects the MLIP
+# model instead of staying at whatever the (disabled) builtin calculator held.
+_last_energy_ev = 0.0
+_EV_TO_KCAL_PER_MOL = 23.0609
+
 def _patch_mace_einsum_cuda_bug():
     """
     Monkey-patch torch.einsum to work around PyTorch 2.10.0 / CUDA 12.9
@@ -368,6 +375,8 @@ def compute_ml_forces(positions: np.ndarray, atom_types: np.ndarray,
     • No per-call ASE Atoms reconstruction – adapter caches it and
       only calls set_positions() each step.
     """
+    global _last_energy_ev
+
     # ── fast path: delegate to mlip_interface ────────────────────────────────
     if _MLIP_INTERFACE_AVAILABLE and _mlip.is_initialized():
         # Normalise pbc to numpy array expected by adapters
@@ -377,7 +386,12 @@ def compute_ml_forces(positions: np.ndarray, atom_types: np.ndarray,
             pbc_arr = np.asarray(pbc, dtype=np.int32)
         cell_arr = np.asarray(cell, dtype=np.float64) if cell is not None \
                    else np.array([100.0, 100.0, 100.0], dtype=np.float64)
-        return _mlip.compute_forces(positions, atom_types, cell_arr, pbc_arr)
+        forces = _mlip.compute_forces(positions, atom_types, cell_arr, pbc_arr)
+        # Reuses the adapter's cached ASE result from the compute_forces() call
+        # above (energy+forces come from the same forward pass) -- no extra
+        # model inference.
+        _last_energy_ev = _mlip.get_last_energy()
+        return forces
 
     # ── legacy fallback: old _ase_calculator path (backward compat) ──────────
     global _ase_calculator, _atoms_cache
@@ -410,6 +424,10 @@ def compute_ml_forces(positions: np.ndarray, atom_types: np.ndarray,
                 _atoms_cache.set_cell(cell)
 
         forces = _atoms_cache.get_forces()
+        try:
+            _last_energy_ev = float(_atoms_cache.get_potential_energy()) * _EV_TO_KCAL_PER_MOL
+        except Exception:
+            _last_energy_ev = 0.0
         if _mace_device != "cpu":
             torch.cuda.synchronize()
         return np.ascontiguousarray(forces, dtype=np.float64)
@@ -468,9 +486,23 @@ def compute_force(positions: np.ndarray, atom_types: np.ndarray,
     Inputs are non-owning NumPy views of C++-owned buffers, so a Cython
     provider can use typed memoryviews without converting Python lists.
     """
+    global _last_energy_ev
     if _user_pt_provider is not None:
+        # Generic user-supplied force provider has no notion of potential
+        # energy; don't leave a stale MLIP value behind for get_last_energy().
+        _last_energy_ev = 0.0
         return _user_pt_provider.compute_force(positions, atom_types, cell, pbc)
     return compute_ml_forces(positions, atom_types, cell, pbc)
+
+
+def get_last_energy() -> float:
+    """
+    Potential energy (kcal/mol) from the most recent compute_force() /
+    compute_ml_forces() call.  Called by C++ (python_interface.cpp) right
+    after the forces callback returns, so the reported PE reflects the
+    active MLIP model instead of the (possibly disabled) builtin calculator.
+    """
+    return _last_energy_ev
 
 
 def c_compute_ml_forces(pos_ptr, types_ptr, n_atoms, model_path, forces_ptr):

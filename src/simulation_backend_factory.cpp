@@ -21,7 +21,7 @@ std::unique_ptr<ForceCalculator> create_force_calculator_for_build(int rank) {
     }
     fc->initialize();
     return fc;
-#else
+#elif defined(USE_CUDA)
     try {
         auto fc = std::make_unique<ForceCalculatorCUDA>();
         fc->initialize();
@@ -38,6 +38,13 @@ std::unique_ptr<ForceCalculator> create_force_calculator_for_build(int rank) {
         fc->initialize();
         return fc;
     }
+#else
+    auto fc = std::make_unique<ForceCalculatorCPU>();
+    if (rank == 0) {
+        std::cout << "Using CPU for force calculations" << std::endl;
+    }
+    fc->initialize();
+    return fc;
 #endif
 }
 

@@ -12,6 +12,7 @@
 #include <algorithm>  // For std::sort
 #include <numeric>    // For std::iota
 #include <cstdint>
+#include <cmath>
 #include <unistd.h>  // For getcwd
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -254,7 +255,77 @@ void MDSystem::initialize_velocities(Real temperature) {
     }
 }
 
-void MDSystem::load_topology(const std::string& topo_file) {
+void MDSystem::initialize_distributed_velocities(Real temperature) {
+    const size_t local_count = get_local_particles();
+    std::random_device rd;
+    std::seed_seq seed{rd(), rd(), static_cast<unsigned int>(rank)};
+    std::mt19937 gen(seed);
+    std::normal_distribution<Real> normal(0.0, 1.0);
+
+    for (size_t i = 0; i < local_count; ++i) {
+        particles.vx[i] = normal(gen);
+        particles.vy[i] = normal(gen);
+        particles.vz[i] = normal(gen);
+    }
+
+    Real local_moments[4] = {0.0, 0.0, 0.0, 0.0};
+    for (size_t i = 0; i < local_count; ++i) {
+        const Real mass = particles.mass[i];
+        local_moments[0] += mass * particles.vx[i];
+        local_moments[1] += mass * particles.vy[i];
+        local_moments[2] += mass * particles.vz[i];
+        local_moments[3] += mass;
+    }
+    Real global_moments[4] = {0.0, 0.0, 0.0, 0.0};
+    MPI_Allreduce(local_moments, global_moments, 4, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    if (global_moments[3] <= 0.0) {
+        throw std::runtime_error("Cannot initialize velocities: total mass is not positive");
+    }
+
+    const Real cm_vx = global_moments[0] / global_moments[3];
+    const Real cm_vy = global_moments[1] / global_moments[3];
+    const Real cm_vz = global_moments[2] / global_moments[3];
+    Real local_ke_unscaled = 0.0;
+    for (size_t i = 0; i < local_count; ++i) {
+        particles.vx[i] -= cm_vx;
+        particles.vy[i] -= cm_vy;
+        particles.vz[i] -= cm_vz;
+        const Real v2 = particles.vx[i] * particles.vx[i] +
+                        particles.vy[i] * particles.vy[i] +
+                        particles.vz[i] * particles.vz[i];
+        local_ke_unscaled += 0.5 * particles.mass[i] * v2;
+    }
+
+    Real global_ke_unscaled = 0.0;
+    MPI_Allreduce(&local_ke_unscaled, &global_ke_unscaled, 1,
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    unsigned long long local_atoms = static_cast<unsigned long long>(local_count);
+    unsigned long long global_atoms = 0;
+    MPI_Allreduce(&local_atoms, &global_atoms, 1,
+                  MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+
+    const Real dof = global_atoms > 1 ? static_cast<Real>(3 * global_atoms - 3) : 0.0;
+    const Real target_ke = 0.5 * dof * kB * temperature;
+    const Real current_ke = global_ke_unscaled * mvv2e;
+    const Real scale = (target_ke > 0.0 && current_ke > 0.0)
+        ? std::sqrt(target_ke / current_ke) : 0.0;
+    for (size_t i = 0; i < local_count; ++i) {
+        particles.vx[i] *= scale;
+        particles.vy[i] *= scale;
+        particles.vz[i] *= scale;
+    }
+    for (size_t i = local_count; i < particles.vx.size(); ++i) {
+        particles.vx[i] = particles.vy[i] = particles.vz[i] = 0.0;
+    }
+
+    if (rank == 0) {
+        std::cout << "Reinitialized post-minimization velocities at T = "
+                  << temperature << " K" << std::endl;
+    }
+}
+
+void MDSystem::load_topology(const std::string& topo_file,
+                             const std::string& parameter_file) {
     if (rank == 0) {
         std::cout << "Loading topology from " << topo_file << std::endl;
     }
@@ -278,7 +349,9 @@ void MDSystem::load_topology(const std::string& topo_file) {
     
     int load_ok = 0;
     if (rank == 0) {
-        load_ok = topology->load_topology(clean_filename, rank) ? 1 : 0;
+        load_ok = parameter_file.empty()
+            ? (topology->load_topology(clean_filename, rank) ? 1 : 0)
+            : (topology->load_canonical(clean_filename, parameter_file, rank) ? 1 : 0);
     }
     MPI_Bcast(&load_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
     if (!load_ok) {
@@ -287,8 +360,38 @@ void MDSystem::load_topology(const std::string& topo_file) {
 
     topology->broadcast(MPI_COMM_WORLD, 0);
 
+    int atom_count_matches = 1;
+    if (rank == 0) {
+        atom_count_matches = topology->get_num_atoms() == static_cast<int>(particles.num_particles) ? 1 : 0;
+    }
+    MPI_Bcast(&atom_count_matches, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (!atom_count_matches) {
+        throw std::runtime_error("Coordinate/topology atom-count mismatch: XYZ has " +
+            std::to_string(particles.num_particles) + ", topology has " +
+            std::to_string(topology->get_num_atoms()));
+    }
+
+    int element_mismatch = -1;
+    if (rank == 0 && topology->is_canonical()) {
+        for (size_t i = 0; i < coordinate_elements_.size(); ++i) {
+            const std::string& expected = topology->get_atom_element(static_cast<int>(i));
+            if (!expected.empty() && coordinate_elements_[i] != expected) {
+                element_mismatch = static_cast<int>(i);
+                std::cerr << "Coordinate/topology element mismatch at atom " << i
+                          << ": XYZ has '" << coordinate_elements_[i]
+                          << "', topology has '" << expected << "'" << std::endl;
+                break;
+            }
+        }
+    }
+    MPI_Bcast(&element_mismatch, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (element_mismatch >= 0) {
+        throw std::runtime_error("Coordinate/topology element-order mismatch at atom " +
+                                 std::to_string(element_mismatch));
+    }
+
     // Only root performs the O(Nglobal) atom-property lookup.  The resulting
-    // per-particle fields are distributed before dsDecomp compacts each rank.
+    // per-particle fields are distributed before dsDecompX compacts each rank.
     if (rank == 0) {
         assign_masses_from_topology();
         assign_charges_from_topology();
@@ -307,10 +410,10 @@ void MDSystem::setup_domain_decomposition() {
         return;
     }
 
-    // dsDecomp owns the Cartesian topology and local-domain geometry.
+    // dsDecompX owns the Cartesian topology and local-domain geometry.
     initialize_decomposition_runtime();
     // Root alone owns the global input arrays.  It classifies particles with
-    // dsDecomp, groups them by destination rank, and scatters only the owned
+    // dsDecompX, groups them by destination rank, and scatters only the owned
     // slices.  Non-root ranks never allocate the global particle set.
     std::uint64_t total_particles_u64 =
         (rank == 0) ? static_cast<std::uint64_t>(particles.num_particles) : 0;
@@ -324,7 +427,7 @@ void MDSystem::setup_domain_decomposition() {
         std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
         for (size_t i = 0; i < total_particles; ++i) {
             owners[i] = decomp_runtime_->owner_rank(
-                dsdecomp::Vec3d{particles.x[i], particles.y[i], particles.z[i]});
+                dsdecompx::Vec3d{particles.x[i], particles.y[i], particles.z[i]});
             ++counts[owners[i]];
         }
         for (int r = 1; r < size; ++r) displacements[r] = displacements[r - 1] + counts[r - 1];
@@ -458,6 +561,7 @@ void MDSystem::load_standard_xyz(const std::string& coord_file) {
     particles.type.resize(num_atoms, 0);
     particles.global_id.resize(num_atoms);
     particles.num_particles = num_atoms;  // Set the particle count
+    coordinate_elements_.assign(static_cast<size_t>(num_atoms), "");
     for (int i = 0; i < num_atoms; ++i) particles.global_id[i] = i;
     
     // Read atom coordinates
@@ -468,11 +572,18 @@ void MDSystem::load_standard_xyz(const std::string& coord_file) {
         Real x, y, z;
         
         if (iss >> element >> x >> y >> z) {
+            coordinate_elements_[static_cast<size_t>(atom_count)] = element;
             particles.x[atom_count] = x;
             particles.y[atom_count] = y;
             particles.z[atom_count] = z;
             atom_count++;
         }
+    }
+
+    if (atom_count != num_atoms) {
+        throw std::runtime_error("XYZ atom-count mismatch: header declares " +
+            std::to_string(num_atoms) + " but " + std::to_string(atom_count) +
+            " coordinate records were read");
     }
     
     // Calculate center of mass of loaded coordinates
@@ -519,24 +630,9 @@ void MDSystem::assign_masses_from_topology() {
         return;
     }
 
-    // Build string type name → integer type ID mapping
-    // (type IDs are assigned in order of first occurrence, starting from 0)
-    std::map<std::string, int> type_name_to_id;
-    int next_type_id = 0;
-    
     for (int i = 0; i < static_cast<int>(particles.mass.size()); ++i) {
         try {
-            const std::string& type_name = topology->get_atom_type_name(i);
-            
-            // Assign integer type ID
-            if (!type_name.empty()) {
-                auto it = type_name_to_id.find(type_name);
-                if (it == type_name_to_id.end()) {
-                    type_name_to_id[type_name] = next_type_id++;
-                }
-                particles.type[i] = type_name_to_id[type_name];
-            }
-            
+            particles.type[i] = topology->get_atom_type_id(i);
             particles.mass[i] = topology->get_atom_mass(i);
         } catch (const std::runtime_error& e) {
             if (rank == 0) {
@@ -547,12 +643,7 @@ void MDSystem::assign_masses_from_topology() {
         }
     }
     
-    if (rank == 0 && !type_name_to_id.empty()) {
-        std::cout << "Atom type ID assignment:" << std::endl;
-        for (const auto& kv : type_name_to_id) {
-            std::cout << "  " << kv.first << " -> type " << kv.second << std::endl;
-        }
-    }
+    if (rank == 0) std::cout << "Assigned integer atom type IDs from topology" << std::endl;
 }
 
 void MDSystem::assign_charges_from_topology() {
@@ -582,34 +673,44 @@ void MDSystem::setup_force_field_params() {
         std::cerr << "Error: topology not loaded for force field setup" << std::endl;
         return;
     }
+    ff_params.mie_repulsive_exponent = topology->get_mie_repulsive_exponent();
+    ff_params.mie_attractive_exponent = topology->get_mie_attractive_exponent();
+    const Real n = static_cast<Real>(ff_params.mie_repulsive_exponent);
+    const Real m = static_cast<Real>(ff_params.mie_attractive_exponent);
+    ff_params.mie_prefactor = (n / (n - m)) * std::pow(n / m, m / (n - m));
     
     if (rank == 0) {
-        // Extract unique atom types and build type-based parameter arrays once.
-        std::map<int, std::pair<Real, Real>> type_params;  // type -> (epsilon, sigma)
-        for (size_t i = 0; i < particles.num_particles; i++) {
-            int type = particles.type[i];
-            if (type_params.find(type) == type_params.end()) {
-                try {
-                    Real eps = topology->get_atom_epsilon(static_cast<int>(i));
-                    Real sig = topology->get_atom_sigma(static_cast<int>(i));
-                    type_params[type] = std::make_pair(eps, sig);
-                } catch (const std::runtime_error& e) {
-                    std::cerr << "Warning: Cannot get LJ parameters for atom " << i
-                              << " (type " << type << "): " << e.what() << std::endl;
-                    std::cerr << "Using default LJ parameters" << std::endl;
-                    type_params[type] = std::make_pair(0.238, 3.4);
+        if (topology->has_explicit_pair_parameters()) {
+            ff_params.num_atom_types = static_cast<int>(topology->get_pair_sigma().size());
+            ff_params.sigma_mixed = topology->get_pair_sigma();
+            ff_params.epsilon_mixed = topology->get_pair_epsilon();
+            ff_params.sigma.resize(static_cast<size_t>(ff_params.num_atom_types));
+            ff_params.epsilon.resize(static_cast<size_t>(ff_params.num_atom_types));
+            for (int i = 0; i < ff_params.num_atom_types; ++i) {
+                ff_params.sigma[i] = ff_params.sigma_mixed[i][i];
+                ff_params.epsilon[i] = ff_params.epsilon_mixed[i][i];
+            }
+            ff_params.explicit_pair_parameters = true;
+        } else {
+            std::map<int, std::pair<Real, Real>> type_params;
+            for (size_t i = 0; i < particles.num_particles; i++) {
+                const int type = particles.type[i];
+                if (type_params.find(type) == type_params.end()) {
+                    type_params[type] = {topology->get_atom_epsilon(static_cast<int>(i)),
+                                         topology->get_atom_sigma(static_cast<int>(i))};
                 }
             }
-        }
-
-        ff_params.num_atom_types = static_cast<int>(type_params.size());
-        ff_params.epsilon.resize(static_cast<size_t>(ff_params.num_atom_types));
-        ff_params.sigma.resize(static_cast<size_t>(ff_params.num_atom_types));
-        int type_idx = 0;
-        for (const auto& pair : type_params) {
-            ff_params.epsilon[type_idx] = pair.second.first;
-            ff_params.sigma[type_idx] = pair.second.second;
-            ++type_idx;
+            ff_params.num_atom_types = static_cast<int>(type_params.size());
+            ff_params.epsilon.resize(static_cast<size_t>(ff_params.num_atom_types));
+            ff_params.sigma.resize(static_cast<size_t>(ff_params.num_atom_types));
+            for (const auto& pair : type_params) {
+                if (pair.first < 0 || pair.first >= ff_params.num_atom_types) {
+                    throw std::runtime_error("Legacy atom type IDs are not contiguous");
+                }
+                ff_params.epsilon[pair.first] = pair.second.first;
+                ff_params.sigma[pair.first] = pair.second.second;
+            }
+            ff_params.explicit_pair_parameters = false;
         }
     }
 
@@ -621,13 +722,32 @@ void MDSystem::setup_force_field_params() {
     MPI_Bcast(ff_params.epsilon.data(), ff_params.num_atom_types, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(ff_params.sigma.data(), ff_params.num_atom_types, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // Initialize pre-computed mixing rule lookup tables (type-based, not particle-based)
-    // This avoids repeated sqrt and arithmetic operations during force calculation
-    ff_params.initialize_mixing_tables();
+    int explicit_pairs = (rank == 0 && ff_params.explicit_pair_parameters) ? 1 : 0;
+    MPI_Bcast(&explicit_pairs, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    ff_params.explicit_pair_parameters = explicit_pairs != 0;
+    if (ff_params.explicit_pair_parameters) {
+        if (rank != 0) {
+            ff_params.sigma_mixed.assign(ff_params.num_atom_types,
+                std::vector<Real>(ff_params.num_atom_types));
+            ff_params.epsilon_mixed.assign(ff_params.num_atom_types,
+                std::vector<Real>(ff_params.num_atom_types));
+        }
+        for (int i = 0; i < ff_params.num_atom_types; ++i) {
+            MPI_Bcast(ff_params.sigma_mixed[i].data(), ff_params.num_atom_types,
+                      MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            MPI_Bcast(ff_params.epsilon_mixed[i].data(), ff_params.num_atom_types,
+                      MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        }
+    } else {
+        ff_params.initialize_mixing_tables();
+    }
     
     if (rank == 0) {
         std::cout << "Force field setup: " << particles.num_particles << " particles, " 
                   << ff_params.num_atom_types << " atom types" << std::endl;
+        std::cout << "Nonbonded Mie potential: (" << ff_params.mie_repulsive_exponent
+                  << "," << ff_params.mie_attractive_exponent << "), prefactor="
+                  << ff_params.mie_prefactor << std::endl;
         if (ff_params.num_atom_types > 0 && !ff_params.epsilon_mixed.empty()) {
             std::cout << "Mixing rule tables initialized: " << ff_params.num_atom_types 
                       << "x" << ff_params.num_atom_types << " elements" << std::endl;
@@ -679,7 +799,7 @@ void MDSystem::compute_forces() {
 }
 
 void MDSystem::initialize_decomposition_runtime() {
-    dsdecomp::Config config;
+    dsdecompx::Config config;
     config.domain.lower = {0.0, 0.0, 0.0};
     config.domain.upper = {box.lx, box.ly, box.lz};
     // Preserve the existing algorithm: the MPI Cartesian topology has always
@@ -689,17 +809,17 @@ void MDSystem::initialize_decomposition_runtime() {
     config.process_grid.allow_rank_reorder = false;
     // Keep the established MPI_Dims_create behavior by default. The planner is
     // opt-in so upgrading the library cannot silently change rank ownership.
-    if (const char* policy = std::getenv("DSDECOMP_GRID_POLICY")) {
+    if (const char* policy = std::getenv("GRID_POLICY")) {
         const std::string selected(policy);
         if (selected == "balanced") {
-            config.grid_policy = dsdecomp::GridPolicy::Balanced;
+            config.grid_policy = dsdecompx::GridPolicy::Balanced;
         } else if (selected == "topology" || selected == "topology-aware") {
-            config.grid_policy = dsdecomp::GridPolicy::TopologyAware;
-            if (const char* weight = std::getenv("DSDECOMP_INTER_NODE_WEIGHT")) {
+            config.grid_policy = dsdecompx::GridPolicy::TopologyAware;
+            if (const char* weight = std::getenv("INTER_NODE_WEIGHT")) {
                 const double parsed = std::atof(weight);
                 if (parsed > 0.0) config.topology_info.inter_node_weight = parsed;
             }
-            if (const char* weight = std::getenv("DSDECOMP_INTRA_NODE_WEIGHT")) {
+            if (const char* weight = std::getenv("INTRA_NODE_WEIGHT")) {
                 const double parsed = std::atof(weight);
                 if (parsed > 0.0) config.topology_info.intra_node_weight = parsed;
             }
@@ -708,15 +828,15 @@ void MDSystem::initialize_decomposition_runtime() {
     config.halo.width = physical_cutoff + verlet_skin_ + 1.0;
     config.halo.include_edges_and_corners = true;
 #ifdef USE_CUDA
-    config.execution = dsdecomp::ExecutionMode::Cuda;
+    config.execution = dsdecompx::ExecutionMode::Cuda;
     // GPU-resident mode is mandatory for a CUDA DeepScaleMD build. A backend
     // that cannot consume device buffers must fail instead of staging them.
     config.advanced.allow_host_staging = false;
 #else
-    config.execution = dsdecomp::ExecutionMode::Host;
+    config.execution = dsdecompx::ExecutionMode::Host;
 #endif
 
-    decomp_runtime_ = std::make_unique<dsdecomp::Decomp>(MPI_COMM_WORLD, config);
+    decomp_runtime_ = std::make_unique<dsdecompx::Decomp>(MPI_COMM_WORLD, config);
 
     const auto& topology = decomp_runtime_->topology();
     if (rank==0) {
@@ -727,7 +847,7 @@ void MDSystem::initialize_decomposition_runtime() {
     }
     sync_decomposition_domain();
     if (rank==0) {
-        std::cout << "[Halo] sizeof(ParticleRecord)=" << sizeof(dsdecomp::ParticleRecord)
+        std::cout << "[Halo] sizeof(ParticleRecord)=" << sizeof(dsdecompx::ParticleRecord)
                   << " bytes, halo_width=" << decomp_runtime_->halo_width() << std::endl;
     }
 }
@@ -740,7 +860,7 @@ void MDSystem::sync_decomposition_domain() {
         box.xlo = box.ylo = box.zlo = 0.0;
         box.xhi = box.lx; box.yhi = box.ly; box.zhi = box.lz;
         if (decomp_runtime_) {
-            dsdecomp::GlobalDomain domain;
+            dsdecompx::GlobalDomain domain;
             domain.lower = {0.0, 0.0, 0.0};
             domain.upper = {box.lx, box.ly, box.lz};
             domain.periodic = {true, true, true};
@@ -750,10 +870,10 @@ void MDSystem::sync_decomposition_domain() {
         return;
     }
     if (!decomp_runtime_) {
-        throw std::runtime_error("dsDecomp topology is not initialized");
+        throw std::runtime_error("dsDecompX topology is not initialized");
     }
 
-    dsdecomp::GlobalDomain domain;
+    dsdecompx::GlobalDomain domain;
     domain.lower = {0.0, 0.0, 0.0};
     domain.upper = {box.lx, box.ly, box.lz};
     domain.periodic = {true, true, true};
@@ -786,7 +906,7 @@ bool MDSystem::migrate_particles_check() {
 
 void MDSystem::redistribute_particles_after_scale() {
     if (size == 1) return;
-    if (!decomp_runtime_) throw std::runtime_error("dsDecomp is not initialized");
+    if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
     particles.reset_counts(get_local_particles(), ghost_count_);
     const auto result = decomp_runtime_->migrate(particles);
     const size_t new_local = result.new_owned_count;
@@ -819,6 +939,9 @@ void MDSystem::refresh_local_bonded_topology() {
     local_bonds_.clear();
     local_angles_.clear();
     local_dihedrals_.clear();
+    local_impropers_.clear();
+    local_special_pairs_.clear();
+    local_constraints_.clear();
     if (!topology) return;
 
     std::unordered_map<int, size_t> slot;
@@ -864,6 +987,37 @@ void MDSystem::refresh_local_bonded_topology() {
             {i->second, j->second, k->second, l->second, dihedral.type});
     }
 
+    local_impropers_.reserve(topology->get_impropers().size() / static_cast<size_t>(std::max(size, 1)) + 1);
+    for (const Dihedral& improper : topology->get_impropers()) {
+        const int owner = std::min(improper.atom2, improper.atom3);
+        if (!owned_slot(owner)) continue;
+        auto i = slot.find(improper.atom1), j = slot.find(improper.atom2);
+        auto k = slot.find(improper.atom3), l = slot.find(improper.atom4);
+        if (i == slot.end() || j == slot.end() || k == slot.end() || l == slot.end()) continue;
+        local_impropers_.push_back(
+            {i->second, j->second, k->second, l->second, improper.type});
+    }
+
+    local_special_pairs_.reserve(topology->get_special_pairs().size() / static_cast<size_t>(std::max(size, 1)) + 1);
+    for (const SpecialPair& pair : topology->get_special_pairs()) {
+        const int owner = std::min(pair.atom1, pair.atom2);
+        if (!owned_slot(owner)) continue;
+        auto i = slot.find(pair.atom1), j = slot.find(pair.atom2);
+        if (i == slot.end() || j == slot.end()) continue;
+        local_special_pairs_.push_back(
+            {i->second, j->second, pair.lj_scale, pair.coulomb_scale,
+             pair.sigma, pair.epsilon});
+    }
+
+    local_constraints_.reserve(topology->get_constraints().size() / static_cast<size_t>(std::max(size, 1)) + 1);
+    for (const Constraint& c : topology->get_constraints()) {
+        const int owner = std::min(c.atom1, c.atom2);
+        if (!owned_slot(owner)) continue;
+        auto i = slot.find(c.atom1), j = slot.find(c.atom2);
+        if (i == slot.end() || j == slot.end()) continue;
+        local_constraints_.push_back({i->second, j->second, c.distance});
+    }
+
     bonded_layout_global_ids_ = particles.global_id;
     bonded_layout_local_count_ = local_count;
 }
@@ -874,10 +1028,10 @@ bool MDSystem::exchange_halo_on_device(ForceCalculatorCUDA& calculator,
     if (size == 1) return false;
     const size_t owned = get_local_particles();
     cudaStream_t stream = calculator.get_force_stream();
-    dsdecomp::ParticleInfo storage(
+    dsdecompx::ParticleInfo storage(
         owned, ghost_count_, calculator);
     const auto result = decomp_runtime_->exchange_halo(
-        storage, dsdecomp::HaloExchangeOptions{rebuild_halo, stream});
+        storage, dsdecompx::HaloExchangeOptions{rebuild_halo, stream});
     resize_particle_storage(owned + result.ghost_count);
     ghost_count_ = result.ghost_count;
     return result.storage_reallocated;
@@ -887,7 +1041,7 @@ bool MDSystem::migrate_particles_on_device(ForceCalculatorCUDA& calculator) {
     if (size == 1) return false;
     const size_t owned = get_local_particles();
     cudaStream_t stream = calculator.get_force_stream();
-    dsdecomp::ParticleInfo storage(
+    dsdecompx::ParticleInfo storage(
         owned, ghost_count_, calculator);
     const auto result = decomp_runtime_->migrate(storage, stream);
     resize_particle_storage(result.new_owned_count);
@@ -900,25 +1054,25 @@ bool MDSystem::migrate_particles_on_device(ForceCalculatorCUDA& calculator) {
 
 void MDSystem::reverse_halo_on_device(ForceCalculatorCUDA& calculator) {
     if (size == 1) return;
-    if (!decomp_runtime_) throw std::runtime_error("dsDecomp is not initialized");
+    if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
     const size_t owned = get_local_particles();
-    dsdecomp::ParticleInfo storage(
+    dsdecompx::ParticleInfo storage(
         owned, ghost_count_, calculator);
     decomp_runtime_->reverse_halo(storage, calculator.get_force_stream());
 }
 #endif
 
-dsdecomp::HaloResult MDSystem::perform_halo_exchange(bool rebuild) {
+dsdecompx::HaloResult MDSystem::perform_halo_exchange(bool rebuild) {
     // A single MPI rank already owns the full periodic box.  Creating 26
     // self-images here would duplicate interactions because the serial
     // neighbor builder also applies the minimum-image convention.
     if (size == 1) {
         return {};
     }
-    if (!decomp_runtime_) throw std::runtime_error("dsDecomp is not initialized");
+    if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
     particles.reset_counts(get_local_particles(), ghost_count_);
     const auto result = decomp_runtime_->exchange_halo(
-        particles, dsdecomp::HaloExchangeOptions{rebuild, nullptr});
+        particles, dsdecompx::HaloExchangeOptions{rebuild, nullptr});
     ghost_count_ = result.ghost_count;
     particles.num_particles = get_local_particles() + ghost_count_;
     return result;
@@ -955,13 +1109,13 @@ bool MDSystem::sync_distributed_particles(bool local_rebuild_hint,
 
 bool MDSystem::unify_rebuild_decision(bool local_rebuild_flag) const {
     if (size == 1) return local_rebuild_flag;
-    if (!decomp_runtime_) throw std::runtime_error("dsDecomp is not initialized");
+    if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
     return decomp_runtime_->any_rank_true(local_rebuild_flag);
 }
 
 void MDSystem::perform_reverse_halo_exchange() {
     if (size == 1) return;
-    if (!decomp_runtime_) throw std::runtime_error("dsDecomp is not initialized");
+    if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
     particles.reset_counts(get_local_particles(), ghost_count_);
     decomp_runtime_->reverse_halo(particles);
 }

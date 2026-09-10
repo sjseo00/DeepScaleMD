@@ -1,11 +1,11 @@
-# dsDecomp integration validation
+# dsDecompX integration validation
 
 ## Scope and boundary
 
 The canonical audit is in
-`dsDecomp/docs/integration-boundary-audit.md`. DeepScaleMD owns physics,
+`dsDecompX/docs/integration-boundary-audit.md`. DeepScaleMD owns physics,
 particle/ghost storage, neighbor-list indices, CUDA stream policy, and MPI
-lifecycle. dsDecomp owns topology, ownership queries, halo communication,
+lifecycle. dsDecompX owns topology, ownership queries, halo communication,
 migration communication, and its communication buffers.
 
 ## Required release matrix
@@ -31,7 +31,7 @@ Acceptance:
 ## Performance procedure
 
 Use a warm-up followed by at least five measured runs. Record median and range.
-Set `MD_TIMING=1` and enable dsDecomp counters only for the instrumented run.
+Set `MD_TIMING=1` and enable dsDecompX counters only for the instrumented run.
 Compare:
 
 - total step time and communication critical path;
@@ -46,9 +46,9 @@ communication-buffer growth after warm-up.
 
 ## Status on this workstation
 
-The dsDecomp sources, all public headers, examples, MPI tests, performance-off
+The dsDecompX sources, all public headers, examples, MPI tests, performance-off
 configuration, and the DeepScaleMD adapter passed C++17 syntax/type checking
-against a temporary MPI interface. A separately archived `libdsdecomp.a` was
+against a temporary MPI interface. A separately archived `libdsdecompx.a` was
 linked and executed from an external consumer smoke test.
 
 Actual MPI 2/4/8-rank, CUDA, trajectory comparison, sanitizer, and performance

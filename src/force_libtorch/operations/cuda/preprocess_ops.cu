@@ -12,7 +12,7 @@
  *   compute_edge_vectors      (requires positions + edge_index + cell)
  */
 
-#include "mlip/operations/operation_registry.h"
+#include "force_libtorch/operations/operation_registry.h"
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <stdexcept>

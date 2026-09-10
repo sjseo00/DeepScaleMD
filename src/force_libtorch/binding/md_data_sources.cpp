@@ -4,7 +4,7 @@
  * Registers MD device data sources and output targets.
  */
 
-#include "mlip/binding/md_data_sources.h"
+#include "force_libtorch/binding/md_data_sources.h"
 #include <iostream>
 
 namespace mlip {

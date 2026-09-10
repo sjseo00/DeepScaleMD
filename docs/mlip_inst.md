@@ -1261,7 +1261,7 @@ YAML 명세 자체가 CUDA Graph 적용을 방해해서는 안 됩니다.
 
 ```text
 src/
-  mlip/
+  force_libtorch/
     runtime/
       mlip_runtime.*
       execution_plan.*

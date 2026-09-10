@@ -4,8 +4,8 @@
  * Generic MLIP runtime implementation.
  */
 
-#include "mlip/runtime/mlip_runtime.h"
-#include "mlip/config/yaml_parser.h"
+#include "force_libtorch/runtime/mlip_runtime.h"
+#include "force_libtorch/config/yaml_parser.h"
 
 #include <iostream>
 #include <stdexcept>

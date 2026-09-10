@@ -32,9 +32,9 @@ constexpr Real nktv2p = 68568.415;  // Pressure unit conversion to bar
 
 
 // Structure of Arrays for GPU efficiency
-struct ParticleData : dsdecomp::ParticleInfo {
+struct ParticleData : dsdecompx::ParticleInfo {
     void resize(size_t n) {
-        dsdecomp::ParticleInfo::resize(n);
+        dsdecompx::ParticleInfo::resize(n);
         for (size_t i = 0; i < n; ++i) global_id[i] = static_cast<int>(i);
     }
 };
@@ -120,6 +120,13 @@ struct ForceFieldParams {
     // Computed once at initialization to avoid repeated calculations
     std::vector<std::vector<Real>> epsilon_mixed;  // sqrt(eps_i * eps_j)
     std::vector<std::vector<Real>> sigma_mixed;    // 0.5 * (sig_i + sig_j)
+    bool explicit_pair_parameters = false;
+    int mie_repulsive_exponent = 12;
+    int mie_attractive_exponent = 6;
+    Real mie_prefactor = 4.0;
+    // Negative disables switching. Otherwise the Mie potential is multiplied
+    // by the CHARMM/XPLOR smooth switching function from this radius to cutoff.
+    Real lj_switch_distance = -1.0;
     
     // Constructor to initialize with default LJ parameters
     ForceFieldParams() {

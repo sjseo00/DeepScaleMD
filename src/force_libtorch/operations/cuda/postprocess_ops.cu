@@ -11,7 +11,7 @@
  *   ghost_force_extract — extract ghost portion for reverse communication
  */
 
-#include "mlip/operations/operation_registry.h"
+#include "force_libtorch/operations/operation_registry.h"
 #include <cuda_runtime.h>
 #include <math.h>
 #include <cstring>

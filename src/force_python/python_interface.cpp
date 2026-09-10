@@ -1,5 +1,5 @@
 
-#include "../include/force_calculator.h"
+#include "../../include/force_calculator.h"
 #include <iostream>
 #include <stdexcept>
 
@@ -57,6 +57,7 @@ PythonForceInterface::PythonForceInterface()
     : python_force_path("python_force"),
       py_module(nullptr), py_ml_module(nullptr),
       py_compute_func(nullptr), py_ml_compute_func(nullptr),
+      py_ml_get_energy_func(nullptr),
       py_cached_atom_types(nullptr), py_cached_pbc(nullptr),
       _cached_n_particles(0) {}
 
@@ -185,6 +186,7 @@ void PythonForceInterface::finalize_python() {
 #ifdef ENABLE_PYTHON_INTERFACE
         // Release cached Python objects before Py_Finalize
         if (py_ml_compute_func)  { Py_DECREF((PyObject*)py_ml_compute_func);  py_ml_compute_func  = nullptr; }
+        if (py_ml_get_energy_func) { Py_DECREF((PyObject*)py_ml_get_energy_func); py_ml_get_energy_func = nullptr; }
         if (py_ml_module)        { Py_DECREF((PyObject*)py_ml_module);        py_ml_module        = nullptr; }
         if (py_compute_func)     { Py_DECREF((PyObject*)py_compute_func);     py_compute_func     = nullptr; }
         if (py_module)           { Py_DECREF((PyObject*)py_module);           py_module           = nullptr; }
@@ -467,6 +469,30 @@ void PythonForceInterface::compute_force(ParticleData& particles, const ForceFie
                     particles.fx[i] += static_cast<Real>(_frc_buf[i * 3 + 0]);
                     particles.fy[i] += static_cast<Real>(_frc_buf[i * 3 + 1]);
                     particles.fz[i] += static_cast<Real>(_frc_buf[i * 3 + 2]);
+                }
+
+                // ============================================================
+                // [STEP 8b] Fetch potential energy for this step.  The additive
+                // force ABI above returns forces only, so the caller must pull
+                // energy separately via ml_forces.get_last_energy() (kcal/mol,
+                // already reflects whatever the compute_force() call just did).
+                // ============================================================
+                if (!py_ml_get_energy_func) {
+                    py_ml_get_energy_func = (void*)PyObject_GetAttrString(
+                        (PyObject*)py_ml_module, "get_last_energy");
+                    if (!py_ml_get_energy_func || !PyCallable_Check((PyObject*)py_ml_get_energy_func)) {
+                        Py_XDECREF((PyObject*)py_ml_get_energy_func);
+                        py_ml_get_energy_func = nullptr;
+                    }
+                }
+                if (py_ml_get_energy_func) {
+                    PyObject* py_energy = PyObject_CallObject((PyObject*)py_ml_get_energy_func, nullptr);
+                    if (py_energy) {
+                        last_computed_energy_ = PyFloat_AsDouble(py_energy);
+                        Py_DECREF(py_energy);
+                    } else {
+                        PyErr_Clear();
+                    }
                 }
 
                 // ============================================================

@@ -26,6 +26,15 @@ public:
         size_t atom1, atom2, atom3, atom4;
         std::string type;
     };
+    struct LocalSpecialPair {
+        size_t atom1, atom2;
+        Real lj_scale, coulomb_scale;
+        Real sigma, epsilon;
+    };
+    struct LocalConstraint {
+        size_t atom1, atom2;
+        Real distance;
+    };
 
 private:
     ParticleData particles;
@@ -44,8 +53,9 @@ private:
     int local_start;
     int local_end;
     size_t num_local_particles_;
+    std::vector<std::string> coordinate_elements_;
 
-    std::unique_ptr<dsdecomp::Decomp> decomp_runtime_;
+    std::unique_ptr<dsdecompx::Decomp> decomp_runtime_;
 
     void* d_particles;
     bool use_gpu;
@@ -54,6 +64,9 @@ private:
     std::vector<LocalBond> local_bonds_;
     std::vector<LocalAngle> local_angles_;
     std::vector<LocalDihedral> local_dihedrals_;
+    std::vector<LocalDihedral> local_impropers_;
+    std::vector<LocalSpecialPair> local_special_pairs_;
+    std::vector<LocalConstraint> local_constraints_;
     std::vector<int> bonded_layout_global_ids_;
     size_t bonded_layout_local_count_ = static_cast<size_t>(-1);
     void resize_particle_storage(size_t count);
@@ -69,8 +82,10 @@ public:
     void initialize_mpi();
     void load_config(const std::string& config_file);
     void load_coordinates(const std::string& coord_file);
-    void load_topology(const std::string& topo_file);
+    void load_topology(const std::string& topo_file,
+                       const std::string& parameter_file = "");
     void initialize_velocities(Real temperature);
+    void initialize_distributed_velocities(Real temperature);
     void setup_domain_decomposition();
     void allocate_device_memory();
     void copy_to_device();
@@ -90,9 +105,13 @@ public:
     ForceFieldParams& get_ff_params() { return ff_params; }
     NeighborList& get_neighbor_list() { return neighbor_list; }
     Topology& get_topology() { return *topology; }
+    bool has_topology() const { return static_cast<bool>(topology); }
     const std::vector<LocalBond>& get_local_bonds() const { return local_bonds_; }
     const std::vector<LocalAngle>& get_local_angles() const { return local_angles_; }
     const std::vector<LocalDihedral>& get_local_dihedrals() const { return local_dihedrals_; }
+    const std::vector<LocalDihedral>& get_local_impropers() const { return local_impropers_; }
+    const std::vector<LocalSpecialPair>& get_local_special_pairs() const { return local_special_pairs_; }
+    const std::vector<LocalConstraint>& get_local_constraints() const { return local_constraints_; }
     ForceManager& get_force_manager() { return *force_manager; }
 
     size_t get_num_particles() const { return particles.num_particles; }
@@ -113,7 +132,7 @@ public:
     void invalidate_halo_cache();
     void refresh_local_bonded_topology();
 
-    dsdecomp::HaloResult perform_halo_exchange(bool rebuild = false);
+    dsdecompx::HaloResult perform_halo_exchange(bool rebuild = false);
     bool sync_halo_particles(bool rebuild_halo, NeighborList* nlist = nullptr);
     bool sync_distributed_particles(bool local_rebuild_hint,
                                     NeighborList* nlist = nullptr);

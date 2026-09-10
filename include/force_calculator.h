@@ -42,6 +42,7 @@ private:
     void* py_ml_module;              // PyObject* (ml_forces module)
     void* py_compute_func;           // PyObject* (compute function)
     void* py_ml_compute_func;        // PyObject* (ML compute function)
+    void* py_ml_get_energy_func;     // PyObject* (ml_forces.get_last_energy)
 
     // Per-step zero-malloc optimisation buffers
     void* py_cached_atom_types;      // PyObject* – atom types never change; created once
@@ -49,7 +50,11 @@ private:
     std::vector<double> _pos_buf;    // interleaved position buffer [x0,y0,z0, ...]
     std::vector<double> _frc_buf;    // interleaved force buffer [fx0,fy0,fz0, ...]
     size_t _cached_n_particles;      // particle count when caches were built
-    
+
+    // Potential energy (kcal/mol) reported by ml_forces.get_last_energy()
+    // after the most recent compute_force() call.
+    double last_computed_energy_ = 0.0;
+
 public:
     PythonForceInterface();
     ~PythonForceInterface();
@@ -74,7 +79,13 @@ public:
                        const NeighborList& nlist, double box_x = 50.0,
                        double box_y = 50.0, double box_z = 50.0,
                        bool pbc_x = true, bool pbc_y = true, bool pbc_z = true);
-    
+
+    // Potential energy (kcal/mol) from the compute_force() call above.
+    // Not part of the additive-force ABI's return value, so the caller must
+    // pull it separately after each step.
+    double get_last_energy() const { return last_computed_energy_; }
+
+
     // Individual force computation methods (legacy, for backwards compatibility)
     void compute_bond_forces(ParticleData& particles, const ForceFieldParams& params);
     void compute_angle_forces(ParticleData& particles, const ForceFieldParams& params);

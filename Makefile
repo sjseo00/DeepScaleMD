@@ -1,13 +1,13 @@
-# Compatibility wrapper around the CMake build. dsDecomp is consumed only as
-# an installed package; this file never compiles files from dsDecomp/src.
+# Compatibility wrapper around the CMake build. dsDecompX is consumed only as
+# an installed package; this file never compiles files from dsDecompX/src.
 
 CMAKE ?= cmake
 JOBS ?=
 BUILD_TYPE ?= cpu
 LIBTORCH ?= OFF
 
-DSDECOMP_CPU_PREFIX ?= $(CURDIR)/install/dsdecomp-cpu
-DSDECOMP_CUDA_PREFIX ?= $(CURDIR)/install/dsdecomp-cuda
+CPU_DSDECOMPX_DIR ?= $(CURDIR)/install/dsdecompx-cpu
+CUDA_DSDECOMPX_DIR ?= $(CURDIR)/install/dsdecompx-cuda
 
 CPU_BUILD_DIR := build/deepscalemd-cpu
 CUDA_BUILD_DIR := build/deepscalemd-cuda
@@ -24,15 +24,15 @@ cpu:
 	$(CMAKE) -S . -B $(CPU_BUILD_DIR) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DBACKEND=CPU \
-		-DCMAKE_PREFIX_PATH="$(DSDECOMP_CPU_PREFIX)"
+		-DDSDECOMPX_DIR="$(CPU_DSDECOMPX_DIR)"
 	$(CMAKE) --build $(CPU_BUILD_DIR) --parallel $(JOBS)
 
 cuda:
 	$(CMAKE) -S . -B $(CUDA_BUILD_DIR) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DBACKEND=CUDA \
-		-DDEEPSCALEMD_ENABLE_LIBTORCH=$(LIBTORCH) \
-		-DCMAKE_PREFIX_PATH="$(DSDECOMP_CUDA_PREFIX)"
+		-DENABLE_LIBTORCH=$(LIBTORCH) \
+		-DDSDECOMPX_DIR="$(CUDA_DSDECOMPX_DIR)"
 	$(CMAKE) --build $(CUDA_BUILD_DIR) --parallel $(JOBS)
 
 sycl:
@@ -40,7 +40,7 @@ sycl:
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_CXX_COMPILER=icpx \
 		-DBACKEND=SYCL \
-		-DCMAKE_PREFIX_PATH="$(DSDECOMP_CPU_PREFIX)"
+		-DDSDECOMPX_DIR="$(CPU_DSDECOMPX_DIR)"
 	$(CMAKE) --build $(SYCL_BUILD_DIR) --parallel $(JOBS)
 
 clean:
@@ -51,4 +51,4 @@ clean:
 help:
 	@echo "CMake wrapper targets: cpu | cuda | sycl | clean"
 	@echo "Set LIBTORCH=ON with the cuda target to enable the LibTorch MLIP interface."
-	@echo "Override DSDECOMP_CPU_PREFIX or DSDECOMP_CUDA_PREFIX when needed."
+	@echo "Override CPU_DSDECOMPX_DIR or CUDA_DSDECOMPX_DIR when needed."

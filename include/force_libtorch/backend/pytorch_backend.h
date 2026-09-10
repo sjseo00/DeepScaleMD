@@ -10,7 +10,7 @@
 #ifndef MLIP_PYTORCH_BACKEND_H
 #define MLIP_PYTORCH_BACKEND_H
 
-#include "mlip/backend/backend_interface.h"
+#include "force_libtorch/backend/backend_interface.h"
 #include <memory>
 #include <string>
 

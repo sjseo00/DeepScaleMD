@@ -346,6 +346,16 @@ void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox
         const int* sdx = stencil_dx.data();
         const int* sdy = stencil_dy.data();
         const int* sdz = stencil_dz.data();
+        // When a periodic dimension has only one or two cells, different
+        // stencil offsets wrap to the same cell.  Visiting that cell more than
+        // once duplicates atom pairs and multiplies both force and energy.
+        // Keep this scratch buffer thread-local so the OpenMP path remains
+        // race-free without allocating once per atom.
+        thread_local std::vector<int> visited_cells;
+        visited_cells.clear();
+        if (visited_cells.capacity() < static_cast<size_t>(stencil_size)) {
+            visited_cells.reserve(static_cast<size_t>(stencil_size));
+        }
         for (int s = 0; s < stencil_size; ++s) {
             int xc = ix + sdx[s];
             int yc = iy + sdy[s];
@@ -362,6 +372,10 @@ void VerletCellListNeighborBuilder::build(ParticleData& particles, SimulationBox
             }
             int cell_id = zc * nx * ny + yc * nx + xc;
             if (cell_id < 0 || cell_id >= total_cells) continue;
+            if (std::find(visited_cells.begin(), visited_cells.end(), cell_id) != visited_cells.end()) {
+                continue;
+            }
+            visited_cells.push_back(cell_id);
             // Half-list (Newton ON, CPU only): for local-local, only j > i
             // Full-list (Newton OFF, GPU path): all pairs stored
             for (int j = cell_head_ptr[cell_id]; j >= 0; j = cell_next_ptr[j]) {
@@ -782,8 +796,6 @@ void MortonZOrderNeighborBuilder::build(ParticleData& particles, SimulationBox& 
     // === CUDA fast path: fully GPU-side Morton sort + neighbor build ===
 #ifdef USE_CUDA
     if (gpu_available) {
-        auto t_gpu_start = std::chrono::high_resolution_clock::now();
-
         const int max_neighbors_per_particle = 512;
         const size_t neighbor_slots = local_N * (size_t)max_neighbors_per_particle;
 
@@ -848,8 +860,6 @@ void MortonZOrderNeighborBuilder::build(ParticleData& particles, SimulationBox& 
 
         // Upload original (unsorted) positions to GPU using async transfer
         cudaStream_t stream = 0;
-        auto t_upload_start = std::chrono::high_resolution_clock::now();
-
         cudaMemcpyAsync(d_x, particles.x.data(), total_N * sizeof(Real), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_y, particles.y.data(), total_N * sizeof(Real), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(d_z, particles.z.data(), total_N * sizeof(Real), cudaMemcpyHostToDevice, stream);
@@ -878,8 +888,6 @@ void MortonZOrderNeighborBuilder::build(ParticleData& particles, SimulationBox& 
         );
 
         cudaStreamSynchronize(stream);
-        auto t_kernel_end = std::chrono::high_resolution_clock::now();
-
         // Download compact results (much smaller than padded array)
         // After kernel: d_neighbor_offset_tmp[i] = compact CSR offset, d_num_neighbors_tmp[i] = count
         std::vector<int> h_num_neighbors(local_N);
@@ -900,18 +908,10 @@ void MortonZOrderNeighborBuilder::build(ParticleData& particles, SimulationBox& 
             cudaMemcpy(h_compact_neighbors.data(), d_compact_neighbors, total_neighbors * sizeof(int), cudaMemcpyDeviceToHost);
         }
 
-        auto t_download_end = std::chrono::high_resolution_clock::now();
-
         // Build output arrays directly from compact data (already in original index order)
         nlist.neighbors.assign(h_compact_neighbors.begin(), h_compact_neighbors.end());
         nlist.num_neighbors.assign(h_num_neighbors.begin(), h_num_neighbors.end());
         nlist.neighbor_offset.assign(h_neighbor_offset.begin(), h_neighbor_offset.end());
-
-        auto t_gpu_end = std::chrono::high_resolution_clock::now();
-
-        auto ms_kernel = std::chrono::duration_cast<std::chrono::microseconds>(t_kernel_end - t_upload_start).count();
-        auto ms_download = std::chrono::duration_cast<std::chrono::microseconds>(t_download_end - t_kernel_end).count();
-        auto ms_total = std::chrono::duration_cast<std::chrono::microseconds>(t_gpu_end - t_gpu_start).count();
 
         if (!info_printed) {
             int max_neighbors = 0;

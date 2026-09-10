@@ -16,7 +16,7 @@
 #ifndef MLIP_MD_DATA_SOURCES_H
 #define MLIP_MD_DATA_SOURCES_H
 
-#include "mlip/operations/operation_registry.h"
+#include "force_libtorch/operations/operation_registry.h"
 #include <functional>
 
 namespace mlip {

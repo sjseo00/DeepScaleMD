@@ -148,40 +148,7 @@ neighbor_list_type: morton_code
 
 ---
 
-## 4. CUDA Graphs 시스템
-
-### 관련 파일: `src/cuda_graphs_system.cpp`
-
-반복적인 MD 루프의 커널 론칭 오버헤드를 제거한다.
-
-### 동작 원리
-
-```
-[Warmup 5회]
-    ↓
-[Graph Capture 시작]
-  capture_force_computation_graph()
-  capture_integration_graph()
-  capture_neighbor_update_graph()    ← 10스텝마다만 캡처
-[Graph Capture 종료]
-    ↓
-[이후 스텝: cudaGraphLaunch() 한 번으로 전체 실행]
-```
-
-```cpp
-cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
-// ... 커널들 론칭 ...
-cudaStreamEndCapture(capture_stream, &simulation_graph);
-cudaGraphInstantiate(&graph_exec, simulation_graph, ...);
-// 실행
-cudaGraphLaunch(graph_exec, stream);
-```
-
-**100스텝마다 그래프 재캡처** (설정 가능)
-
----
-
-## 5. PME 정전기 계산 (CUDA)
+## 4. PME 정전기 계산 (CUDA)
 
 ### 관련 파일: `src/pme_calculator.cu`, `src/pme_kernels.cu`
 
@@ -206,7 +173,7 @@ Particle Mesh Ewald 방법으로 장거리 정전기를 O(N log N)으로 계산�
 
 ---
 
-## 6. MLIP GPU-resident 연동
+## 5. MLIP GPU-resident 연동
 
 ### C++ MLIP Runtime (TorchScript 모드)
 
@@ -237,7 +204,7 @@ void launch_interleave_positions(
 
 ---
 
-## 7. 이중 정밀도 vs 단정밀도
+## 6. 이중 정밀도 vs 단정밀도
 
 | 데이터 | 정밀도 | 이유 |
 |--------|--------|------|
@@ -247,7 +214,7 @@ void launch_interleave_positions(
 
 ---
 
-## 8. GPU 프로파일링
+## 7. GPU 프로파일링
 
 ```bash
 # Nsight Systems로 프로파일
@@ -265,7 +232,7 @@ MD_TIMING=1 bin/md_simulation_cuda input.yaml
 
 ---
 
-## 9. 주요 성능 지표 (RTX 2080 Ti 기준)
+## 8. 주요 성능 지표 (RTX 2080 Ti 기준)
 
 | 시스템 | MLIP | 스텝당 시간 |
 |--------|------|------------|

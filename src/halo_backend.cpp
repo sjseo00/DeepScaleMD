@@ -37,7 +37,7 @@ public:
     }
 
     void on_post_halo(MDSystem&, ForceCalculator*, bool, bool) override {}
-    const char* name() const override { return "dsdecomp_cuda_resident"; }
+    const char* name() const override { return "dsdecompx_cuda_resident"; }
 };
 #endif
 

@@ -1,4 +1,4 @@
-# dsDecomp v0.2 architecture
+# dsDecompX v0.2 architecture
 
 ## Current application boundary
 
@@ -11,7 +11,7 @@ MDSimulation
 MDSystem (ParticleData adapter; storage owner)
   |  non-owning ConstParticleView / ParticleView
   v
-dsdecomp::Decomposition
+dsdecompx::Decomposition
   |-- Cartesian topology and neighbor discovery
   |-- halo plan, persistent halo/migration buffers
   |-- separate halo and migration operations
@@ -21,7 +21,7 @@ detail::Backend
 MPI backend (communicator, datatype, requests, collectives)
 ```
 
-`dsDecomp` never resizes or owns `ParticleData`. Migration produces a reusable
+`dsDecompX` never resizes or owns `ParticleData`. Migration produces a reusable
 library-owned ordered record view; `MDSystem` copies that result into its SoA.
 Force, integrator, neighbor-list, and CUDA stream policy remain application
 responsibilities.

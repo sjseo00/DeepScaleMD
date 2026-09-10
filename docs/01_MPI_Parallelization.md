@@ -1,9 +1,9 @@
 # MPI 병렬화 및 최적화
 
 > **현재 architecture:** Cartesian decomposition, halo exchange, migration은
-> `dsDecomp`를 사용한다. 이 문서의 삭제된 legacy `DomainDecomposition`
+> `dsDecompX`를 사용한다. 이 문서의 삭제된 legacy `DomainDecomposition`
 > source 참조는 역사적 설명이다. 현재 경계는
-> `dsDecomp/docs/integration-boundary-audit.md`를 참고한다.
+> `dsDecompX/docs/integration-boundary-audit.md`를 참고한다.
 
 ## 개요
 

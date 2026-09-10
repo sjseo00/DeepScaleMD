@@ -2,8 +2,8 @@
  * // Include mlip_types BEFORE LibTorch to ensure mlip types are defined.
 // DO NOT use "using namespace mlip" here — it would cause ScalarType ambiguity
 // with c10::ScalarType when torch headers are processed.
-#include "mlip/mlip_types.h"
-#include "mlip/backend/pytorch_backend.h"
+#include "force_libtorch/mlip_types.h"
+#include "force_libtorch/backend/pytorch_backend.h"
 
 #ifdef USE_LIBTORCH
 #  include <torch/torch.h>
@@ -17,8 +17,8 @@
  */
 
 // Include mlip_types BEFORE LibTorch to define ::ScalarType before c10::ScalarType
-#include "mlip/mlip_types.h"
-#include "mlip/backend/pytorch_backend.h"
+#include "force_libtorch/mlip_types.h"
+#include "force_libtorch/backend/pytorch_backend.h"
 
 #ifdef USE_LIBTORCH
 #  include <torch/torch.h>
@@ -36,7 +36,7 @@
 #  define CUDA_CHECK(e) (void)(e)
 #endif
 
-#include "mlip/backend/backend_interface.h"  // REGISTER_MLIP_BACKEND
+#include "force_libtorch/backend/backend_interface.h"  // REGISTER_MLIP_BACKEND
 #include <iostream>
 #include <stdexcept>
 #include <vector>

@@ -170,7 +170,7 @@ cudaStreamSynchronize(force_stream);
 
 ## 5. C++ ↔ Python 인터페이스 상세
 
-### 5.1 `src/python_interface.cpp`: `compute_ml_forces()`
+### 5.1 `src/force_python/python_interface.cpp`: `compute_ml_forces()`
 
 ```
 입력 (C++ → Python 변환):
@@ -276,7 +276,7 @@ NVCC_FLAGS = ... -DENABLE_PYTHON_INTERFACE $(PYTHON_INCLUDES) $(NUMPY_FLAGS)
 | 파일 | 역할 |
 |------|------|
 | `src/md_simulation.cpp` | MLP 데이터 흐름 제어 (D→H, 호출, H→D) |
-| `src/python_interface.cpp` | C++ ↔ Python C API 브릿지, NumPy 배열 변환 |
+| `src/force_python/python_interface.cpp` | C++ ↔ Python C API 브릿지, NumPy 배열 변환 |
 | `src/force_calculator_cuda.cu` | `download_positions_for_ml`, `upload_forces_from_ml`, `register_ml_pinned_buffers` 구현 |
 | `include/force_calculator_cuda.h` | 위 함수들 선언 |
 | `python_force/ml_forces.py` | MACE ASE calculator 래퍼, `_patch_mace_einsum_cuda_bug()` |

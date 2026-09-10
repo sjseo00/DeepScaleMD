@@ -10,9 +10,9 @@
  */
 
 #include "force_calculator_cuda.h"
-#include "mlip/mlip_types.h"
-#include "mlip/runtime/mlip_runtime.h"
-#include "mlip/binding/md_data_sources.h"
+#include "force_libtorch/mlip_types.h"
+#include "force_libtorch/runtime/mlip_runtime.h"
+#include "force_libtorch/binding/md_data_sources.h"
 
 void mlip_bridge_register_md_sources(void* fc_cuda_ptr)
 {

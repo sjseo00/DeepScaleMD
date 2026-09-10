@@ -230,9 +230,9 @@ __global__ void build_neighbor_list_kernel(
     // Lane 0 writes the final count
     if (lane == 0) {
         local_neighbor_count = s_neighbor_count[warp_in_block];
-        // Clamp to max limit
-        if (local_neighbor_count > max_neighbors_per_particle) local_neighbor_count = max_neighbors_per_particle;
-        
+        // Preserve the true count even on overflow. The host validates it
+        // before any force kernel consumes this list; silently clamping here
+        // produces plausible-looking but physically incomplete forces.
         num_neighbors[i] = local_neighbor_count;
         neighbor_offset[i] = base_offset;
     }
