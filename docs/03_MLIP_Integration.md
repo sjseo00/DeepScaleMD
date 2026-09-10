@@ -1,41 +1,41 @@
-# MLIP 연동 아키텍처
+# MLIP Integration Architecture
 
-## 개요
+## Overview
 
-DeepScaleMD는 두 가지 독립적인 MLIP 연동 경로를 제공한다.
+DeepScaleMD provides two independent MLIP integration paths.
 
-| 경로 | 설정 | 특징 |
+| Path | Configuration | Characteristics |
 |------|------|------|
-| **C++ MLIP Runtime** | `force_calculation.mode: libtorch` | TorchScript 전용, GPU-resident, 최고 성능 |
-| **Python Interface** | `force_calculation.mode: python` | fairchem/MACE/NequIP 등 모든 ASE 계산기 지원 |
+| **C++ MLIP Runtime** | `force_calculation.mode: libtorch` | TorchScript only, GPU-resident, best performance |
+| **Python Interface** | `force_calculation.mode: python` | Supports all ASE calculators, including fairchem/MACE/NequIP |
 
 ---
 
-## 경로 1: C++ MLIP Runtime (mlip_inst.md 아키텍처)
+## Path 1: C++ MLIP Runtime (mlip_inst.md architecture)
 
-### 설계 목표
+### Design Goals
 
-- Python 인터프리터 없이 C++에서 직접 TorchScript 모델 실행
-- 데이터가 GPU 메모리에 상주 (GPU → CPU → GPU 왕복 제거)
-- CUDA 스트림을 DeepScaleMD와 LibTorch가 공유
+- Run TorchScript models directly in C++ without a Python interpreter
+- Keep data resident in GPU memory (eliminate GPU → CPU → GPU round trips)
+- Share the CUDA stream between DeepScaleMD and LibTorch
 
-### 계층 구조
+### Layer Structure
 
 ```
 input.yaml
   └─ force_calculation.mode: libtorch
-  └─ spec_file: examples/xxx/model_spec.yaml   ← MLIP 명세 YAML
+  └─ spec_file: examples/xxx/model_spec.yaml   ← MLIP specification YAML
                  │
                  ▼
          MlipRuntime::initialize()
                  │
          ┌───────────────────┐
-         │  MlipModelSpec    │  — YAML 파서가 생성
+         │  MlipModelSpec    │  — produced by the YAML parser
          │  (parsed spec)    │
          └───────────────────┘
                  │
          ┌───────────────────┐
-         │  ExecutionPlan    │  — 입출력 파이프라인 컴파일
+         │  ExecutionPlan    │  — compiles the input/output pipeline
          │  (compiled plan)  │
          └───────────────────┘
                  │
@@ -45,9 +45,9 @@ input.yaml
          └───────────────────┘
 ```
 
-### MLIP 명세 YAML 스키마
+### MLIP Specification YAML Schema
 
-`model_spec.yaml` (예: `examples/mlip_runtime/mock_lj_spec.yaml`):
+`model_spec.yaml` (example: `examples/mlip_runtime/mock_lj_spec.yaml`):
 
 ```yaml
 schema_version: 1
@@ -55,7 +55,7 @@ schema_version: 1
 model:
   name: my_model
   backend: pytorch          # pytorch | onnx | tensorrt
-  path: path/to/model.pt    # TorchScript 파일 경로
+  path: path/to/model.pt    # path to the TorchScript file
   device: cuda
   precision: float32
 
@@ -67,8 +67,8 @@ backend:
 
 inputs:
   positions:
-    source: md.positions    # MD 데이터 소스 이름
-    tensor_name: pos        # 모델 입력 키 이름
+    source: md.positions    # MD data source name
+    tensor_name: pos        # model input key name
     shape: [nall, 3]
     dtype: float32
   species:
@@ -77,14 +77,14 @@ inputs:
     shape: [nall]
     dtype: int64
     transform:
-      - species_map          # MD 타입 → 원자번호 변환
+      - species_map          # MD type → atomic number conversion
   edge_index:
     source: md.neighbor_list
     tensor_name: edge_index
     shape: [2, nedges]
     dtype: int64
     transform:
-      - full_directed_edge_list  # 반목록 → 전방향 목록
+      - full_directed_edge_list  # half list → full directed list
 
 outputs:
   energy:
@@ -126,67 +126,67 @@ capabilities:
   external_cuda_stream: true
 ```
 
-### GPU-resident 데이터 흐름
+### GPU-resident Data Flow
 
 ```
 ForceCalculatorCUDA (GPU)
 │
-├─ d_x[], d_y[], d_z[]          ← SoA 위치 (float64)
-├─ d_edge_coo_packed[]          ← 반목록 COO (int32)
+├─ d_x[], d_y[], d_z[]          ← SoA positions (float64)
+├─ d_edge_coo_packed[]          ← neighbor list COO (int32)
 │
-▼ [CUDA 커널: launch_interleave_positions]
+▼ [CUDA kernel: launch_interleave_positions]
 │
-├─ d_pos_interleaved[N,3]       ← AoS 위치 (모델 입력 형식)
+├─ d_pos_interleaved[N,3]       ← AoS positions (model input format)
 │
-▼ [CUDA 커널: launch_half_to_full_edges]
+▼ [CUDA kernel: launch_half_to_full_edges]
 │
-├─ d_edge_index[2, E_full]      ← 전방향 엣지
+├─ d_edge_index[2, E_full]      ← directed edges
 │
 ▼ [PyTorchBackend::execute() — LibTorch CUDA forward]
 │
 ├─ model output: energy (scalar)
 ├─ model output: forces [N, 3]
 │
-▼ [CUDA 커널: launch_accumulate_forces_scaled]
+▼ [CUDA kernel: launch_accumulate_forces_scaled]
 │
-└─ d_fx[], d_fy[], d_fz[]       ← 힘 누적 완료
+└─ d_fx[], d_fy[], d_fz[]       ← force accumulation complete
 ```
 
-### 단위 변환 (UnitConversion)
+### Unit Conversion (UnitConversion)
 
-`execution_plan.cpp`에서 컴파일 시 계산:
+Computed at compile time in `execution_plan.cpp`:
 
 ```cpp
 uc.energy_scale = e_model / e_md;          // eV → kcal/mol: × 0.04336
 uc.force_scale  = (e_model/l_model) / (e_md/l_md);
 ```
 
-### 핵심 파일 목록
+### Key File List
 
-| 파일 | 역할 |
+| File | Role |
 |------|------|
-| `src/force_libtorch/runtime/mlip_runtime.cpp` | 런타임 진입점, 초기화/실행 |
-| `src/force_libtorch/runtime/execution_plan.cpp` | 파이프라인 컴파일, 단위 변환 |
-| `src/force_libtorch/config/yaml_parser.cpp` | MLIP 명세 YAML 파서 |
-| `src/force_libtorch/backend/pytorch_backend.cpp` | LibTorch 래퍼 (ABI=0으로 컴파일) |
-| `src/force_libtorch/backend/pytorch_backend_register.cpp` | 백엔드 자동 등록 (ABI=1) |
-| `src/force_libtorch/binding/md_data_sources.cpp` | MD 데이터 소스/타겟 등록 |
-| `src/force_libtorch/cuda/edge_conversion.cu` | 엣지 변환 CUDA 커널 |
-| `src/force_libtorch/cuda/force_accumulation.cu` | 힘 누적 CUDA 커널 |
-| `include/force_libtorch/runtime/model_specification.h` | 명세 데이터 구조 정의 |
-| `include/force_libtorch/backend/backend_interface.h` | 백엔드 추상 인터페이스 + 레지스트리 |
+| `src/force_libtorch/runtime/mlip_runtime.cpp` | Runtime entry point, initialization/execution |
+| `src/force_libtorch/runtime/execution_plan.cpp` | Pipeline compilation, unit conversion |
+| `src/force_libtorch/config/yaml_parser.cpp` | MLIP specification YAML parser |
+| `src/force_libtorch/backend/pytorch_backend.cpp` | LibTorch wrapper (compiled with ABI=0) |
+| `src/force_libtorch/backend/pytorch_backend_register.cpp` | Backend auto-registration (ABI=1) |
+| `src/force_libtorch/binding/md_data_sources.cpp` | MD data source/target registration |
+| `src/force_libtorch/cuda/edge_conversion.cu` | Edge conversion CUDA kernel |
+| `src/force_libtorch/cuda/force_accumulation.cu` | Force accumulation CUDA kernel |
+| `include/force_libtorch/runtime/model_specification.h` | Specification data structure definitions |
+| `include/force_libtorch/backend/backend_interface.h` | Backend abstract interface + registry |
 
 ---
 
-## 경로 2: Python Interface
+## Path 2: Python Interface
 
-### 설계 목표
+### Design Goals
 
-- C++ 바이너리 재컴파일 없이 임의의 ML 계산기 사용 가능
-- fairchem UMA, MACE, NequIP, CHGNet, SevenNet, ORB 지원
-- ASE(Atomic Simulation Environment) 계산기 인터페이스 공유
+- Allow arbitrary ML calculators to be used without recompiling the C++ binary
+- Support fairchem UMA, MACE, NequIP, CHGNet, SevenNet, ORB
+- Share the ASE (Atomic Simulation Environment) calculator interface
 
-### 아키텍처
+### Architecture
 
 ```
 bin/md_simulation_cuda  (C++)
@@ -201,62 +201,62 @@ bin/md_simulation_cuda  (C++)
     │            ↓
     │      ADAPTER_REGISTRY[key]()  →  UMAAdapter / MACEAdapter / ...
     │
-    │  매 MD 스텝:
+    │  Every MD step:
     │      compute_ml_forces(positions, types, cell, pbc)
     │            ↓
     │      mlip_interface.compute_forces(...)
     │            ↓
     │      adapter.compute_forces(...)  →  ASE atoms.get_forces()
     │
-    └─ 힘 배열 반환 → C++ GPU 메모리에 복사
+    └─ Force array returned → copied into C++ GPU memory
 ```
 
-### Python-C++ 인터페이스 데이터 전달
+### Python-C++ Interface Data Transfer
 
 ```cpp
 // src/force_python/python_interface.cpp
-// 위치: NumPy 배열로 공유 (복사 없음)
+// Positions: shared as a NumPy array (no copy)
 npy_intp pos_dims[2] = {n_particles, 3};
 PyObject* py_positions = PyArray_SimpleNewFromData(
     2, pos_dims, NPY_DOUBLE, particle_data.x);
 
-// Cell: 1D 배열 [box_x, box_y, box_z]
+// Cell: 1D array [box_x, box_y, box_z]
 cell_data[0] = box_x;
 cell_data[1] = box_y;
 cell_data[2] = box_z;
 
-// PBC: int32 배열 [1,1,1]
+// PBC: int32 array [1,1,1]
 pbc_data[i] = pbc_x ? 1 : 0;
 ```
 
-### UMAAdapter (fairchem UMA 전용)
+### UMAAdapter (fairchem UMA only)
 
 ```python
 # python_force/mlip_interface.py
 
 class UMAAdapter(MLIPAdapter):
     def initialize(self, model_path, task_name="omat", ...):
-        # external_graph_gen=True 필수:
-        # False이면 r_edges=False → "No edges found" 오류 발생
+        # external_graph_gen=True is required:
+        # if False, r_edges=False, which causes a "No edges found" error
         inf_settings = InferenceSettings(external_graph_gen=True)
         predict_unit = MLIPPredictUnit(model_path, device=self.device,
                                        inference_settings=inf_settings)
         self._calculator = FAIRChemCalculator(predict_unit, task_name=task)
 
     def compute_forces(self, positions, atom_types, cell, pbc):
-        self._sync_before()          # CUDA synchronize (C++ GPU 작업 완료 대기)
-        self._update_atoms(...)      # ASE Atoms 위치 갱신
+        self._sync_before()          # CUDA synchronize (wait for C++ GPU work to finish)
+        self._update_atoms(...)      # update ASE Atoms positions
         forces = self._atoms.get_forces()
-        self._sync_after()           # CUDA synchronize (Python GPU 작업 완료 대기)
+        self._sync_after()           # CUDA synchronize (wait for Python GPU work to finish)
         return forces
 ```
 
-**`external_graph_gen=True` 이유:**
-- `False`(기본값)일 때 `FAIRChemCalculator`는 `r_edges=False`로 `AtomicData.from_ase` 호출
-- 이 경우 모델 내부 그래프 빌더가 작동하지 않아 "No edges found" 발생
-- `True`로 설정하면 `r_edges=True` → ASE 기반 radius-graph 외부 생성
+**Why `external_graph_gen=True` is needed:**
+- When `False` (the default), `FAIRChemCalculator` calls `AtomicData.from_ase` with `r_edges=False`
+- In that case the model's internal graph builder does not run, producing a "No edges found" error
+- Setting it to `True` makes `r_edges=True`, so the radius graph is generated externally via ASE
 
-### 지원 어댑터 목록
+### List of Supported Adapters
 
 ```python
 # python_force/mlip_interface.py
@@ -274,58 +274,58 @@ ADAPTER_REGISTRY = {
 }
 ```
 
-### GPU 메모리 최적화 (MLIPAdapter 기반 클래스)
+### GPU Memory Optimization (MLIPAdapter Base Class)
 
 ```python
 class MLIPAdapter:
     def _ensure_gpu_resources(self, atom_types):
-        # 1. 원자 타입 GPU 텐서 — 첫 스텝에만 업로드, 이후 재사용
+        # 1. Atom type GPU tensor — uploaded only on the first step, reused afterward
         if self._atom_types_gpu is None:
             self._atom_types_gpu = torch.tensor(atom_types, device=self.device)
 
-        # 2. 핀 메모리 스테이징 버퍼 — PCIe DMA 가속
+        # 2. Pinned-memory staging buffer — accelerates PCIe DMA
         if self._pos_buf is None:
             self._pos_buf = torch.empty((n,3), dtype=torch.float64,
                                         pin_memory=True).numpy()
 
-        # 3. 전용 CUDA 스트림 — H2D 전송 오버랩
+        # 3. Dedicated CUDA stream — overlaps H2D transfers
         if self._transfer_stream is None:
             self._transfer_stream = torch.cuda.Stream(device=self.device)
 ```
 
 ---
 
-## 경로 비교
+## Path Comparison
 
-| 항목 | C++ MLIP Runtime | Python Interface |
+| Item | C++ MLIP Runtime | Python Interface |
 |------|-----------------|-----------------|
-| **지원 모델 형식** | TorchScript (.pt) | 모든 ASE 계산기 |
-| **GPU-resident** | ✅ 완전 GPU 상주 | ⚠️ CPU 경유 (positions) |
-| **C++ 재컴파일** | 불필요 (YAML만 수정) | 불필요 |
-| **새 모델 추가** | `model_spec.yaml` 작성 | `ADAPTER_REGISTRY` 에 클래스 추가 |
-| **fairchem UMA** | ❌ (TorchScript 비지원) | ✅ |
-| **MACE-MP** | ✅ (export 필요) | ✅ |
-| **속도** | 최고 | 모델 forward 속도와 동일 |
+| **Supported model format** | TorchScript (.pt) | Any ASE calculator |
+| **GPU-resident** | ✅ Fully GPU-resident | ⚠️ Goes through CPU (positions) |
+| **C++ recompilation** | Not required (only YAML changes) | Not required |
+| **Adding a new model** | Write a `model_spec.yaml` | Add a class to `ADAPTER_REGISTRY` |
+| **fairchem UMA** | ❌ (TorchScript not supported) | ✅ |
+| **MACE-MP** | ✅ (export required) | ✅ |
+| **Speed** | Best | Same as the model's forward pass speed |
 
 ---
 
-## 새 모델 추가 방법
+## How to Add a New Model
 
-### C++ MLIP Runtime 경로
+### C++ MLIP Runtime Path
 
-1. 모델을 TorchScript로 export
-2. `model_spec.yaml` 작성 (입출력 매핑, 단위 정의)
-3. `input.yaml`에서 `spec_file: path/to/model_spec.yaml`
+1. Export the model to TorchScript
+2. Write a `model_spec.yaml` (input/output mapping, unit definitions)
+3. In `input.yaml`, set `spec_file: path/to/model_spec.yaml`
 
-### Python Interface 경로
+### Python Interface Path
 
-1. `python_force/mlip_interface.py`에 어댑터 클래스 추가:
+1. Add an adapter class to `python_force/mlip_interface.py`:
 ```python
 class MyModelAdapter(MLIPAdapter):
     def initialize(self, model_path, ...): ...
     def compute_forces(self, positions, atom_types, cell, pbc): ...
 ```
-2. `ADAPTER_REGISTRY`에 등록:
+2. Register it in `ADAPTER_REGISTRY`:
 ```python
 ADAPTER_REGISTRY["mymodel"] = MyModelAdapter
 ```

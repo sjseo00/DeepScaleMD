@@ -1,62 +1,62 @@
-# GPU 병렬화 및 최적화
+# GPU Parallelization and Optimization
 
-## 개요
+## Overview
 
-DeepScaleMD는 NVIDIA CUDA를 통해 MD 시뮬레이션의 핵심 연산을 GPU에서 수행한다. 힘 계산, 이웃 목록 구축, 적분, PME 정전기 계산이 모두 GPU 커널로 구현되어 있으며, GPU-resident 방식으로 데이터를 GPU 메모리에 상주시켜 PCIe 전송을 최소화한다.
+DeepScaleMD performs the core computations of MD simulation on the GPU via NVIDIA CUDA. Force calculation, neighbor list construction, integration, and PME electrostatics calculation are all implemented as GPU kernels, and data is kept resident in GPU memory (GPU-resident approach) to minimize PCIe transfers.
 
 ---
 
-## 1. 빌드 구성
+## 1. Build Configuration
 
 ```makefile
-# Makefile — CUDA 빌드
-make cuda LIBTORCH=ON  # CUDA + LibTorch (MLIP 지원)
+# Makefile — CUDA build
+make cuda LIBTORCH=ON  # CUDA + LibTorch (MLIP support)
 make cuda            # CUDA only
 make cpu             # CPU fallback
 ```
 
-**컴파일러:** `nvcc` + `g++-11 (ccbin)`  
-**CUDA 버전:** 12.9  
-**대상 아키텍처:** SM 7.5+ (RTX 2080 Ti 기준)
+**Compiler:** `nvcc` + `g++-11 (ccbin)`
+**CUDA version:** 12.9
+**Target architecture:** SM 7.5+ (based on RTX 2080 Ti)
 
 ---
 
-## 2. ForceCalculatorCUDA — GPU 힘 계산기
+## 2. ForceCalculatorCUDA — GPU Force Calculator
 
-### 관련 파일
+### Related Files
 - `src/force_calculator_cuda.cu`
 - `include/force_calculator_cuda.h`
 
-### GPU-resident 데이터 레이아웃
+### GPU-resident Data Layout
 
-모든 입자 데이터를 GPU에 상주시킨다. SOA(Structure of Arrays) 방식:
+All particle data is kept resident on the GPU, using a Structure of Arrays (SOA) layout:
 
 ```
-GPU 메모리:
-  d_x[N], d_y[N], d_z[N]       — 위치
-  d_vx[N], d_vy[N], d_vz[N]    — 속도
-  d_fx[N], d_fy[N], d_fz[N]    — 힘
-  d_mass[N], d_charge[N]        — 질량, 전하
-  d_type[N]                     — 원자 타입
+GPU memory:
+  d_x[N], d_y[N], d_z[N]       — positions
+  d_vx[N], d_vy[N], d_vz[N]    — velocities
+  d_fx[N], d_fy[N], d_fz[N]    — forces
+  d_mass[N], d_charge[N]        — mass, charge
+  d_type[N]                     — atom type
 ```
 
-### 최소 이미지 관례 (Minimum Image Convention)
+### Minimum Image Convention
 
-**브랜치리스(branchless) 최적화:**
+**Branchless optimization:**
 ```cuda
 __device__ inline void apply_minimum_image_device(
     Real& dx, Real& dy, Real& dz,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z)
 {
-    // round() 사용으로 if-branch 제거 → warp divergence 방지
+    // Use round() to eliminate if-branches → avoids warp divergence
     dx -= box_x * round(dx * inv_box_x);
     dy -= box_y * round(dy * inv_box_y);
     dz -= box_z * round(dz * inv_box_z);
 }
 ```
 
-### Lennard-Jones 힘 커널
+### Lennard-Jones Force Kernel
 
 ```cuda
 __global__ void lj_force_kernel(
@@ -65,29 +65,29 @@ __global__ void lj_force_kernel(
     int* neighbor_list, int* num_neighbors,
     Real cutoff_sq, ...)
 {
-    // 한 스레드 = 한 입자
+    // One thread = one particle
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    // 이웃 목록 순회 → 힘 누적
-    // atomicAdd로 반응 힘(reaction force) 기록
+    // Iterate over the neighbor list → accumulate forces
+    // Record the reaction force via atomicAdd
 }
 ```
 
-### Double precision atomicAdd
+### Double Precision atomicAdd
 
-구형 아키텍처(< SM 6.0) 지원을 위한 fallback 구현:
+Fallback implementation for supporting older architectures (< SM 6.0):
 ```cuda
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
-// 네이티브 double atomicAdd 사용
+// Use the native double atomicAdd
 #else
 __device__ double atomicAdd(double* address, double val) {
-    // CAS 기반 emulation
+    // CAS-based emulation
 }
 #endif
 ```
 
-### __constant__ 메모리 활용
+### Use of `__constant__` Memory
 
-자주 사용하는 상수를 constant cache에 배치:
+Frequently used constants are placed in constant cache:
 ```cuda
 __constant__ Real d_cutoff_sq;
 __constant__ Real d_k_coulomb;
@@ -97,106 +97,106 @@ __constant__ size_t d_total_particles;
 
 ---
 
-## 3. 이웃 목록 (Neighbor List)
+## 3. Neighbor List
 
-### 관련 파일
+### Related Files
 - `src/neighbor_list_kernels.cu`
 - `src/neighbor_list_kernels_optimized.cu`
 - `include/neighbor_list.h`
 
-### Verlet-Cell 하이브리드 방식
+### Verlet-Cell Hybrid Approach
 
 ```
-Cell List 구축 → O(N) 셀 할당
+Build cell list → O(N) cell assignment
     ↓
-Verlet skin 반경으로 이웃 후보 필터링
+Filter neighbor candidates using the Verlet skin radius
     ↓
-Neighbor list 저장 (반목록, E_half 엣지)
+Store the neighbor list (half list, E_half edges)
 ```
 
-**Skin 거리:** `cutoff + verlet_skin`까지의 입자를 캐시하여 매 스텝 재구축 불필요
+**Skin distance:** particles up to `cutoff + verlet_skin` are cached, so the list does not need to be rebuilt every step
 
-### GPU 기반 재구축 필요성 판단
+### GPU-based Rebuild Necessity Check
 
 ```cuda
-// 현재 위치 vs 마지막 구축 위치 변위 계산
+// Compute displacement between the current position and the last build position
 __global__ void compute_displacement_sq_kernel(...) {
     Real dx = x_new[i] - x_old[i];
-    // 최소 이미지 관례 적용
+    // Apply the minimum image convention
     d_disp_sq[i] = dx*dx + dy*dy + dz*dz;
 }
 
-// Thrust로 GPU에서 최대값 계산
+// Compute the maximum value on the GPU using Thrust
 Real max_disp_sq = thrust::reduce(
     thrust::cuda::par.on(stream),
     thrust::device_pointer_cast(d_disp_sq_tmp), ...
 );
-// max_disp > verlet_skin/2 이면 재구축
+// Rebuild if max_disp > verlet_skin/2
 ```
 
-CPU로 복사 없이 GPU에서 재구축 필요성을 판단한다.
+The need for a rebuild is determined entirely on the GPU, without copying data back to the CPU.
 
-### Morton Z-order 정렬 (옵션)
+### Morton Z-order Sorting (Optional)
 
 ```yaml
 neighbor_list_type: morton_code
 ```
 
-공간 locality 향상을 위해 Morton 코드(Z-curve)로 입자 재정렬:
-- 인접한 입자가 메모리에도 인접 → 캐시 히트율 향상
-- `thrust::sort` 사용
+Particles are reordered using the Morton code (Z-curve) to improve spatial locality:
+- Particles that are close in space are also placed close together in memory → improves cache hit rate
+- Uses `thrust::sort`
 
 ---
 
-## 4. PME 정전기 계산 (CUDA)
+## 4. PME Electrostatics Calculation (CUDA)
 
-### 관련 파일: `src/pme_calculator.cu`, `src/pme_kernels.cu`
+### Related Files: `src/pme_calculator.cu`, `src/pme_kernels.cu`
 
-Particle Mesh Ewald 방법으로 장거리 정전기를 O(N log N)으로 계산한다.
+Long-range electrostatics are computed in O(N log N) using the Particle Mesh Ewald method.
 
-### GPU 파이프라인
+### GPU Pipeline
 
 ```
-1. Charge spreading  (GPU kernel) — B-spline으로 전하를 격자에 분산
+1. Charge spreading  (GPU kernel) — spread charges onto the grid using B-splines
        ↓
-2. 3D FFT           (cuFFT)       — 전하 격자 → 역공간
+2. 3D FFT           (cuFFT)       — charge grid → reciprocal space
        ↓
-3. Poisson solver   (GPU kernel) — 역공간에서 에너지/힘 계산
+3. Poisson solver   (GPU kernel) — compute energy/forces in reciprocal space
        ↓
-4. Inverse FFT      (cuFFT)       — 역공간 → 실공간
+4. Inverse FFT      (cuFFT)       — reciprocal space → real space
        ↓
-5. Force interpolation (GPU kernel) — 격자 → 입자 힘
+5. Force interpolation (GPU kernel) — grid → particle forces
 ```
 
-**B-spline 차수:** 4차 (cubic)  
-**격자 크기:** `input.yaml`에서 `pme_grid_size: [64, 64, 64]`로 설정
+**B-spline order:** 4th order (cubic)
+**Grid size:** set via `pme_grid_size: [64, 64, 64]` in `input.yaml`
 
 ---
 
-## 5. MLIP GPU-resident 연동
+## 5. MLIP GPU-resident Integration
 
-### C++ MLIP Runtime (TorchScript 모드)
+### C++ MLIP Runtime (TorchScript Mode)
 
 ```
-GPU 메모리 (DeepScaleMD)
-  d_x, d_y, d_z [N]      — SoA 위치
-  d_edge_coo_packed       — 반목록 COO 엣지
+GPU memory (DeepScaleMD)
+  d_x, d_y, d_z [N]      — SoA positions
+  d_edge_coo_packed       — half-list COO edges
         ↓
-  launch_interleave_positions()  — SoA → AoS 변환 (GPU 커널)
-  launch_half_to_full_edges()    — 반목록 → 전방향 목록 (GPU 커널)
+  launch_interleave_positions()  — SoA → AoS conversion (GPU kernel)
+  launch_half_to_full_edges()    — half list → full list (GPU kernel)
         ↓
-  torch::jit::load() 모델 forward (CUDA 텐서, 스트림 공유)
+  torch::jit::load() model forward pass (CUDA tensors, shared stream)
         ↓
-  launch_accumulate_forces_scaled()  — 모델 출력 힘 누적 (GPU 커널)
+  launch_accumulate_forces_scaled()  — accumulate the model's output forces (GPU kernel)
 ```
 
-**스트림 공유:** `share_cuda_stream: true` 설정 시 DeepScaleMD CUDA 스트림을 LibTorch에 전달하여 동기화 오버헤드 제거
+**Stream sharing:** when `share_cuda_stream: true` is set, the DeepScaleMD CUDA stream is passed to LibTorch, eliminating synchronization overhead
 
-### 위치 인터리빙 커널
+### Position Interleaving Kernel
 
 ```cuda
 // SoA (d_x[], d_y[], d_z[]) → AoS ([x0,y0,z0, x1,y1,z1, ...])
-// 모델 입력 형식: [N, 3] float64
+// Model input format: [N, 3] float64
 void launch_interleave_positions(
     const double* d_x, const double* d_y, const double* d_z,
     double* out, int N, cudaStream_t stream);
@@ -204,37 +204,37 @@ void launch_interleave_positions(
 
 ---
 
-## 6. 이중 정밀도 vs 단정밀도
+## 6. Double Precision vs. Single Precision
 
-| 데이터 | 정밀도 | 이유 |
+| Data | Precision | Reason |
 |--------|--------|------|
-| 입자 위치/힘 | `double` (float64) | MD 정확도 요구사항 |
-| PME 격자 | `Real` (빌드 설정) | 정확도/성능 트레이드오프 |
-| MLIP 입력 | `float32` (설정 가능) | 모델 학습 정밀도와 일치 |
+| Particle positions/forces | `double` (float64) | Required for MD accuracy |
+| PME grid | `Real` (build configuration) | Accuracy/performance tradeoff |
+| MLIP input | `float32` (configurable) | Matches the model's training precision |
 
 ---
 
-## 7. GPU 프로파일링
+## 7. GPU Profiling
 
 ```bash
-# Nsight Systems로 프로파일
+# Profile with Nsight Systems
 nsys profile --trace=cuda,mpi bin/md_simulation_cuda input.yaml
 
-# 환경변수로 타이밍 활성화
+# Enable timing via an environment variable
 MD_TIMING=1 bin/md_simulation_cuda input.yaml
 ```
 
-`timing_breakdown.cpp`에서 각 구성요소별 시간 측정:
-- Pair (힘 계산)
-- Neigh (이웃 목록)
-- Comm (MPI 통신)
-- Output (출력)
+`timing_breakdown.cpp` measures the time spent in each component:
+- Pair (force calculation)
+- Neigh (neighbor list)
+- Comm (MPI communication)
+- Output (output)
 
 ---
 
-## 8. 주요 성능 지표 (RTX 2080 Ti 기준)
+## 8. Key Performance Metrics (based on RTX 2080 Ti)
 
-| 시스템 | MLIP | 스텝당 시간 |
+| System | MLIP | Time per Step |
 |--------|------|------------|
 | 32 mol water | LJ (builtin) | ~1 ms |
 | 32 mol water | MACE-MP-0 small | ~15 ms |

@@ -1,19 +1,19 @@
-# Input 스크립트 작성 가이드
+# Input Script Writing Guide
 
-## 기본 구조
+## Basic Structure
 
-DeepScaleMD는 YAML 형식의 입력 파일을 사용한다. 파일은 여러 섹션(section)과 키-값 쌍으로 구성된다.
+DeepScaleMD uses input files in YAML format. A file is composed of several sections and key-value pairs.
 
 ```yaml
-# 섹션 헤더: 들여쓰기 없는 줄, 콜론으로 끝남
+# Section header: a line with no indentation, ending with a colon
 section_name:
-  key: value    # 섹션 내 파라미터 (들여쓰기 필수)
+  key: value    # Parameter within the section (indentation required)
 
-# 최상위 키: 들여쓰기 없음
+# Top-level key: no indentation
 top_level_key: value
 ```
 
-**실행 방법:**
+**How to run:**
 ```bash
 bin/md_simulation_cuda input.yaml
 mpirun -n 4 bin/md_simulation_cuda input.yaml
@@ -21,23 +21,23 @@ mpirun -n 4 bin/md_simulation_cuda input.yaml
 
 ---
 
-## 1. 필수 파라미터
+## 1. Required Parameters
 
-이 파라미터들이 없으면 시뮬레이션이 시작되지 않는다.
+The simulation will not start without these parameters.
 
 ```yaml
-# 입력 파일
-coordinate_file:   water.xyz        # 초기 좌표 (XYZ 형식)
-topology_file:     water.top        # 토폴로지 (원자 타입, 질량, 전하, FF 파라미터)
+# Input files
+coordinate_file:   water.xyz        # Initial coordinates (XYZ format)
+topology_file:     water.top        # Topology (atom types, masses, charges, FF parameters)
 
-# 시뮬레이션 조건
-target_temperature: 300.0           # 목표 온도 (K) — 초기 속도 분포에 사용
-timestep:           0.5             # 시간 스텝 (fs)
-total_steps:        10000           # 총 MD 스텝 수
+# Simulation conditions
+target_temperature: 300.0           # Target temperature (K) — used for the initial velocity distribution
+timestep:           0.5             # Timestep (fs)
+total_steps:        10000           # Total number of MD steps
 ```
 
-Canonical classical force-field package를 사용할 때는 좌표·topology·parameter
-세 경로 대신 manifest 하나를 지정할 수 있다.
+When using the canonical classical force-field package, you can specify a single
+manifest instead of separate coordinate, topology, and parameter file paths.
 
 ```yaml
 input_system: examples/dsMD_input_lj/manifest.yaml
@@ -46,20 +46,20 @@ timestep: 1.0
 total_steps: 1000
 ```
 
-manifest 내부 경로는 manifest 위치를 기준으로 해석된다. 포맷 정의는
-[`06_dsMD_input_Format.md`](06_dsMD_input_Format.md)를 참고한다.
+Paths inside the manifest are resolved relative to the manifest's location. See
+[`06_dsMD_input_Format.md`](06_dsMD_input_Format.md) for the format definition.
 
 ---
 
-## 2. 시뮬레이션 박스
+## 2. Simulation Box
 
 ```yaml
-# 박스 크기 (Angstrom)
+# Box dimensions (Angstrom)
 box_x: 30.0
 box_y: 30.0
 box_z: 30.0
 
-# 주기 경계 조건
+# Periodic boundary conditions
 periodic_x: true
 periodic_y: true
 periodic_z: true
@@ -67,162 +67,166 @@ periodic_z: true
 
 ---
 
-## 3. 이웃 목록 (Neighbor List)
+## 3. Neighbor List
 
 ```yaml
-cutoff_distance: 12.0              # 힘 계산 차단 거리 (Å)
+cutoff_distance: 12.0              # Cutoff distance for force calculation (Å)
 
-# 이웃 목록 유형
-neighbor_list_type: verlet_cell_list   # verlet_cell_list (권장) | morton_code
-verlet_skin:        2.0                # Verlet skin 거리 (Å) — cutoff에 추가
-neighbor_list_update_freq: 10          # 최대 재구축 간격 (스텝 수)
-                                        # 실제로는 displacement 기준으로 자동 재구축
+# Neighbor list type
+neighbor_list_type: verlet_cell_list   # verlet_cell_list (recommended) | morton_code
+verlet_skin:        2.0                # Verlet skin distance (Å) — added on top of the cutoff
+neighbor_list_update_freq: 10          # Maximum rebuild interval (number of steps)
+                                        # In practice, rebuilding is triggered automatically based on displacement
 ```
 
-**권장 값:**
-- LJ 시스템: `cutoff_distance: 12.0`, `verlet_skin: 2.0`
-- MLIP 시스템: `cutoff_distance: 6.0` (모델에 따라 다름), `verlet_skin: 1.0`
+**Recommended values:**
+- LJ systems: `cutoff_distance: 12.0`, `verlet_skin: 2.0`
+- MLIP systems: `cutoff_distance: 6.0` (varies by model), `verlet_skin: 1.0`
 - UMA-S: `cutoff_distance: 6.0`
 
 ---
 
-## 4. 적분기 (Integrator)
+## 4. Integrator
 
 ```yaml
-integrator: velocity_verlet    # velocity_verlet (권장) | verlet | leap_frog
+integrator: velocity_verlet    # velocity_verlet (recommended) | verlet | leap_frog
 ```
 
-| 값 | 설명 |
+| Value | Description |
 |----|------|
-| `velocity_verlet` | Velocity-Verlet (2단계, 에너지 보존 우수) |
-| `verlet` | 기본 Verlet |
-| `leap_frog` | Leap-frog (속도 반스텝 오프셋) |
+| `velocity_verlet` | Velocity-Verlet (two-stage, excellent energy conservation) |
+| `verlet` | Basic Verlet |
+| `leap_frog` | Leap-frog (velocities offset by half a step) |
 
 ---
 
-## 5. 온도 제어 (Thermostat)
+## 5. Thermostat
 
 ```yaml
 thermostat: none           # none | langevin | nose_hoover | berendsen
 
-# Langevin 설정
+# Langevin settings
 thermostat: langevin
-tau_t: 0.1                 # 완화 시간 (ps) — thermostat_damping과 동의어
+tau_t: 0.1                 # Relaxation time (ps) — synonym for thermostat_damping
 
-# Nosé-Hoover 설정
+# Nosé-Hoover settings
 thermostat: nose_hoover
 tau_t: 0.5
 ```
 
-| 값 | 설명 |
+| Value | Description |
 |----|------|
-| `none` | NVE (에너지 보존 앙상블) |
-| `langevin` | 랑주뱅 (NVT, stochastic) |
+| `none` | NVE (energy-conserving ensemble) |
+| `langevin` | Langevin (NVT, stochastic) |
 | `nose_hoover` | Nosé-Hoover chain (NVT, deterministic) |
 | `berendsen` | Berendsen (NVT, velocity rescaling) |
 
 ---
 
-## 6. 압력 제어 (Barostat)
+## 6. Barostat
 
 ```yaml
 barostat: none             # none | berendsen | parrinello_rahman
 
 # Berendsen NPT
 barostat: berendsen
-target_pressure: 1.0       # 목표 압력 (bar)
-tau_p: 1.0                 # 완화 시간 (ps) — barostat_damping과 동의어
+target_pressure: 1.0       # Target pressure (bar)
+tau_p: 1.0                 # Relaxation time (ps) — synonym for barostat_damping
 ```
 
 ---
 
-## 7. 출력 설정
+## 7. Output Settings
 
 ```yaml
-output_prefix:            my_sim      # 출력 파일 기본 이름
-output_freq:              100         # 스크린 출력 주기 (스텝)
-output_info:              STEP, T, KE, PE, ETOTAL, P   # 출력할 물리량
+output_prefix:            my_sim      # Base name for output files
+output_freq:              100         # Screen output interval (steps)
+output_info:              STEP, T, KE, PE, ETOTAL, P   # Physical quantities to output
 
 # Trajectory
-trajectory_output_freq:   100                 # trajectory 저장 주기 (스텝)
-trajectory_format:        xyz, dcd            # 콤마로 여러 포맷 동시 지정 가능
-                                               # xyz | dump | dcd | bp (레거시: both = xyz,dump)
-trajectory_include_velocities: false          # 속도 포함 여부 (xyz/bp만 지원)
-trajectory_include_forces:     false          # 힘 포함 여부 (xyz/bp만 지원)
+trajectory_output_freq:   100                 # Trajectory save interval (steps)
+trajectory_format:        xyz, dcd            # Multiple formats can be specified at once, comma-separated
+                                               # xyz | dump | dcd | bp (legacy: both = xyz,dump)
+trajectory_include_velocities: false          # Whether to include velocities (supported only for xyz/bp)
+trajectory_include_forces:     false          # Whether to include forces (supported only for xyz/bp)
 ```
 
-**주의:** trajectory 파일은 `output_freq`와 `trajectory_output_freq`를 모두
-만족하는 스텝에서만 기록된다 (`step % output_freq == 0 AND step %
-trajectory_output_freq == 0`). 둘을 다르게 설정했다면 실제 저장 주기는 둘의
-최소공배수에 가까워질 수 있으니, 보통은 `output_freq`를
-`trajectory_output_freq`의 배수(또는 동일한 값)로 맞추는 것이 안전하다.
+**Note:** trajectory files are only written on steps that satisfy both `output_freq`
+and `trajectory_output_freq` (`step % output_freq == 0 AND step %
+trajectory_output_freq == 0`). If the two are set to different values, the actual
+save interval can end up close to their least common multiple, so it is generally
+safest to set `output_freq` to a multiple of (or equal to) `trajectory_output_freq`.
 
-**`output_info` 가능 값:**
+**Possible values for `output_info`:**
 
-| 키워드 | 의미 |
+| Keyword | Meaning |
 |--------|------|
-| `STEP` | 현재 스텝 번호 |
-| `T` | 온도 (K) |
-| `KE` | 운동 에너지 (kcal/mol) |
-| `PE` | 위치 에너지 (kcal/mol) |
-| `ETOTAL` | 총 에너지 (kcal/mol) |
-| `P` 또는 `PRESS` | 압력 (bar) |
-| `FMAX` | 최대 힘 크기 |
+| `STEP` | Current step number |
+| `T` | Temperature (K) |
+| `KE` | Kinetic energy (kcal/mol) |
+| `PE` | Potential energy (kcal/mol) |
+| `ETOTAL` | Total energy (kcal/mol) |
+| `P` or `PRESS` | Pressure (bar) |
+| `FMAX` | Maximum force magnitude |
 
-**`trajectory_format` 옵션별 특징:**
+**Characteristics of each `trajectory_format` option:**
 
-| 값 | 파일 | 특징 |
+| Value | File | Characteristics |
 |----|------|------|
-| `xyz` | `<prefix>_<step>.xyz` (스텝마다 별도 파일) | 텍스트, 사람이 읽기 쉬움 |
-| `dump` | `<prefix>_dump.<step>` (스텝마다 별도 파일) | LAMMPS dump 텍스트 포맷 |
-| `dcd` | `<prefix>.dcd` (단일 파일, 프레임 append) | CHARMM/NAMD 바이너리, VMD/MDAnalysis에서 바로 열림. 위치만 기록(속도/힘 미지원) |
-| `bp` | `<prefix>.bp/` (ADIOS2 BP 디렉터리) | 진짜 병렬 쓰기 — 대규모 노드용, 아래 참고 |
+| `xyz` | `<prefix>_<step>.xyz` (separate file per step) | Text, human-readable |
+| `dump` | `<prefix>_dump.<step>` (separate file per step) | LAMMPS dump text format |
+| `dcd` | `<prefix>.dcd` (single file, frames appended) | CHARMM/NAMD binary format, opens directly in VMD/MDAnalysis. Records positions only (velocities/forces not supported) |
+| `bp` | `<prefix>.bp/` (ADIOS2 BP directory) | True parallel writing — for large-scale node counts, see below |
 
-`xyz`/`dump`/`dcd`는 모두 매 출력 스텝마다 전체 랭크의 입자를 rank 0으로
-`MPI_Gatherv`한 뒤 `global_id` 순서로 재정렬해서 기록한다 (도메인 분해로 각
-랭크가 갖는 원자 집합은 공간 위치에 따라 정해지고 마이그레이션으로 계속
-바뀌므로, gather 순서 그대로 저장하면 프레임마다 같은 행이 다른 원자를
-가리키게 된다 — 이를 막기 위한 재정렬이다). 즉 이 세 포맷은 **랭크 수가
-커질수록 rank 0 쪽 통신·쓰기 비용이 커지는 직렬 병목**을 그대로 갖고 있다.
+`xyz`, `dump`, and `dcd` all work by using `MPI_Gatherv` to gather particles from
+all ranks to rank 0 at every output step, then reordering them by `global_id`
+before writing (because domain decomposition assigns each rank's set of atoms
+based on spatial location, and this keeps changing due to migration, writing
+records in raw gather order would make the same row point to a different atom
+in each frame — the reordering prevents this). In other words, these three
+formats retain a **serial bottleneck where the communication and write cost on
+rank 0 grows as the number of ranks increases**.
 
-### `bp` (ADIOS2 BP) — 대규모 노드 병렬 쓰기
+### `bp` (ADIOS2 BP) — Parallel Writing for Large-Scale Node Counts
 
-`bp`는 gather를 전혀 하지 않는다. 각 랭크가 **자신이 소유한 로컬 입자만**을
-독립적인 로컬 블록으로 곧장 쓰고, 그 블록에 `global_id` 배열을 함께 붙여
-후처리 단계에서 전역 순서를 재구성할 수 있게 한다. ADIOS2의 BP5 엔진은
-랭크별 블록을 aggregator 기반으로 병합하므로, HDF5류 parallel I/O에서
-문제가 되는 "매 스텝 collective 메타데이터 연산" 병목이 구조적으로 없다 —
-랭크 수가 수백~수천으로 늘어나도 이 방식이 훨씬 잘 스케일링된다.
+`bp` performs no gathering at all. Each rank writes **only the local particles
+it owns** directly as an independent local block, attaching a `global_id` array
+to that block so the global ordering can be reconstructed in a post-processing
+step. ADIOS2's BP5 engine merges per-rank blocks using aggregators, so it
+structurally avoids the "collective metadata operation on every step" bottleneck
+that plagues HDF5-style parallel I/O — this approach scales much better as the
+rank count grows into the hundreds or thousands.
 
 ```yaml
 trajectory_format: bp
 ```
 
-이 포맷을 쓰려면 빌드 시 `-DENABLE_ADIOS2=ON`과 MPI 지원으로
-빌드된 ADIOS2가 필요하다 (`docs/BUILD.md` 참고). 이 옵션 없이 빌드된
-바이너리에서 `trajectory_format: bp`를 지정하면 설정 파싱 단계에서 바로
-에러가 난다.
+Using this format requires building with `-DENABLE_ADIOS2=ON` against an
+ADIOS2 build with MPI support (see `docs/BUILD.md`). If a binary built without
+this option is given `trajectory_format: bp`, it immediately raises an error
+during configuration parsing.
 
-`<prefix>.bp/` 디렉터리에는 매 스텝 `x, y, z, global_id`(그리고 설정에 따라
-`vx,vy,vz`/`fx,fy,fz`), `step`, `time_fs`, `box`가 랭크별 로컬 배열로
-저장되고, `natoms_global` attribute로 전체 원자 수가 기록된다. VMD가 직접
-읽지는 못하므로, 분석 시에는 ADIOS2 Python 바인딩으로 각 스텝의 랭크별
-블록을 읽어 `global_id`로 정렬하는 후처리가 필요하다.
+In the `<prefix>.bp/` directory, `x, y, z, global_id` (and, depending on
+configuration, `vx,vy,vz`/`fx,fy,fz`), `step`, `time_fs`, and `box` are stored
+as per-rank local arrays at every step, with the total atom count recorded as
+the `natoms_global` attribute. VMD cannot read this directly, so analysis
+requires post-processing with the ADIOS2 Python bindings to read the per-rank
+blocks for each step and sort them by `global_id`.
 
 ---
 
-## 8. 힘 계산 모드
+## 8. Force Calculation Modes
 
-### 8-1. 내장 힘장 (builtin)
+### 8-1. Built-in Force Field (builtin)
 
 ```yaml
 force_calculation:
   mode: builtin
 ```
 
-토폴로지 파일에서 읽은 LJ 파라미터와 전하를 사용한다.
+Uses the LJ parameters and charges read from the topology file.
 
-**정전기 계산 (PME):**
+**Electrostatics calculation (PME):**
 ```yaml
 force_calculation:
   mode: builtin
@@ -245,19 +249,19 @@ mlip_config:
   dtype:       float32         # float32 | float64
 ```
 
-**지원 model_type:**
+**Supported model_type values:**
 
-| model_type | 설명 | 모델 파일 필요 |
+| model_type | Description | Model file required |
 |-----------|------|---------------|
 | `uma`, `uma_s` | fairchem UMA-S/M | ✅ `.pt` |
-| `mace`, `mace_mp` | MACE-MP-0 | ❌ (자동 다운로드) or ✅ |
-| `mace_off` | MACE-OFF | ❌ (자동 다운로드) |
+| `mace`, `mace_mp` | MACE-MP-0 | ❌ (auto-downloaded) or ✅ |
+| `mace_off` | MACE-OFF | ❌ (auto-downloaded) |
 | `nequip` | NequIP | ✅ deployed `.pth` |
-| `chgnet` | CHGNet | ❌ (자동 다운로드) |
-| `sevennet`, `7net` | SevenNet | ❌ (자동 다운로드) |
-| `orb` | ORB | ❌ (자동 다운로드) |
+| `chgnet` | CHGNet | ❌ (auto-downloaded) |
+| `sevennet`, `7net` | SevenNet | ❌ (auto-downloaded) |
+| `orb` | ORB | ❌ (auto-downloaded) |
 
-**MACE 사전 학습 모델 크기:**
+**MACE pretrained model sizes:**
 ```yaml
 mlip_config:
   model_type:  mace_mp
@@ -265,7 +269,7 @@ mlip_config:
   device:      cuda
 ```
 
-### 8-3. C++ MLIP Runtime (TorchScript 전용)
+### 8-3. C++ MLIP Runtime (TorchScript only)
 
 ```yaml
 force_calculation:
@@ -273,11 +277,11 @@ force_calculation:
   spec_file: examples/my_model/model_spec.yaml
 ```
 
-`model_spec.yaml` 작성에 대한 상세 내용은 `docs/03_MLIP_Integration.md` 참고.
+See `docs/03_MLIP_Integration.md` for details on writing `model_spec.yaml`.
 
 ---
 
-## 9. 좌표 파일 형식 (XYZ)
+## 9. Coordinate File Format (XYZ)
 
 ```
 96
@@ -288,13 +292,13 @@ H  1.717432  1.814335  1.818719
 ...
 ```
 
-- 첫 줄: 원자 수
-- 둘째 줄: 주석
-- 이후: `원소기호  x  y  z` (Angstrom)
+- First line: number of atoms
+- Second line: comment
+- Following lines: `element_symbol  x  y  z` (Angstrom)
 
 ---
 
-## 10. 토폴로지 파일 형식 (.top)
+## 10. Topology File Format (.top)
 
 ```
 # Water topology
@@ -314,9 +318,9 @@ HW  OW  HW  55.0  104.52
 
 ---
 
-## 11. 완전한 예시 파일
+## 11. Complete Example Files
 
-### NVE (에너지 보존)
+### NVE (Energy Conservation)
 
 ```yaml
 coordinate_file: water_32mol.xyz
@@ -442,54 +446,59 @@ mlip_config:
 
 ---
 
-## 12. 에너지 최소화 (Energy Minimization)
+## 12. Energy Minimization
 
-PDB/PSF 등 실험 구조에서 만든 초기 좌표는 원자 간 겹침(steric clash)이나
-비물리적으로 늘어난 결합을 포함하기 쉽다. 이 상태로 바로 MD를 시작하면 힘이
-발산해 시뮬레이션이 즉시 깨진다. `minimize` 섹션을 추가하면 MD 루프(1 스텝)를
-시작하기 전에 [FIRE](https://doi.org/10.1103/PhysRevLett.97.170201)
-(Fast Inertial Relaxation Engine) 알고리즘으로 potential energy가 지역 최솟값에
-가까워질 때까지 좌표를 이완시킨 뒤 MD를 시작한다.
+Initial coordinates built from experimental structures such as PDB/PSF often
+contain steric clashes or unphysically stretched bonds. Starting MD directly
+from this state causes forces to diverge and the simulation to blow up
+immediately. Adding a `minimize` section relaxes the coordinates using the
+[FIRE](https://doi.org/10.1103/PhysRevLett.97.170201) (Fast Inertial Relaxation
+Engine) algorithm until the potential energy approaches a local minimum, before
+starting the MD loop (step 1).
 
 ```yaml
 minimize:
-  method: fire            # none (기본값) | fire
-  max_steps: 500           # 최소화 반복 횟수 상한
-  force_tolerance: 5.0     # kcal/mol/Å — 전역 최대 |F_i|가 이 값 아래로 내려오면 수렴
-  # 아래는 고급 옵션 (생략 시 timestep 기반으로 자동 설정됨)
-  # dt_start: 0.5          # fs, FIRE 의사-동역학의 초기 시간 간격
-  # dt_max:   2.0           # fs, 위 값의 상한
-  output_freq: 10           # 진행 상황을 출력할 반복 간격
+  method: fire            # none (default) | fire
+  max_steps: 500           # Upper limit on the number of minimization iterations
+  force_tolerance: 5.0     # kcal/mol/Å — converges once the global maximum |F_i| drops below this value
+  # The options below are advanced (auto-configured based on timestep if omitted)
+  # dt_start: 0.5          # fs, initial time increment for FIRE's pseudo-dynamics
+  # dt_max:   2.0           # fs, upper bound for the value above
+  output_freq: 10           # Iteration interval for printing progress
 ```
 
-**동작 방식:**
-- FIRE는 속도(velocity) 배열을 의사-동역학 상태로 재사용한다. 최소화 시작 시
-  Maxwell-Boltzmann로 초기화된 열적 속도는 0으로 리셋되고, 최소화가 끝나면
-  다시 0으로 리셋된 뒤 MD가 실제 `target_temperature`로 시작한다 — 즉
-  `minimize`는 초기 속도 분포에 영향을 주지 않는다.
-- 매 반복마다 힘을 재계산하고(이웃 목록/halo도 매번 갱신), 전역 최대 힘
-  성분(|F_i|, 모든 랭크에 걸쳐)이 `force_tolerance` 아래로 떨어지면 즉시
-  종료한다. `max_steps`에 도달하면 수렴 여부와 무관하게 중단하고 MD를
-  이어서 시작한다(경고와 함께 마지막 PE/Fmax를 출력).
-- CPU와 CUDA 빌드 양쪽에서 동작하며, CUDA 빌드에서는 좌표·힘·속도가 최소화
-  전체 구간 동안 GPU에 상주한 채로 계산된다(스칼라 몇 개만 매 반복 호스트로
-  전송됨).
-- MPI 다중 랭크에서도 동작한다 — 힘/속도 합과 최대값은 모든 랭크에 걸쳐
-  전역 리듀스되므로, 각 랭크는 항상 동일한 수렴/스텝 크기 결정을 내린다.
+**How it works:**
+- FIRE reuses the velocity array as its pseudo-dynamics state. At the start of
+  minimization, the thermal velocities initialized from the Maxwell-Boltzmann
+  distribution are reset to zero; once minimization finishes, velocities are
+  reset to zero again, and MD then starts at the actual `target_temperature` —
+  in other words, `minimize` does not affect the initial velocity distribution.
+- Forces are recomputed every iteration (with the neighbor list/halo also
+  updated each time), and the process terminates immediately once the global
+  maximum force component (|F_i|, across all ranks) drops below
+  `force_tolerance`. If `max_steps` is reached, minimization stops regardless
+  of whether it converged and MD proceeds (printing a warning along with the
+  final PE/Fmax).
+- Works on both CPU and CUDA builds; in CUDA builds, coordinates, forces, and
+  velocities remain resident on the GPU throughout minimization (only a few
+  scalars are transferred to the host each iteration).
+- Also works across multiple MPI ranks — the sums and maxima of forces/
+  velocities are globally reduced across all ranks, so every rank always makes
+  the same convergence/step-size decisions.
 
-**단점:** 매 반복마다 이웃 목록을 무조건 재구축하므로(초기 겹침 때문에
-displacement 기반 재사용을 안전하게 건너뛸 수 없음) 큰 시스템에서는 최소화
-구간이 상대적으로 느릴 수 있다. `max_steps`를 시스템 크기에 맞게 제한하는 것을
-권장한다.
+**Drawback:** because the neighbor list is unconditionally rebuilt every
+iteration (displacement-based reuse cannot safely be skipped due to the initial
+overlaps), the minimization phase can be relatively slow for large systems. It
+is recommended to limit `max_steps` according to system size.
 
 ---
 
-## 13. 자주 발생하는 오류
+## 13. Common Errors
 
-| 오류 메시지 | 원인 | 해결책 |
+| Error Message | Cause | Solution |
 |------------|------|--------|
-| `Missing required configuration parameters` | 필수 파라미터 누락 | `coordinate_file`, `target_temperature`, `timestep`, `total_steps` 확인 |
-| `Cannot open config file` | 파일 경로 오류 | 프로젝트 루트에서 실행, 상대경로 확인 |
-| `No edges found in input system` | MLIP graph 미생성 | UMA의 경우 `external_graph_gen=True` 필요 (자동 처리) |
-| `Failed to load model` | TorchScript 비호환 | `libtorch` 모드에서 fairchem 모델 사용 불가 → `python` 모드 사용 |
-| `Invalid timestep` | `timestep ≤ 0` | 양수 값 설정 |
+| `Missing required configuration parameters` | A required parameter is missing | Check `coordinate_file`, `target_temperature`, `timestep`, `total_steps` |
+| `Cannot open config file` | Incorrect file path | Run from the project root and verify the relative path |
+| `No edges found in input system` | MLIP graph was not generated | For UMA, `external_graph_gen=True` is required (handled automatically) |
+| `Failed to load model` | TorchScript incompatibility | fairchem models cannot be used in `libtorch` mode → use `python` mode instead |
+| `Invalid timestep` | `timestep ≤ 0` | Set a positive value |

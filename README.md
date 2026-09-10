@@ -170,7 +170,7 @@ YAML input files select the force-calculation route and expose the following MD 
 | DCD | `dcd` | Gathered to rank 0, single binary file readable by VMD/MDAnalysis |
 | ADIOS2 BP | `bp` | **Parallel** — every rank writes only the particles it owns, no gather; recommended for large-scale, many-node runs |
 
-See the [input guide](docs/04_Input_Script_Guide.md#7-출력-설정) for the full
+See the [input guide](docs/04_Input_Script_Guide.md#7-output-settings) for the full
 option reference and I/O-pattern details.
 
 ## Input files and examples
