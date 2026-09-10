@@ -30,71 +30,20 @@ For the CUDA backend, install the NVIDIA CUDA Toolkit and use a CUDA-enabled `ds
 
 ## Build
 
-DeepScaleMD links against an installed `dsDecompX` package. Build and install the CPU variant first:
-
-```bash
-cd dsDecompX
-mkdir -p build-cpu && cd build-cpu
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=../../install/dsdecompx-cpu
-cmake --build . --parallel
-cmake --install .
-cd ../..
-```
-
-Then configure and build DeepScaleMD:
-
-```bash
-mkdir -p build/deepscalemd-cpu && cd build/deepscalemd-cpu
-cmake ../.. -DCMAKE_BUILD_TYPE=Release -DBACKEND=CPU \
-  -DDSDECOMPX_DIR=../../install/dsdecompx-cpu
-cmake --build . --parallel
-```
-
-The executable is written to `build/deepscalemd-cpu/bin/dsMD`.
-
-### CUDA build
-
-Build a CUDA-enabled `dsDecompX` first, then use its installation prefix:
-
-```bash
-cd dsDecompX
-mkdir -p build-cuda && cd build-cuda
-cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON \
-  -DCMAKE_INSTALL_PREFIX=../../install/dsdecompx-cuda
-cmake --build . --parallel
-cmake --install .
-cd ../..
-
-mkdir -p build/deepscalemd-cuda && cd build/deepscalemd-cuda
-cmake ../.. -DCMAKE_BUILD_TYPE=Release -DBACKEND=CUDA \
-  -DDSDECOMPX_DIR=../../install/dsdecompx-cuda
-cmake --build . --parallel
-```
-
-### Build options
-
-| CMake option | Values | Description |
-| --- | --- | --- |
-| `BACKEND` | `CPU`, `CUDA` | Selects the MPI-enabled execution backend. SYCL support is under development. |
-| `DSDECOMPX_DIR` | Path | Locates the matching `dsDecompX` package. You can pass either the package config directory or an install/build prefix. |
-| `ENABLE_PYTHON` | `ON`, `OFF` | Enables or disables the embedded Python force interface; enabled by default. |
-| `ENABLE_LIBTORCH` | `ON`, `OFF` | Enables the native LibTorch/TorchScript MLIP runtime; requires `BACKEND=CUDA`. |
-| `NATIVE_OPTIMIZATION` | `ON`, `OFF` | Enables native CPU optimization flags for Release builds; enabled by default. |
-| `ENABLE_ADIOS2` | `ON`, `OFF` | Enables the ADIOS2 BP parallel trajectory writer (`trajectory_format: bp`); requires an MPI-enabled ADIOS2 install; off by default. |
-
-For TorchScript MLIP inference, use `-DBACKEND=CUDA -DENABLE_LIBTORCH=ON` with `-DDSDECOMPX_DIR=<cuda-dsdecompx-prefix>`. Add only the LibTorch prefix to `CMAKE_PREFIX_PATH`.
-
-The top-level Makefile provides equivalent convenience targets:
+DeepScaleMD links against a separately built and installed `dsDecompX`
+package. The top-level Makefile wraps the CMake configure/build/install
+steps for both:
 
 ```bash
 make cpu
 make cuda
-make sycl
+make sycl   # under development
 ```
 
 Enable the LibTorch MLIP interface on the CUDA backend with `make cuda LIBTORCH=ON`.
 
-See [the build guide](docs/BUILD.md) for details, including NCCL and NVSHMEM options.
+See [the build guide](docs/BUILD.md) for the underlying CMake commands, the
+full CMake option reference, and NCCL/NVSHMEM/ADIOS2 options.
 
 ## Quick start
 
@@ -128,7 +77,7 @@ DeepScaleMD has two MLIP integration paths. These are independent of the CPU/CUD
 
 The LibTorch MLIP interface uses YAML model specifications and TorchScript models.
 
-Browse [MLIP examples](MLIP_EXAMPLES.md) and the [MLIP integration guide](docs/03_MLIP_Integration.md) for integration setup and the native runtime specification.
+See the [MLIP integration guide](docs/03_MLIP_Integration.md) for integration setup and the native runtime specification.
 
 ## Simulation controls
 
@@ -143,25 +92,17 @@ YAML input files select the force-calculation route and expose the following MD 
 
 ## Trajectory output
 
-`trajectory_format` accepts a comma-separated list, so multiple formats can be
-written from the same run (e.g. `trajectory_format: xyz, bp`):
+`trajectory_format` accepts a comma-separated list (e.g. `trajectory_format: xyz, bp`):
 
 | Format | Config value | I/O pattern |
 | --- | --- | --- |
-| XYZ | `xyz` | Every rank's particles gathered to rank 0, one text file per output step |
-| LAMMPS dump | `dump` | Same gather-to-rank-0 pattern, LAMMPS dump text format |
-| DCD | `dcd` | Same gather-to-rank-0 pattern, single binary file readable by VMD/MDAnalysis |
-| ADIOS2 BP | `bp` | **Parallel** — every rank writes only the particles it owns as an independent block, no gather |
+| XYZ | `xyz` | Gathered to rank 0, one text file per output step |
+| LAMMPS dump | `dump` | Gathered to rank 0, LAMMPS dump text format |
+| DCD | `dcd` | Gathered to rank 0, single binary file readable by VMD/MDAnalysis |
+| ADIOS2 BP | `bp` | **Parallel** — every rank writes only the particles it owns, no gather; recommended for large-scale, many-node runs |
 
-XYZ, dump, and DCD all funnel through an `MPI_Gatherv` to rank 0, which is
-fine at modest rank counts but becomes the bottleneck at large node counts.
-The ADIOS2 BP writer avoids this entirely: each rank writes its own local
-particles directly, tagged with a persistent `global_id` so the global atom
-order can be reconstructed during post-processing. It requires a build with
-`-DENABLE_ADIOS2=ON` (see [Build options](#build-options) and the
-[build guide](docs/BUILD.md)) and is the recommended format for large-scale,
-many-node runs. See the [input guide](docs/04_Input_Script_Guide.md#7-출력-설정)
-for the full option reference.
+See the [input guide](docs/04_Input_Script_Guide.md#7-출력-설정) for the full
+option reference and I/O-pattern details.
 
 ## Input files and examples
 
@@ -190,20 +131,10 @@ force_calculation:
   force_calculation_type: lj
 ```
 
-Included examples cover:
-
-- Lennard-Jones systems with 32K, 100K, and 1M particles
-- NVE, NVT, and NPT ensembles
-- Python-backed MLIP workflows
-- C++ TorchScript MLIP workflows
-- Cross-engine benchmark input sets for the 32K LJ system
-
-See the [input guide](docs/04_Input_Script_Guide.md) for all configuration fields and [`examples/`](examples/) for runnable inputs.
-
-Classical force fields can also be loaded from a versioned `dsMD_input`
-directory containing XYZ coordinates, topology, and a fully resolved
-parameter table. See the [dsMD_input format](docs/06_dsMD_input_Format.md)
-and [`examples/dsMD_input_lj`](examples/dsMD_input_lj).
+See the [input guide](docs/04_Input_Script_Guide.md) for all configuration
+fields and [`examples/`](examples/) for runnable LJ, MLIP, and benchmark
+inputs, including the versioned [`dsMD_input`](docs/06_dsMD_input_Format.md)
+classical force-field format.
 
 ## Project layout
 

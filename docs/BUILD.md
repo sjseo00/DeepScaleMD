@@ -7,6 +7,17 @@ package. It includes dsDecompX public headers and links the exported
 MPI is required for every build. CPU and CUDA variants use separate build
 directories and separate dsDecompX installation prefixes.
 
+## CMake options
+
+| CMake option | Values | Description |
+| --- | --- | --- |
+| `BACKEND` | `CPU`, `CUDA` | Selects the MPI-enabled execution backend. SYCL support is under development. |
+| `DSDECOMPX_DIR` | Path | Locates the matching `dsDecompX` package. You can pass either the package config directory or an install/build prefix. |
+| `ENABLE_PYTHON` | `ON`, `OFF` | Enables or disables the embedded Python force interface; enabled by default. |
+| `ENABLE_LIBTORCH` | `ON`, `OFF` | Enables the native LibTorch/TorchScript MLIP runtime; requires `BACKEND=CUDA`. |
+| `NATIVE_OPTIMIZATION` | `ON`, `OFF` | Enables native CPU optimization flags for Release builds; enabled by default. |
+| `ENABLE_ADIOS2` | `ON`, `OFF` | Enables the ADIOS2 BP parallel trajectory writer (`trajectory_format: bp`); requires an MPI-enabled ADIOS2 install; off by default. |
+
 ## CPU + MPI
 
 ```sh
