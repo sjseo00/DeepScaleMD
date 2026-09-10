@@ -47,7 +47,7 @@ total_steps: 1000
 ```
 
 Paths inside the manifest are resolved relative to the manifest's location. See
-[`06_dsMD_input_Format.md`](06_dsMD_input_Format.md) for the format definition.
+[`06_Classical_Force_Field_Support.md`](06_Classical_Force_Field_Support.md) for the format definition.
 
 ---
 

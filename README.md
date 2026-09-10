@@ -202,7 +202,7 @@ force_calculation:
 
 See the [input guide](docs/04_Input_Script_Guide.md) for all configuration
 fields and [`examples/`](examples/) for runnable LJ, MLIP, and benchmark
-inputs, including the versioned [`dsMD_input`](docs/06_dsMD_input_Format.md)
+inputs, including the versioned [`dsMD_input`](docs/06_Classical_Force_Field_Support.md)
 classical force-field format.
 
 ## Project layout
@@ -225,8 +225,7 @@ DeepScaleMD/
 - [MLIP integration](docs/03_MLIP_Integration.md)
 - [Input script guide](docs/04_Input_Script_Guide.md)
 - [Code architecture](docs/05_Code_Architecture.md)
-- [dsMD_input classical force-field format](docs/06_dsMD_input_Format.md)
-- [Classical force-field status and roadmap](docs/07_Classical_Force_Field_Status_and_Roadmap.md)
+- [Classical force-field support (dsMD_input format, status, roadmap)](docs/06_Classical_Force_Field_Support.md)
 
 ## License
 
