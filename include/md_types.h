@@ -1,7 +1,7 @@
 #ifndef MD_TYPES_H
 #define MD_TYPES_H
 
-#include <runtime.hpp>
+#include <dsdecompx.hpp>
 
 #include <vector>
 #include <memory>

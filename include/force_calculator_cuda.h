@@ -3,7 +3,7 @@
 
 #include "../include/force_calculator.h"
 #include "../include/md_types.h"
-#include <runtime.hpp>
+#include <dsdecompx.hpp>
 #include <vector>
 #include <stdexcept>
 

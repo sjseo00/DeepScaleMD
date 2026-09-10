@@ -1,7 +1,7 @@
 #ifndef MD_SYSTEM_H
 #define MD_SYSTEM_H
 
-#include "runtime.hpp"
+#include "dsdecompx.hpp"
 #include "force_manager.h"
 #include "md_types.h"
 #include "topology.h"
