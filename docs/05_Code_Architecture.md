@@ -27,7 +27,6 @@ DeepScaleMD/
 │   ├── force_calculator_cpu.cpp/.h  # CPU built-in force calculation
 │   ├── force_calculator_sycl.cpp/.h # SYCL force calculation backend
 │   ├── neighbor_list*.cpp/.cu  # Neighbor list management
-│   ├── mpi_optimizer.cpp/.h    # MPI collective operation optimization
 │   ├── mpi_utils.cpp/.h        # MPI rank/size helpers
 │   ├── comm_backend.cpp/.h, halo_backend.cpp/.h  # Communication/halo backend abstractions
 │   ├── simulation_backend_factory.cpp/.h  # Picks CUDA/CPU/SYCL force calculator at runtime
@@ -103,9 +102,7 @@ MDSimulation                          ← Top-level orchestrator
 │   ├── VerletIntegrator
 │   └── LeapFrogIntegrator
 │
-├── dsdecompx::Decomp                 ← Domain decomposition + halo/migration (external library)
-│
-└── MPIOptimizer                      ← MPI_Iallreduce batching
+└── dsdecompx::Decomp                 ← Domain decomposition + halo/migration (external library)
 ```
 
 Note: there is no separate `PMECalculator` class. Ewald/PME reciprocal-space
@@ -198,9 +195,10 @@ single_step(step)
 │         ├─ model_.forward({inputs}) → energy, forces
 │         └─ forces used directly from the GPU buffer
 │
-├─ [5] MPI force reduction (for multi-rank runs)
-│     MPIOptimizer::allreduce_forces()
-│     → batched MPI_Iallreduce (non-blocking)
+├─ [5] Ghost-particle force return (for multi-rank runs)
+│     dsdecompx::Decomp::reverse_halo()
+│     → returns forces computed on ghost particles to their owning rank;
+│       no global MPI_Allreduce over the force arrays
 │
 ├─ [6] Remaining half-step velocity update
 │     integrator->complete_velocity_update_on_device(dt/2)
@@ -294,7 +292,6 @@ create_neighbor_list_builder()     src/neighbor_list*.cpp
 | `force_calculator_cpu.cpp` | `ForceCalculatorCPU` | CPU builtin force calculation |
 | `force_calculator_sycl.cpp` | `ForceCalculatorSYCL` | SYCL builtin force calculation |
 | `neighbor_list_kernels_optimized.cu` | kernels | Verlet-cell neighbor list GPU kernels |
-| `mpi_optimizer.cpp` | `MPIOptimizer` | MPI_Iallreduce batching optimization |
 | `force_libtorch/runtime/mlip_runtime.cpp` | `mlip::MlipRuntime` | TorchScript/LibTorch model loading/inference |
 | `force_libtorch/runtime/execution_plan.cpp` | `mlip::ExecutionPlan` | Abstraction of the per-step MLIP execution plan |
 | `force_libtorch/binding/md_data_sources.cpp` | `mlip::register_md_sources()` | Registers MD device pointers with the MLIP operation registry (MLIP-specific, not general I/O) |
@@ -350,9 +347,8 @@ Rank 0                          Rank 1 ... N
   │                               │
   ├─ compute boundary forces      ├─ compute boundary forces
   │                               │
-  └─ MPIOptimizer::allreduce_forces()
-       MPI_Iallreduce (batched, non-blocking)
-       → deliver summed forces to all ranks
+  └─ dsdecompx::Decomp::reverse_halo()
+       → returns ghost-particle forces to their owning rank
 ```
 
 ---

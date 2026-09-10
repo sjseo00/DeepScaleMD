@@ -71,35 +71,7 @@ halo_width_ = cutoff * 1.2;  // cutoff + 20% margin
 
 ---
 
-## 4. MPIOptimizer — Asynchronous Collective Communication
-
-### Related files: `src/mpi_optimizer.cpp`, `include/mpi_optimizer.h`
-
-### Key optimizations
-
-| Technique | Description |
-|------|------|
-| **Asynchronous Allreduce** | Uses `MPI_Iallreduce` to overlap communication with computation |
-| **Request batching** | Groups many small reductions to process at once |
-| **Deferred synchronization** | Defers waiting for completion until `wait_all()` is called |
-
-```cpp
-// Asynchronous double array reduction
-void MPIOptimizer::allreduce_async_double(
-    const double* sendbuf, double* recvbuf,
-    int count, MPI_Op op)
-{
-    MPI_Iallreduce(..., &req.request);  // returns immediately
-    requests_.push_back(req);           // stored in the queue
-}
-
-// Wait on all of them together later
-void MPIOptimizer::wait_all();
-```
-
----
-
-## 5. CUDA-aware MPI
+## 4. CUDA-aware MPI
 
 CUDA-aware-MPI and NCCL/NVSHMEM detection and handling are implemented inside the `dsDecompX` library, which the MPI backend delegates to when `config.execution == dsdecompx::ExecutionMode::Cuda` (see section 2 above).
 
@@ -109,36 +81,29 @@ For GPU-to-GPU collectives via NCCL/NVSHMEM instead of MPI, see `dsDecompX/docs/
 
 ---
 
-## 6. Communication/Computation Overlap
+## 5. Communication/Computation Overlap
 
-Asynchronous, non-blocking communication in the current stack is limited to: (a) `MPIOptimizer`'s asynchronous allreduce (section 4), and (b) whatever overlap the `dsDecompX` MPI backend itself provides internally during halo exchange (per `dsDecompX/docs/user-guide/mpi.md`, "overlap depends on MPI progress support"). Readers interested in dsDecompX-side overlap behavior should consult that library's documentation directly.
-
----
-
-## 7. Force Reduction
-
-Sums the forces computed on each rank via a collective reduction.
-
-```cpp
-// Asynchronously sum the global force vectors
-mpi_optimizer.allreduce_async_double(local_fx, global_fx, N, MPI_SUM);
-mpi_optimizer.allreduce_async_double(local_fy, global_fy, N, MPI_SUM);
-mpi_optimizer.allreduce_async_double(local_fz, global_fz, N, MPI_SUM);
-// ...perform other computations...
-mpi_optimizer.wait_all();  // Wait for completion
-```
+Asynchronous, non-blocking communication in the current stack is limited to whatever overlap the `dsDecompX` MPI backend itself provides internally during halo exchange (per `dsDecompX/docs/user-guide/mpi.md`, "overlap depends on MPI progress support"). Readers interested in dsDecompX-side overlap behavior should consult that library's documentation directly.
 
 ---
 
-## 8. MPI Scaling Characteristics
+## 6. Scalar Reductions
+
+Per-rank scalar quantities (potential/kinetic energy, virial, particle counts, neighbor-list rebuild flags) are combined across ranks with plain blocking `MPI_Allreduce` calls scattered across the files that compute them — for example `src/force_calculator_cpu.cpp` (potential energy, virial), `src/md_system.cpp` (kinetic energy, atom counts), `src/thermostat.cpp`, and `src/neighbor_list.cpp` (rebuild flag, checked once every `neighbor_list_update_freq` steps rather than every step). Where two related scalars are needed together, some call sites batch them into a single `MPI_Allreduce` on a small array (e.g. `src/force_calculator_cpu.cpp` combines the potential-energy and particle-count reductions into one two-element call) rather than issuing them separately.
+
+Per-particle force accumulation across ranks does not go through a global `MPI_Allreduce` at all — it is handled by `dsDecompX`'s halo mechanism (`exchange_halo()` / `reverse_halo()`, section 3 above), which only exchanges data with neighboring subdomains.
+
+---
+
+## 7. MPI Scaling Characteristics
 
 ### Implemented optimizations
 
 | Optimization | Implementation location | Effect |
 |--------|-----------|------|
-| Asynchronous collective communication | `MPIOptimizer` (`src/mpi_optimizer.cpp`) | Hides communication latency |
 | Domain decomposition / grid selection | `dsdecompx::Decomp` (external dsDecompX library, configured in `src/md_system.cpp`) | Minimizes communication volume |
-| Communication/computation overlap | Not implemented in DeepScaleMD; depends on dsDecompX's internal MPI backend behavior, if any | Hides boundary communication |
+| Halo-based force return (no global reduction) | `dsdecompx::Decomp::reverse_halo()` | Avoids an O(N) global force reduction |
+| Communication/computation overlap | Depends on dsDecompX's internal MPI backend behavior | Hides boundary communication |
 | CUDA-aware MPI | Handled inside dsDecompX's MPI backend (see `dsDecompX/docs/user-guide/mpi.md`) | Eliminates H2D/D2H copies |
 | Single OpenMP thread per rank by default | `main.cpp` | Prevents oversubscription |
 

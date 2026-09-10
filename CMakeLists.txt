@@ -109,7 +109,6 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/force_calculator_cpu.cpp
     src/force_manager.cpp
     src/mpi_utils.cpp
-    src/mpi_optimizer.cpp
     src/main.cpp)
 
 set(DEEPSCALEMD_HOST_SOURCES
