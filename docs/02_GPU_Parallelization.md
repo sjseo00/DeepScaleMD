@@ -21,79 +21,29 @@ make cpu             # CPU fallback
 
 ---
 
-## 2. ForceCalculatorCUDA — GPU Force Calculator
+## 2. GPU-Resident Execution Pipeline
 
-### Related Files
-- `src/force_calculator_cuda.cu`
-- `include/force_calculator_cuda.h`
+"GPU-resident" here means something specific and enforced, not just "there are CUDA kernels": for a CUDA build, `MDSimulation::single_step()` (`src/md_simulation.cpp`) never copies the particle position/velocity/force arrays back to host memory to advance the simulation. Every phase of the step operates on device pointers owned by `ForceCalculatorCUDA`, and the code actively refuses to fall back to a host path when it can't stay resident.
 
-### GPU-resident Data Layout
+### The per-step phases, and what actually stays on the GPU
 
-All particle data is kept resident on the GPU, using a Structure of Arrays (SOA) layout:
+`single_step()` runs five phases in order — `handle_integrate1_phase` → `handle_neighbor_phase` → `handle_force_phase` → `handle_integrate2_phase` → `handle_modify_phase` (thermostat/KE/barostat) — and for a CUDA run, every one of them branches on `cuda_calc_cached_` and takes a device-side path:
 
-```
-GPU memory:
-  d_x[N], d_y[N], d_z[N]       — positions
-  d_vx[N], d_vy[N], d_vz[N]    — velocities
-  d_fx[N], d_fy[N], d_fz[N]    — forces
-  d_mass[N], d_charge[N]        — mass, charge
-  d_type[N]                     — atom type
-```
+- **Integration** (`cuda_calc->integrate_on_device(...)`, `complete_velocity_update_on_device(...)`) advances positions/velocities with CUDA kernels operating directly on `d_x/d_y/d_z/d_vx/d_vy/d_vz`.
+- **Thermostat and barostat** are not host-side operations that would require downloading velocities: `Thermostat::apply_device()` and `Barostat::apply_device()` take `cuda_calc->get_device_vx()/get_device_x()/...` — raw device pointers — and run their own CUDA kernels on them (`src/md_simulation.cpp`, `handle_thermostat_phase`/`handle_barostat_phase`).
+- **Constraints** (SHAKE/RATTLE) also have `apply_shake_on_device()`/`apply_rattle_on_device()` variants used whenever `cuda_calc` is present.
 
-### Minimum Image Convention
+### Halo exchange and migration: dsDecompX pulls pointers, not copies
 
-**Branchless optimization:**
-```cuda
-__device__ inline void apply_minimum_image_device(
-    Real& dx, Real& dy, Real& dz,
-    Real box_x, Real box_y, Real box_z,
-    Real inv_box_x, Real inv_box_y, Real inv_box_z)
-{
-    // Use round() to eliminate if-branches → avoids warp divergence
-    dx -= box_x * round(dx * inv_box_x);
-    dy -= box_y * round(dy * inv_box_y);
-    dz -= box_z * round(dz * inv_box_z);
-}
-```
+The multi-rank case is where "GPU-resident" is actually enforced rather than just convenient. `MDSystem::exchange_halo_on_device()` (`src/md_system.cpp`) builds a `dsdecompx::ParticleInfo storage(owned, ghost_count_, calculator)` — the third argument is the `ForceCalculatorCUDA` itself, passed as a dsDecompX `Provider`. dsDecompX calls back into it (`particle_info_view()` / `resize_particle_info()`, implemented in `force_calculator_cuda.cu`) to get the *actual device addresses* of the position/field buffers and to grow them in place when more ghost particles arrive — it never receives a host-side copy to exchange. The halo/migration communication itself (`decomp_runtime_->exchange_halo(storage, {rebuild_halo, stream})`) then runs on the CUDA stream returned by `calculator.get_force_stream()`, so it's ordered with the rest of that step's kernels without an explicit host sync.
 
-### Lennard-Jones Force Kernel
+This path is selected by a small backend abstraction: `create_halo_backend()` (`src/halo_backend.cpp`) picks a `CudaResidentHaloBackend` whenever the force calculator is a `ForceCalculatorCUDA`. That backend's `try_gpu_direct_halo()` is not a best-effort optimization — if it's asked to run and the force calculator *isn't* CUDA, or if `try_gpu_direct_halo()` isn't available, `handle_neighbor_phase()` (`src/md_simulation.cpp`) throws (`"CUDA execution requires the dsDecompX GPU-resident halo backend; host ParticleData fallback is disabled"`) rather than silently falling back to copying particles through host memory. Force return after the force kernels runs the same way, through `reverse_halo_on_device()` / `dsdecompx::Decomp::reverse_halo()`.
 
-```cuda
-__global__ void lj_force_kernel(
-    Real* x, Real* y, Real* z,
-    Real* fx, Real* fy, Real* fz,
-    int* neighbor_list, int* num_neighbors,
-    Real cutoff_sq, ...)
-{
-    // One thread = one particle
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    // Iterate over the neighbor list → accumulate forces
-    // Record the reaction force via atomicAdd
-}
-```
+For a single-rank run (`comm_backend_->is_gpu_single_rank(...)`), there is nothing to exchange with, so this whole halo step — and the dsDecompX call into it — is skipped outright rather than doing a degenerate no-op round trip.
 
-### Double Precision atomicAdd
+### The one deliberate host round-trip: Python MLIP mode
 
-Fallback implementation for supporting older architectures (< SM 6.0):
-```cuda
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
-// Use the native double atomicAdd
-#else
-__device__ double atomicAdd(double* address, double val) {
-    // CAS-based emulation
-}
-#endif
-```
-
-### Use of `__constant__` Memory
-
-Frequently used constants are placed in constant cache:
-```cuda
-__constant__ Real d_cutoff_sq;
-__constant__ Real d_k_coulomb;
-__constant__ size_t d_local_particles;
-__constant__ size_t d_total_particles;
-```
+The single place this pipeline intentionally leaves the GPU is the Python MLIP path. Because the embedded Python interpreter needs NumPy-backed host arrays, `compute_forces_with_mode()` calls `cuda_calc->download_positions_for_ml()` before invoking `python_interface->compute_force(...)`, and `cuda_calc->upload_forces_from_ml()` afterward to push the returned forces back to the device force buffers. The LibTorch/TorchScript MLIP path (section 5 below) has no equivalent round-trip — tensors are built directly from the device buffers.
 
 ---
 
@@ -190,7 +140,7 @@ runtime in `ensure_ewald_initialized()` from the box size and cutoff (via
 
 ## 5. MLIP GPU-resident Integration
 
-### C++ MLIP Runtime (TorchScript Mode)
+### `libtorch` mode (TorchScript)
 
 ```
 GPU memory (DeepScaleMD)
