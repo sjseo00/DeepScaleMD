@@ -1,9 +1,7 @@
 # Full Source Code Execution Flow
 
 > **Current architecture:** DeepScaleMD relies on the standalone `dsDecompX`
-> library for Cartesian topology, halo communication, and migration. There is
-> no locally-defined domain-decomposition source file anymore — the previous
-> `domain_decomposition.cpp/.h` was removed and its role is now filled by
+> library for Cartesian topology, halo communication, and migration, via
 > `dsdecompx::Decomp`, constructed from `MDSystem::initialize_decomposition_runtime()`
 > in `src/md_system.cpp`. For the underlying library, see
 > `dsDecompX/docs/integration.md`.
