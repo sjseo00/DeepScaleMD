@@ -150,26 +150,41 @@ Particles are reordered using the Morton code (Z-curve) to improve spatial local
 
 ## 4. PME Electrostatics Calculation (CUDA)
 
-### Related Files: `src/pme_calculator.cu`, `src/pme_kernels.cu`
+### Related Files: `src/force_calculator_cuda.cu`, `include/force_calculator_cuda.h`
 
-Long-range electrostatics are computed in O(N log N) using the Particle Mesh Ewald method.
+Electrostatics are implemented as a full Ewald summation, combining a real-space
+(erfc-screened, neighbor-list) part with a reciprocal-space part solved via
+Particle Mesh Ewald (PME). This lives directly inside `force_calculator_cuda.cu`
+(functions `compute_electrostatic_forces_kernel`, `ensure_ewald_initialized`,
+`compute_electrostatic_forces_ewald`, and the `pme_*` device kernels) — there
+is no separate `pme_calculator.cu`/`pme_kernels.cu` file, and the CPU
+(`src/force_calculator_cpu.cpp`, via FFTW) and SYCL (`src/force_calculator_sycl.cpp`)
+backends implement the corresponding math independently.
 
 ### GPU Pipeline
 
 ```
-1. Charge spreading  (GPU kernel) — spread charges onto the grid using B-splines
+1. Real-space sum      (GPU kernel)  — erfc(alpha*r)-screened Coulomb over the neighbor list
+2. Charge spreading     (GPU kernel)  — spread charges onto the grid using B-splines
        ↓
-2. 3D FFT           (cuFFT)       — charge grid → reciprocal space
+3. 3D FFT              (cuFFT, CUFFT_Z2Z) — charge grid → reciprocal space
        ↓
-3. Poisson solver   (GPU kernel) — compute energy/forces in reciprocal space
+4. Poisson solver       (GPU kernel)  — reciprocal-space energy/virial, electric-field grid
        ↓
-4. Inverse FFT      (cuFFT)       — reciprocal space → real space
+5. Inverse FFT          (cuFFT, CUFFT_Z2Z) — reciprocal space → real space
        ↓
-5. Force interpolation (GPU kernel) — grid → particle forces
+6. Force interpolation  (GPU kernel)  — grid → particle forces
+7. Self-energy correction (GPU kernel)
 ```
 
-**B-spline order:** 4th order (cubic)
-**Grid size:** set via `pme_grid_size: [64, 64, 64]` in `input.yaml`
+**B-spline order:** fixed at 4th order (cubic) — `ewald_spline_order_ = 4` is hardcoded, not user-configurable.
+**Grid size / splitting parameter (alpha):** both are computed automatically at
+runtime in `ensure_ewald_initialized()` from the box size and cutoff (via
+`ewald_solve_alpha()` and `ewald_next_good_fft_size()`) — there are no
+`pme_grid_size`, `pme_alpha`, or `pme_order` keys in `input.yaml`.
+**Enabling electrostatics:** set the force list to include `coulomb` / `PME` /
+`electrostatic` (parsed in `src/force_manager.cpp`), which sets
+`force_config.enable_coulomb = true`.
 
 ---
 

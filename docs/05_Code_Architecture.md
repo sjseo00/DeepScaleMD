@@ -1,9 +1,11 @@
 # Full Source Code Execution Flow
 
 > **Current architecture:** DeepScaleMD relies on the standalone `dsDecompX`
-> library for Cartesian topology, halo communication, and migration. The
-> legacy `domain_decomposition.cpp/.h` references below are a historical
-> description. For the supported integration, see
+> library for Cartesian topology, halo communication, and migration. There is
+> no locally-defined domain-decomposition source file anymore — the previous
+> `domain_decomposition.cpp/.h` was removed and its role is now filled by
+> `dsdecompx::Decomp`, constructed from `MDSystem::initialize_decomposition_runtime()`
+> in `src/md_system.cpp`. For the underlying library, see
 > `dsDecompX/docs/integration.md`.
 
 This document summarizes DeepScaleMD's file organization, class hierarchy, and function call flow.
@@ -17,31 +19,59 @@ DeepScaleMD/
 ├── src/                        # C++ source files
 │   ├── main.cpp                # Entry point
 │   ├── md_simulation.cpp/.h    # Top-level simulation manager
-│   ├── md_system.cpp/.h        # Atom data container (CPU)
+│   ├── md_system.cpp/.h        # Atom data container (CPU) + dsDecompX setup
+│   ├── topology.cpp            # Topology/force-field parameter parsing (include/topology.h)
 │   ├── integrator.cpp/.h       # Numerical integrator (Velocity-Verlet, etc.)
-│   ├── force_calculator.cpp/.h # Force calculation base class
-│   ├── force_calculator_cuda.cu/.h  # GPU built-in force calculation
-│   ├── pme_calculator.cpp/.h   # PME electrostatics (cuFFT)
+│   ├── integrator_kernels.cu   # GPU integration kernels
+│   ├── force_manager.cpp/.h    # Selects/owns the active force backend
+│   ├── force_calculator.h      # Force calculation base class + PythonForceInterface decl.
+│   ├── force_calculator_cuda.cu/.h  # GPU built-in force calculation (LJ, bonded, Ewald/PME)
+│   ├── force_calculator_cpu.cpp/.h  # CPU built-in force calculation
+│   ├── force_calculator_sycl.cpp/.h # SYCL force calculation backend
 │   ├── neighbor_list*.cpp/.cu  # Neighbor list management
-│   ├── domain_decomposition.cpp/.h  # MPI domain decomposition (legacy, replaced by dsDecompX)
 │   ├── mpi_optimizer.cpp/.h    # MPI collective operation optimization
-│   ├── mlip_runtime.cpp/.h     # C++ TorchScript MLIP runner
-│   ├── python_force_interface.cpp/.h  # Python embedding interface
-│   ├── execution_plan.cpp/.h   # Simulation step execution plan
-│   ├── md_data_sources.cpp/.h  # I/O (XYZ parsing, etc.)
+│   ├── mpi_utils.cpp/.h        # MPI rank/size helpers
+│   ├── comm_backend.cpp/.h, halo_backend.cpp/.h  # Communication/halo backend abstractions
+│   ├── simulation_backend_factory.cpp/.h  # Picks CUDA/CPU/SYCL force calculator at runtime
+│   ├── thermostat.cpp/.h, thermostat_kernels.cu   # Temperature control
+│   ├── barostat.cpp/.h, barostat_kernels.cu       # Pressure control (NPT)
+│   ├── constraint_solver.cpp/.h  # Bond/angle constraint solver
+│   ├── minimizer.cpp/.h        # Energy minimization
+│   ├── timing_breakdown.cpp    # Per-phase timing accumulation/reporting
+│   ├── force_python/
+│   │   └── python_interface.cpp   # PythonForceInterface impl. (class declared in include/force_calculator.h)
+│   └── force_libtorch/         # MLIP (TorchScript / LibTorch) runtime, split by concern
+│       ├── runtime/
+│       │   ├── mlip_runtime.cpp/.h     # C++ TorchScript MLIP runner
+│       │   └── execution_plan.cpp/.h   # Per-step MLIP execution plan abstraction
+│       ├── binding/
+│       │   └── md_data_sources.cpp/.h  # Registers MD device pointers ("md.positions", ...)
+│       │                                #   with the MLIP operation registry (MLIP-specific,
+│       │                                #   NOT a general XYZ/TOP file loader)
+│       ├── backend/             # pytorch_backend.cpp/.h + backend_interface.h
+│       ├── operations/          # operation_registry + CUDA pre/post-process ops
+│       ├── config/               # yaml_parser.cpp/.h
+│       ├── cuda/                 # edge_conversion.cu, force_accumulation.cu, mlip_cuda_utils.cuh
+│       ├── mlip_force_bridge.cpp
+│       └── mlip_runtime_stub.cpp # No-op stub used in builds without LibTorch
 │   └── ...
-├── python/                     # Python layer (MLIP adapters)
+├── python_force/                # Python layer (MLIP adapters + reference force terms)
 │   ├── mlip_interface.py       # MLIPAdapter base class + ADAPTER_REGISTRY
+│   │                            #   (UMAAdapter, MACEAdapter, NequIPAdapter, CHGNetAdapter,
+│   │                            #    SevenNetAdapter, ORBAdapter, etc. — all in this one file)
 │   ├── ml_forces.py            # Entry point called by the C++ PythonForceInterface
-│   ├── uma_adapter.py          # UMA / fairchem adapter
-│   ├── mace_adapter.py         # MACE-MP adapter
-│   ├── nequip_adapter.py       # NequIP adapter
-│   ├── chgnet_adapter.py       # CHGNet adapter
+│   ├── force_calculator.py     # Reference/pure-Python force calculator
+│   ├── bond_forces.py, angle_forces.py, dihedral_forces.py
+│   ├── lj_forces.py, electrostatic_forces.py, mace_forces.py
+│   ├── user_pt_force.pyx, setup_user_pt_force.py, USER_PT_FORCE.md
 │   └── ...
-├── include/                    # Public headers
+├── include/                    # Public headers (mirrors src/ layout, e.g. force_libtorch/...)
+├── python_converter/           # Standalone input/format conversion utilities
+├── cmake/                      # CMake build modules
+├── configs/                    # Example/reference configuration files
+├── examples/                   # Example input files
 ├── bin/                        # Build artifacts
 │   └── md_simulation_cuda
-├── examples/                   # Example input files
 └── docs/                       # This documentation
 ```
 
@@ -54,26 +84,37 @@ MDSimulation                          ← Top-level orchestrator
 ├── MDSystem                          ← Atom data (CPU, SOA)
 │   ├── positions[], velocities[], forces[]
 │   ├── masses[], charges[], atom_types[]
-│   └── topology info (bonds, angles, ...)
+│   ├── topology info (bonds, angles, ...)
+│   └── decomp_runtime_ (dsdecompx::Decomp)   ← domain decomposition + halo/migration
 │
-├── ForceCalculator (abstract base)
-│   ├── ForceCalculatorCUDA           ← builtin LJ + PME (GPU)
-│   │   ├── NeighborListBuilder       ← Verlet-cell or Morton
-│   │   └── PMECalculator             ← cuFFT PME
-│   └── MlipRuntime                   ← C++ TorchScript MLIP
+├── ForceManager                      ← selects/owns the active force backend
+│   └── ForceCalculator (abstract base)
+│       ├── ForceCalculatorCUDA       ← builtin LJ + bonded + Ewald/PME electrostatics (GPU)
+│       │   └── NeighborListBuilder   ← Verlet-cell or Morton
+│       ├── ForceCalculatorCPU        ← CPU builtin force calculation
+│       └── ForceCalculatorSYCL       ← SYCL builtin force calculation
 │
-├── PythonForceInterface              ← Python embedding (python mode)
-│   └── (python/ml_forces.py → MLIPAdapter subclass)
+├── PythonForceInterface              ← Python embedding (python mode; declared in force_calculator.h)
+│   └── (python_force/ml_forces.py → MLIPAdapter subclass)
+│
+├── mlip::MlipRuntime                 ← C++ TorchScript/LibTorch MLIP runner (force_libtorch/runtime)
+│   └── mlip::ExecutionPlan           ← per-step MLIP execution plan
 │
 ├── Integrator (abstract base)
 │   ├── VelocityVerletIntegrator
 │   ├── VerletIntegrator
 │   └── LeapFrogIntegrator
 │
-├── dsDecompX                          ← Domain decomposition + halo/migration (external library)
+├── dsdecompx::Decomp                 ← Domain decomposition + halo/migration (external library)
 │
 └── MPIOptimizer                      ← MPI_Iallreduce batching
 ```
+
+Note: there is no separate `PMECalculator` class. Ewald/PME reciprocal-space
+electrostatics (charge spreading, cuFFT solve, force interpolation) are
+implemented as kernels and member functions directly inside
+`ForceCalculatorCUDA` (see `src/force_calculator_cuda.cu`, e.g.
+`ensure_ewald_initialized()` / `compute_electrostatic_forces_ewald()`).
 
 ---
 
@@ -83,20 +124,24 @@ MDSimulation                          ← Top-level orchestrator
 main()
   │
   ├─ MPI_Init_thread(MPI_THREAD_MULTIPLE)
-  ├─ config_file = argv[1]
+  ├─ config_file = argv[1] (or "input.yaml" by default)
   │
   └─ MDSimulation sim
        ├─ sim.initialize(config_file)
        │     │
-       │     ├─ parse_simulation_config()          ← YAML parsing
-       │     ├─ MDDataSources::load_coordinates()  ← read .xyz
-       │     ├─ MDDataSources::load_topology()     ← read .top
-       │     ├─ initialize_velocities()            ← Maxwell-Boltzmann
-       │     ├─ setup_domain_decomposition()       ← MPI_Cart_create
-       │     ├─ ForceCalculatorCUDA::initialize()  ← GPU allocation + kernel setup
+       │     ├─ MDSystem::load_config()                ← YAML parsing
+       │     ├─ parse_simulation_config()               ← MDSimulation-level params
+       │     ├─ MDSystem::load_coordinates()            ← read .xyz
+       │     ├─ MDSystem::load_topology()               ← read .top (if provided)
+       │     ├─ MDSystem::setup_force_field_params()
+       │     ├─ MDSystem::initialize_velocities()       ← Maxwell-Boltzmann
+       │     ├─ MDSystem::setup_domain_decomposition()  ← builds dsdecompx::Decomp
+       │     │     └─ initialize_decomposition_runtime() (multi-rank only)
+       │     ├─ create_force_calculator_for_build()     ← simulation_backend_factory
+       │     ├─ ForceCalculatorCUDA::initialize()       ← GPU allocation + kernel setup
        │     ├─ [python mode] PythonForceInterface::initialize()
        │     │     └─ Py_Initialize → import ml_forces.py
-      │     ├─ [libtorch mode] MlipRuntime::initialize()
+       │     ├─ [libtorch mode] mlip::MlipRuntime::initialize()
        │     │     └─ torch::jit::load(model.pt)
        │     └─ create_neighbor_list_builder()
        │
@@ -130,7 +175,7 @@ single_step(step)
 │     → call build_neighbor_list() if the condition is met
 │
 ├─ [3] MPI halo exchange (for multi-rank runs)
-│     Halo exchange via dsDecompX
+│     Halo exchange via dsdecompx::Decomp
 │     → MPI_Isend / MPI_Irecv (ghost atoms)
 │
 ├─ [4] Force calculation
@@ -139,7 +184,7 @@ single_step(step)
 │     │   ├─ lj_force_kernel<<<...>>>      ← pairwise potential
 │     │   ├─ bond_force_kernel<<<...>>>
 │     │   ├─ angle_force_kernel<<<...>>>
-│     │   └─ PMECalculator::compute_pme() ← electrostatics (cuFFT)
+│     │   └─ compute_electrostatic_forces_ewald() ← Ewald/PME reciprocal space (cuFFT)
 │     │
 │     ├─ [python] PythonForceInterface::compute_ml_forces()
 │     │   ├─ copy positions GPU → CPU (pinned buffer)
@@ -150,8 +195,8 @@ single_step(step)
 │     │   │       └─ ...
 │     │   └─ copy forces CPU → GPU
 │     │
-│     └─ [libtorch] MlipRuntime::compute_forces()
-│         ├─ positions → torch::Tensor (GPU)
+│     └─ [libtorch] mlip::MlipRuntime::compute_forces()
+│         ├─ positions → torch::Tensor (GPU), via md_data_sources-registered pointers
 │         ├─ model_.forward({inputs}) → energy, forces
 │         └─ forces used directly from the GPU buffer
 │
@@ -183,37 +228,55 @@ single_step(step)
 ## 5. Initialization Sequence (`initialize()`)
 
 ```
-parse_simulation_config()     src/md_simulation.cpp
-  │  Fully populate the config struct from YAML
+MDSystem::load_config()            src/md_system.cpp
+  │  Parse the top-level YAML config
   │
-load_coordinates()            src/md_data_sources.cpp
+parse_simulation_config()          src/md_simulation.cpp
+  │  Populate MDSimulation-level parameters
+  │
+MDSystem::load_coordinates()       src/md_system.cpp
   │  .xyz → MDSystem::positions[], atom_symbols[]
   │
-load_topology()               src/md_data_sources.cpp
+MDSystem::load_topology()          src/md_system.cpp
   │  .top → masses, charges, LJ params, bonds, angles
+  │  (must run before initialize_velocities(), so masses are set)
   │
-initialize_velocities()       src/md_simulation.cpp
+MDSystem::initialize_velocities()  src/md_system.cpp
   │  Maxwell-Boltzmann distribution → velocities[]
   │  remove v_cm
   │
-setup_domain_decomposition()  src/domain_decomposition.cpp
-  │  MPI_Cart_create (3D)
-  │  Compute each rank's subdomain range
-  │  → local atom selection
+MDSystem::setup_domain_decomposition()  src/md_system.cpp
+  │  Single rank: local range = full particle set, no library call.
+  │  Multi-rank: MDSystem::initialize_decomposition_runtime()
+  │    │  Builds a dsdecompx::Config (domain bounds, periodicity,
+  │    │  process grid policy, halo width, CUDA/host execution mode)
+  │    └─ decomp_runtime_ = make_unique<dsdecompx::Decomp>(MPI_COMM_WORLD, config)
+  │  Root classifies particles via decomp_runtime_->owner_rank(...) and
+  │  scatters only each rank's owned slice (MPI_Bcast + point-to-point).
+  │
+create_force_calculator_for_build()  src/simulation_backend_factory.cpp
+  │  Picks ForceCalculatorCUDA / ForceCalculatorCPU / ForceCalculatorSYCL
   │
 ForceCalculatorCUDA::initialize()  src/force_calculator_cuda.cu
   │  cudaMalloc (positions_d, forces_d, ...)
   │  cudaMemcpy H→D (initial data)
   │  Register constants in constant memory (__constant__)
+  │  Ewald/PME grid + cuFFT plan resources are allocated lazily on first use
+  │  via ensure_ewald_initialized(), not during this initialize() call
   │
-PythonForceInterface::initialize()  src/python_force_interface.cpp
+PythonForceInterface::initialize()  src/force_python/python_interface.cpp
+  │  (class declared in include/force_calculator.h)
   │  Py_Initialize()
   │  PyRun_SimpleString("import sys; sys.path.insert(...)")
   │  import ml_forces
-  │  adapter = create_adapter(model_type, ...)
+  │  adapter = create_adapter(model_type, ...)   ← from python_force/mlip_interface.py
   │
-  └─ create_neighbor_list_builder()  src/neighbor_list*.cpp
-       create a verlet_cell_list or morton_code instance
+mlip::MlipRuntime::initialize()    src/force_libtorch/runtime/mlip_runtime.cpp
+  │  Registers MD device-pointer sources (src/force_libtorch/binding/md_data_sources.cpp)
+  │  torch::jit::load(model.pt)
+  │
+create_neighbor_list_builder()     src/neighbor_list*.cpp
+  │  create a verlet_cell_list or morton_code instance
 ```
 
 ---
@@ -224,20 +287,23 @@ PythonForceInterface::initialize()  src/python_force_interface.cpp
 |------|-----------|------|
 | `main.cpp` | `main()` | MPI initialization, entry point |
 | `md_simulation.cpp` | `MDSimulation` | Overall simulation flow control |
-| `md_system.cpp` | `MDSystem` | CPU atom data container |
-| `md_data_sources.cpp` | `MDDataSources` | XYZ/TOP file parsing |
+| `md_system.cpp` | `MDSystem` | CPU atom data container; owns `dsdecompx::Decomp` setup |
+| `topology.cpp` | topology parsing helpers | Topology/force-field parameter parsing |
 | `integrator.cpp` | `*Integrator` | Integrates Newton's equations of motion |
-| `force_calculator_cuda.cu` | `ForceCalculatorCUDA` | GPU LJ, bond, angle forces |
+| `force_manager.cpp` | `ForceManager` | Owns/selects the active `ForceCalculator` backend |
+| `simulation_backend_factory.cpp` | `create_force_calculator_for_build()` | Chooses CUDA/CPU/SYCL backend at build/runtime |
+| `force_calculator_cuda.cu` | `ForceCalculatorCUDA` | GPU LJ, bond, angle forces + Ewald/PME electrostatics (cuFFT) |
+| `force_calculator_cpu.cpp` | `ForceCalculatorCPU` | CPU builtin force calculation |
+| `force_calculator_sycl.cpp` | `ForceCalculatorSYCL` | SYCL builtin force calculation |
 | `neighbor_list_kernels_optimized.cu` | kernels | Verlet-cell neighbor list GPU kernels |
-| `pme_calculator.cpp` | `PMECalculator` | PME electrostatics (cuFFT) |
 | `mpi_optimizer.cpp` | `MPIOptimizer` | MPI_Iallreduce batching optimization |
-| `mlip_runtime.cpp` | `MlipRuntime` | TorchScript model loading/inference |
-| `python_force_interface.cpp` | `PythonForceInterface` | Python-embedded MLIP invocation |
-| `execution_plan.cpp` | `ExecutionPlan` | Abstraction of the per-step execution plan |
-| `python/ml_forces.py` | `calculate_forces()` | Python entry point called from C++ |
-| `python/mlip_interface.py` | `MLIPAdapter`, `ADAPTER_REGISTRY` | Adapter base class + registration |
-| `python/uma_adapter.py` | `UMAAdapter` | UMA/fairchem model wrapper |
-| `python/mace_adapter.py` | `MACEAdapter` | MACE-MP wrapper |
+| `force_libtorch/runtime/mlip_runtime.cpp` | `mlip::MlipRuntime` | TorchScript/LibTorch model loading/inference |
+| `force_libtorch/runtime/execution_plan.cpp` | `mlip::ExecutionPlan` | Abstraction of the per-step MLIP execution plan |
+| `force_libtorch/binding/md_data_sources.cpp` | `mlip::register_md_sources()` | Registers MD device pointers with the MLIP operation registry (MLIP-specific, not general I/O) |
+| `force_python/python_interface.cpp` | `PythonForceInterface` (declared in `force_calculator.h`) | Python-embedded MLIP invocation |
+| `python_force/ml_forces.py` | `calculate_forces()` | Python entry point called from C++ |
+| `python_force/mlip_interface.py` | `MLIPAdapter`, `ADAPTER_REGISTRY` | Adapter base class + registration (all adapters in this one file) |
+| `python_force/force_calculator.py` | reference force calculator | Pure-Python reference LJ/bonded/electrostatic forces |
 
 ---
 
@@ -260,7 +326,7 @@ PythonForceInterface::initialize()  src/python_force_interface.cpp
 │  Neighbor List Buffer (int*)                    │
 │  neighbor_list_d[]  num_neighbors_d[]           │
 │                                                 │
-│  [builtin] LJ kernel → PME kernel               │
+│  [builtin] LJ/bonded kernels → Ewald/PME (cuFFT)│
 │  [libtorch] torch::Tensor (shared mem)      │
 │  [python] D→H copy → Python → H→D copy          │
 └─────────────────────────────────────────────────┘
@@ -276,12 +342,13 @@ PythonForceInterface::initialize()  src/python_force_interface.cpp
 ```
 Rank 0                          Rank 1 ... N
   │                               │
-  ├─ subdomain [0, Lx/N)          ├─ subdomain [Lx/N, ...]
+  ├─ subdomain owned via          ├─ subdomain owned via
+  │  dsdecompx::Decomp topology   │  dsdecompx::Decomp topology
   │                               │
   ├─ compute local atom forces    ├─ compute local atom forces
   │                               │
   ├─ halo exchange (ghost atoms)──┤  MPI_Isend/Irecv
-  │  dsDecompX                     │  boundary atoms within cutoff distance
+  │  via dsdecompx::Decomp        │  boundary atoms within cutoff distance
   │                               │
   ├─ compute boundary forces      ├─ compute boundary forces
   │                               │
@@ -301,7 +368,7 @@ After the simulation completes, the time spent in each kernel/function is printe
 Neighbor list build:    0.123 s ( 12.3%)
 Force calculation:      0.456 s ( 45.6%)
   LJ kernel:            0.234 s
-  PME:                  0.222 s
+  Ewald/PME:            0.222 s
 Integration:            0.045 s (  4.5%)
 MPI communication:      0.089 s (  8.9%)
 Python MLIP calls:      0.287 s ( 28.7%)

@@ -89,14 +89,24 @@ neighbor_list_update_freq: 10          # Maximum rebuild interval (number of ste
 ## 4. Integrator
 
 ```yaml
-integrator: velocity_verlet    # velocity_verlet (recommended) | verlet | leap_frog
+integrator: velocity_verlet    # velocity_verlet (recommended) | leap_frog
 ```
 
 | Value | Description |
 |----|------|
 | `velocity_verlet` | Velocity-Verlet (two-stage, excellent energy conservation) |
-| `verlet` | Basic Verlet |
-| `leap_frog` | Leap-frog (velocities offset by half a step) |
+| `leap_frog` / `leapfrog` | Leap-frog (velocities offset by half a step) |
+| `r_respa` | Not usable — always throws at initialization ("r_respa requires explicit fast/slow force components and is not supported by the current force API") |
+
+**Known quirk:** any other value (including the literal string `verlet`) is not
+recognized. It falls through to the `else` branch, which prints `Unknown
+integrator type '<value>', using Velocity-Verlet as default` and silently runs
+Velocity-Verlet. The internal default for `integrator_type` is actually the
+string `"verlet"`, so if you omit the `integrator:` key entirely, the
+simulation still runs correctly with Velocity-Verlet, but this "unknown
+integrator type" warning will be printed at startup — this is expected and
+harmless, but explicitly setting `integrator: velocity_verlet` avoids the
+spurious warning.
 
 ---
 
@@ -126,12 +136,18 @@ tau_t: 0.5
 ## 6. Barostat
 
 ```yaml
-barostat: none             # none | berendsen | parrinello_rahman
+barostat: none             # none | berendsen | parrinello_rahman | andersen
 
 # Berendsen NPT
 barostat: berendsen
 target_pressure: 1.0       # Target pressure (bar)
 tau_p: 1.0                 # Relaxation time (ps) — synonym for barostat_damping
+
+# Andersen NPT
+barostat: andersen
+target_pressure: 1.0       # Target pressure (bar)
+tau_p: 1.0                 # Relaxation time (ps); internally converted to a
+                            # compressibility-like coupling constant (1e-5 / tau_p)
 ```
 
 ---
@@ -226,14 +242,21 @@ force_calculation:
 
 Uses the LJ parameters and charges read from the topology file.
 
-**Electrostatics calculation (PME):**
+**Electrostatics:** the builtin path implements full Ewald summation (real-space
+sum + reciprocal-space PME grid via FFTW + self-energy correction) in
+`compute_electrostatic_forces_ewald()`. There is no `coulomb_method`,
+`pme_grid_size`, `pme_alpha`, or `pme_order` config key — these are not parsed
+anywhere in the codebase. The PME grid dimensions and Ewald `alpha` are derived
+automatically from the box size and cutoff distance and are not
+user-configurable. To turn electrostatics on or off, use the `force_types`
+list (or the legacy `force_calculation_enable_coulomb` flag):
+
 ```yaml
 force_calculation:
   mode: builtin
-  coulomb_method: pme          # direct | pme | ewald
-  pme_grid_size: [64, 64, 64]
-  pme_alpha: 0.25
-  pme_order: 4
+  force_types: lj, coulomb     # comma-separated; also accepts "PME" or "electrostatic"
+                                # as aliases for "coulomb". Omit "coulomb"/leave the
+                                # list empty to disable electrostatics.
 ```
 
 ### 8-2. Python MLIP Interface
