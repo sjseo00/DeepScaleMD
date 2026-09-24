@@ -87,8 +87,10 @@ MDSimulation                          ← Top-level orchestrator
 ├── ForceManager                      ← selects/owns the active force backend
 │   └── ForceCalculator (abstract base)
 │       ├── ForceCalculatorCUDA       ← builtin LJ + bonded + Ewald/PME electrostatics (GPU)
-│       │   └── NeighborListBuilder   ← Verlet-cell or Morton
+│       │   └── builds its neighbor list directly on-device (neighbor_list_kernels*.cu),
+│       │       bypassing the NeighborList interface below
 │       ├── ForceCalculatorCPU        ← CPU builtin force calculation
+│       │   └── NeighborList (abstract; CpuSpatialVerletList today, see neighbor_list.h)
 │       └── ForceCalculatorSYCL       ← SYCL builtin force calculation
 │
 ├── PythonForceInterface              ← Python embedding (python mode; declared in force_calculator.h)
@@ -142,6 +144,7 @@ main()
        │
        ├─ sim.run()
        │     │
+       │     ├─ run_energy_minimization()             ← optional, FIRE (minimize.method)
        │     ├─ prepare_first_step()
        │     │     ├─ build_neighbor_list()           ← initial neighbor list
        │     │     └─ compute_forces()                ← initial forces
@@ -150,7 +153,7 @@ main()
        │           single_step(step)
        │
        └─ sim.finalize()
-             └─ print_timing_breakdown()
+             └─ print_timing_report()                 ← src/timing_breakdown.cpp
 ```
 
 ---
@@ -274,8 +277,8 @@ mlip::MlipRuntime::initialize()    src/force_libtorch/runtime/mlip_runtime.cpp
   │  Registers MD device-pointer sources (src/force_libtorch/binding/md_data_sources.cpp)
   │  torch::jit::load(model.pt)
   │
-create_neighbor_list_builder()     src/neighbor_list*.cpp
-  │  create a verlet_cell_list or morton_code instance
+create_neighbor_list()             src/neighbor_list_factory.cpp
+  │  create a cpu_spatial_verlet (or, once implemented, gpu_tile_verlet) instance
 ```
 
 ---
@@ -372,3 +375,23 @@ Python MLIP calls:      0.287 s ( 28.7%)
 Total wall time:        1.000 s
 Performance:            10.0 ns/day  (96-atom water)
 ```
+
+### 9-1. Profiling Environment Variables
+
+Two environment variables control extra timing instrumentation, read once in
+`MDSimulation::run()` (`src/md_simulation.cpp`):
+
+| Variable | Values | Effect |
+|---|---|---|
+| `MD_TIMING_TRACE` | `every`, `step` | Enables a per-step timing trace (`parse_timing_trace_mode()`); `every` traces every step, `step` traces a reduced subset. Unset/anything else = off. |
+| `MD_TIMING_TRACE_FORCE` | `1` | Enables per-force-component breakdown. On the CUDA backend this calls `ForceCalculatorCUDA::set_timing_breakdown_enabled(true)`, which times `bonded` / `mlip` / `lj` / `electrostatic` / `special_pairs` separately via `cudaEvent` markers on `force_stream` (`force_calculator_cuda.cu`, `get_last_force_component_timings()`); no extra `cudaStreamSynchronize` is added, so it doesn't perturb the LJ/PME stream overlap it's measuring. Results appear in the end-of-run report. |
+
+```bash
+MD_TIMING_TRACE_FORCE=1 ./dsMD input.yaml
+MD_TIMING_TRACE=every MD_TIMING_TRACE_FORCE=1 ./dsMD input.yaml
+```
+
+Use `MD_TIMING_TRACE_FORCE=1` together with `force_calculation.nonbonded_kernel`
+(`tiled` vs `graph`) or `force_calculation.precision` (`double` vs `mixed`) to
+compare the `lj`/`electrostatic` timings between kernel/precision choices on
+a given GPU.

@@ -786,6 +786,20 @@ bool Topology::load_canonical(const std::string& topology_filename,
             validate_atom(static_cast<int>(key >> 32), "exclusion");
             validate_atom(static_cast<int>(key & 0xffffffffu), "exclusion");
         }
+
+        // Robustness: always exclude directly bonded (1-2), angle-endpoint
+        // (1-3), and dihedral-endpoint (1-4) pairs even if the input
+        // [exclusions] list is incomplete.
+        for (const Bond& b : bonds) {
+            exclusion_keys.push_back(pair_key(b.atom1, b.atom2));
+        }
+        for (const Angle& a : angles) {
+            exclusion_keys.push_back(pair_key(a.atom1, a.atom3));
+        }
+        for (const Dihedral& d : dihedrals) {
+            exclusion_keys.push_back(pair_key(d.atom1, d.atom4));
+        }
+
         std::sort(exclusion_keys.begin(), exclusion_keys.end());
         exclusion_keys.erase(std::unique(exclusion_keys.begin(), exclusion_keys.end()), exclusion_keys.end());
         for (const SpecialPair& sp : special_pairs) {

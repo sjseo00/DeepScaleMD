@@ -35,7 +35,7 @@ make cpu             # CPU fallback
 
 ### Halo exchange and migration: dsDecompX pulls pointers, not copies
 
-The multi-rank case is where "GPU-resident" is actually enforced rather than just convenient. `MDSystem::exchange_halo_on_device()` (`src/md_system.cpp`) builds a `dsdecompx::ParticleInfo storage(owned, ghost_count_, calculator)` — the third argument is the `ForceCalculatorCUDA` itself, passed as a dsDecompX `Provider`. dsDecompX calls back into it (`particle_info_view()` / `resize_particle_info()`, implemented in `force_calculator_cuda.cu`) to get the *actual device addresses* of the position/field buffers and to grow them in place when more ghost particles arrive — it never receives a host-side copy to exchange. The halo/migration communication itself (`decomp_runtime_->exchange_halo(storage, {rebuild_halo, stream})`) then runs on the CUDA stream returned by `calculator.get_force_stream()`, so it's ordered with the rest of that step's kernels without an explicit host sync.
+The multi-rank case is where "GPU-resident" is actually enforced rather than just convenient. `MDSystem::exchange_halo_on_device()` (`src/md_system.cpp`) builds a `dsdecompx::ParticleInfo storage(owned, particles.ghost_count(), calculator)` — the third argument is the `ForceCalculatorCUDA` itself, passed as a dsDecompX `Provider`. The inherited `ParticleInfo` owned/ghost counts are the single source of truth for both host and CUDA paths. dsDecompX calls back into the provider (`particle_info_view()` / `resize_particle_info()`, implemented in `force_calculator_cuda.cu`) to get the *actual device addresses* of the position/field buffers and to grow them in place when more ghost particles arrive — it never receives a host-side copy to exchange. The halo/migration communication itself (`decomp_runtime_->exchange_halo(storage, {rebuild_halo, stream})`) then runs on the CUDA stream returned by `calculator.get_force_stream()`, so it's ordered with the rest of that step's kernels without an explicit host sync.
 
 This path is selected by a small backend abstraction: `create_halo_backend()` (`src/halo_backend.cpp`) picks a `CudaResidentHaloBackend` whenever the force calculator is a `ForceCalculatorCUDA`. That backend's `try_gpu_direct_halo()` is not a best-effort optimization — if it's asked to run and the force calculator *isn't* CUDA, or if `try_gpu_direct_halo()` isn't available, `handle_neighbor_phase()` (`src/md_simulation.cpp`) throws (`"CUDA execution requires the dsDecompX GPU-resident halo backend; host ParticleData fallback is disabled"`) rather than silently falling back to copying particles through host memory. Force return after the force kernels runs the same way, through `reverse_halo_on_device()` / `dsdecompx::Decomp::reverse_halo()`.
 
@@ -86,15 +86,18 @@ Real max_disp_sq = thrust::reduce(
 
 The need for a rebuild is determined entirely on the GPU, without copying data back to the CPU.
 
-### Morton Z-order Sorting (Optional)
+### Neighbor list type on CUDA builds
 
-```yaml
-neighbor_list_type: morton_code
-```
-
-Particles are reordered using the Morton code (Z-curve) to improve spatial locality:
-- Particles that are close in space are also placed close together in memory → improves cache hit rate
-- Uses `thrust::sort`
+`neighbor_list_type: morton_code` (and `verlet_cell_list`) are deprecated
+config values kept only for backward compatibility -- they now print a
+warning and fall back to `cpu_spatial_verlet`'s naming, but have no effect on
+the CUDA path described above: `ForceCalculatorCUDA` still builds its
+neighbor list directly on-device via the kernels in
+`neighbor_list_kernels.cu` / `neighbor_list_kernels_optimized.cu` regardless
+of this setting (a `gpu_tile_verlet` config value exists for a future 32-atom
+warp-tile rewrite of this path, but it is not implemented yet). Particles are
+still reordered using a Morton code (Z-curve) to improve spatial locality
+before the cell-list build, using `thrust::sort`.
 
 ---
 
@@ -176,24 +179,50 @@ void launch_interleave_positions(
 | Particle positions/forces | `double` (float64) | Required for MD accuracy |
 | PME grid | `Real` (build configuration) | Accuracy/performance tradeoff |
 | MLIP input | `float32` (configurable) | Matches the model's training precision |
+| LJ / Ewald real-space pair math | `double` (default) or `float` (`force_calculation.precision: mixed`) | See section 9.1 |
+
+Position storage and force/energy/virial accumulation stay `double` in both
+modes — only the LJ/Ewald real-space kernels' per-pair intermediate math is
+affected by `precision: mixed`.
 
 ---
 
 ## 7. GPU Profiling
 
-```bash
-# Profile with Nsight Systems
-nsys profile --trace=cuda,mpi bin/md_simulation_cuda input.yaml
+An end-of-run timing report prints automatically (`src/timing_breakdown.cpp`,
+called from `MDSimulation::finalize()`) -- no flag needed. It's a small tree:
+`init` / `minimize` / `md_loop`, with `md_loop` broken into
+neighbor/integrate/force/comm/migrate/thermostat/barostat/ke/output, plus a
+comparison against the whole-program wall clock (surfacing any unaccounted
+gap, e.g. one-time CUDA/PME/dsDecompX setup cost hiding outside both
+`init` and the loop). Single-rank runs get one clean column; multi-rank runs
+add `[min/max/var]` next to each row.
 
-# Enable timing via an environment variable
-MD_TIMING=1 bin/md_simulation_cuda input.yaml
+Two independent, opt-in environment variables add more detail on top of that
+report without changing what's measured by default:
+
+```bash
+# Per-step [TIMING] line: "step" = only on output steps, "every" = every step
+MD_TIMING_TRACE=step  bin/md_simulation_cuda input.yaml
+MD_TIMING_TRACE=every bin/md_simulation_cuda input.yaml
+
+# Break the "force" bucket into its GPU components (bonded/lj/electrostatic/
+# special_pairs/mlip, whichever ran) -- shows up in the per-step trace line
+# (if MD_TIMING_TRACE is also set) AND in the end-of-run report's "force"
+# sub-rows. Uses cudaEvent markers on the existing force_stream rather than
+# extra cudaStreamSynchronize calls, so turning it on does not perturb the
+# deliberate LJ/PME stream overlap it's measuring.
+MD_TIMING_TRACE_FORCE=1 bin/md_simulation_cuda input.yaml
 ```
 
-`timing_breakdown.cpp` measures the time spent in each component:
-- Pair (force calculation)
-- Neigh (neighbor list)
-- Comm (MPI communication)
-- Output (output)
+(These replace `MD_TIMING`, `MD_TIMING_EVERY_STEP`, and the ad hoc
+`MD_TIMING_FORCE_BREAKDOWN` env var from earlier revisions of this codebase.)
+
+For kernel-level detail beyond what the above buckets show (e.g. which PME
+sub-kernel or cuFFT call dominates "electrostatic"), use an external
+profiler: `nsys profile --trace=cuda,mpi bin/md_simulation_cuda input.yaml`
+if Nsight Systems is available on the target machine (it doesn't ship with
+every CUDA Toolkit install).
 
 ---
 
@@ -205,3 +234,176 @@ MD_TIMING=1 bin/md_simulation_cuda input.yaml
 | 32 mol water | MACE-MP-0 small | ~15 ms |
 | 32 mol water | UMA-S-1.1 | ~125 ms |
 | 96 mol water | LJ (builtin) | ~3 ms |
+
+---
+
+## 9. Nonbonded Pair-List Optimizations (LJ / Ewald Real-Space)
+
+### Related files: `src/force_calculator_cuda.cu` (`compute_lj_forces_kernel`, `compute_electrostatic_forces_kernel`)
+
+Two optimizations were tried on the LJ and Ewald real-space kernels (section
+4/6) after profiling a large gap against NAMD on identical hardware (RTX
+A6000, apoa1 benchmark), measured with `MD_TIMING_FORCE_BREAKDOWN=1` (prints
+a `[FORCE_BREAKDOWN] bonded_ms=... lj_ms=... electrostatic_ms=...
+special_pairs_ms=...` line per step). One (9.1) is in the codebase; the other
+(9.2) measured no benefit and was reverted, but is documented here because
+the reason it failed is informative.
+
+### 9.1 Mixed precision (`force_calculation.precision: mixed`)
+
+- Positions are always differenced in `double`, and force/energy/virial
+  always accumulate in `double`. What changes under `mixed` is the pair
+  loop's intermediate math — `r^-2`, the Mie powers, `erf`/`exp`, the force
+  magnitude — which is templated on `PairT` and runs in `float` instead.
+- Config:
+  ```yaml
+  force_calculation:
+    mode: builtin
+    precision: mixed    # double (default) | mixed
+  ```
+- Rationale: workstation/gaming Ampere+ GPUs (RTX A6000/30xx/40xx) have FP64
+  throughput a small fraction of FP32, unlike datacenter parts (A100/H100)
+  where double math is far less penalized. On the apoa1 benchmark this
+  roughly halved both `lj_ms` and `electrostatic_ms`. The gain was ~2x rather
+  than the much larger FP64:FP32 ratio would suggest, because the kernel is
+  also memory-bound: the `x`/`y`/`z`/`charge` arrays stay `double` regardless
+  of this setting, so narrowing the arithmetic doesn't reduce the scattered
+  global-memory traffic from walking the neighbor list.
+- Caveat: for excluded (1-2/1-3/1-4) pairs, the real-space kernel cancels
+  PME's reciprocal-space contribution via `erf(alpha*r)`. In `mixed` mode
+  that cancellation is only as precise as `erff()`, leaving a slightly larger
+  residual than full double — acceptable for the intended tradeoff, but not
+  an exact cancellation.
+
+### 9.2 Half-list evaluation for local-local pairs — tried, reverted, and why
+
+The neighbor list built in `neighbor_list_kernels.cu` (section 3) is a
+**full/symmetric** list: if `j` is within cutoff of `i`, `i`'s list contains
+`j` *and* `j`'s list contains `i`. Both nonbonded kernels walk the entire
+full list, so every pair's distance/`r2inv`/`erf`/`exp`/force-magnitude math
+runs twice — once from each side. This looks like an obvious 2x win, and a
+version was implemented and measured:
+
+```cuda
+bool j_is_local = (j < local_particles);
+int gid_j = global_id[j];
+if (j_is_local && gid_j < gid_i) continue;   // the other side owns this pair
+// ... lower-global_id side does the pair math once, then:
+atomicAdd(&fx[j], -fx_pair);
+atomicAdd(&fy[j], -fy_pair);
+atomicAdd(&fz[j], -fz_pair);
+```
+
+**Measured result: no change** in `lj_ms`/`electrostatic_ms` on the apoa1
+benchmark. The kernel was reverted to the plain full-list form (still with
+mixed precision, section 9.1) rather than keep dead-weight complexity and
+extra atomic traffic for zero benefit.
+
+**Why it didn't help — SIMT/warp divergence.** A GPU warp (32 threads == 32
+different atoms `i` here) executes in lockstep: at a given loop iteration,
+if even *one* lane in the warp needs the expensive branch, the whole warp
+pays for it — the other lanes just sit masked/idle for those instructions,
+they don't free up any cycles. `gid_j` ordering has no relationship to which
+atoms happen to land in the same warp, so at any iteration the "skip" and
+"keep" outcomes are close to independently random across the 32 lanes. The
+probability that *all 32* lanes skip in the same iteration (the only case
+that would actually save wall-clock time) is roughly `0.5^32 ≈ 2×10^-10` —
+essentially never. So the warp executes the full-cost path on almost every
+iteration regardless, and the per-thread skip buys nothing in practice.
+
+This is exactly the problem NAMD's tile-based design (mentioned in 9.3 below)
+is built to avoid: by deciding "process or skip" once **per warp-sized tile
+of atoms**, not once per individual thread, the skip decision is shared
+across the whole warp instead of fighting against it.
+
+### 9.4 `const`/`__restrict__` on the Verlet kernels' read-only pointers
+
+Before committing to the restructuring in 9.3, a much smaller, zero-risk
+change was tried first: the Verlet-list LJ/Ewald-real-space kernels'
+read-only pointer parameters (`x`/`y`/`z`, `type`, `global_id`, `neighbors`,
+`epsilon_mixed`/`sigma_mixed`, `charge`, `exclusion_*`) had no `const`/
+`__restrict__` qualifiers, which stops the compiler from proving they don't
+alias `fx`/`fy`/`fz`/`potential_energy`/`virial` and from routing their loads
+through the read-only (`__ldg`) cache path -- exactly the kind of thing a
+scattered-gather kernel benefits from. Added throughout both kernels (see
+their definitions). Purely additive (no logic change), so safe regardless of
+what else is tried, but on its own does not change the fundamental memory
+access pattern described in 9.3 -- it was expected to help modestly at best,
+which is why section 10 (actually restructuring around cells) followed
+immediately.
+
+---
+
+## 10. Cell-Pair Nonbonded Path — tried, reverted, root cause, and the corrected plan
+
+### 10.2 Root cause: a cube-shaped stencil scanning a sphere-shaped problem
+
+A 3×3×3 stencil of cells sized `R = cutoff + skin` covers a **cube** of side
+`3R`, volume `27R³`. The pairs that can actually matter lie within a
+**sphere** of radius `R` around each atom, volume `(4/3)πR³ ≈ 4.19R³`.
+
+```
+cube volume / sphere volume = 27 / 4.19 ≈ 6.4
+```
+
+So for every atom, the cell-pair kernel was distance-checking roughly **6.4x
+more candidate pairs** than the Verlet list's neighbor list (which is
+already filtered to the search-radius sphere, ~1027 candidates/atom on this
+system) -- each of those extra checks is cheap (a handful of subtracts/
+multiplies before the `continue`), but 6.4x more of them, plus the
+shared-memory tile load and `__syncthreads()` overhead for 27 cell visits
+per block, outweighed the memory-reuse benefit the cell-blocking was meant
+to provide. This is a well-known classical inefficiency of the "naive"
+cell-list construction (cell size = cutoff, single-shell stencil) -- the
+standard fix is to shrink the cells and widen the stencil so the cube more
+tightly approximates the sphere, which was not done in the reverted attempt.
+
+### 10.3 Corrected plan (not yet implemented)
+
+1. **Fix the geometry first, alone, with no other change.** Shrink
+   `cell_size` to `R/k` and widen the stencil to `(2k+1)³` cells for some
+   integer `k`, keeping the search radius `R` (and therefore correctness)
+   identical:
+
+   | k | cell_size | stencil | cube volume | cube/sphere ratio |
+   |---|-----------|---------|-------------|--------------------|
+   | 1 (reverted attempt) | R | 3×3×3 | 27R³ | 6.4x |
+   | 2 | R/2 | 5×5×5 | 15.625R³ | 3.7x |
+   | 3 | R/3 | 7×7×7 | 12.7R³ | 3.0x |
+
+   Returns diminish past `k≈3`: more, smaller cells means more per-cell
+   overhead (more blocks or more tile loads/`__syncthreads()` per home
+   cell), so this is a real trade-off to measure, not "smaller is always
+   better." Everything else (full 27→125→343-cell stencil, no half-list,
+   same energy/virial accounting) stays exactly as in the reverted version --
+   isolate this one variable.
+
+2. **Measure before adding anything else.** With `MD_TIMING_TRACE_FORCE=1`,
+   confirm `lj_ms`/`electrostatic_ms` for the geometry-corrected kernel beat
+   the Verlet path's mixed-precision numbers (43 ms / 27 ms on this system)
+   *before* layering on more changes. Try `k=2` and `k=3` and compare --
+   don't assume which one wins without a number.
+
+3. **Only then, add the half-cell-stencil.** Once the geometry ratio is
+   fixed, a block-granularity half-stencil (visit roughly half of the
+   `(2k+1)³` cells, e.g. only cells with linear index ≥ the home cell's, and
+   scatter the reaction contribution to the other cell's atoms) is safe to
+   add for another ~2x: the skip/keep decision is made once per **block**,
+   not once per thread, so it does not hit the SIMT-divergence trap that
+   made the earlier per-thread half-list attempt (section 9.2) a no-op. Add
+   this as its own separate, separately-measured step.
+
+4. **Cross-validate energy/forces against the Verlet path at every step of
+   this**, not just at the end -- a structurally different traversal
+   (different cell size, different stencil) makes it easy to introduce
+   subtle correctness bugs (double-counted or missed pairs at cell/stencil
+   boundaries) that a single end-to-end energy check might not catch.
+
+### 10.4 Why this wasn't re-attempted immediately
+
+Steps 1-3 each require a measure-and-compare cycle on the actual target GPU,
+which isn't available in the environment these changes were authored in.
+Rather than ship another fully-baked multi-step kernel rewrite blind (as
+10.1 was, with the geometry bug undetected until measured), the plan above
+is scoped to land **one variable at a time**, each validated by the person
+running it on real hardware before the next is added.

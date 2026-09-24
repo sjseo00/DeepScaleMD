@@ -72,8 +72,14 @@ periodic_z: true
 ```yaml
 cutoff_distance: 12.0              # Cutoff distance for force calculation (Å)
 
-# Neighbor list type
-neighbor_list_type: verlet_cell_list   # verlet_cell_list (recommended) | morton_code
+# Neighbor list type: auto (recommended) | cpu_spatial_verlet | gpu_tile_verlet
+# "auto" resolves at compile time to whichever backend this binary was built
+# for (BACKEND=CPU/SYCL -> cpu_spatial_verlet, BACKEND=CUDA -> gpu_tile_verlet)
+# -- it is not a runtime GPU probe. gpu_tile_verlet is not implemented yet;
+# CUDA builds currently keep using their existing on-device neighbor kernels
+# regardless of this setting. The legacy values verlet_cell_list/morton_code
+# are still accepted and map to cpu_spatial_verlet with a deprecation warning.
+neighbor_list_type: auto
 verlet_skin:        2.0                # Verlet skin distance (Å) — added on top of the cutoff
 neighbor_list_update_freq: 10          # Maximum rebuild interval (number of steps)
                                         # In practice, rebuilding is triggered automatically based on displacement
@@ -162,9 +168,9 @@ output_info:              STEP, T, KE, PE, ETOTAL, P   # Physical quantities to 
 # Trajectory
 trajectory_output_freq:   100                 # Trajectory save interval (steps)
 trajectory_format:        xyz, dcd            # Multiple formats can be specified at once, comma-separated
-                                               # xyz | dump | dcd | bp (legacy: both = xyz,dump)
-trajectory_include_velocities: false          # Whether to include velocities (supported only for xyz/bp)
-trajectory_include_forces:     false          # Whether to include forces (supported only for xyz/bp)
+                                               # xyz | dump | dcd | bp | h5md (legacy: both = xyz,dump)
+trajectory_include_velocities: false          # Whether to include velocities (supported only for xyz/bp/h5md)
+trajectory_include_forces:     false          # Whether to include forces (supported only for xyz/bp/h5md)
 ```
 
 **Note:** trajectory files are only written on steps that satisfy both `output_freq`
@@ -193,6 +199,7 @@ safest to set `output_freq` to a multiple of (or equal to) `trajectory_output_fr
 | `dump` | `<prefix>_dump.<step>` (separate file per step) | LAMMPS dump text format |
 | `dcd` | `<prefix>.dcd` (single file, frames appended) | CHARMM/NAMD binary format, opens directly in VMD/MDAnalysis. Records positions only (velocities/forces not supported) |
 | `bp` | `<prefix>.bp/` (ADIOS2 BP directory) | True parallel writing — for large-scale node counts, see below |
+| `h5md` | `<prefix>.h5` (single parallel HDF5 file) | True parallel writing on the H5MD schema — readable by h5py/MDAnalysis/VMD's h5md plugin, see below |
 
 `xyz`, `dump`, and `dcd` all work by using `MPI_Gatherv` to gather particles from
 all ranks to rank 0 at every output step, then reordering them by `global_id`
@@ -208,10 +215,11 @@ rank 0 grows as the number of ranks increases**.
 `bp` performs no gathering at all. Each rank writes **only the local particles
 it owns** directly as an independent local block, attaching a `global_id` array
 to that block so the global ordering can be reconstructed in a post-processing
-step. ADIOS2's BP5 engine merges per-rank blocks using aggregators, so it
-structurally avoids the "collective metadata operation on every step" bottleneck
-that plagues HDF5-style parallel I/O — this approach scales much better as the
-rank count grows into the hundreds or thousands.
+step. ADIOS2's BP5 engine merges per-rank blocks using aggregators, so unlike
+`h5md` below it never needs a collective metadata call (extending a dataset)
+on every output step — this lets `bp` scale a bit further as the rank count
+grows into the thousands, at the cost of needing ADIOS2-aware tooling to read
+the trajectory back.
 
 ```yaml
 trajectory_format: bp
@@ -228,6 +236,41 @@ as per-rank local arrays at every step, with the total atom count recorded as
 the `natoms_global` attribute. VMD cannot read this directly, so analysis
 requires post-processing with the ADIOS2 Python bindings to read the per-rank
 blocks for each step and sort them by `global_id`.
+
+### `h5md` (parallel HDF5) — Parallel Writing on a Standard, Widely-Readable Schema
+
+`h5md` also performs no gathering: each rank writes only the local particles
+it owns as a hyperslab of a shared dataset, using `MPI_Exscan` every step to
+find its slice of the particle axis (since dsDecompX migration changes which
+particles each rank owns from one step to the next) and writing under a
+**collective** MPI-IO transfer mode so the underlying MPI-IO layer merges all
+ranks' hyperslabs into large, stripe-friendly requests instead of many small
+ones. Like `bp`, an `id` dataset records each row's `global_id` so a reader
+can restore atom-index order. Unlike `bp`, every output step still needs one
+collective HDF5 metadata call (extending the frame dimension) that every rank
+must participate in — this is the one place `h5md` pays a cost `bp` avoids,
+though it is far cheaper than the `MPI_Gatherv` the `xyz`/`dump`/`dcd` writers
+pay every step.
+
+```yaml
+trajectory_format: h5md
+```
+
+Using this format requires building with `-DENABLE_HDF5=ON` against an HDF5
+build configured with `--enable-parallel` (see `docs/BUILD.md`). If a binary
+built without this option is given `trajectory_format: h5md`, it immediately
+raises an error during configuration parsing; if the HDF5 CMake finds is
+serial-only, `-DENABLE_HDF5=ON` fails at configure time with a clear message
+instead of a link error.
+
+The resulting `<prefix>.h5` file follows the [H5MD](https://www.h5md.org)
+schema: `/particles/all/position/value` (and, depending on configuration,
+`velocity`/`force`), `/particles/all/id/value`, `/particles/all/species/value`,
+and `/particles/all/box/edges/value` are extendible datasets shaped
+`(n_frames, N_global, ...)`. Because it is a single, standard HDF5 file, it
+can be opened directly with `h5py`, MDAnalysis, or VMD's h5md plugin — sort
+each frame's rows by its `id` array to recover atom-index order, the same
+step the ADIOS2 Python bindings require for `bp`.
 
 ---
 
@@ -258,6 +301,80 @@ force_calculation:
                                 # as aliases for "coulomb". Omit "coulomb"/leave the
                                 # list empty to disable electrostatics.
 ```
+
+**Precision (CUDA builtin path only):** `force_calculation.precision` selects
+whether the LJ and Ewald real-space pair kernels do their per-pair math
+(distance, r^-2, erf/exp, force magnitude) in double (default) or float.
+Positions are always differenced in double and forces/energy/virial always
+accumulate in double either way, so `mixed` trades a little per-pair accuracy
+for throughput, not overall numerical stability.
+
+```yaml
+force_calculation:
+  mode: builtin
+  precision: mixed    # double (default) | mixed
+```
+
+This matters most on workstation/gaming Ampere+ GPUs (RTX A6000/30xx/40xx),
+whose FP64 throughput is a small fraction of FP32 — `mixed` can be many times
+faster there. It matters far less on datacenter GPUs (A100/H100), where
+double-precision math isn't nearly as penalized relative to float.
+
+**Nonbonded kernel:**
+`force_calculation.nonbonded_kernel` accepts `tiled` (the existing/default
+path) or `graph`. `graph` maintains an `rc + skin` outer Verlet CSR and a
+directed active CSR at `rc + skin/2`. The active CSR is reused until the
+maximum owned/ghost displacement reaches `skin/4`, then compacted again.
+Force kernels still apply the exact `r < rc` test. CPU classical forces
+traverse one owned source row at a time. The CUDA MLIP runtime receives that
+same compact directed edge set, without a persistent per-edge coordinate/type
+copy.
+
+```yaml
+force_calculation:
+  mode: builtin
+  nonbonded_kernel: graph    # tiled (default) | graph
+```
+
+CUDA built-in classical LJ/PME currently supports `tiled`; selecting `graph`
+there fails explicitly. CUDA `graph` is supported for the LibTorch MLIP path.
+
+**PME cluster spread (CUDA builtin path only, Hopper/GH200):**
+`force_calculation.pme_cluster_spread: true` opts into a thread-block-cluster
+PME charge-spread kernel (distributed shared memory across a cluster of
+blocks). It only takes effect on a GPU the runtime reports as compute
+capability >= 9.0; on anything older this setting is silently ignored and
+the ordinary warp-aggregated spread kernel runs. This path has not been run
+or benchmarked on real Hopper hardware yet — treat it as experimental.
+
+```yaml
+force_calculation:
+  mode: builtin
+  pme_cluster_spread: true    # false (default) | true
+```
+
+**Electrostatics solver (all backends):** `force_calculation.electrostatics_solver`
+selects the long-range electrostatics algorithm. Only `pme` (the default,
+FFT-based smooth particle-mesh Ewald) is implemented. `fmm` is reserved for a
+future Fast Multipole Method solver — see
+[docs/01_MPI_Parallelization.md, section 8](01_MPI_Parallelization.md#8-pme-reciprocal-space-long-range-electrostatics-scaling)
+for why FFT-based PME eventually needs one at very large atom/rank counts.
+Selecting `fmm` today fails fast at config-parse time rather than silently
+falling back to `pme`.
+
+```yaml
+force_calculation:
+  mode: builtin
+  electrostatics_solver: pme    # pme (default) | fmm (not implemented yet)
+```
+
+**CPU PME and `OMP_NUM_THREADS`:** on the CPU backend, the PME
+reciprocal-space pipeline (charge spreading, FFTs, Poisson solve, force
+interpolation) scales with `OMP_NUM_THREADS`, independently of LJ/real-space
+Coulomb, which are pinned to a single thread regardless of that setting (see
+[docs/01_MPI_Parallelization.md, section 8](01_MPI_Parallelization.md#8-pme-reciprocal-space-long-range-electrostatics-scaling)
+for the full picture, including the current MPI-rank scaling limitation this
+does *not* address).
 
 ### 8-2. Python MLIP Interface
 
@@ -367,7 +484,7 @@ trajectory_output_freq: 100
 trajectory_format: xyz
 
 cutoff_distance: 9.0
-neighbor_list_type: verlet_cell_list
+neighbor_list_type: auto
 verlet_skin: 2.0
 neighbor_list_update_freq: 10
 
@@ -403,7 +520,7 @@ trajectory_output_freq: 50
 trajectory_format: xyz
 
 cutoff_distance: 6.0
-neighbor_list_type: verlet_cell_list
+neighbor_list_type: auto
 verlet_skin: 1.0
 neighbor_list_update_freq: 5
 
@@ -446,7 +563,7 @@ trajectory_output_freq: 50
 trajectory_format: xyz
 
 cutoff_distance: 6.0
-neighbor_list_type: verlet_cell_list
+neighbor_list_type: auto
 verlet_skin: 1.0
 neighbor_list_update_freq: 5
 
@@ -525,3 +642,4 @@ is recommended to limit `max_steps` according to system size.
 | `No edges found in input system` | MLIP graph was not generated | For UMA, `external_graph_gen=True` is required (handled automatically) |
 | `Failed to load model` | TorchScript incompatibility | fairchem models cannot be used in `libtorch` mode → use `python` mode instead |
 | `Invalid timestep` | `timestep ≤ 0` | Set a positive value |
+| `electrostatics_solver = fmm is a placeholder ... not implemented yet` | `electrostatics_solver: fmm` was requested | Use `pme` (the default); `fmm` is reserved for future work, see section 8 above |

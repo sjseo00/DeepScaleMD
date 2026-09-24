@@ -23,6 +23,8 @@
 #include <set>
 #include <filesystem>
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 
 // ── C++ MLIP Runtime (mlip_inst.md architecture) ────────────────────────────
 #include "force_libtorch/runtime/mlip_runtime.h"
@@ -121,10 +123,11 @@ MDSimulation::MDSimulation() :
     energy_output_freq(10),
     cutoff_distance(12.0),
     lj_switch_distance(-1.0),
-    neighbor_list_type_str("verlet_cell_list"),
-    neighbor_list_tile_size(256),
     neighbor_list_update_freq(10),  // Default update frequency: every 10 steps
     verlet_skin(2.0),               // Default Verlet skin distance
+    neighbor_rebuild_hi_frac(0.5),
+    neighbor_rebuild_lo_frac(0.4),
+    neighbor_displacement_check_stride(0),
     neighbor_list_builds(0),        // Initialize counter
     force_calculation_mode("builtin"),  // Default: use builtin force calculations
     force_calculation_type(""),         // Default: no specific ML type
@@ -151,8 +154,7 @@ MDSimulation::MDSimulation() :
     python_force_enabled(false),
     cached_potential_energy(0.0),
     neighbor_rebuild_forced(false),
-    timing_enabled(false),
-    timing_every_step(false) {
+    adaptive_rebuild_armed_(true) {
     system = std::make_unique<MDSystem>();
 }
 
@@ -195,6 +197,13 @@ void MDSimulation::rebuild_output_info_items_cache() {
 }
 
 void MDSimulation::initialize(const std::string& config_file) {
+    const double init_time = measure_seconds([&]() {
+        initialize_impl(config_file);
+    });
+    cumulative_timing.init_time += init_time;
+}
+
+void MDSimulation::initialize_impl(const std::string& config_file) {
     // Load configuration
     system->load_config(config_file);
     
@@ -225,18 +234,55 @@ void MDSimulation::initialize(const std::string& config_file) {
 
     // Build-dependent backend choice is centralized in simulation_backend_factory.
     force_calc = create_force_calculator_for_build(system->get_rank());
+    force_calc->set_nonbonded_kernel(nonbonded_kernel_);
+    if (system->get_rank() == 0) {
+        std::cout << "[Nonbonded kernel] loaded force_calculation.nonbonded_kernel = "
+                  << nonbonded_kernel_ << std::endl;
+        if (nonbonded_kernel_ == "graph") {
+            std::cout << "[Nonbonded kernel] graph dispatch enabled: outer CSR(rc+skin)"
+                      << " -> displacement-triggered active directed CSR(rc+skin/2)"
+                      << " -> exact rc force check"
+                      << " (legacy tile graph disabled)"
+                      << std::endl;
+        } else {
+            std::cout << "[Nonbonded kernel] tiled dispatch enabled (legacy path)"
+                      << std::endl;
+        }
+    }
     cuda_calc_cached_ = dynamic_cast<ForceCalculatorCUDA*>(force_calc.get());
     using_cuda_backend_cached_ = (cuda_calc_cached_ != nullptr);
-
-    const bool using_cuda_backend = is_using_cuda_backend();
 
     halo_backend_ = create_halo_backend(force_calculation_mode, force_calc.get());
     comm_backend_ = create_comm_backend();
 #ifdef USE_CUDA
     if (cuda_calc_cached_) {
         cuda_calc_cached_->set_builtin_forces_enabled(enable_builtin_forces_);
+        cuda_calc_cached_->set_mixed_precision(force_precision_ == "mixed");
+        if (force_precision_ == "mixed" && system->get_rank() == 0) {
+            std::cout << "[Force precision] mixed precision enabled: LJ/Ewald "
+                      << "real-space pair math runs in float, forces/energy/"
+                      << "virial still accumulate in double" << std::endl;
+        }
+        cuda_calc_cached_->set_pme_cluster_spread_enabled(pme_cluster_spread_);
+        if (pme_cluster_spread_ && system->get_rank() == 0) {
+            std::cout << "[PME] thread-block-cluster spread kernel requested -- "
+                      << "unverified on real Hopper hardware; only takes "
+                      << "effect if this rank's GPU is compute capability "
+                      << ">= 9.0, otherwise the usual kernel runs."
+                      << std::endl;
+        }
     }
 #endif
+    // CPU backend: force_precision_ previously only reached the CUDA branch
+    // above -- "precision: mixed" in the YAML had no effect at all on a CPU
+    // run. set_mixed_precision() prints its own confirmation (including the
+    // AVX2-build fallback warning), so nothing else is needed here. Only
+    // call for "mixed" (never explicitly pass false) so a config left at the
+    // "double" default doesn't clobber the MD_NONBONDED_PRECISION env-var
+    // escape hatch ForceCalculatorCPU also supports.
+    if (!cuda_calc_cached_ && force_precision_ == "mixed") {
+        force_calc->set_mixed_precision(true);
+    }
 
     // Python is a separate additive component; it does not replace built-in
     // or LibTorch forces.
@@ -286,7 +332,7 @@ void MDSimulation::initialize(const std::string& config_file) {
             "[LibTorch] libtorch force mode requires a CUDA build (USE_CUDA). "
             "Current build does not enable CUDA.");
 #else
-        if (!using_cuda_backend) {
+        if (!is_using_cuda_backend()) {
             throw std::runtime_error(
                 "[LibTorch] libtorch force mode requires an active CUDA backend. "
                 "Current run is not using ForceCalculatorCUDA.");
@@ -332,69 +378,24 @@ void MDSimulation::initialize(const std::string& config_file) {
 #endif
     }
     
-    // Initialize neighbor list builder
-    Real cutoff = cutoff_distance; // Use configured cutoff distance
-    
-    // Parse neighbor list type
-    NeighborListType nlist_type = NeighborListType::VERLET_CELL_LIST; // Use verlet cell list by default
-    if (neighbor_list_type_str == "morton_code") {
-        nlist_type = NeighborListType::MORTON_Z_ORDER_CSR;
-        if (system->get_rank() == 0) {
-            std::cout << "Using Morton Z-order neighbor list (optimized for MPI/CUDA)" << std::endl;
-        }
-    } else if (neighbor_list_type_str == "verlet_cell_list") {
-        nlist_type = NeighborListType::VERLET_CELL_LIST;
-        if (system->get_rank() == 0) {
-            std::cout << "Using Verlet-Cell hybrid neighbor list with skin distance: " << verlet_skin << std::endl;
-        }
-    } else {
-        if (system->get_rank() == 0) {
-            std::cout << "Unknown neighbor list type '" << neighbor_list_type_str 
-                      << "', using verlet cell list (default)" << std::endl;
-        }
-        nlist_type = NeighborListType::VERLET_CELL_LIST;
+    // Initialize the neighbor list. cpu_spatial_verlet (CpuSpatialVerletList
+    // in neighbor_list.h) is the only backend; there is no config knob to
+    // select anything else any more.
+    Real cutoff = cutoff_distance;
+    if (system->get_rank() == 0) {
+        std::cout << "Using cpu_spatial_verlet neighbor list with skin distance: "
+                  << verlet_skin << std::endl;
     }
-    
-    // Set up neighbor list configuration based on type
-    std::string nlist_config;
-    if (nlist_type == NeighborListType::VERLET_CELL_LIST) {
-        // For Verlet-Cell hybrid, use verlet_skin distance
-        nlist_config = std::to_string(verlet_skin);
-    } else {
-        // For Morton Z-order, use verlet_skin for stability
-        nlist_config = std::to_string(verlet_skin);
-    }
-    
-    neighbor_builder = create_neighbor_list_builder(nlist_type, cutoff, nlist_config, system->get_rank());
-    neighbor_builder->initialize();
 
-    // Seed neighbor-list metadata for GPU-first builds.
-    // CUDA neighbor build uses nlist.cutoff before any host-side build occurs.
-    {
-        NeighborList& nlist = system->get_neighbor_list();
-        nlist.skin_distance = verlet_skin;
-        nlist.cutoff = cutoff_distance + verlet_skin;
-        nlist.needs_rebuild = true;
-    }
-    
-    // Set update frequency information for proper logging
-    VerletCellListNeighborBuilder* verlet_builder = dynamic_cast<VerletCellListNeighborBuilder*>(neighbor_builder.get());
-    if (verlet_builder) {
-        verlet_builder->set_update_info(neighbor_list_update_freq, 0);
-        // Enable automatic rebuild check for better performance (LAMMPS-style)
-        verlet_builder->enable_check(true);
-        // CUDA path: use full-list (Newton OFF) so GPU kernel (which does not apply
-        // Newton's 3rd law atomics) sees every i-j pair and produces correct forces.
-        // CPU/SYCL paths keep half-list behavior.
-        if (using_cuda_backend) {
-            verlet_builder->set_use_half_list(false);
-        }
-    }
-    MortonZOrderNeighborBuilder* morton_builder = dynamic_cast<MortonZOrderNeighborBuilder*>(neighbor_builder.get());
-    if (morton_builder) {
-        morton_builder->set_update_info(neighbor_list_update_freq, 0);
-    }
-    
+    neighbor_list_ = create_neighbor_list(NeighborListBackend::CPU_SPATIAL_VERLET, cutoff, verlet_skin);
+    neighbor_list_->set_nonbonded_kernel(nonbonded_kernel_);
+    // Only the LibTorch MLIP GNN edge-list builder reads the atom-pair CSR
+    // outside of graph-kernel mode (see set_mlip_edge_list_needed()'s doc
+    // comment) -- tell the neighbor list so it can skip building that CSR
+    // entirely in the common tiled+builtin-forces configuration.
+    neighbor_list_->set_mlip_edge_list_needed(enable_libtorch_forces_);
+    system->set_neighbor_list(neighbor_list_.get());
+
     // Initialize components based on configuration
     initialize_integrator();
     initialize_thermostat();
@@ -424,6 +425,12 @@ void MDSimulation::initialize(const std::string& config_file) {
                       << (cuda_calc_cached_ ? "CUDA" : "CPU") << ") for "
                       << system->get_topology().get_constraints().size()
                       << " constraint(s)" << std::endl;
+            if (system->get_size() > 1) {
+                std::cout << "[Constraints] MPI mode: cross-rank constraints "
+                          << "(one endpoint on a ghost slot) are skipped by "
+                          << "the CPU solver to avoid inconsistent owner/ghost "
+                          << "state updates." << std::endl;
+            }
         }
     }
 
@@ -437,7 +444,8 @@ bool MDSimulation::is_using_cuda_backend() const {
 }
 
 void MDSimulation::single_step() {
-    // Performance timing (enabled via MD_TIMING=1 environment variable)
+    // Per-phase timing always accumulates (cheap chrono calls); whether it's
+    // ever printed depends on MD_TIMING_TRACE (see run()).
     auto step_start = std::chrono::high_resolution_clock::now();
     
     // Check if using CUDA (GPU-resident mode)
@@ -568,12 +576,99 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
     // prepare_first_step() performs build zero. Avoid rebuilding the same list
     // immediately in the first call to single_step() while current_step is
     // still zero.
-    bool should_rebuild = (neighbor_list_builds == 0) ||
+    const bool periodic_rebuild_due = (neighbor_list_builds == 0) ||
         (current_step > 0 && current_step % neighbor_list_update_freq == 0);
+    bool should_rebuild = periodic_rebuild_due;
+    bool reason_periodic = periodic_rebuild_due;
+    bool reason_adaptive = false;
+    bool reason_forced = false;
+    bool reason_mpi_sync = false;
     migrate_time = 0.0;
+
+    if (periodic_rebuild_due) {
+        adaptive_rebuild_armed_ = true;
+    }
+
+    // Adaptive rebuild gate: when periodic rebuild is not due, rebuild only
+    // if particles moved more than skin/2 since the last neighbor build.
+    // To avoid per-step D2H synchronization overhead on CUDA, only sample
+    // displacement every few steps between periodic full rebuild points.
+    if (!should_rebuild && neighbor_list_builds > 0) {
+        const int displacement_check_stride =
+            (neighbor_displacement_check_stride > 0)
+                ? neighbor_displacement_check_stride
+                : std::max(1, neighbor_list_update_freq / 4);
+        const bool run_displacement_check =
+            (current_step > 0) && (current_step % displacement_check_stride == 0);
+
+        if (!run_displacement_check) {
+            should_rebuild = false;
+        } else {
+        const Real skin = (verlet_skin > 0.0) ? verlet_skin : 2.0;
+        const Real hi_frac = neighbor_rebuild_hi_frac;
+        const Real lo_frac = neighbor_rebuild_lo_frac;
+        const Real disp_hi_sq = (skin * hi_frac) * (skin * hi_frac);
+        const Real disp_lo_sq = (skin * lo_frac) * (skin * lo_frac);
+
+#ifdef USE_CUDA
+        const bool using_cuda_backend = (cuda_calc_cached_ != nullptr);
+        if (using_cuda_backend) {
+            const Real max_disp_sq = cuda_calc_cached_->compute_max_displacement_on_device(
+                system->get_local_particles(), system->get_box());
+            if (max_disp_sq <= disp_lo_sq) {
+                adaptive_rebuild_armed_ = true;
+            }
+            should_rebuild = adaptive_rebuild_armed_ && (max_disp_sq > disp_hi_sq);
+            if (should_rebuild) {
+                adaptive_rebuild_armed_ = false;
+                reason_adaptive = true;
+            }
+        } else
+#endif
+        if (!should_rebuild) {
+            // Mirror the CUDA branch above exactly (same disp_hi_sq/disp_lo_sq
+            // band, same adaptive_rebuild_armed_ state): rearm only once
+            // displacement drops back below the LOW threshold, not merely
+            // below the high one. The previous version called
+            // needs_rebuild(), which only knows a single hardcoded 0.5*skin
+            // threshold with no low band of its own -- the outer wrapper's
+            // "rearm whenever not displaced" then re-armed as soon as
+            // displacement dipped just under that one threshold, giving CPU
+            // a narrower/noisier rebuild band than CUDA's and triggering
+            // extra rebuilds when a few atoms hover near the threshold
+            // (e.g. from residual steric clashes after a loose minimize).
+            Real local_max_disp_sq = neighbor_list_->compute_local_max_displacement_sq(
+                system->get_particles(), system->get_box(), system->get_local_particles());
+            // A negative return is this class's sentinel for "owned-atom set
+            // changed, treat as unconditional rebuild" (see
+            // CpuSpatialVerletList::compute_local_max_displacement_sq) --
+            // promote it to +inf so MPI_MAX can't let another rank's smaller,
+            // ordinary displacement mask it.
+            if (local_max_disp_sq < 0.0) {
+                local_max_disp_sq = std::numeric_limits<Real>::max();
+            }
+            Real max_disp_sq = local_max_disp_sq;
+            int mpi_init = 0;
+            MPI_Initialized(&mpi_init);
+            if (mpi_init) {
+                MPI_Allreduce(&local_max_disp_sq, &max_disp_sq, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            }
+            if (max_disp_sq <= disp_lo_sq) {
+                adaptive_rebuild_armed_ = true;
+            }
+            should_rebuild = adaptive_rebuild_armed_ && (max_disp_sq > disp_hi_sq);
+            if (should_rebuild) {
+                adaptive_rebuild_armed_ = false;
+                reason_adaptive = true;
+            }
+        }
+        }
+    }
 
     if (neighbor_rebuild_forced) {
         should_rebuild = true;
+        reason_forced = true;
+        adaptive_rebuild_armed_ = true;
         neighbor_rebuild_forced = false;
     }
 
@@ -598,8 +693,11 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         }
 
         if (!gpu_direct_halo_done) {
-            should_rebuild = system->sync_distributed_particles(
-                should_rebuild, &system->get_neighbor_list());
+            const bool rebuild_before_sync = should_rebuild;
+            should_rebuild = system->sync_distributed_particles(should_rebuild);
+            if (!rebuild_before_sync && should_rebuild) {
+                reason_mpi_sync = true;
+            }
         }
 
         if (halo_backend_) {
@@ -621,7 +719,31 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
     }
 
     nlist_build_time = measure_seconds([&]() {
+        if (should_rebuild) {
+            if (reason_periodic) ++rebuild_reason_periodic_;
+            if (reason_adaptive) ++rebuild_reason_adaptive_;
+            if (reason_forced) ++rebuild_reason_forced_;
+            if (reason_mpi_sync) ++rebuild_reason_mpi_sync_;
+            if (!reason_periodic && !reason_adaptive && !reason_forced && !reason_mpi_sync) {
+                ++rebuild_reason_other_;
+            }
+        }
         handle_neighbor_rebuild_if_needed(should_rebuild);
+        // The graph backend keeps a long-lived rc+skin outer list but
+        // compacts it against current coordinates every step.  This is
+        // deliberately independent of the outer-list rebuild cadence.
+        if (nonbonded_kernel_ == "graph" && !cuda_calc_cached_ && neighbor_list_builds > 0) {
+            const bool prune_due = neighbor_list_->needs_active_prune(
+                system->get_particles(), system->get_box(),
+                system->get_local_particles());
+            if (prune_due) {
+                neighbor_list_->prune_active(system->get_particles(), system->get_box(),
+                                             system->get_local_particles());
+                ++active_graph_prunes_;
+            } else {
+                ++active_graph_reuses_;
+            }
+        }
     });
 }
 
@@ -683,7 +805,14 @@ void MDSimulation::reverse_halo_for_bonded_if_needed() {
 
     const auto& cfg = system->get_force_manager().get_config();
     const bool has_bonded = cfg.enable_bonds || cfg.enable_angles || cfg.enable_dihedrals;
-    if (!has_bonded) {
+    const bool has_special_pairs =
+        (cfg.enable_lennard_jones || cfg.enable_coulomb) &&
+        !system->get_local_special_pairs().empty();
+
+    // Reverse halo is required for any force term that writes onto ghost slots
+    // and expects those contributions to be accumulated back to owners.
+    // Bonded terms do this, and special_pairs currently does as well.
+    if (!has_bonded && !has_special_pairs) {
         return;
     }
 
@@ -708,17 +837,15 @@ void MDSimulation::handle_neighbor_rebuild_if_needed(bool should_rebuild) {
         // CUDA builds are GPU-resident by contract. Do not silently download
         // particles and rebuild on the host if the device builder fails.
         cuda_calc->build_neighbor_list_on_device(*system);
-        cuda_calc->update_reference_positions_on_device(system->get_local_particles());
 #else
-        neighbor_builder->build(system->get_particles(), system->get_box(),
-                                system->get_neighbor_list(), system->get_local_particles());
+        neighbor_list_->build(system->get_particles(), system->get_box(), system->get_local_particles());
 #endif
     } else {
-        neighbor_builder->build(system->get_particles(), system->get_box(),
-                                system->get_neighbor_list(), system->get_local_particles());
+        neighbor_list_->build(system->get_particles(), system->get_box(), system->get_local_particles());
     }
 
     neighbor_list_builds++;
+
 }
 
 void MDSimulation::handle_force_phase(ForceCalculatorCUDA* cuda_calc, double& force_time) {
@@ -764,7 +891,6 @@ void MDSimulation::accumulate_step_timing(double integrate1_time, double nlist_b
                                           double barostat_time, double modify_time,
                                           double total_time) {
     // Keep per-step phase timing in milliseconds for optional diagnostics.
-    last_timing.domain_ms = 0.0;
     last_timing.nlist_build_ms = nlist_build_time * 1000.0;
     last_timing.comm_ms = comm_time * 1000.0;
     last_timing.migrate_ms = migrate_time * 1000.0;
@@ -774,6 +900,7 @@ void MDSimulation::accumulate_step_timing(double integrate1_time, double nlist_b
     last_timing.ke_ms = ke_time * 1000.0;
     last_timing.barostat_ms = barostat_time * 1000.0;
     last_timing.total_ms = total_time * 1000.0;
+    last_timing.force_components_ms.clear();
 
     cumulative_timing.neighbor_time += nlist_build_time;
     cumulative_timing.force_time += force_time;
@@ -785,6 +912,25 @@ void MDSimulation::accumulate_step_timing(double integrate1_time, double nlist_b
     cumulative_timing.migration_time += migrate_time;
     cumulative_timing.total_time += total_time;
     cumulative_timing.step_count++;
+
+    // Force-component breakdown (MD_TIMING_TRACE_FORCE=1): cudaEvent-based on
+    // CUDA (ForceCalculatorCUDA::compute_forces(), zero added synchronization
+    // when enabled), std::chrono wall-clock on CPU (ForceCalculatorCPU::
+    // compute_forces()) -- see set_timing_breakdown_enabled().
+    if (timing_trace_force_ && force_calc) {
+        for (const auto& component : force_calc->get_last_force_component_timings()) {
+            last_timing.force_components_ms.emplace_back(component.name, component.ms);
+
+            auto it = std::find_if(cumulative_timing.force_component_time.begin(),
+                                    cumulative_timing.force_component_time.end(),
+                                    [&](const auto& entry) { return entry.first == component.name; });
+            if (it != cumulative_timing.force_component_time.end()) {
+                it->second += component.ms / 1000.0;
+            } else {
+                cumulative_timing.force_component_time.emplace_back(component.name, component.ms / 1000.0);
+            }
+        }
+    }
 
     (void)modify_time;
 }
@@ -904,17 +1050,15 @@ void MDSimulation::handle_box_change_rebuild() {
     if (cuda_calc) {
 #ifdef USE_CUDA
         cuda_calc->build_neighbor_list_on_device(*system);
-        cuda_calc->update_reference_positions_on_device(system->get_local_particles());
 #else
-        neighbor_builder->build(system->get_particles(), system->get_box(),
-                                system->get_neighbor_list(), system->get_local_particles());
+        neighbor_list_->build(system->get_particles(), system->get_box(), system->get_local_particles());
 #endif
     } else {
-        neighbor_builder->build(system->get_particles(), system->get_box(),
-                                system->get_neighbor_list(), system->get_local_particles());
+        neighbor_list_->build(system->get_particles(), system->get_box(), system->get_local_particles());
     }
 
     ++neighbor_list_builds;
+    ++rebuild_reason_box_change_;
     neighbor_rebuild_forced = false;
 
     if (!cuda_calc) {
@@ -1062,6 +1206,27 @@ void MDSimulation::run_energy_minimization() {
         const Real global_v_norm = std::sqrt(std::max<Real>(comm_backend_->sum_reduce(local_v2), 0.0));
         const Real fmax = std::sqrt(std::max<Real>(comm_backend_->max_reduce(local_fmax2), 0.0));
 
+        // FIRE has no built-in step-size safety check: an aggressive dt
+        // combined with a badly-clashing starting geometry (large LJ/Coulomb
+        // forces) can make the pseudo-dynamics diverge. Once a coordinate
+        // goes non-finite, the GPU cell-list builder (build_cell_list_kernel
+        // in neighbor_list_kernels.cu) is fed a NaN/Inf position on the next
+        // handle_neighbor_phase() call below; without this guard that fault
+        // propagates silently and is only ever surfaced several iterations
+        // later (stdout for the intervening "[minimize] step N" lines is
+        // buffered, so the divergence looks like an "immediate" crash) as a
+        // misleading cudaErrorInvalidDevice from an unrelated thrust call.
+        // Fail fast here instead, with an accurate diagnostic.
+        if (!std::isfinite(global_power) || !std::isfinite(global_f_norm) ||
+            !std::isfinite(global_v_norm) || !std::isfinite(fmax)) {
+            throw std::runtime_error(
+                "[minimize] FIRE diverged at step " + std::to_string(iter) +
+                " (non-finite force/velocity norm). The starting geometry likely "
+                "has severe atomic overlaps/clashes for the configured "
+                "minimize.dt_start/minimize.dt_max; reduce the initial timestep "
+                "or pre-relax the structure.");
+        }
+
         if (system->get_rank() == 0 && (iter % minimizer_output_freq_ == 0)) {
             std::cout << "[minimize] step " << iter << "  PE=" << cached_potential_energy
                       << "  Fmax=" << fmax << std::endl;
@@ -1121,58 +1286,90 @@ void MDSimulation::run_energy_minimization() {
 }
 
 
-void MDSimulation::run() {
-    timing_enabled = env_flag_enabled("MD_TIMING");
-    timing_every_step = env_flag_enabled("MD_TIMING_EVERY_STEP");
+MDSimulation::TimingTraceMode MDSimulation::parse_timing_trace_mode() {
+    const char* value = std::getenv("MD_TIMING_TRACE");
+    if (!value) return TimingTraceMode::Off;
+    const std::string v(value);
+    if (v == "every") return TimingTraceMode::Every;
+    if (v == "step") return TimingTraceMode::Step;
+    return TimingTraceMode::Off;
+}
 
-   
+void MDSimulation::run() {
+    timing_trace_mode_ = parse_timing_trace_mode();
+    timing_trace_force_ = env_flag_enabled("MD_TIMING_TRACE_FORCE");
+    if (force_calc) {
+        force_calc->set_timing_breakdown_enabled(timing_trace_force_);
+    }
     if (system->get_rank() == 0) {
         std::cout << "Starting MD simulation for " << total_steps << " steps" << std::endl;
-        if (timing_enabled) {
-            std::cout << "Per-step timing output enabled (MD_TIMING=1)" << std::endl;
-            if (timing_every_step) {
-                std::cout << "Timing print mode: every step (MD_TIMING_EVERY_STEP=1)" << std::endl;
-            } else {
-                std::cout << "Timing print mode: output steps only" << std::endl;
-            }
+        if (timing_trace_mode_ != TimingTraceMode::Off) {
+            std::cout << "Per-step timing trace enabled (MD_TIMING_TRACE="
+                      << (timing_trace_mode_ == TimingTraceMode::Every ? "every" : "step") << ")"
+                      << (timing_trace_force_ ? ", with force-component breakdown" : "") << std::endl;
+        } else if (timing_trace_force_) {
+            std::cout << "Force-component timing enabled (MD_TIMING_TRACE_FORCE=1); "
+                      << "will appear in the end-of-run report" << std::endl;
         }
     }
-    
+
     // Reset state flags
     current_step = 0;
     neighbor_rebuild_forced = false;
+    adaptive_rebuild_armed_ = true;
+    rebuild_reason_periodic_ = 0;
+    rebuild_reason_adaptive_ = 0;
+    rebuild_reason_forced_ = 0;
+    rebuild_reason_mpi_sync_ = 0;
+    rebuild_reason_box_change_ = 0;
+    rebuild_reason_other_ = 0;
 
     // Optional energy minimization runs once before the MD loop, then restores
     // a physical velocity distribution at target_temperature. It leaves
     // neighbor_rebuild_forced set so prepare_first_step() rebuilds against the
     // relaxed geometry.
-    run_energy_minimization();
+    const double minimize_time = measure_seconds([&]() {
+        run_energy_minimization();
+    });
+    cumulative_timing.minimize_time += minimize_time;
 
     // Prepare initial forces at t=0 before starting MD loop
     prepare_first_step();
 
     // Output initial state (step 0)
     output_results(0);
-    
+
     // Main simulation loop - current_step is already 1 from initialization
     for (int step = 1; step <= total_steps; step++) {
         single_step();
 
-        if (timing_every_step && should_print_timing_for_step(step)) {
+        if (timing_trace_mode_ == TimingTraceMode::Every && should_print_timing_for_step(step)) {
             print_step_timing(step);
         }
 
         handle_step_output(step);
     }
-    
+
     // Output neighbor list statistics at end
     if (system->get_rank() == 0) {
         std::cout << "Neighbor list builds = " << neighbor_list_builds << std::endl;
+        if (nonbonded_kernel_ == "graph") {
+            std::cout << "Active graph incremental prunes = " << active_graph_prunes_
+                      << ", safe reuses = " << active_graph_reuses_ << std::endl;
+        }
+        std::cout << "Neighbor rebuild reasons (overlapping counts):"
+                  << " periodic=" << rebuild_reason_periodic_
+                  << " adaptive=" << rebuild_reason_adaptive_
+                  << " forced=" << rebuild_reason_forced_
+                  << " mpi_sync=" << rebuild_reason_mpi_sync_
+                  << " box_change=" << rebuild_reason_box_change_
+                  << " other=" << rebuild_reason_other_
+                  << std::endl;
     }
 }
 
 void MDSimulation::print_step_timing(int step) {
-    if (!timing_enabled || system->get_rank() != 0) {
+    if (timing_trace_mode_ == TimingTraceMode::Off || system->get_rank() != 0) {
         return;
     }
 
@@ -1186,8 +1383,11 @@ void MDSimulation::print_step_timing(int step) {
               << " thermo_ms=" << last_timing.thermostat_ms
               << " ke_ms=" << last_timing.ke_ms
               << " baro_ms=" << last_timing.barostat_ms
-              << " io_ms=" << last_timing.io_ms
-              << std::endl;
+              << " io_ms=" << last_timing.io_ms;
+    for (const auto& [name, ms] : last_timing.force_components_ms) {
+        std::cout << " force." << name << "_ms=" << ms;
+    }
+    std::cout << std::endl;
 }
 
 bool MDSimulation::should_output_step(int step) const {
@@ -1204,10 +1404,10 @@ bool MDSimulation::should_write_trajectory_step(int step) const {
 }
 
 bool MDSimulation::should_print_timing_for_step(int step) const {
-    if (!timing_enabled) {
+    if (timing_trace_mode_ == TimingTraceMode::Off) {
         return false;
     }
-    if (timing_every_step) {
+    if (timing_trace_mode_ == TimingTraceMode::Every) {
         return true;
     }
     return should_output_step(step);
@@ -1220,7 +1420,7 @@ void MDSimulation::handle_step_output(int step) {
         return;
     }
 
-    if (emit_text && should_print_timing_for_step(step) && !timing_every_step) {
+    if (emit_text && should_print_timing_for_step(step) && timing_trace_mode_ != TimingTraceMode::Every) {
         print_step_timing(step);
     }
 
@@ -1390,13 +1590,13 @@ void MDSimulation::output_results(int step, bool emit_text) {
     cumulative_timing.output_time += output_time;
 }
 
-void MDSimulation::finalize() {
-    // Print LAMMPS-style timing breakdown
-    // CRITICAL: All ranks must call this function because it uses MPI_Reduce
+void MDSimulation::finalize(double program_wallclock_ms) {
+    // CRITICAL: All ranks must call this function -- the multi-rank path in
+    // print_timing_report() uses MPI_Reduce.
     if (cumulative_timing.step_count > 0) {
-        print_timing_breakdown();
+        print_timing_report(program_wallclock_ms);
     }
-    
+
     if (force_calc) {
         // Unregister pinned buffers before destroying the CUDA context
         ForceCalculatorCUDA* cuda_fin = cuda_calc_cached_;
@@ -1412,10 +1612,6 @@ void MDSimulation::finalize() {
         python_interface->finalize_python();
     }
     
-    if (neighbor_builder) {
-        neighbor_builder->finalize();
-    }
-
     // Collective: patches the DCD NSET header and closes the ADIOS2 engine
     // (Engine::Close() is collective across all writing ranks).
     finalize_trajectory_writers();
@@ -1539,6 +1735,15 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                 force_calculation_type = value;
             } else if (key == "spec_file" || key == "mlip_spec_file") {
                 mlip_spec_file_ = value;
+            } else if (key == "precision") {
+                force_precision_ = trim_copy(value);
+            } else if (key == "nonbonded_kernel") {
+                nonbonded_kernel_ = trim_copy(value);
+            } else if (key == "pme_cluster_spread") {
+                std::string v = trim_copy(value);
+                pme_cluster_spread_ = (v == "true" || v == "1" || v == "on");
+            } else if (key == "electrostatics_solver") {
+                electrostatics_solver_ = trim_copy(value);
             }
         } else if (current_section == "minimize") {
             if (key == "method") {
@@ -1611,12 +1816,16 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             cutoff_distance = std::stod(value);
         } else if (key == "lj_switch_distance" || key == "switchdist") {
             lj_switch_distance = std::stod(value);
-        } else if (key == "neighbor_list_type") {
-            neighbor_list_type_str = value;
         } else if (key == "neighbor_list_update_freq") {
             neighbor_list_update_freq = std::stoi(value);
         } else if (key == "verlet_skin") {
             verlet_skin = std::stod(value);
+        } else if (key == "neighbor_rebuild_hi_frac") {
+            neighbor_rebuild_hi_frac = std::stod(value);
+        } else if (key == "neighbor_rebuild_lo_frac") {
+            neighbor_rebuild_lo_frac = std::stod(value);
+        } else if (key == "neighbor_displacement_check_stride") {
+            neighbor_displacement_check_stride = std::stoi(value);
         } else if (key == "integrator") {
             integrator_type = value;
         } else if (key == "thermostat") {
@@ -1708,6 +1917,56 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     enable_python_forces_   = force_components.count("python") != 0;
     enable_libtorch_forces_ = force_components.count("libtorch") != 0;
 
+    force_precision_ = trim_copy(force_precision_);
+    if (force_precision_.empty()) {
+        force_precision_ = "double";
+    }
+    if (force_precision_ != "double" && force_precision_ != "mixed") {
+        throw std::runtime_error(
+            "Invalid force_calculation.precision: '" + force_precision_
+            + "'. Supported values are: double, mixed");
+    }
+
+    nonbonded_kernel_ = trim_copy(nonbonded_kernel_);
+    if (nonbonded_kernel_.empty()) {
+        nonbonded_kernel_ = "tiled";
+    }
+    std::transform(nonbonded_kernel_.begin(), nonbonded_kernel_.end(),
+                   nonbonded_kernel_.begin(), [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    if (nonbonded_kernel_ != "tiled" && nonbonded_kernel_ != "graph") {
+        throw std::runtime_error(
+            "Invalid force_calculation.nonbonded_kernel: '" + nonbonded_kernel_
+            + "'. Supported values are: tiled, graph");
+    }
+
+    // STAGE 3 PLACEHOLDER (see PME reciprocal-space parallelization roadmap):
+    // "fmm" is accepted here and threaded through to
+    // ForceCalculatorCPU/ForceCalculatorCUDA so the config surface and
+    // dispatch plumbing already exist, but there is no FMM implementation
+    // yet -- selecting it fails fast with a clear message rather than
+    // silently falling back to PME. Wire up the real solve when FFT-based
+    // PME's communication cost (even with slab-decomposed FFTW MPI /
+    // cuFFTMp, see stage 2) becomes the hard limit at very large atom/rank
+    // counts.
+    electrostatics_solver_ = trim_copy(electrostatics_solver_);
+    if (electrostatics_solver_.empty()) {
+        electrostatics_solver_ = "pme";
+    }
+    if (electrostatics_solver_ != "pme" && electrostatics_solver_ != "fmm") {
+        throw std::runtime_error(
+            "Invalid force_calculation.electrostatics_solver: '" + electrostatics_solver_
+            + "'. Supported values are: pme, fmm");
+    }
+    if (electrostatics_solver_ == "fmm") {
+        throw std::runtime_error(
+            "force_calculation.electrostatics_solver = fmm is a placeholder for a "
+            "future Fast Multipole Method solver and is not implemented yet. Use "
+            "'pme' (the default).");
+    }
+
+
     // Parse trajectory_format.  Accepts a comma-separated set, e.g.
     // "xyz, dcd, bp". "both" is a legacy alias for "xyz, dump".
     {
@@ -1715,10 +1974,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         if (trim_copy(normalized) == "both") normalized = "xyz,dump";
         trajectory_formats_ = parse_force_components(normalized);
         for (const auto& fmt : trajectory_formats_) {
-            if (fmt != "xyz" && fmt != "dump" && fmt != "dcd" && fmt != "bp") {
+            if (fmt != "xyz" && fmt != "dump" && fmt != "dcd" && fmt != "bp" && fmt != "h5md") {
                 throw std::runtime_error(
                     "Invalid trajectory_format component: '" + fmt
-                    + "'. Supported components are: xyz, dump, dcd, bp (or legacy 'both')");
+                    + "'. Supported components are: xyz, dump, dcd, bp, h5md (or legacy 'both')");
             }
         }
 #ifndef USE_ADIOS2
@@ -1726,6 +1985,13 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             throw std::runtime_error(
                 "trajectory_format 'bp' requires a build with ADIOS2 enabled "
                 "(-DENABLE_ADIOS2=ON at CMake configure time).");
+        }
+#endif
+#ifndef USE_HDF5
+        if (trajectory_formats_.count("h5md")) {
+            throw std::runtime_error(
+                "trajectory_format 'h5md' requires a build with parallel HDF5 enabled "
+                "(-DENABLE_HDF5=ON at CMake configure time).");
         }
 #endif
     }
@@ -1757,6 +2023,36 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     }
     if (neighbor_list_update_freq <= 0) {
         throw std::runtime_error("Invalid neighbor_list_update_freq: must be positive");
+    }
+    if (!(neighbor_rebuild_lo_frac > 0.0 && neighbor_rebuild_lo_frac < 1.0)) {
+        throw std::runtime_error("Invalid neighbor_rebuild_lo_frac: must be in (0, 1)");
+    }
+    if (!(neighbor_rebuild_hi_frac > 0.0 && neighbor_rebuild_hi_frac < 1.0)) {
+        throw std::runtime_error("Invalid neighbor_rebuild_hi_frac: must be in (0, 1)");
+    }
+    if (neighbor_rebuild_lo_frac >= neighbor_rebuild_hi_frac) {
+        throw std::runtime_error("Invalid adaptive rebuild thresholds: neighbor_rebuild_lo_frac must be smaller than neighbor_rebuild_hi_frac");
+    }
+    // Verlet-list safety invariant: two particles closing head-on can together
+    // cover at most `skin` before a rebuild is forced, which requires each
+    // particle's own displacement trigger to fire at or before skin/2. This
+    // must be enforced here, not just defaulted correctly: an hi_frac above
+    // 0.5 lets a close-contact pair go completely unlisted between rebuilds
+    // (zero force applied while it keeps closing), producing a large,
+    // unphysical force spike and injecting energy the moment it's finally
+    // detected. The CPU path (CpuSpatialVerletList::needs_rebuild)
+    // hard-codes 0.5 for exactly this reason; the GPU/adaptive path exposed
+    // hi_frac as a free config knob without this bound, which is what let an
+    // unsafe default (0.55) ship silently.
+    if (neighbor_rebuild_hi_frac > 0.5) {
+        throw std::runtime_error(
+            "Invalid neighbor_rebuild_hi_frac: must be <= 0.5 to preserve the Verlet-skin "
+            "safety invariant (two particles closing head-on must not together cover more "
+            "than the skin distance before a rebuild is forced); got " +
+            std::to_string(neighbor_rebuild_hi_frac));
+    }
+    if (neighbor_displacement_check_stride < 0) {
+        throw std::runtime_error("Invalid neighbor_displacement_check_stride: must be non-negative (0 means auto)");
     }
     if (lj_switch_distance >= 0.0 &&
         (lj_switch_distance <= 0.0 || lj_switch_distance >= cutoff_distance)) {
@@ -1802,8 +2098,14 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         if (lj_switch_distance > 0.0) {
             std::cout << "  LJ switch distance: " << lj_switch_distance << std::endl;
         }
-        std::cout << "  Neighbor list type: " << neighbor_list_type_str << std::endl;
         std::cout << "  Neighbor list update frequency: " << neighbor_list_update_freq << " steps" << std::endl;
+        std::cout << "  Neighbor adaptive rebuild: hi=" << neighbor_rebuild_hi_frac
+              << "*skin, lo=" << neighbor_rebuild_lo_frac
+              << "*skin, check_stride="
+              << (neighbor_displacement_check_stride > 0
+                  ? std::to_string(neighbor_displacement_check_stride)
+                  : std::string("auto(update_freq/4)"))
+              << std::endl;
         std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
         if (enable_python_forces_) {
             std::cout << "  Python force path: " << python_force_path << std::endl;
@@ -2148,9 +2450,9 @@ void MDSimulation::gather_particles_for_serial_output(SerialTrajectoryFrame& fra
     }
 }
 
-// Collective: called by every rank (via output_results()), because both the
-// serial-format gather above and the ADIOS2 BP writer below need every
-// rank's participation.
+// Collective: called by every rank (via output_results()), because the
+// serial-format gather above, the ADIOS2 BP writer, and the H5MD writer
+// below all need every rank's participation.
 void MDSimulation::write_trajectory(int step) {
     if (trajectory_formats_.empty()) return;
 
@@ -2171,6 +2473,12 @@ void MDSimulation::write_trajectory(int step) {
 #ifdef USE_ADIOS2
     if (trajectory_formats_.count("bp")) {
         write_adios2_frame(step);
+    }
+#endif
+
+#ifdef USE_HDF5
+    if (trajectory_formats_.count("h5md")) {
+        write_h5md_frame(step);
     }
 #endif
 }
@@ -2357,10 +2665,11 @@ void MDSimulation::write_dcd_frame(int step, const SerialTrajectoryFrame& frame)
 void MDSimulation::initialize_trajectory_writers() {
     if (trajectory_formats_.empty()) return;
 
-    if (trajectory_formats_.count("dcd") || trajectory_formats_.count("bp")) {
+    if (trajectory_formats_.count("dcd") || trajectory_formats_.count("bp")
+        || trajectory_formats_.count("h5md")) {
         // Global atom count is constant for the run; every rank must take
-        // part in this reduce even though only rank 0 (DCD) or the ADIOS2
-        // attribute (all ranks, but from identical data) consume it.
+        // part in this reduce even though only rank 0 (DCD) or the ADIOS2/
+        // H5MD attribute (all ranks, but from identical data) consume it.
         int local_n = static_cast<int>(system->get_local_particles());
         int global_n = 0;
         MPI_Allreduce(&local_n, &global_n, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -2383,6 +2692,12 @@ void MDSimulation::initialize_trajectory_writers() {
     }
 #endif
 
+#ifdef USE_HDF5
+    if (trajectory_formats_.count("h5md")) {
+        initialize_h5md_writer();
+    }
+#endif
+
     trajectory_writers_initialized_ = true;
 }
 
@@ -2402,6 +2717,12 @@ void MDSimulation::finalize_trajectory_writers() {
 #ifdef USE_ADIOS2
     if (trajectory_formats_.count("bp")) {
         finalize_adios2_writer();
+    }
+#endif
+
+#ifdef USE_HDF5
+    if (trajectory_formats_.count("h5md")) {
+        finalize_h5md_writer();
     }
 #endif
 }
@@ -2509,4 +2830,348 @@ void MDSimulation::finalize_adios2_writer() {
 }
 #endif // USE_ADIOS2
 
-// print_timing_breakdown() is now defined in timing_breakdown.cpp
+#ifdef USE_HDF5
+// ==================== H5MD parallel trajectory writer ====================
+// Same no-gather design as the ADIOS2 writer above, expressed against the
+// H5MD (https://www.h5md.org) schema so the trajectory is directly
+// readable by h5py/MDAnalysis/VMD's h5md plugin without a custom reader.
+//
+// Every rank writes only the particles it currently owns, as a hyperslab
+// of a dataset shared by the whole run (shape (n_frames, N_global, ...)).
+// Per-rank write offsets along the particle axis are NOT stable across
+// steps -- dsDecompX migrates particles between ranks -- so every step
+// recomputes this rank's offset with an MPI_Exscan (exclusive prefix sum)
+// over local particle counts, and every frame also writes an "id" dataset
+// recording each row's global_id so a reader can restore atom-index order
+// (the same problem gather_particles_for_serial_output() solves for the
+// serial writers above, solved here without ever collecting onto rank 0).
+//
+// Dataset extension (H5Dset_extent) is a collective HDF5 metadata call and
+// must be issued identically by every rank. The big per-particle arrays
+// (position/velocity/force/id/species) are then written with disjoint,
+// per-rank hyperslabs under a COLLECTIVE transfer property list, which lets
+// the MPI-IO layer merge them into large, stripe-friendly requests -- this
+// is what makes the writer scale on Lustre/GPFS instead of serializing
+// through one rank the way the xyz/dump/dcd writers do. The handful of
+// tiny, run-wide scalars (step/time/box edges) are instead written by rank
+// 0 alone under the default INDEPENDENT transfer mode: every rank holds an
+// identical value, so nothing is lost by having only one rank issue the
+// write, and it avoids the undefined behavior of multiple ranks
+// collectively writing overlapping hyperslabs.
+
+namespace {
+
+hid_t h5md_create_extendible_dataset(hid_t loc, const char* name, hid_t type,
+                                      int rank, const hsize_t* dims, const hsize_t* chunk_dims) {
+    std::vector<hsize_t> maxdims(dims, dims + rank);
+    maxdims[0] = H5S_UNLIMITED;
+    hid_t space = H5Screate_simple(rank, dims, maxdims.data());
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    H5Pset_chunk(dcpl, rank, chunk_dims);
+    hid_t dset = H5Dcreate2(loc, name, type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    return dset;
+}
+
+void h5md_write_string_attr(hid_t loc, const char* name, const std::string& value) {
+    hid_t strtype = H5Tcopy(H5T_C_S1);
+    H5Tset_size(strtype, value.size() + 1);
+    hid_t space = H5Screate(H5S_SCALAR);
+    hid_t attr = H5Acreate2(loc, name, strtype, space, H5P_DEFAULT, H5P_DEFAULT);
+    H5Awrite(attr, strtype, value.c_str());
+    H5Aclose(attr);
+    H5Sclose(space);
+    H5Tclose(strtype);
+}
+
+void h5md_extend(hid_t dset, std::initializer_list<hsize_t> dims) {
+    std::vector<hsize_t> d(dims);
+    H5Dset_extent(dset, d.data());
+}
+
+} // namespace
+
+void MDSimulation::initialize_h5md_writer() {
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_fapl_mpio(fapl, MPI_COMM_WORLD, MPI_INFO_NULL);
+    const std::string filename = output_prefix + ".h5";
+    h5md_file_ = H5Fcreate(filename.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    H5Pclose(fapl);
+    if (h5md_file_ < 0) {
+        throw std::runtime_error("Cannot open H5MD trajectory file: " + filename);
+    }
+
+    hid_t h5md_group = H5Gcreate2(h5md_file_, "/h5md", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    {
+        int version[2] = {1, 1};
+        hsize_t dims2[1] = {2};
+        hid_t space = H5Screate_simple(1, dims2, nullptr);
+        hid_t attr = H5Acreate2(h5md_group, "version", H5T_NATIVE_INT, space, H5P_DEFAULT, H5P_DEFAULT);
+        H5Awrite(attr, H5T_NATIVE_INT, version);
+        H5Aclose(attr);
+        H5Sclose(space);
+    }
+    hid_t creator_group = H5Gcreate2(h5md_group, "creator", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    h5md_write_string_attr(creator_group, "name", "DeepScaleMD");
+    H5Gclose(creator_group);
+    hid_t author_group = H5Gcreate2(h5md_group, "author", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    const char* user_env = std::getenv("USER");
+    if (!user_env) user_env = std::getenv("USERNAME");
+    h5md_write_string_attr(author_group, "name", user_env ? user_env : "unknown");
+    H5Gclose(author_group);
+    H5Gclose(h5md_group);
+
+    hid_t particles_group = H5Gcreate2(h5md_file_, "/particles", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    hid_t all_group = H5Gcreate2(particles_group, "all", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+    hid_t box_group = H5Gcreate2(all_group, "box", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    {
+        int dim = 3;
+        hid_t space = H5Screate(H5S_SCALAR);
+        hid_t attr = H5Acreate2(box_group, "dimension", H5T_NATIVE_INT, space, H5P_DEFAULT, H5P_DEFAULT);
+        H5Awrite(attr, H5T_NATIVE_INT, &dim);
+        H5Aclose(attr);
+        H5Sclose(space);
+    }
+    {
+        hid_t strtype = H5Tcopy(H5T_C_S1);
+        H5Tset_size(strtype, 9);  // "periodic" + NUL
+        hsize_t dims3[1] = {3};
+        hid_t space = H5Screate_simple(1, dims3, nullptr);
+        hid_t attr = H5Acreate2(box_group, "boundary", strtype, space, H5P_DEFAULT, H5P_DEFAULT);
+        char boundary[3][9] = {"periodic", "periodic", "periodic"};
+        H5Awrite(attr, strtype, boundary);
+        H5Aclose(attr);
+        H5Sclose(space);
+        H5Tclose(strtype);
+    }
+    {
+        hid_t edges_group = H5Gcreate2(box_group, "edges", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        hsize_t dims[2] = {0, 3};
+        hsize_t chunk[2] = {1, 3};
+        h5md_box_edges_ = h5md_create_extendible_dataset(edges_group, "value", H5T_NATIVE_DOUBLE, 2, dims, chunk);
+        H5Gclose(edges_group);
+    }
+    H5Gclose(box_group);
+
+    const hsize_t n_global = static_cast<hsize_t>(trajectory_natoms_global_cached_);
+
+    {
+        hid_t id_group = H5Gcreate2(all_group, "id", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        hsize_t dims[2] = {0, n_global};
+        hsize_t chunk[2] = {1, n_global};
+        h5md_id_value_ = h5md_create_extendible_dataset(id_group, "value", H5T_NATIVE_INT, 2, dims, chunk);
+        H5Gclose(id_group);
+    }
+    {
+        hid_t species_group = H5Gcreate2(all_group, "species", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        hsize_t dims[2] = {0, n_global};
+        hsize_t chunk[2] = {1, n_global};
+        h5md_species_value_ = h5md_create_extendible_dataset(species_group, "value", H5T_NATIVE_INT, 2, dims, chunk);
+        H5Gclose(species_group);
+    }
+    {
+        hid_t position_group = H5Gcreate2(all_group, "position", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        hsize_t dims1[1] = {0};
+        hsize_t chunk1[1] = {1};
+        h5md_position_step_ = h5md_create_extendible_dataset(position_group, "step", H5T_NATIVE_INT, 1, dims1, chunk1);
+        h5md_position_time_ = h5md_create_extendible_dataset(position_group, "time", H5T_NATIVE_DOUBLE, 1, dims1, chunk1);
+        hsize_t dims3[3] = {0, n_global, 3};
+        hsize_t chunk3[3] = {1, n_global, 3};
+        h5md_position_value_ = h5md_create_extendible_dataset(position_group, "value", H5T_NATIVE_DOUBLE, 3, dims3, chunk3);
+        H5Gclose(position_group);
+    }
+    if (trajectory_include_velocities) {
+        hid_t velocity_group = H5Gcreate2(all_group, "velocity", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        hsize_t dims1[1] = {0};
+        hsize_t chunk1[1] = {1};
+        h5md_velocity_step_ = h5md_create_extendible_dataset(velocity_group, "step", H5T_NATIVE_INT, 1, dims1, chunk1);
+        h5md_velocity_time_ = h5md_create_extendible_dataset(velocity_group, "time", H5T_NATIVE_DOUBLE, 1, dims1, chunk1);
+        hsize_t dims3[3] = {0, n_global, 3};
+        hsize_t chunk3[3] = {1, n_global, 3};
+        h5md_velocity_value_ = h5md_create_extendible_dataset(velocity_group, "value", H5T_NATIVE_DOUBLE, 3, dims3, chunk3);
+        H5Gclose(velocity_group);
+    }
+    if (trajectory_include_forces) {
+        hid_t force_group = H5Gcreate2(all_group, "force", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        hsize_t dims1[1] = {0};
+        hsize_t chunk1[1] = {1};
+        h5md_force_step_ = h5md_create_extendible_dataset(force_group, "step", H5T_NATIVE_INT, 1, dims1, chunk1);
+        h5md_force_time_ = h5md_create_extendible_dataset(force_group, "time", H5T_NATIVE_DOUBLE, 1, dims1, chunk1);
+        hsize_t dims3[3] = {0, n_global, 3};
+        hsize_t chunk3[3] = {1, n_global, 3};
+        h5md_force_value_ = h5md_create_extendible_dataset(force_group, "value", H5T_NATIVE_DOUBLE, 3, dims3, chunk3);
+        H5Gclose(force_group);
+    }
+
+    H5Gclose(all_group);
+    H5Gclose(particles_group);
+
+    h5md_frame_count_ = 0;
+    h5md_active_ = true;
+}
+
+void MDSimulation::write_h5md_frame(int step) {
+    if (!h5md_active_) return;
+
+    int local_n = static_cast<int>(system->get_local_particles());
+    ParticleData& particles = system->get_particles();
+    const hsize_t n_global = static_cast<hsize_t>(trajectory_natoms_global_cached_);
+    const hsize_t frame = static_cast<hsize_t>(h5md_frame_count_);
+    const int rank = system->get_rank();
+
+    // Exclusive prefix sum over this frame's local particle counts -- must
+    // be recomputed every step because dsDecompX migration changes how many
+    // particles (and which ones) each rank owns. Rank 0 receives no partial
+    // sum from MPI_Exscan since nothing precedes it.
+    int local_offset_int = 0;
+    MPI_Exscan(&local_n, &local_offset_int, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (rank == 0) local_offset_int = 0;
+    const hsize_t local_offset = static_cast<hsize_t>(local_offset_int);
+    const hsize_t local_count = static_cast<hsize_t>(local_n);
+
+    // Collective extend: every rank must call this identically before any
+    // rank writes into the newly extended frame.
+    h5md_extend(h5md_position_step_, {frame + 1});
+    h5md_extend(h5md_position_time_, {frame + 1});
+    h5md_extend(h5md_position_value_, {frame + 1, n_global, 3});
+    h5md_extend(h5md_id_value_, {frame + 1, n_global});
+    h5md_extend(h5md_species_value_, {frame + 1, n_global});
+    h5md_extend(h5md_box_edges_, {frame + 1, 3});
+    if (trajectory_include_velocities) {
+        h5md_extend(h5md_velocity_step_, {frame + 1});
+        h5md_extend(h5md_velocity_time_, {frame + 1});
+        h5md_extend(h5md_velocity_value_, {frame + 1, n_global, 3});
+    }
+    if (trajectory_include_forces) {
+        h5md_extend(h5md_force_step_, {frame + 1});
+        h5md_extend(h5md_force_time_, {frame + 1});
+        h5md_extend(h5md_force_value_, {frame + 1, n_global, 3});
+    }
+
+    hid_t dxpl_collective = H5Pcreate(H5P_DATASET_XFER);
+    H5Pset_dxpl_mpio(dxpl_collective, H5FD_MPIO_COLLECTIVE);
+
+    // Writes this rank's disjoint [local_offset, local_offset+local_count)
+    // slice of a (1, N_global, 3) frame slab. An empty selection (local_n
+    // == 0, e.g. more ranks than particles in a region) is expressed as
+    // H5S_SELECT_NONE rather than a zero-length hyperslab.
+    auto write_vec3 = [&](hid_t dset, const std::vector<Real>& buf) {
+        hid_t filespace = H5Dget_space(dset);
+        if (local_count > 0) {
+            hsize_t offset[3] = {frame, local_offset, 0};
+            hsize_t count[3] = {1, local_count, 3};
+            H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, nullptr, count, nullptr);
+        } else {
+            H5Sselect_none(filespace);
+        }
+        hsize_t mem_dims[3] = {1, local_count, 3};
+        hid_t memspace = H5Screate_simple(3, mem_dims, nullptr);
+        if (local_count == 0) H5Sselect_none(memspace);
+        H5Dwrite(dset, H5T_NATIVE_DOUBLE, memspace, filespace, dxpl_collective, buf.data());
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    };
+    auto write_ids = [&](hid_t dset, const int* data) {
+        hid_t filespace = H5Dget_space(dset);
+        if (local_count > 0) {
+            hsize_t offset[2] = {frame, local_offset};
+            hsize_t count[2] = {1, local_count};
+            H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, nullptr, count, nullptr);
+        } else {
+            H5Sselect_none(filespace);
+        }
+        hsize_t mem_dims[2] = {1, local_count};
+        hid_t memspace = H5Screate_simple(2, mem_dims, nullptr);
+        if (local_count == 0) H5Sselect_none(memspace);
+        H5Dwrite(dset, H5T_NATIVE_INT, memspace, filespace, dxpl_collective, data);
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    };
+    auto pack_xyz = [&](const Real* a, const Real* b, const Real* c) {
+        std::vector<Real> buf(static_cast<size_t>(local_n) * 3);
+        for (int i = 0; i < local_n; ++i) {
+            buf[3 * i + 0] = a[i]; buf[3 * i + 1] = b[i]; buf[3 * i + 2] = c[i];
+        }
+        return buf;
+    };
+
+    write_vec3(h5md_position_value_, pack_xyz(particles.x.data(), particles.y.data(), particles.z.data()));
+    write_ids(h5md_id_value_, particles.global_id.data());
+    write_ids(h5md_species_value_, particles.type.data());
+    if (trajectory_include_velocities) {
+        write_vec3(h5md_velocity_value_, pack_xyz(particles.vx.data(), particles.vy.data(), particles.vz.data()));
+    }
+    if (trajectory_include_forces) {
+        write_vec3(h5md_force_value_, pack_xyz(particles.fx.data(), particles.fy.data(), particles.fz.data()));
+    }
+
+    H5Pclose(dxpl_collective);
+
+    // Tiny, run-wide scalars: identical on every rank, so only rank 0 needs
+    // to actually issue the write (default H5P_DEFAULT dxpl == independent
+    // access -- see the file-header comment for why this beats a redundant
+    // collective write to the same overlapping hyperslab).
+    if (rank == 0) {
+        auto write_scalar = [&](hid_t dset, hid_t type, const void* value) {
+            hid_t filespace = H5Dget_space(dset);
+            hsize_t offset[1] = {frame};
+            hsize_t count[1] = {1};
+            H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset, nullptr, count, nullptr);
+            hid_t memspace = H5Screate_simple(1, count, nullptr);
+            H5Dwrite(dset, type, memspace, filespace, H5P_DEFAULT, value);
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+        };
+        write_scalar(h5md_position_step_, H5T_NATIVE_INT, &step);
+        const Real time_fs = static_cast<Real>(step) * dt;
+        write_scalar(h5md_position_time_, H5T_NATIVE_DOUBLE, &time_fs);
+        if (trajectory_include_velocities) {
+            write_scalar(h5md_velocity_step_, H5T_NATIVE_INT, &step);
+            write_scalar(h5md_velocity_time_, H5T_NATIVE_DOUBLE, &time_fs);
+        }
+        if (trajectory_include_forces) {
+            write_scalar(h5md_force_step_, H5T_NATIVE_INT, &step);
+            write_scalar(h5md_force_time_, H5T_NATIVE_DOUBLE, &time_fs);
+        }
+
+        Real box_vals[3] = {system->get_box().lx, system->get_box().ly, system->get_box().lz};
+        hid_t filespace = H5Dget_space(h5md_box_edges_);
+        hsize_t offset2[2] = {frame, 0};
+        hsize_t count2[2] = {1, 3};
+        H5Sselect_hyperslab(filespace, H5S_SELECT_SET, offset2, nullptr, count2, nullptr);
+        hid_t memspace = H5Screate_simple(2, count2, nullptr);
+        H5Dwrite(h5md_box_edges_, H5T_NATIVE_DOUBLE, memspace, filespace, H5P_DEFAULT, box_vals);
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+    }
+
+    ++h5md_frame_count_;
+}
+
+void MDSimulation::finalize_h5md_writer() {
+    if (!h5md_active_) return;
+
+    H5Dclose(h5md_position_step_);
+    H5Dclose(h5md_position_time_);
+    H5Dclose(h5md_position_value_);
+    H5Dclose(h5md_id_value_);
+    H5Dclose(h5md_species_value_);
+    H5Dclose(h5md_box_edges_);
+    if (trajectory_include_velocities) {
+        H5Dclose(h5md_velocity_step_);
+        H5Dclose(h5md_velocity_time_);
+        H5Dclose(h5md_velocity_value_);
+    }
+    if (trajectory_include_forces) {
+        H5Dclose(h5md_force_step_);
+        H5Dclose(h5md_force_time_);
+        H5Dclose(h5md_force_value_);
+    }
+    H5Fclose(h5md_file_);
+    h5md_active_ = false;
+}
+#endif // USE_HDF5
+
+// print_timing_report() is defined in timing_breakdown.cpp

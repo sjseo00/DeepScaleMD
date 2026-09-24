@@ -13,36 +13,26 @@
 #include <numeric>    // For std::iota
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <unistd.h>  // For getcwd
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
 
 void MDSystem::resize_particle_storage(size_t count) {
-    particles.x.resize(count); particles.y.resize(count); particles.z.resize(count);
-    particles.vx.resize(count); particles.vy.resize(count); particles.vz.resize(count);
-    particles.fx.resize(count); particles.fy.resize(count); particles.fz.resize(count);
-    particles.mass.resize(count); particles.charge.resize(count);
-    particles.type.resize(count); particles.global_id.resize(count);
-    particles.num_particles = count;
+    // Bypass ParticleData::resize(), which assigns sequential global IDs and
+    // would corrupt IDs when storage grows or shrinks after halo/migration.
+    static_cast<dsdecompx::ParticleInfo&>(particles).resize(count);
 }
 
-MDSystem::MDSystem() : physical_cutoff(12.0), rank(0), size(1), local_start(0), local_end(0), d_particles(nullptr), use_gpu(false), cuda_direct_halo_(false) {
+MDSystem::MDSystem() : physical_cutoff(12.0), rank(0), size(1) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     topology = std::make_unique<Topology>();
     force_manager = std::make_unique<ForceManager>();
-#ifdef USE_CUDA
-    const char* env = std::getenv("MD_CUDA_DIRECT_HALO");
-    if (env && std::string(env)=="1") cuda_direct_halo_ = true;
-#endif
 }
 
-MDSystem::~MDSystem() {
-    if (d_particles) {
-        // Free device memory - implementation depends on backend
-    }
-}
+MDSystem::~MDSystem() = default;
 
 void MDSystem::initialize_mpi() {
     // MPI is already initialized in main.cpp
@@ -400,8 +390,6 @@ void MDSystem::load_topology(const std::string& topo_file,
 
 void MDSystem::setup_domain_decomposition() {
     if (size == 1) {
-        local_start = 0;
-        local_end   = particles.num_particles;
         particles.reset_counts(particles.num_particles, 0);
         box.xlo = 0.0; box.xhi = box.lx;
         box.ylo = 0.0; box.yhi = box.ly;
@@ -473,38 +461,17 @@ void MDSystem::setup_domain_decomposition() {
     scatter_real(particles.mass); scatter_real(particles.charge);
     scatter_int(particles.type); scatter_int(particles.global_id);
 
-    num_local_particles_ = static_cast<size_t>(local_count);
-    particles.num_particles = num_local_particles_;
-    particles.reset_counts(num_local_particles_, 0);
-    local_start = 0;
-    local_end = static_cast<int>(num_local_particles_);
+    const size_t owned_count = static_cast<size_t>(local_count);
+    particles.num_particles = owned_count;
+    particles.reset_counts(owned_count, 0);
     refresh_local_bonded_topology();
 
     if (rank == 0) {
         const auto& dimensions = decomp_runtime_->topology().dimensions();
         std::cout << "Spatial domain decomposition: " << dimensions[0] << "x" << dimensions[1]
                   << "x" << dimensions[2] << " grid, " << total_particles << " particles" << std::endl;
-        std::cout << "  Rank 0: " << num_local_particles_ << " local particles" << std::endl;
+        std::cout << "  Rank 0: " << owned_count << " local particles" << std::endl;
     }
-}
-
-void MDSystem::allocate_device_memory() {
-    if (!use_gpu) return;
-    
-    // Device memory allocation - implementation depends on backend (CUDA/SYCL)
-    // This is handled in the specific force calculator implementations
-}
-
-void MDSystem::copy_to_device() {
-    if (!use_gpu) return;
-    
-    // Copy data to device - implementation depends on backend
-}
-
-void MDSystem::copy_from_device() {
-    if (!use_gpu) return;
-    
-    // Copy data from device - implementation depends on backend
 }
 
 void MDSystem::load_standard_xyz(const std::string& coord_file) {
@@ -823,6 +790,20 @@ void MDSystem::initialize_decomposition_runtime() {
                 const double parsed = std::atof(weight);
                 if (parsed > 0.0) config.topology_info.intra_node_weight = parsed;
             }
+        } else if (selected == "dynamic") {
+            config.grid_policy = dsdecompx::GridPolicy::Dynamic;
+            if (const char* value = std::getenv("DYNAMIC_BALANCE_INTERVAL")) {
+                const long parsed = std::atol(value);
+                if (parsed >= 0) config.dynamic.interval = static_cast<size_t>(parsed);
+            }
+            if (const char* value = std::getenv("DYNAMIC_IMBALANCE_THRESHOLD")) {
+                const double parsed = std::atof(value);
+                if (parsed >= 1.0) config.dynamic.imbalance_threshold = parsed;
+            }
+            if (const char* value = std::getenv("DYNAMIC_RELAXATION")) {
+                const double parsed = std::atof(value);
+                if (parsed > 0.0 && parsed <= 1.0) config.dynamic.relaxation = parsed;
+            }
         }
     }
     config.halo.width = physical_cutoff + verlet_skin_ + 1.0;
@@ -893,28 +874,51 @@ bool MDSystem::migrate_particles_check() {
     if (size == 1) return false;
     if (!decomp_runtime_) return false;
 
-    const size_t local_N = get_local_particles();
-    particles.reset_counts(local_N, ghost_count_);
-    if (!decomp_runtime_->has_out_of_domain_particles(particles)) {
-        return false;
-    }
+    // Robustness-first MPI path: run dsDecompX migration every step.
+    // The cheap pre-check based on owner_rank() can miss edge cases near
+    // periodic wrap/subdomain cuts; invoking migrate() directly lets dsDecompX
+    // perform canonical wrap + owner classification in one place.
+    const auto result = decomp_runtime_->migrate(particles);
+    // BUG FIX: migrate() reassigns which particles this rank owns (and how
+    // many), returned in result.new_owned_count -- this MUST be applied to
+    // `particles` (resize + reset_counts) before anything else runs this
+    // step. get_local_particles()/get_num_particles()/get_ghost_count() all
+    // read straight from `particles.owned_count()`/`ghost_count()`/`size()`
+    // now (see include/md_system.h), so leaving them stale here meant every
+    // downstream consumer (neighbor list build, bonded topology, force
+    // calculation) kept using the PRE-migration local/ghost split for the
+    // rest of the step -- exactly the kind of corruption that produces a
+    // sudden, localized force blowup once a real cross-rank migration
+    // occurs. Mirrors migrate_particles_on_device()'s CUDA-path handling of
+    // this same MigrationResult.
+    resize_particle_storage(result.new_owned_count);
+    particles.reset_counts(result.new_owned_count, 0);
 
-    redistribute_particles_after_scale();
-    invalidate_halo_cache();  // Particles moved; rebuild halo buffers from scratch next time
-    return true;
+    const auto& local = decomp_runtime_->topology().local_domain();
+    box.xlo = local.lower[0]; box.xhi = local.upper[0];
+    box.ylo = local.lower[1]; box.yhi = local.upper[1];
+    box.zlo = local.lower[2]; box.zhi = local.upper[2];
+
+    if (result.ownership_changed) {
+        // Particle ownership changed; halo selection must be rebuilt from
+        // scratch before the next exchange.
+        invalidate_halo_cache();
+    }
+    return result.ownership_changed;
 }
 
 void MDSystem::redistribute_particles_after_scale() {
     if (size == 1) return;
     if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
-    particles.reset_counts(get_local_particles(), ghost_count_);
     const auto result = decomp_runtime_->migrate(particles);
-    const size_t new_local = result.new_owned_count;
-    local_start = 0;
-    local_end   = static_cast<int>(new_local);
-    num_local_particles_ = new_local;
-    ghost_count_ = 0;
+    // BUG FIX: see the identical fix/comment in migrate_particles_check().
+    resize_particle_storage(result.new_owned_count);
+    particles.reset_counts(result.new_owned_count, 0);
 
+    const auto& local = decomp_runtime_->topology().local_domain();
+    box.xlo = local.lower[0]; box.xhi = local.upper[0];
+    box.ylo = local.lower[1]; box.yhi = local.upper[1];
+    box.zlo = local.lower[2]; box.zhi = local.upper[2];
 }
 
 void MDSystem::migrate_particles() {
@@ -1029,11 +1033,11 @@ bool MDSystem::exchange_halo_on_device(ForceCalculatorCUDA& calculator,
     const size_t owned = get_local_particles();
     cudaStream_t stream = calculator.get_force_stream();
     dsdecompx::ParticleInfo storage(
-        owned, ghost_count_, calculator);
+        owned, particles.ghost_count(), calculator);
     const auto result = decomp_runtime_->exchange_halo(
         storage, dsdecompx::HaloExchangeOptions{rebuild_halo, stream});
     resize_particle_storage(owned + result.ghost_count);
-    ghost_count_ = result.ghost_count;
+    particles.reset_counts(owned, result.ghost_count);
     return result.storage_reallocated;
 }
 
@@ -1042,13 +1046,14 @@ bool MDSystem::migrate_particles_on_device(ForceCalculatorCUDA& calculator) {
     const size_t owned = get_local_particles();
     cudaStream_t stream = calculator.get_force_stream();
     dsdecompx::ParticleInfo storage(
-        owned, ghost_count_, calculator);
+        owned, particles.ghost_count(), calculator);
     const auto result = decomp_runtime_->migrate(storage, stream);
     resize_particle_storage(result.new_owned_count);
-    local_start = 0;
-    local_end = static_cast<int>(result.new_owned_count);
-    num_local_particles_ = result.new_owned_count;
-    ghost_count_ = 0;
+    particles.reset_counts(result.new_owned_count, 0);
+    const auto& local = decomp_runtime_->topology().local_domain();
+    box.xlo = local.lower[0]; box.xhi = local.upper[0];
+    box.ylo = local.lower[1]; box.yhi = local.upper[1];
+    box.zlo = local.lower[2]; box.zhi = local.upper[2];
     return result.ownership_changed;
 }
 
@@ -1057,7 +1062,7 @@ void MDSystem::reverse_halo_on_device(ForceCalculatorCUDA& calculator) {
     if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
     const size_t owned = get_local_particles();
     dsdecompx::ParticleInfo storage(
-        owned, ghost_count_, calculator);
+        owned, particles.ghost_count(), calculator);
     decomp_runtime_->reverse_halo(storage, calculator.get_force_stream());
 }
 #endif
@@ -1070,38 +1075,34 @@ dsdecompx::HaloResult MDSystem::perform_halo_exchange(bool rebuild) {
         return {};
     }
     if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
-    particles.reset_counts(get_local_particles(), ghost_count_);
     const auto result = decomp_runtime_->exchange_halo(
         particles, dsdecompx::HaloExchangeOptions{rebuild, nullptr});
-    ghost_count_ = result.ghost_count;
-    particles.num_particles = get_local_particles() + ghost_count_;
     return result;
 }
 
-bool MDSystem::sync_halo_particles(bool rebuild_halo, NeighborList* nlist) {
+bool MDSystem::sync_halo_particles(bool rebuild_halo) {
     if (size == 1) return false;
 
-    (void)nlist;
     const auto result = perform_halo_exchange(rebuild_halo);
     refresh_local_bonded_topology();
     return result.layout_changed;
 }
 
-bool MDSystem::sync_distributed_particles(bool local_rebuild_hint,
-                                          NeighborList* nlist) {
+bool MDSystem::sync_distributed_particles(bool local_rebuild_hint) {
     if (size == 1) {
         return local_rebuild_hint;
     }
 
     bool should_rebuild = unify_rebuild_decision(local_rebuild_hint);
-    if (should_rebuild) {
-        const bool migrated = migrate_particles_check();
-        if (migrated) {
-            should_rebuild = true;
-        }
+
+    // Migration check follows neighbor-rebuild cadence: only run the owner
+    // reclassification path when a rebuild is already due.
+    const bool migrated = should_rebuild ? migrate_particles_check() : false;
+    if (migrated) {
+        should_rebuild = true;
     }
 
-    const bool layout_changed = sync_halo_particles(should_rebuild, nlist);
+    const bool layout_changed = sync_halo_particles(should_rebuild);
     if (layout_changed) should_rebuild = true;
 
     return should_rebuild;
@@ -1116,7 +1117,5 @@ bool MDSystem::unify_rebuild_decision(bool local_rebuild_flag) const {
 void MDSystem::perform_reverse_halo_exchange() {
     if (size == 1) return;
     if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
-    particles.reset_counts(get_local_particles(), ghost_count_);
     decomp_runtime_->reverse_halo(particles);
 }
-

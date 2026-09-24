@@ -29,6 +29,19 @@ public:
             throw std::runtime_error(
                 "CUDA build requires ForceCalculatorCUDA for GPU-resident halo exchange");
         }
+        // Cross-rank ownership migration must run every step, not just on
+        // rebuild steps: a particle can drift past its subdomain boundary on
+        // any step, and until it is reassigned to its new owning rank it is
+        // computed with stale local-frame coordinates on the old rank while
+        // the new rank only ever sees it as a ghost -- missing/duplicated
+        // near-boundary interactions that get worse the longer migration is
+        // skipped. This mirrors the host path's migrate_particles_check(),
+        // which runs unconditionally in MDSystem::sync_distributed_particles()
+        // for exactly this reason. Ownership changes invalidate the halo, so
+        // this must happen before exchange_halo_on_device() below.
+        if (system.migrate_particles_on_device(*cuda)) {
+            should_rebuild = true;
+        }
         // A capacity change invalidates all cached device neighbor indices.
         if (system.exchange_halo_on_device(*cuda, should_rebuild)) {
             should_rebuild = true;

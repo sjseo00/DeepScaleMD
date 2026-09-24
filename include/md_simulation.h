@@ -13,10 +13,16 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 #ifdef USE_ADIOS2
 #include <adios2.h>
+#endif
+
+#ifdef USE_HDF5
+#include <hdf5.h>
 #endif
 
 // Forward-declare MlipRuntime so MD core does NOT need mlip headers
@@ -47,7 +53,7 @@ private:
     std::unique_ptr<Integrator> integrator;
     std::unique_ptr<Thermostat> thermostat;
     std::unique_ptr<Barostat> barostat;
-    std::unique_ptr<NeighborListBuilder> neighbor_builder;
+    std::unique_ptr<NeighborList> neighbor_list_;
     std::unique_ptr<PythonForceInterface> python_interface;
     ForceCalculatorCUDA* cuda_calc_cached_;
     bool using_cuda_backend_cached_;
@@ -72,18 +78,43 @@ private:
     int energy_output_freq;
     Real cutoff_distance;
     Real lj_switch_distance;
-    std::string neighbor_list_type_str;
-    int neighbor_list_tile_size;
     int neighbor_list_update_freq;  // Added neighbor list update frequency
     Real verlet_skin;               // Verlet list skin distance
+    Real neighbor_rebuild_hi_frac;  // rebuild trigger threshold as fraction of skin
+    Real neighbor_rebuild_lo_frac;  // re-arm threshold as fraction of skin
+    int neighbor_displacement_check_stride; // 0: auto (update_freq/4)
     int neighbor_list_builds;       // Count of neighbor list builds
+    int active_graph_prunes_ = 0;   // incremental active-CSR rebuilds
+    int active_graph_reuses_ = 0;   // steps that safely reused active CSR
+    // Rebuild reason diagnostics (a single rebuild can increment multiple
+    // buckets when conditions overlap).
+    int rebuild_reason_periodic_ = 0;
+    int rebuild_reason_adaptive_ = 0;
+    int rebuild_reason_forced_ = 0;
+    int rebuild_reason_mpi_sync_ = 0;
+    int rebuild_reason_box_change_ = 0;
+    int rebuild_reason_other_ = 0;
     // Comma-separated enabled components: builtin, python, libtorch.
     // Components are evaluated in that order and add to the same force buffer.
     std::string force_calculation_mode;
     bool enable_builtin_forces_ = true;
     bool enable_python_forces_ = false;
     bool enable_libtorch_forces_ = false;
-    std::string force_calculation_type;  // "mace", "nequip", "lj", etc.
+    std::string force_calculation_type;
+    std::string force_precision_ = "double";
+
+    std::string nonbonded_kernel_ = "tiled";
+
+    // Opt-in for the unverified Hopper (sm_90+) thread-block-cluster PME
+    // spread kernel; see ForceCalculatorCUDA::set_pme_cluster_spread_enabled.
+    // Ignored on any GPU below compute capability 9.0.
+    bool pme_cluster_spread_ = false;
+
+    // Long-range electrostatics solver: "pme" (default, FFT-based Ewald) or
+    // "fmm" (Fast Multipole Method placeholder -- config surface only, not
+    // implemented; rejected at parse time with a clear error). See the PME
+    // reciprocal-space parallelization roadmap's stage 3.
+    std::string electrostatics_solver_ = "pme";
 
     // Model-agnostic configuration for the Python MLIP adapter.  `mace_config`
     // remains accepted by the parser solely as a legacy YAML section name.
@@ -116,7 +147,7 @@ private:
     
     // Trajectory output settings
     std::string trajectory_format;      // raw config string, kept for logging
-    std::set<std::string> trajectory_formats_;  // parsed: any of xyz, dump, dcd, bp
+    std::set<std::string> trajectory_formats_;  // parsed: any of xyz, dump, dcd, bp, h5md
     bool trajectory_include_velocities; // Include velocities in output
     bool trajectory_include_forces;     // Include forces in output
 
@@ -148,6 +179,22 @@ private:
     adios2::Variable<Real> adios2_var_box_;
     bool adios2_active_ = false;
 #endif
+
+    // ── H5MD writer state (parallel HDF5: every rank writes its own local
+    // particles as a hyperslab of a shared, collectively-extended dataset,
+    // tagged with an "id" dataset so a reader can reassemble global order --
+    // same no-gather design as the ADIOS2 writer above, on the H5MD schema) ─
+#ifdef USE_HDF5
+    hid_t h5md_file_ = -1;
+    hid_t h5md_position_value_ = -1, h5md_position_step_ = -1, h5md_position_time_ = -1;
+    hid_t h5md_velocity_value_ = -1, h5md_velocity_step_ = -1, h5md_velocity_time_ = -1;
+    hid_t h5md_force_value_ = -1, h5md_force_step_ = -1, h5md_force_time_ = -1;
+    hid_t h5md_id_value_ = -1;
+    hid_t h5md_species_value_ = -1;
+    hid_t h5md_box_edges_ = -1;
+    int h5md_frame_count_ = 0;
+    bool h5md_active_ = false;
+#endif
     bool trajectory_writers_initialized_ = false;
 
     // Gathered, global_id-ordered snapshot used by the single-file serial
@@ -172,12 +219,28 @@ private:
     
     // Critical simulation state flags (LAMMPS-style)
     bool neighbor_rebuild_forced;       // Force neighbor rebuild (e.g., after barostat)
+    // Adaptive neighbor rebuild hysteresis state:
+    // trigger when displacement exceeds hi threshold, re-arm only after
+    // dropping below lo threshold to avoid threshold-chatter rebuilds.
+    bool adaptive_rebuild_armed_ = true;
     
-    // Timing infrastructure
-    bool timing_enabled;
-    bool timing_every_step;
+    // ── Timing infrastructure ────────────────────────────────────────────
+    // Two independent opt-in knobs, both env-var driven (see run()):
+    //   MD_TIMING_TRACE=step|every   -- print a per-step [TIMING] line
+    //   MD_TIMING_TRACE_FORCE=1      -- also break "force" into its GPU
+    //                                   components (bonded/lj/electrostatic/
+    //                                   ...); folds into BOTH the per-step
+    //                                   trace line (when tracing is on) and
+    //                                   the always-on end-of-run report.
+    // Replaces the older MD_TIMING / MD_TIMING_EVERY_STEP /
+    // MD_TIMING_FORCE_BREAKDOWN env vars from earlier in this codebase's
+    // history -- those names are no longer read.
+    enum class TimingTraceMode { Off, Step, Every };
+    TimingTraceMode timing_trace_mode_ = TimingTraceMode::Off;
+    bool timing_trace_force_ = false;
+    static TimingTraceMode parse_timing_trace_mode();
+
     struct StepTiming {
-        double domain_ms = 0.0;
         double nlist_build_ms = 0.0;
         double comm_ms = 0.0;
         double migrate_ms = 0.0;
@@ -188,12 +251,21 @@ private:
         double barostat_ms = 0.0;
         double io_ms = 0.0;
         double total_ms = 0.0;
+        // Only populated when timing_trace_force_ is set; empty otherwise.
+        std::vector<std::pair<std::string, double>> force_components_ms;
     } last_timing;
-    
-    // Cumulative timing statistics (LAMMPS-style)
+
+    // Cumulative timing statistics, printed as a tree by print_timing_report()
+    // (src/timing_breakdown.cpp) at the end of the run. total_time is the sum
+    // of per-step wall times (i.e. the MD loop's own time, "Loop time" in
+    // LAMMPS terms); the whole-program wall clock (which also covers
+    // init_time, minimize_time, and the negligible finalize() cost itself)
+    // is passed into finalize() by main.cpp rather than re-measured here.
     struct CumulativeTiming {
+        double init_time = 0.0;         // MDSimulation::initialize()
+        double minimize_time = 0.0;     // run_energy_minimization() (FIRE)
         double neighbor_time = 0.0;     // Neighbor list rebuild/build
-        double force_time = 0.0;        // Force calculation
+        double force_time = 0.0;        // Force calculation (all components)
         double integration_time = 0.0;  // Integrate1 + Integrate2
         double thermostat_time = 0.0;   // Thermostat apply
         double barostat_time = 0.0;     // Barostat apply (+ rebuild trigger handling)
@@ -201,8 +273,10 @@ private:
         double comm_time = 0.0;         // Halo communication/exchange
         double migration_time = 0.0;    // Escaped-particle migration
         double output_time = 0.0;       // Output/IO operations
-        double total_time = 0.0;        // Total simulation time
+        double total_time = 0.0;        // MD loop wall time (sum of step totals)
         int step_count = 0;             // Number of steps timed
+        // Accumulated across steps; only non-empty when timing_trace_force_.
+        std::vector<std::pair<std::string, double>> force_component_time;
     } cumulative_timing;
 
     struct OutputMetrics {
@@ -217,15 +291,26 @@ private:
     };
     
     void print_step_timing(int step);
-    void print_timing_breakdown();   // Print LAMMPS-style timing breakdown
-    
+    // Prints the end-of-run timing tree (src/timing_breakdown.cpp): init,
+    // minimize, md_loop and its per-phase (and, with MD_TIMING_TRACE_FORCE=1,
+    // per-force-component) buckets. program_wallclock_ms is main.cpp's own
+    // measured span covering the whole program (the only place that can see
+    // time spent before this object existed); passing < 0 just omits the
+    // "total (wall clock)"/"unaccounted" rows that compare against it.
+    void print_timing_report(double program_wallclock_ms) const;
+
+    // The actual body of initialize(); wrapped by the public entry point
+    // below purely so its wall-clock time can be recorded into
+    // cumulative_timing.init_time for the report above.
+    void initialize_impl(const std::string& config_file);
+
 public:
     MDSimulation();
     ~MDSimulation();
-    
+
     void initialize(const std::string& config_file);
     void run();
-    void finalize();
+    void finalize(double program_wallclock_ms = -1.0);
     
     void single_step();
     void output_results(int step, bool emit_text = true);
@@ -302,6 +387,12 @@ private:
     void initialize_adios2_writer();
     void write_adios2_frame(int step);
     void finalize_adios2_writer();
+#endif
+
+#ifdef USE_HDF5
+    void initialize_h5md_writer();
+    void write_h5md_frame(int step);
+    void finalize_h5md_writer();
 #endif
 };
 

@@ -2,6 +2,30 @@ cmake_minimum_required(VERSION 3.18)
 
 project(DeepScaleMD VERSION 0.1.0 LANGUAGES CXX)
 
+# PERF: every optimization flag below (-O3, -march=native, -mtune=native) is
+# gated on `$<CONFIG:Release>`, which is CMake's per-target check against
+# CMAKE_BUILD_TYPE. A single-config generator (Makefiles, Ninja) with no
+# -DCMAKE_BUILD_TYPE on the cmake command line leaves that variable EMPTY --
+# not some sane default -- so all three flags silently evaporate and the
+# build falls back to whatever the compiler does with no -O flag at all
+# (GCC/Clang: -O0, no vectorization, no inlining). This is indistinguishable
+# from a "successful" build: it configures, compiles and runs, just at a
+# fraction of the speed, and is a common way for a plain `cmake ..` on an
+# HPC login node to silently produce a debug-speed binary. Default it to
+# Release here so that failure mode requires deliberately overriding this,
+# not deliberately opting in. Skipped for multi-config generators (Visual
+# Studio, Ninja Multi-Config), where CMAKE_BUILD_TYPE has no meaning and the
+# per-target config is chosen at build time instead (e.g. `cmake --build .
+# --config Release`).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING
+        "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+        Debug Release RelWithDebInfo MinSizeRel)
+    message(STATUS "DeepScaleMD: CMAKE_BUILD_TYPE not set, defaulting to Release "
+                    "(pass -DCMAKE_BUILD_TYPE=Debug explicitly for a debug build)")
+endif()
+
 include(CTest)
 
 set(BACKEND "CPU" CACHE STRING
@@ -14,6 +38,8 @@ option(ENABLE_LIBTORCH
        "Enable the native LibTorch/TorchScript MLIP runtime (CUDA only)" OFF)
 option(ENABLE_ADIOS2
        "Enable the ADIOS2 BP parallel trajectory writer (trajectory_format: bp)" OFF)
+option(ENABLE_HDF5
+       "Enable the H5MD parallel trajectory writer (trajectory_format: h5md)" OFF)
 option(NATIVE_OPTIMIZATION
        "Enable native CPU optimization for Release builds" ON)
 set(DSDECOMPX_DIR "" CACHE PATH
@@ -37,6 +63,30 @@ if(BACKEND STREQUAL "CUDA")
 
     if(DEFINED CMAKE_CUDA_HOST_COMPILER)
         message(STATUS "DeepScaleMD: CUDA host compiler ${CMAKE_CUDA_HOST_COMPILER}")
+    endif()
+
+    # Left unset, nvcc falls back to an old default virtual architecture
+    # (pre-Pascal on most toolkits). double-precision atomicAdd -- used
+    # heavily in the per-pair force kernels and PME grid deposition -- has no
+    # native instruction below compute capability 6.0, so nvcc silently emits
+    # a CAS-loop emulation instead. That emulation is what actually runs on
+    # the GPU regardless of its real architecture, and under the heavy
+    # atomicAdd contention in these kernels it is catastrophically slower
+    # (10-100x) than the native instruction. Default to a reasonably modern
+    # architecture list so a plain `cmake -DBACKEND=CUDA` build isn't silently
+    # crippled; override with -DCMAKE_CUDA_ARCHITECTURES=<arch> to match your GPU
+    # exactly (e.g. 86 for RTX A6000/30xx, 80 for A100, 90 for H100).
+    # 90 (Hopper/H100, GH200) is included alongside the workstation/datacenter
+    # Ampere/Ada architectures for forward compatibility with the
+    # thread-block-cluster PME spread launch path (force_calculator_cuda.cu,
+    # pme_spread_charges_cluster_kernel). That kernel itself has no
+    # architecture-specific device code and builds fine for every listed
+    # arch; only the *launch* -- a cudaLaunchKernelEx call with a cluster
+    # dimension attribute -- actually requires Hopper, and that call is
+    # gated at runtime by device_supports_clusters_, never selected on any
+    # GPU below compute capability 9.0.
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
     endif()
 
     enable_language(CUDA)
@@ -92,6 +142,29 @@ else()
     set(_fftw_target deepscalemd_fftw3)
 endif()
 
+# Optional: FFTW's OpenMP-threaded backend. Preferred over libfftw3_threads
+# (pthread-based) since it shares the same OpenMP runtime already linked via
+# OpenMP::OpenMP_CXX rather than mixing two threading models. Purely additive
+# -- if not found, PME reciprocal-space FFTs stay single-threaded (which is
+# also what happens at runtime with OMP_NUM_THREADS=1 either way) and nothing
+# else is affected.
+find_library(FFTW3_OMP_LIBRARY NAMES fftw3_omp)
+if(FFTW3_OMP_LIBRARY)
+    set(_fftw_omp_target ${FFTW3_OMP_LIBRARY})
+    set(DEEPSCALEMD_HAVE_FFTW_OMP TRUE)
+    message(STATUS "DeepScaleMD: found libfftw3_omp (${FFTW3_OMP_LIBRARY}) -- "
+                    "PME reciprocal-space FFTs will run multi-threaded "
+                    "(OMP_NUM_THREADS threads, same as everything else)")
+else()
+    set(_fftw_omp_target "")
+    set(DEEPSCALEMD_HAVE_FFTW_OMP FALSE)
+    message(STATUS "DeepScaleMD: libfftw3_omp NOT found -- PME reciprocal-space "
+                    "FFTs will run SINGLE-THREADED regardless of OMP_NUM_THREADS, "
+                    "which becomes a larger fraction of step time at higher core "
+                    "counts. Install a FFTW3 build with its OpenMP backend (or set "
+                    "FFTW3_OMP_LIBRARY manually) to fix this.")
+endif()
+
 set(DEEPSCALEMD_COMMON_SOURCES
     src/md_system.cpp
     src/topology.cpp
@@ -99,7 +172,8 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/constraint_solver.cpp
     src/thermostat.cpp
     src/barostat.cpp
-    src/neighbor_list.cpp
+    src/neighbor_list_cpu.cpp
+    src/neighbor_list_factory.cpp
     src/minimizer.cpp
     src/simulation_backend_factory.cpp
     src/halo_backend.cpp
@@ -145,10 +219,14 @@ target_include_directories(deepscalemd PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/force_libtorch")
 target_compile_definitions(deepscalemd PRIVATE USE_MPI)
+if(DEEPSCALEMD_HAVE_FFTW_OMP)
+    target_compile_definitions(deepscalemd PRIVATE DEEPSCALEMD_HAVE_FFTW_OMP)
+endif()
 target_link_libraries(deepscalemd PRIVATE
     dsdecompx::dsdecompx
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
+    ${_fftw_omp_target}
     ${_fftw_target}
     ${CMAKE_DL_LIBS})
 
@@ -164,6 +242,24 @@ if(ENABLE_ADIOS2)
     find_package(ADIOS2 REQUIRED)
     target_compile_definitions(deepscalemd PRIVATE USE_ADIOS2)
     target_link_libraries(deepscalemd PRIVATE adios2::cxx11_mpi)
+endif()
+
+if(ENABLE_HDF5)
+    # The H5MD writer opens the file with H5Pset_fapl_mpio() and issues
+    # collective MPI-IO hyperslab writes -- both require an HDF5 build
+    # configured with --enable-parallel. A serial HDF5 install is missing
+    # H5Pset_fapl_mpio entirely, so fail early with a clear message instead
+    # of a confusing undefined-reference/link error later.
+    find_package(HDF5 REQUIRED COMPONENTS C)
+    if(NOT HDF5_IS_PARALLEL)
+        message(FATAL_ERROR
+            "ENABLE_HDF5 requires a parallel HDF5 build (configured with "
+            "--enable-parallel / HDF5_ENABLE_PARALLEL=ON), but the HDF5 "
+            "found at ${HDF5_C_LIBRARIES} is serial-only.")
+    endif()
+    target_compile_definitions(deepscalemd PRIVATE USE_HDF5)
+    target_include_directories(deepscalemd PRIVATE ${HDF5_C_INCLUDE_DIRS})
+    target_link_libraries(deepscalemd PRIVATE ${HDF5_C_LIBRARIES})
 endif()
 
 if(BACKEND STREQUAL "CPU")
@@ -206,13 +302,88 @@ else()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
+    # PERF: applied to RelWithDebInfo too, not just Release -- RelWithDebInfo
+    # is the build type people actually reach for when profiling (e.g. `perf
+    # stat`/`perf record` want symbols), and a profile taken from an
+    # unoptimized-but-symbolized binary tells you nothing about where the
+    # optimized binary spends time.
+    set(_deepscalemd_opt_configs "$<CONFIG:Release,RelWithDebInfo>")
     target_compile_options(deepscalemd PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-Wall>
-        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>)
+        $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-O3>
+        # PERF: safe, ISA-independent vectorization unlock. By default GCC/
+        # Clang treat sqrt/pow/exp/etc as having the side effect of setting
+        # `errno` on a domain error (glibc's libm behavior), which the
+        # standard permits them to assume the caller might check. Nothing in
+        # this codebase ever reads errno after a math call, but the compiler
+        # can't know that, so it refuses to vectorize (or even inline as a
+        # single hardware instruction) any loop containing sqrt/exp/erfc --
+        # exactly the loops that matter here: the tile bounding-sphere cull,
+        # minimum-image distance checks, and the Ewald table build all call
+        # sqrt or exp per iteration. -fno-math-errno tells the compiler no
+        # caller depends on errno from these, which is true here, and changes
+        # NO rounding behavior or numerical result -- it only unlocks
+        # instruction selection/vectorization the standard otherwise forbids.
+        # -fno-trapping-math is the same kind of unlock for FP exceptions,
+        # which this codebase never traps on. Neither flag is -ffast-math:
+        # they do not permit reassociation, do not assume no NaN/Inf, and do
+        # not change any energy/virial computation's result.
+        $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-fno-math-errno>
+        $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-fno-trapping-math>)
     if(NATIVE_OPTIMIZATION)
+        # PERF: -march=native only helps if the CPU that builds the binary is
+        # the same as the CPU that runs it -- NOT guaranteed on an HPC
+        # cluster, where a login/build node can be a different (often older)
+        # generation than the compute nodes jobs actually run on. That
+        # mismatch fails in one of two silent-ish ways: built-for-older-CPU
+        # leaves AVX-512/newer-AVX2 features unused on the compute node
+        # (correct but slow, exactly this ticket's symptom), or
+        # built-for-newer-CPU raises SIGILL the moment an unsupported
+        # instruction executes on the compute node. Override with
+        # -DDEEPSCALEMD_TARGET_ARCH=<gcc -march value> (e.g. skylake-avx512,
+        # znver3, x86-64-v3) when building on a node that does not match
+        # where the binary will actually run; this defaults to the historical
+        # "native" behavior when left unset.
+        set(DEEPSCALEMD_TARGET_ARCH "native" CACHE STRING
+            "-march/-mtune value for NATIVE_OPTIMIZATION (default: native, i.e. the build machine's own CPU -- override on HPC systems where the build node differs from the compute node, e.g. skylake-avx512, znver3, x86-64-v3)")
         target_compile_options(deepscalemd PRIVATE
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-march=native>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-mtune=native>)
+            $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-march=${DEEPSCALEMD_TARGET_ARCH}>
+            $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-mtune=${DEEPSCALEMD_TARGET_ARCH}>)
+        message(STATUS "DeepScaleMD: CPU codegen target = ${DEEPSCALEMD_TARGET_ARCH} "
+                        "(applies to Release/RelWithDebInfo only; set NATIVE_OPTIMIZATION=OFF to disable, "
+                        "or -DDEEPSCALEMD_TARGET_ARCH=<value> to target a different CPU than the build machine)")
+    else()
+        message(STATUS "DeepScaleMD: NATIVE_OPTIMIZATION=OFF -- building for the compiler's "
+                        "generic baseline ISA (no AVX2/AVX-512/FMA). The CPU nonbonded kernels "
+                        "in force_calculator_cpu.cpp have hand-written AVX2 paths that fall back "
+                        "to scalar code without it; expect substantially slower LJ/PME real-space "
+                        "performance than the same run built with NATIVE_OPTIMIZATION=ON.")
+    endif()
+
+    # PERF (opt-in): cross-translation-unit inlining/optimization. Off by
+    # default -- it materially increases link time and, on some toolchains,
+    # can interact awkwardly with a CUDA build's split host/device linking --
+    # but the CPU-only build is dominated by one large hot translation unit
+    # (force_calculator_cpu.cpp) calling into small helpers defined in
+    # neighbor_list_cpu.cpp (tile graph accessors) and md_types.h; LTO lets
+    # the compiler inline and specialize across that boundary the way a
+    # single-TU build already can. Enable with -DENABLE_LTO=ON; verify the
+    # exact-PE regression tests (ctest) still pass after enabling it, since
+    # LTO's more aggressive inlining can occasionally change floating-point
+    # evaluation order at -O3.
+    option(ENABLE_LTO "Enable interprocedural (link-time) optimization for Release/RelWithDebInfo builds" OFF)
+    if(ENABLE_LTO)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT _deepscalemd_ipo_supported OUTPUT _deepscalemd_ipo_error)
+        if(_deepscalemd_ipo_supported)
+            set_target_properties(deepscalemd PROPERTIES
+                INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+                INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+            message(STATUS "DeepScaleMD: ENABLE_LTO=ON -- link-time optimization enabled for Release/RelWithDebInfo")
+        else()
+            message(WARNING "DeepScaleMD: ENABLE_LTO=ON but this toolchain does not support IPO/LTO "
+                             "(${_deepscalemd_ipo_error}); continuing without it.")
+        endif()
     endif()
 endif()
 
@@ -279,6 +450,16 @@ if(BUILD_TESTING)
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             "-DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestTrajectoryOutput.cmake")
+
+    if(ENABLE_HDF5)
+        add_test(
+            NAME dsMD_input_h5md_output
+            COMMAND "${CMAKE_COMMAND}"
+                "-DDSMD_EXECUTABLE=$<TARGET_FILE:deepscalemd>"
+                "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                "-DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestTrajectoryOutputH5MD.cmake")
+    endif()
 endif()
 
 message(STATUS "DeepScaleMD backend: ${BACKEND}")

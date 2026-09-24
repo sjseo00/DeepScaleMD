@@ -3,7 +3,6 @@
 #include "mpi_utils.h"
 #include <iostream>
 #include <chrono>
-#include <iomanip>
 #include <string>
 #include <cstring>
 #include <cstdlib>
@@ -60,47 +59,31 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        // Create and initialize simulation
-        auto init_start = std::chrono::high_resolution_clock::now();
+        // Create and initialize simulation. Per-phase timing (init, minimize,
+        // the MD loop and its sub-phases) is tracked internally by
+        // MDSimulation and printed as a single report inside finalize() --
+        // see src/timing_breakdown.cpp. The only thing this function needs
+        // to measure itself is the whole-program wall clock, since that
+        // starts before this object exists.
         MDSimulation simulation;
-        
         simulation.initialize(config_file);
-        auto init_end = std::chrono::high_resolution_clock::now();
-        
-        if (is_rank_zero()) {
-            auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start);
-            std::cout << "Initialization time: " << std::fixed << std::setprecision(3) 
-                      << init_duration.count() / 1000.0 << " seconds" << std::endl;
-        }
 
-        // Run simulation
         if (is_rank_zero()) {
             std::cout << "Starting simulation run..." << std::endl;
         }
-        
-        auto run_start = std::chrono::high_resolution_clock::now();
         simulation.run();
-        auto run_end = std::chrono::high_resolution_clock::now();
-        
-        if (is_rank_zero()) {
-            auto run_duration = std::chrono::duration_cast<std::chrono::milliseconds>(run_end - run_start);
-            std::cout << "Simulation run time: " << std::fixed << std::setprecision(3) 
-                      << run_duration.count() / 1000.0 << " seconds" << std::endl;
-        }
 
-        // Finalize
-        simulation.finalize();
-        
-        // Calculate and print total execution time
         auto end_time = std::chrono::high_resolution_clock::now();
         auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-        
+
+        // CRITICAL: every rank must call finalize() -- its timing report
+        // uses MPI_Reduce.
+        simulation.finalize(static_cast<double>(total_duration.count()));
+
         if (is_rank_zero()) {
-            std::cout << "=== Total execution time: " << std::fixed << std::setprecision(3) 
-                      << total_duration.count() / 1000.0 << " seconds ===" << std::endl;
             std::cout << "=== MD Simulation Completed ===" << std::endl;
         }
-        
+
     } catch (const std::exception& e) {
         if (is_rank_zero()) {
             std::cerr << "Error: " << e.what() << std::endl;

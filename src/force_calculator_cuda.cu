@@ -1,6 +1,7 @@
 #include "../include/force_calculator_cuda.h"
 #include "../include/force_calculator.h"
 #include "../include/md_system.h"
+#include "../include/neighbor_list.h"
 #include "../include/topology.h"
 #include "../include/mpi_utils.h"
 #include "../include/md_types.h"
@@ -16,6 +17,9 @@ using namespace mlip;
 #include <algorithm>   // std::sort, std::unique, std::distance
 #include <unordered_map>
 #include <utility>     // std::pair
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
 
 // C bridge functions (defined in src/force_libtorch/mlip_force_bridge.cpp):
 void mlip_bridge_register_md_sources(void* fc_cuda_ptr);
@@ -66,9 +70,30 @@ __global__ void k_min_image_edge_vectors(
     ev[e*3]           = dx;  ev[e*3+1]           = dy;  ev[e*3+2]           = dz;
     ev[(E_half+e)*3]  = -dx; ev[(E_half+e)*3+1]  = -dy; ev[(E_half+e)*3+2]  = -dz;
 }
+
+__global__ void k_min_image_edge_vectors_directed(
+    const double* __restrict__ x, const double* __restrict__ y,
+    const double* __restrict__ z, const int32_t* __restrict__ src,
+    const int32_t* __restrict__ dst, float* __restrict__ ev, int64_t edges,
+    float lx, float ly, float lz, bool px, bool py, bool pz)
+{
+    const int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (e >= edges) return;
+    const int s = src[e], d = dst[e];
+    float dx = static_cast<float>(x[d] - x[s]);
+    float dy = static_cast<float>(y[d] - y[s]);
+    float dz = static_cast<float>(z[d] - z[s]);
+    if (px) { if (dx > lx * 0.5f) dx -= lx; else if (dx < -lx * 0.5f) dx += lx; }
+    if (py) { if (dy > ly * 0.5f) dy -= ly; else if (dy < -ly * 0.5f) dy += ly; }
+    if (pz) { if (dz > lz * 0.5f) dz -= lz; else if (dz < -lz * 0.5f) dz += lz; }
+    ev[e * 3] = dx; ev[e * 3 + 1] = dy; ev[e * 3 + 2] = dz;
+}
 #include <iostream>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+#include <thrust/system/cuda/execution_policy.h>
 #include <mpi.h>
 #include <cmath>
 #include <cufft.h>
@@ -129,9 +154,15 @@ __global__ void clear_forces_kernel(Real* fx, Real* fy, Real* fz, size_t n) {
     }
 }
 
-__device__ inline void apply_minimum_image_device(Real& dx, Real& dy, Real& dz,
-                                                   Real box_x, Real box_y, Real box_z,
-                                                   Real inv_box_x, Real inv_box_y, Real inv_box_z) {
+// Templated so callers on the mixed-precision (PairT=float) hot path can
+// wrap in float instead of paying double round()/multiply throughput: the
+// wrap only has to pick the correct periodic image, a decision box>>cutoff
+// makes trivially tolerant of float's ~1e-7 relative error, so there is no
+// accuracy reason to force this through double.
+template <typename T>
+__device__ inline void apply_minimum_image_device(T& dx, T& dy, T& dz,
+                                                    T box_x, T box_y, T box_z,
+                                                    T inv_box_x, T inv_box_y, T inv_box_z) {
     // Branchless optimization using round
     dx -= box_x * round(dx * inv_box_x);
     dy -= box_y * round(dy * inv_box_y);
@@ -144,168 +175,371 @@ __device__ inline unsigned long long exclusion_pair_key(int atom1, int atom2) {
     return (static_cast<unsigned long long>(lo) << 32) | hi;
 }
 
-__device__ inline bool is_excluded_pair(const unsigned long long* keys,
-                                        size_t count, int atom1, int atom2) {
-    if (count == 0) return false;
-    const unsigned long long target = exclusion_pair_key(atom1, atom2);
-    size_t first = 0, last = count;
-    while (first < last) {
-        const size_t middle = first + (last - first) / 2;
-        if (keys[middle] < target) first = middle + 1;
-        else last = middle;
+__device__ inline bool is_excluded_pair(const int* offsets,
+                                        const int* partners,
+                                        size_t atom_count,
+                                        int atom1, int atom2) {
+    if (!offsets || !partners || atom1 < 0 ||
+        static_cast<size_t>(atom1) >= atom_count) return false;
+    // Molecular exclusion degree is small (normally bonded 1-2/1-3/1-4
+    // neighbors), so a short contiguous scan is much cheaper than a binary
+    // search through the run-wide pair-key array for every nonbonded pair.
+    const int begin = offsets[atom1];
+    const int end = offsets[atom1 + 1];
+    for (int index = begin; index < end; ++index) {
+        const int candidate = partners[index];
+        if (candidate == atom2) return true;
+        if (candidate > atom2) break;
     }
-    return first < count && keys[first] == target;
+    return false;
 }
 
-__global__ void compute_lj_forces_kernel(
-    Real* x, Real* y, Real* z, 
-    Real* fx, Real* fy, Real* fz,
-    int* type, int* global_id,
-    int* neighbors, int* num_neighbors, int* neighbor_offset,
-    Real* epsilon_mixed, Real* sigma_mixed,
-    const unsigned long long* exclusion_keys, size_t num_exclusions,
-    Real* potential_energy,
-    Real* virial,  // NEW: virial for pressure calculation
+// Fixed-point force accumulation for the LJ and Ewald real-space pair
+// kernels. atomicAdd on a native double force buffer is race-safe but not
+// bit-reproducible: the summation order concurrent threads happen to apply
+// their atomics in is scheduling-dependent, so results can drift slightly
+// run to run. Scaling each contribution to a 64-bit integer before the
+// atomic add makes 64-bit integer addition commutative/associative in
+// hardware, so the reduction becomes order-independent. Scale chosen to
+// leave headroom for the largest forces seen near LJ-repulsive-wall
+// contacts while keeping sub-part-per-billion rounding error for typical
+// pair forces (int64 range / scale ~= 8.8e12 in force units).
+#define FORCE_FIXED_SCALE 1048576.0  // 2^20
+
+__device__ __forceinline__ long long real_to_fixed_force(Real val) {
+    return static_cast<long long>(llround(val * FORCE_FIXED_SCALE));
+}
+
+__device__ __forceinline__ Real fixed_force_to_real(long long val) {
+    return static_cast<Real>(val) * (1.0 / FORCE_FIXED_SCALE);
+}
+
+__device__ __forceinline__ void atomicAddFixed(long long* addr, Real val) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(addr),
+              static_cast<unsigned long long>(real_to_fixed_force(val)));
+}
+
+// Converts the fixed-point scratch buffers back into the double force
+// buffers. One thread per particle, no atomics needed: this always runs on
+// force_stream strictly after the racy kernel that filled the fixed buffers
+// (stream-ordered), so there is no concurrent writer left when it executes.
+__global__ void flush_fixed_forces_kernel(
+    const long long* __restrict__ fx_fixed,
+    const long long* __restrict__ fy_fixed,
+    const long long* __restrict__ fz_fixed,
+    Real* __restrict__ fx, Real* __restrict__ fy, Real* __restrict__ fz,
+    size_t n)
+{
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    fx[i] += fixed_force_to_real(fx_fixed[i]);
+    fy[i] += fixed_force_to_real(fy_fixed[i]);
+    fz[i] += fixed_force_to_real(fz_fixed[i]);
+}
+
+constexpr int LJ_CLUSTER_SIZE = 8;
+constexpr int LJ_CLUSTER_GROUPS_PER_WARP = 32 / LJ_CLUSTER_SIZE;
+
+__global__ void compute_max_displacement_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const Real* __restrict__ x_ref, const Real* __restrict__ y_ref,
+    const Real* __restrict__ z_ref, Real* max_disp_sq,
+    Real box_x, Real box_y, Real box_z,
+    bool periodic_x, bool periodic_y, bool periodic_z, size_t n);
+
+// Device-shared Mie-potential (LJ, n=12 special-cased) pair force/energy,
+// with optional switching -- the math core of compute_lj_forces_tiled_kernel
+// and compute_nonbonded_forces_tiled_kernel below, extracted so both call one
+// copy instead of duplicating it (mirrors compute_lj_pair() on the CPU side,
+// force_calculator_cpu.cpp).
+template <typename PairT>
+__device__ __forceinline__ void device_compute_lj_pair(
+        PairT r2, PairT eps, PairT sig, int mie_n, int mie_m, PairT mie_prefactor,
+        PairT cutoff_sq, PairT switch_distance, PairT switch_sq, PairT inv_denom,
+        PairT& force_mag, PairT& pe_pair) {
+    PairT r2inv = PairT(1.0) / r2;
+    PairT attractive, repulsive;
+    if (mie_n == 12) {
+        PairT sig2 = sig * sig;
+        PairT sig6 = sig2 * sig2 * sig2;
+        attractive = sig6 * r2inv * r2inv * r2inv;
+        repulsive = attractive * attractive;
+    } else {
+        PairT sig_r = sig * sqrt(r2inv);
+        PairT sig3_r3 = sig_r * sig_r * sig_r;
+        attractive = sig3_r3 * sig3_r3;
+        repulsive = attractive * sig3_r3;
+    }
+    force_mag = mie_prefactor * eps * r2inv * (mie_n * repulsive - mie_m * attractive);
+    pe_pair = mie_prefactor * eps * (repulsive - attractive);
+    if (switch_distance > PairT(0.0) && r2 > switch_sq) {
+        PairT a = cutoff_sq - r2;
+        PairT b = cutoff_sq + PairT(2.0) * r2 - PairT(3.0) * switch_sq;
+        PairT switch_value = a * a * b * inv_denom;
+        PairT force_correction = PairT(12.0) * pe_pair * a * (r2 - switch_sq) * inv_denom;
+        force_mag = switch_value * force_mag + force_correction;
+        pe_pair *= switch_value;
+    }
+}
+
+template <typename PairT>
+__global__ void compute_lj_forces_tiled_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    long long* __restrict__ fx_fixed, long long* __restrict__ fy_fixed, long long* __restrict__ fz_fixed,
+    const int* __restrict__ type, const int* __restrict__ global_id,
+    const int* __restrict__ tile_atoms,
+    const int* __restrict__ tile_pair_offsets, const int* __restrict__ tile_pair_j,
+    const unsigned long long* __restrict__ tile_pair_verlet_mask,
+    const Real* __restrict__ epsilon_mixed, const Real* __restrict__ sigma_mixed,
+    const int* __restrict__ exclusion_offsets, const int* __restrict__ exclusion_partners,
+    size_t exclusion_atom_count,
+    Real* __restrict__ potential_energy,
+    Real* __restrict__ virial,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     size_t local_particles, size_t total_particles,
     int max_types,
     int mie_n, int mie_m, Real mie_prefactor,
-    Real cutoff_sq, Real switch_distance) {
-    
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    // REMOVED early return to allow all threads to participate in reduction
-    // if (i >= local_particles) return;
-    
-    Real fx_acc = 0.0;
-    Real fy_acc = 0.0;
-    Real fz_acc = 0.0;
-    Real pe_acc = 0.0;
-    Real virial_acc = 0.0;  // NEW: virial accumulator
-    
-    // Only active particles compute forces
-    if (i < local_particles) {
-        // Load particle i data
-        Real xi = x[i];
-        Real yi = y[i];
-        Real zi = z[i];
-        int type_i = type[i];
-        int gid_i = global_id[i];
-        
-        int n_start = neighbor_offset[i];
-        int n_count = num_neighbors[i];
-        
-        // Optimized loop - use direct neighbor count instead of end calculation
-        for (int n = 0; n < n_count; ++n) {
-            size_t j = neighbors[n_start + n];
-            if (j >= total_particles) continue;
-            
-            Real dx = xi - x[j];
-            Real dy = yi - y[j];
-            Real dz = zi - z[j];
-            
-            apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z, 
-                                       inv_box_x, inv_box_y, inv_box_z);
-            
-            Real r2 = dx*dx + dy*dy + dz*dz;
-            
-            if (r2 >= cutoff_sq || r2 < 1e-10) continue;
-            
-            bool j_is_local = (j < local_particles);
-            
-            int type_j = type[j];
-            if (is_excluded_pair(exclusion_keys, num_exclusions, gid_i,
-                                 global_id[j])) continue;
-            size_t type_idx = type_i * max_types + type_j;
-            Real eps = epsilon_mixed[type_idx];
-            Real sig = sigma_mixed[type_idx];
-            
-            Real r2inv = 1.0 / r2;
-            Real attractive;
-            Real repulsive;
-            if (mie_n == 12) {
-                Real sig2 = sig * sig;
-                Real sig6 = sig2 * sig2 * sig2;
-                attractive = sig6 * r2inv * r2inv * r2inv;
-                repulsive = attractive * attractive;
-            } else {
-                Real sig_r = sig * sqrt(r2inv);
-                Real sig3_r3 = sig_r * sig_r * sig_r;
-                attractive = sig3_r3 * sig3_r3;
-                repulsive = attractive * sig3_r3;
-            }
-            Real force_mag = mie_prefactor * eps * r2inv *
-                (mie_n * repulsive - mie_m * attractive);
-            Real pe_pair = mie_prefactor * eps * (repulsive - attractive);
-            if (switch_distance > 0.0 && r2 > switch_distance * switch_distance) {
-                Real switch_sq = switch_distance * switch_distance;
-                Real cutoff_delta = cutoff_sq - switch_sq;
-                Real a = cutoff_sq - r2;
-                Real b = cutoff_sq + 2.0 * r2 - 3.0 * switch_sq;
-                Real denom = cutoff_delta * cutoff_delta * cutoff_delta;
-                Real switch_value = a * a * b / denom;
-                Real force_correction = 12.0 * pe_pair * a * (r2 - switch_sq) / denom;
-                force_mag = switch_value * force_mag + force_correction;
-                pe_pair *= switch_value;
-            }
-            
-            // Energy counting (Newton off, full list):
-            // - local-local pair: counted twice, use factor 0.5
-            // - local-ghost pair: use global_id to avoid double counting
-            int gid_j = global_id[j];
-            if (j_is_local) {
-                pe_acc += 0.5 * pe_pair;
-            } else {
-                if (gid_i < gid_j) {
-                    pe_acc += pe_pair;
-                }
-            }
-            
-            // Force components
-            Real fx_pair = force_mag * dx;
-            Real fy_pair = force_mag * dy;
-            Real fz_pair = force_mag * dz;
-            
-            fx_acc += fx_pair;
-            fy_acc += fy_pair;
-            fz_acc += fz_pair;
-            
-            // NEW: Virial calculation (r · F)
-            // Count only local-local pairs with factor 0.5, or local-ghost with gid check
-            if (j_is_local) {
-                virial_acc += 0.5 * (dx * fx_pair + dy * fy_pair + dz * fz_pair);
-            } else {
-                if (gid_i < gid_j) {
-                    virial_acc += (dx * fx_pair + dy * fy_pair + dz * fz_pair);
-                }
-            }
-        }
-        
-        // Direct write - no atomics needed since each thread updates its own particle
-        fx[i] += fx_acc;
-        fy[i] += fy_acc;
-        fz[i] += fz_acc;
-    }
-    
-    // Warp-level reduction for potential energy and virial
-    // All threads in the warp must participate. 
-    // Threads with i >= local_particles contribute 0.0 (pe_acc initialized to 0.0)
-    // Use __activemask() to be safe, but 0xffffffff is fine if we ensure no divergence in control flow reaching here
-    // (which we did by removing early return)
-    // unsigned int mask = __activemask(); 
-    for (int offset = 16; offset > 0; offset /= 2) {
-        pe_acc += __shfl_down_sync(0xffffffff, pe_acc, offset);
-        virial_acc += __shfl_down_sync(0xffffffff, virial_acc, offset);  // NEW: reduce virial too
+    Real cutoff_sq, Real switch_distance, Real switch_sq, Real inv_denom,
+    int num_tiles,
+    // Opt-in diagnostic counters (see d_tile_pair_stats_'s comment in
+    // force_calculator_cuda.h): [0] += 1 per candidate atom pair actually
+    // tested against the cutoff, [1] += 1 per pair that passes it (real
+    // pair). Null (the default) skips both atomicAdds entirely.
+    unsigned long long* __restrict__ pair_stats)
+{
+    const int global_lane = threadIdx.x % 32;
+    const int group = global_lane / LJ_CLUSTER_SIZE;   // which sub-group (0..3) this lane belongs to
+    const int sub = global_lane % LJ_CLUSTER_SIZE;      // lane index within its sub-group (0..7)
+    const unsigned GROUP_MASK = 0xFFu << (group * LJ_CLUSTER_SIZE);
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int tile_index = warp_id * LJ_CLUSTER_GROUPS_PER_WARP + group;
+
+    const bool valid_pair = tile_index < num_tiles;
+    const int safe_tile_index = valid_pair ? tile_index : 0;
+
+    int i_atom = tile_atoms[safe_tile_index * LJ_CLUSTER_SIZE + sub];
+    bool valid_i = valid_pair && (i_atom >= 0) && (static_cast<size_t>(i_atom) < local_particles);
+
+    PairT xi = 0.0, yi = 0.0, zi = 0.0;
+    int type_i = 0, gid_i = 0;
+    if (i_atom >= 0) {
+        xi = static_cast<PairT>(x[i_atom]);
+        yi = static_cast<PairT>(y[i_atom]);
+        zi = static_cast<PairT>(z[i_atom]);
+        type_i = type[i_atom]; gid_i = global_id[i_atom];
     }
 
-    // Only the first thread in each warp adds to global memory
-    if ((threadIdx.x & 31) == 0) {
+    const PairT cutoff_sq_p = static_cast<PairT>(cutoff_sq);
+    const PairT switch_distance_p = static_cast<PairT>(switch_distance);
+    // PERF FIX: see compute_lj_forces_kernel above.
+    const PairT switch_sq_p = static_cast<PairT>(switch_sq);
+    const PairT inv_denom_p = static_cast<PairT>(inv_denom);
+    const PairT mie_prefactor_p = static_cast<PairT>(mie_prefactor);
+    const PairT box_x_p = static_cast<PairT>(box_x);
+    const PairT box_y_p = static_cast<PairT>(box_y);
+    const PairT box_z_p = static_cast<PairT>(box_z);
+    const PairT inv_box_x_p = static_cast<PairT>(inv_box_x);
+    const PairT inv_box_y_p = static_cast<PairT>(inv_box_y);
+    const PairT inv_box_z_p = static_cast<PairT>(inv_box_z);
+
+    // Accumulated across EVERY neighbor tile of this home tile (the whole
+    // point of this restructuring): one atomicAddFixed triplet at the very
+    // end instead of one per neighbor tile.
+    Real fx_i_acc = 0.0, fy_i_acc = 0.0, fz_i_acc = 0.0;
+    Real pe_acc = 0.0, virial_acc = 0.0;
+
+    const int e_begin = valid_pair ? tile_pair_offsets[safe_tile_index] : 0;
+    const int e_end   = valid_pair ? tile_pair_offsets[safe_tile_index + 1] : 0;
+
+    for (int e = e_begin; e < e_end; ++e) {
+        // Same address for all 8 lanes of this sub-group -- an ordinary
+        // (broadcast/cached) global load, no shuffle needed.
+        int tile_j = tile_pair_j[e];
+        const unsigned long long verlet_mask = tile_pair_verlet_mask[e];
+        if (verlet_mask == 0) continue;
+        bool same_tile = (tile_j == safe_tile_index);
+
+        int j_atom0 = tile_atoms[tile_j * LJ_CLUSTER_SIZE + sub];
+        PairT xj0 = 0.0, yj0 = 0.0, zj0 = 0.0;
+        int type_j0 = 0, gid_j0 = 0;
+        if (j_atom0 >= 0) {
+            xj0 = static_cast<PairT>(x[j_atom0]);
+            yj0 = static_cast<PairT>(y[j_atom0]);
+            zj0 = static_cast<PairT>(z[j_atom0]);
+            type_j0 = type[j_atom0]; gid_j0 = global_id[j_atom0];
+        }
+
+        Real fx_j_acc = 0.0, fy_j_acc = 0.0, fz_j_acc = 0.0;
+
+        for (int shift = 0; shift < LJ_CLUSTER_SIZE; ++shift) {
+            int src = (sub + shift) & (LJ_CLUSTER_SIZE - 1);
+            int j_atom   = __shfl_sync(GROUP_MASK, j_atom0, src, LJ_CLUSTER_SIZE);
+            PairT xj     = __shfl_sync(GROUP_MASK, xj0, src, LJ_CLUSTER_SIZE);
+            PairT yj     = __shfl_sync(GROUP_MASK, yj0, src, LJ_CLUSTER_SIZE);
+            PairT zj     = __shfl_sync(GROUP_MASK, zj0, src, LJ_CLUSTER_SIZE);
+            int type_j   = __shfl_sync(GROUP_MASK, type_j0, src, LJ_CLUSTER_SIZE);
+            int gid_j    = __shfl_sync(GROUP_MASK, gid_j0, src, LJ_CLUSTER_SIZE);
+
+            const bool in_verlet =
+                ((verlet_mask >> (src * LJ_CLUSTER_SIZE + sub)) & 1ULL) != 0;
+            bool accepted = in_verlet && valid_i && (j_atom >= 0);
+            if (accepted && same_tile) {
+                bool j_is_local = static_cast<size_t>(j_atom) < local_particles;
+                if (j_is_local && !(j_atom > i_atom)) accepted = false;
+            }
+
+            Real my_fxj = 0.0, my_fyj = 0.0, my_fzj = 0.0;
+            if (accepted) {
+                if (pair_stats) atomicAdd(&pair_stats[0], 1ULL);
+                PairT dxp = xi - xj;
+                PairT dyp = yi - yj;
+                PairT dzp = zi - zj;
+                apply_minimum_image_device(dxp, dyp, dzp, box_x_p, box_y_p, box_z_p,
+                                           inv_box_x_p, inv_box_y_p, inv_box_z_p);
+
+                PairT r2 = dxp*dxp + dyp*dyp + dzp*dzp;
+
+                bool j_is_local = static_cast<size_t>(j_atom) < local_particles;
+
+                if (r2 < cutoff_sq_p && r2 >= PairT(1e-10) &&
+                    !is_excluded_pair(exclusion_offsets, exclusion_partners,
+                                      exclusion_atom_count, gid_i, gid_j)) {
+                    if (pair_stats) atomicAdd(&pair_stats[1], 1ULL);
+                    size_t type_idx = static_cast<size_t>(type_i) * max_types + type_j;
+                    PairT eps = static_cast<PairT>(epsilon_mixed[type_idx]);
+                    PairT sig = static_cast<PairT>(sigma_mixed[type_idx]);
+
+                    PairT force_mag, pe_pair;
+                    device_compute_lj_pair(r2, eps, sig, mie_n, mie_m, mie_prefactor_p,
+                                           cutoff_sq_p, switch_distance_p, switch_sq_p, inv_denom_p,
+                                           force_mag, pe_pair);
+
+                    Real fx_pair = static_cast<Real>(force_mag * dxp);
+                    Real fy_pair = static_cast<Real>(force_mag * dyp);
+                    Real fz_pair = static_cast<Real>(force_mag * dzp);
+
+                    fx_i_acc += fx_pair; fy_i_acc += fy_pair; fz_i_acc += fz_pair;
+                    Real virial_pair = static_cast<Real>(dxp) * fx_pair +
+                        static_cast<Real>(dyp) * fy_pair + static_cast<Real>(dzp) * fz_pair;
+
+                    if (j_is_local) {
+                        my_fxj = -fx_pair; my_fyj = -fy_pair; my_fzj = -fz_pair;
+                        pe_acc += static_cast<Real>(pe_pair);
+                        virial_acc += virial_pair;
+                    } else if (gid_i < gid_j) {
+                        pe_acc += static_cast<Real>(pe_pair);
+                        virial_acc += virial_pair;
+                    }
+                }
+            }
+
+            // Route this step's j-side reaction force back to the lane that
+            // actually owns j_atom0 *within this sub-group*: at shift s, the
+            // lane at local offset M computed a contribution intended for the
+            // atom currently at local offset (M+s)&7, so local offset L must
+            // pick up the contribution computed by local offset (L-s)&7 this
+            // step. width=LJ_CLUSTER_SIZE keeps this confined to the sub-group.
+            int recv_from = (sub - shift) & (LJ_CLUSTER_SIZE - 1);
+            fx_j_acc += __shfl_sync(GROUP_MASK, my_fxj, recv_from, LJ_CLUSTER_SIZE);
+            fy_j_acc += __shfl_sync(GROUP_MASK, my_fyj, recv_from, LJ_CLUSTER_SIZE);
+            fz_j_acc += __shfl_sync(GROUP_MASK, my_fzj, recv_from, LJ_CLUSTER_SIZE);
+        }
+
+        // j_atom0 may be a ghost slot (valid index, but outside
+        // local_particles). fx_j_acc is guaranteed 0 for a ghost j_atom0
+        // (my_fxj is only ever set non-zero when j_is_local above), so
+        // skipping the write for ghosts changes nothing numerically -- it
+        // just avoids an atomic add of zero. Written per-e (not deferred)
+        // since tile_j -- and therefore j_atom0 -- changes every iteration.
+        if (valid_pair && j_atom0 >= 0 && static_cast<size_t>(j_atom0) < local_particles) {
+            atomicAddFixed(&fx_fixed[j_atom0], fx_j_acc);
+            atomicAddFixed(&fy_fixed[j_atom0], fy_j_acc);
+            atomicAddFixed(&fz_fixed[j_atom0], fz_j_acc);
+        }
+    }
+
+    // One atomicAddFixed triplet per home-tile atom, regardless of how many
+    // neighbor tiles it took to accumulate fx_i_acc above.
+    if (valid_i) {
+        atomicAddFixed(&fx_fixed[i_atom], fx_i_acc);
+        atomicAddFixed(&fy_fixed[i_atom], fy_i_acc);
+        atomicAddFixed(&fz_fixed[i_atom], fz_i_acc);
+    }
+
+    // Energy/virial reduction: pe_acc/virial_acc here are only valid WITHIN
+    // each 8-lane sub-group (each sub-group owns an independent home tile),
+    // so this must be a width-8 reduction, not a full-warp one -- otherwise
+    // sub-groups would sum each other's energies. This happens after the
+    // divergent e-loop above, at the warp's natural reconvergence point, so
+    // all 32 lanes are back together here and FULL_MASK is safe again.
+    const unsigned FULL_MASK = 0xffffffffu;
+    for (int offset = LJ_CLUSTER_SIZE / 2; offset > 0; offset /= 2) {
+        pe_acc += __shfl_down_sync(FULL_MASK, pe_acc, offset, LJ_CLUSTER_SIZE);
+        virial_acc += __shfl_down_sync(FULL_MASK, virial_acc, offset, LJ_CLUSTER_SIZE);
+    }
+    if (valid_pair && sub == 0) {
         if (pe_acc != 0.0) {
             atomicAdd(potential_energy, pe_acc);
         }
         if (virial_acc != 0.0) {
-            atomicAdd(virial, virial_acc);  // NEW: accumulate virial
+            atomicAdd(virial, virial_acc);
         }
+    }
+}
+
+// Fast erfc(x) via the Abramowitz & Stegun 7.1.26 rational/exponential
+// minimax approximation (max absolute error ~1.5e-7, uniform over x>=0) --
+// see design doc "GPU 기반 MD Nonbonded 커널 설계" 5.2 ("erfc는 내장함수 대신
+// 다항식 근사"). Two wins over calling the library erf()/erfc():
+//   1. A native double erf()/erfc() call has no fast hardware path on any
+//      current GPU architecture -- it's a long software emulation sequence.
+//      This is a handful of FMAs plus one exp(), which the emulation itself
+//      would need anyway.
+//   2. The Ewald real-space force term separately needs exp(-alpha^2*r^2);
+//      this approximation computes exp(-x*x) as an internal step, so the
+//      caller reuses it via `exp_out` instead of paying for a second
+//      exp() call.
+// 1.5e-7 absolute error in erfc is well below the polynomial's own headroom
+// against Real (double)'s ~1e-15 precision, and is the standard tolerance
+// production MD codes (GROMACS, AMBER) accept for exactly this trade.
+template <typename T>
+__device__ __forceinline__ T fast_erfc(T x, T& exp_out) {
+    const T p  = T(0.3275911);
+    const T a1 = T(0.254829592);
+    const T a2 = T(-0.284496736);
+    const T a3 = T(1.421413741);
+    const T a4 = T(-1.453152027);
+    const T a5 = T(1.061405429);
+    const T t = T(1.0) / (T(1.0) + p * x);
+    exp_out = exp(-x * x);
+    return ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * exp_out;
+}
+
+// Device-shared real-space (erfc-screened) Ewald Coulomb pair force/energy --
+// the math core of compute_electrostatic_forces_tiled_kernel and
+// compute_nonbonded_forces_tiled_kernel below, extracted so both call one
+// copy instead of duplicating it (mirrors compute_coulomb_pair_real_space()
+// on the CPU side, force_calculator_cpu.cpp, modulo fast_erfc() replacing the
+// CPU's table lookup -- see fast_erfc's comment for why). The excluded-pair
+// branch is NOT a skip: it applies the erf(alpha*r) cancellation term needed
+// to remove PME's reciprocal-space contribution for excluded pairs.
+template <typename PairT>
+__device__ __forceinline__ void device_compute_coulomb_pair_ewald_real(
+        PairT r2, PairT qi, PairT qj, PairT k_coulomb, PairT alpha,
+        PairT two_alpha_over_sqrt_pi, bool excluded,
+        PairT& force_mag, PairT& pe_pair) {
+    PairT r = sqrt(r2);
+    PairT qq = k_coulomb * qi * qj;
+    PairT exp_term;
+    PairT erfc_ar = fast_erfc(alpha * r, exp_term);
+    PairT erf_ar = PairT(1.0) - erfc_ar;
+    if (excluded) {
+        pe_pair = -qq * erf_ar / r;
+        force_mag = -qq * (erf_ar / (r2 * r) - two_alpha_over_sqrt_pi * exp_term / r2);
+    } else {
+        pe_pair = qq * erfc_ar / r;
+        force_mag = qq * (erfc_ar / (r2 * r) + two_alpha_over_sqrt_pi * exp_term / r2);
     }
 }
 
@@ -314,131 +548,664 @@ __global__ void compute_lj_forces_kernel(
 // the reciprocal-space PME grid contribution (see
 // ForceCalculatorCUDA::compute_electrostatic_forces_ewald) -- together they
 // reproduce the exact 1/r Coulomb sum over all periodic images.
-__global__ void compute_electrostatic_forces_kernel(
-
-    Real* x, Real* y, Real* z,
-    Real* fx, Real* fy, Real* fz,
-    Real* charge, int* global_id,
-    int* neighbors, int* num_neighbors, int* neighbor_offset,
-    const unsigned long long* exclusion_keys, size_t num_exclusions,
-    Real* potential_energy,
-    Real* virial,  // NEW: virial for pressure calculation
+// PairT: see compute_lj_forces_kernel above for the mixed-precision contract.
+// Note: the excluded-pair branch below cancels PME's reciprocal-space
+// contribution via erf(alpha*r); the fast_erfc approximation's ~1.5e-7
+// absolute error becomes the accuracy floor for that cancellation
+// regardless of PairT, slightly larger than full double erf()'s residual
+// but still far below the switch/cutoff/parameter-derived error budget
+// elsewhere in this kernel.
+// PERF FIX: warp/tile version of compute_electrostatic_forces_kernel above,
+// mirroring compute_lj_forces_tiled_kernel's structure exactly (same tile
+// layout, same GROUP_MASK/shuffle scheme, same half-list dedup rule) but
+// with the Mie/switching math swapped for real-space Ewald erfc/erf. nsys
+// profiling showed the plain CSR compute_electrostatic_forces_kernel taking
+// ~15.7ms/step -- the second-largest GPU cost after LJ -- despite doing
+// less arithmetic per pair than LJ, which pointed at atomic contention
+// rather than compute: that CSR kernel does one atomicAddFixed(&fx_fixed[j],
+// ...) triplet PER PAIR, so spatially close atoms (the common case, being
+// each other's neighbors) repeatedly target the same few memory addresses
+// from many concurrent threads. The tiled LJ kernel already solves this by
+// accumulating a whole neighbor-tile's worth of j-reaction-force via
+// __shfl_sync before a single atomic write per tile-pair iteration (8x
+// fewer atomics for the j side, and the i side collapses to exactly one
+// atomic for the whole kernel instead of one per accepted pair) -- this
+// kernel reuses that same scheme for Coulomb. Dispatched from
+// ForceCalculatorCUDA::compute_electrostatic_forces_real_space() only when
+// tile data is available (same condition as the LJ kernel's own tiled/CSR
+// choice), falling back to the plain CSR kernel above otherwise.
+//
+// TRIED AND REVERTED: __launch_bounds__(128, 8), applied here for
+// consistency with compute_lj_forces_tiled_kernel above, measured even
+// worse -- 34.9% SLOWER (13.1ms -> 17.7ms/step). Same conclusion: forcing
+// lower register usage here spills more than it helps. Do not re-add
+// without a measured win.
+template <typename PairT>
+__global__ void compute_electrostatic_forces_tiled_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    long long* __restrict__ fx_fixed, long long* __restrict__ fy_fixed, long long* __restrict__ fz_fixed,
+    const Real* __restrict__ charge, const int* __restrict__ global_id,
+    const int* __restrict__ tile_atoms,
+    const int* __restrict__ tile_pair_offsets, const int* __restrict__ tile_pair_j,
+    const unsigned long long* __restrict__ tile_pair_verlet_mask,
+    const int* __restrict__ exclusion_offsets, const int* __restrict__ exclusion_partners,
+    size_t exclusion_atom_count,
+    Real* __restrict__ potential_energy,
+    Real* __restrict__ virial,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     size_t local_particles, size_t total_particles,
-    Real cutoff_sq, Real k_coulomb, Real alpha) {
+    Real cutoff_sq, Real k_coulomb, Real alpha,
+    int num_tiles)
+{
+    const int global_lane = threadIdx.x % 32;
+    const int group = global_lane / LJ_CLUSTER_SIZE;
+    const int sub = global_lane % LJ_CLUSTER_SIZE;
+    const unsigned GROUP_MASK = 0xFFu << (group * LJ_CLUSTER_SIZE);
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int tile_index = warp_id * LJ_CLUSTER_GROUPS_PER_WARP + group;
 
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= local_particles) return;
+    const bool valid_pair = tile_index < num_tiles;
+    const int safe_tile_index = valid_pair ? tile_index : 0;
 
-    Real qi = charge[i];
-    if (fabs(qi) < 1e-10) return;
+    int i_atom = tile_atoms[safe_tile_index * LJ_CLUSTER_SIZE + sub];
+    bool valid_i = valid_pair && (i_atom >= 0) && (static_cast<size_t>(i_atom) < local_particles);
 
-    Real xi = x[i];
-    Real yi = y[i];
-    Real zi = z[i];
-    int gid_i = global_id[i];
+    PairT xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
+    int gid_i = 0;
+    bool qi_nonzero = false;
+    if (i_atom >= 0) {
+        xi = static_cast<PairT>(x[i_atom]);
+        yi = static_cast<PairT>(y[i_atom]);
+        zi = static_cast<PairT>(z[i_atom]);
+        qi = static_cast<PairT>(charge[i_atom]);
+        gid_i = global_id[i_atom];
+        qi_nonzero = fabs(qi) >= PairT(1e-10);
+    }
 
-    Real fx_acc = 0.0;
-    Real fy_acc = 0.0;
-    Real fz_acc = 0.0;
-    Real pe_acc = 0.0;
-    Real virial_acc = 0.0;  // NEW: virial accumulator
+    const PairT cutoff_sq_p = static_cast<PairT>(cutoff_sq);
+    const PairT k_coulomb_p = static_cast<PairT>(k_coulomb);
+    const PairT alpha_p = static_cast<PairT>(alpha);
+    const PairT two_alpha_over_sqrt_pi = PairT(1.1283791670955126) * alpha_p;
+    const PairT box_x_p = static_cast<PairT>(box_x);
+    const PairT box_y_p = static_cast<PairT>(box_y);
+    const PairT box_z_p = static_cast<PairT>(box_z);
+    const PairT inv_box_x_p = static_cast<PairT>(inv_box_x);
+    const PairT inv_box_y_p = static_cast<PairT>(inv_box_y);
+    const PairT inv_box_z_p = static_cast<PairT>(inv_box_z);
 
-    const Real two_alpha_over_sqrt_pi = 1.1283791670955126 * alpha;  // 2/sqrt(pi) * alpha
+    Real fx_i_acc = 0.0, fy_i_acc = 0.0, fz_i_acc = 0.0;
+    Real pe_acc = 0.0, virial_acc = 0.0;
 
-    size_t neighbor_start = neighbor_offset[i];
-    size_t neighbor_end = neighbor_start + num_neighbors[i];
+    const int e_begin = valid_pair ? tile_pair_offsets[safe_tile_index] : 0;
+    const int e_end   = valid_pair ? tile_pair_offsets[safe_tile_index + 1] : 0;
 
-    for (size_t n_idx = neighbor_start; n_idx < neighbor_end; ++n_idx) {
-        size_t j = neighbors[n_idx];
-        if (j >= total_particles) continue;
+    for (int e = e_begin; e < e_end; ++e) {
+        int tile_j = tile_pair_j[e];
+        const unsigned long long verlet_mask = tile_pair_verlet_mask[e];
+        if (verlet_mask == 0) continue;
+        bool same_tile = (tile_j == safe_tile_index);
 
-        Real qj = charge[j];
-        if (fabs(qj) < 1e-10) continue;
+        int j_atom0 = tile_atoms[tile_j * LJ_CLUSTER_SIZE + sub];
+        PairT xj0 = 0.0, yj0 = 0.0, zj0 = 0.0, qj0 = 0.0;
+        int gid_j0 = 0;
+        if (j_atom0 >= 0) {
+            xj0 = static_cast<PairT>(x[j_atom0]);
+            yj0 = static_cast<PairT>(y[j_atom0]);
+            zj0 = static_cast<PairT>(z[j_atom0]);
+            qj0 = static_cast<PairT>(charge[j_atom0]);
+            gid_j0 = global_id[j_atom0];
+        }
 
-        Real dx = xi - x[j];
-        Real dy = yi - y[j];
-        Real dz = zi - z[j];
+        Real fx_j_acc = 0.0, fy_j_acc = 0.0, fz_j_acc = 0.0;
 
+        for (int shift = 0; shift < LJ_CLUSTER_SIZE; ++shift) {
+            int src = (sub + shift) & (LJ_CLUSTER_SIZE - 1);
+            int j_atom   = __shfl_sync(GROUP_MASK, j_atom0, src, LJ_CLUSTER_SIZE);
+            PairT xj     = __shfl_sync(GROUP_MASK, xj0, src, LJ_CLUSTER_SIZE);
+            PairT yj     = __shfl_sync(GROUP_MASK, yj0, src, LJ_CLUSTER_SIZE);
+            PairT zj     = __shfl_sync(GROUP_MASK, zj0, src, LJ_CLUSTER_SIZE);
+            PairT qj     = __shfl_sync(GROUP_MASK, qj0, src, LJ_CLUSTER_SIZE);
+            int gid_j    = __shfl_sync(GROUP_MASK, gid_j0, src, LJ_CLUSTER_SIZE);
+
+            const bool in_verlet =
+                ((verlet_mask >> (src * LJ_CLUSTER_SIZE + sub)) & 1ULL) != 0;
+            bool accepted = in_verlet && valid_i && qi_nonzero && (j_atom >= 0);
+            if (accepted && same_tile) {
+                bool j_is_local = static_cast<size_t>(j_atom) < local_particles;
+                if (j_is_local && !(j_atom > i_atom)) accepted = false;
+            }
+
+            Real my_fxj = 0.0, my_fyj = 0.0, my_fzj = 0.0;
+            if (accepted) {
+                PairT dxp = xi - xj;
+                PairT dyp = yi - yj;
+                PairT dzp = zi - zj;
+                apply_minimum_image_device(dxp, dyp, dzp, box_x_p, box_y_p, box_z_p,
+                                           inv_box_x_p, inv_box_y_p, inv_box_z_p);
+
+                PairT r2 = dxp*dxp + dyp*dyp + dzp*dzp;
+
+                bool j_is_local = static_cast<size_t>(j_atom) < local_particles;
+                bool qj_nonzero = fabs(qj) >= PairT(1e-10);
+
+                if (r2 < cutoff_sq_p && r2 >= PairT(1e-10) && qj_nonzero) {
+                    const bool excluded = is_excluded_pair(exclusion_offsets, exclusion_partners,
+                                                           exclusion_atom_count, gid_i, gid_j);
+                    PairT force_mag, u_pair;
+                    device_compute_coulomb_pair_ewald_real(r2, qi, qj, k_coulomb_p, alpha_p,
+                                                           two_alpha_over_sqrt_pi, excluded,
+                                                           force_mag, u_pair);
+
+                    Real fx_pair = static_cast<Real>(force_mag * dxp);
+                    Real fy_pair = static_cast<Real>(force_mag * dyp);
+                    Real fz_pair = static_cast<Real>(force_mag * dzp);
+
+                    fx_i_acc += fx_pair; fy_i_acc += fy_pair; fz_i_acc += fz_pair;
+                    Real virial_pair = static_cast<Real>(dxp) * fx_pair +
+                        static_cast<Real>(dyp) * fy_pair + static_cast<Real>(dzp) * fz_pair;
+
+                    if (j_is_local) {
+                        my_fxj = -fx_pair; my_fyj = -fy_pair; my_fzj = -fz_pair;
+                        pe_acc += static_cast<Real>(u_pair);
+                        virial_acc += virial_pair;
+                    } else if (gid_i < gid_j) {
+                        pe_acc += static_cast<Real>(u_pair);
+                        virial_acc += virial_pair;
+                    }
+                }
+            }
+
+            int recv_from = (sub - shift) & (LJ_CLUSTER_SIZE - 1);
+            fx_j_acc += __shfl_sync(GROUP_MASK, my_fxj, recv_from, LJ_CLUSTER_SIZE);
+            fy_j_acc += __shfl_sync(GROUP_MASK, my_fyj, recv_from, LJ_CLUSTER_SIZE);
+            fz_j_acc += __shfl_sync(GROUP_MASK, my_fzj, recv_from, LJ_CLUSTER_SIZE);
+        }
+
+        if (valid_pair && j_atom0 >= 0 && static_cast<size_t>(j_atom0) < local_particles) {
+            atomicAddFixed(&fx_fixed[j_atom0], fx_j_acc);
+            atomicAddFixed(&fy_fixed[j_atom0], fy_j_acc);
+            atomicAddFixed(&fz_fixed[j_atom0], fz_j_acc);
+        }
+    }
+
+    if (valid_i) {
+        atomicAddFixed(&fx_fixed[i_atom], fx_i_acc);
+        atomicAddFixed(&fy_fixed[i_atom], fy_i_acc);
+        atomicAddFixed(&fz_fixed[i_atom], fz_i_acc);
+    }
+
+    const unsigned FULL_MASK = 0xffffffffu;
+    for (int offset = LJ_CLUSTER_SIZE / 2; offset > 0; offset /= 2) {
+        pe_acc += __shfl_down_sync(FULL_MASK, pe_acc, offset, LJ_CLUSTER_SIZE);
+        virial_acc += __shfl_down_sync(FULL_MASK, virial_acc, offset, LJ_CLUSTER_SIZE);
+    }
+    if (valid_pair && sub == 0) {
+        if (pe_acc != 0.0) {
+            atomicAdd(potential_energy, pe_acc);
+        }
+        if (virial_acc != 0.0) {
+            atomicAdd(virial, virial_acc);
+        }
+    }
+}
+
+// PERF FIX (rank-local spatial-tile roadmap, phase 2): compute_lj_forces_
+// tiled_kernel and compute_electrostatic_forces_tiled_kernel above each walk
+// the EXACT SAME tile-pair list independently -- same distance calc, same
+// apply_minimum_image_device, same is_excluded_pair lookup, same half-list
+// dedup, same j-side shuffle-then-atomic pattern -- just to add two
+// different force terms. That is the GPU-tiled-era equivalent of the old
+// CSR-era compute_lj_forces_kernel/compute_electrostatic_forces_kernel
+// duplication that compute_lj_electrostatic_forces_kernel used to fix (see
+// its comment, now stale history -- that kernel no longer exists, CSR having
+// been removed entirely). This kernel re-applies the same fusion to the tile
+// path: one traversal of the tile-pair list, one exclusion lookup, one
+// minimum-image/distance calc, LJ and Coulomb force/energy accumulated into
+// the SAME fx_pair/pe_pair before a single combined atomic write per tile-
+// pair iteration (half as many atomics as running both kernels separately).
+// Math for each term is byte-for-byte identical to the two source kernels:
+//  - LJ (Mie + optional switching): skipped entirely for excluded pairs.
+//  - Real-space Ewald: NOT skipped for excluded pairs -- applies the
+//    erf(alpha*r) cancellation term instead, exactly as before.
+// Dispatched from ForceCalculatorCUDA::compute_forces() only when both LJ
+// and Coulomb are enabled (see use_fused_nonbonded there); either term alone
+// still uses its own standalone tiled kernel above.
+template <typename PairT>
+__global__ void compute_nonbonded_forces_tiled_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    long long* __restrict__ fx_fixed, long long* __restrict__ fy_fixed, long long* __restrict__ fz_fixed,
+    const int* __restrict__ type, const int* __restrict__ global_id, const Real* __restrict__ charge,
+    const int* __restrict__ tile_atoms,
+    const int* __restrict__ tile_pair_offsets, const int* __restrict__ tile_pair_j,
+    const unsigned long long* __restrict__ tile_pair_verlet_mask,
+    const Real* __restrict__ epsilon_mixed, const Real* __restrict__ sigma_mixed,
+    const int* __restrict__ exclusion_offsets, const int* __restrict__ exclusion_partners,
+    size_t exclusion_atom_count,
+    Real* __restrict__ potential_energy,
+    Real* __restrict__ virial,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    size_t local_particles, size_t total_particles,
+    int max_types,
+    int mie_n, int mie_m, Real mie_prefactor,
+    Real cutoff_sq, Real switch_distance, Real switch_sq, Real inv_denom,
+    Real k_coulomb, Real alpha,
+    int num_tiles,
+    // See the matching parameter's comment on compute_lj_forces_tiled_kernel
+    // above; same convention here.
+    unsigned long long* __restrict__ pair_stats)
+{
+    const int global_lane = threadIdx.x % 32;
+    const int group = global_lane / LJ_CLUSTER_SIZE;
+    const int sub = global_lane % LJ_CLUSTER_SIZE;
+    const unsigned GROUP_MASK = 0xFFu << (group * LJ_CLUSTER_SIZE);
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int tile_index = warp_id * LJ_CLUSTER_GROUPS_PER_WARP + group;
+
+    const bool valid_pair = tile_index < num_tiles;
+    const int safe_tile_index = valid_pair ? tile_index : 0;
+
+    int i_atom = tile_atoms[safe_tile_index * LJ_CLUSTER_SIZE + sub];
+    bool valid_i = valid_pair && (i_atom >= 0) && (static_cast<size_t>(i_atom) < local_particles);
+
+    PairT xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
+    int type_i = 0, gid_i = 0;
+    if (i_atom >= 0) {
+        xi = static_cast<PairT>(x[i_atom]);
+        yi = static_cast<PairT>(y[i_atom]);
+        zi = static_cast<PairT>(z[i_atom]);
+        qi = static_cast<PairT>(charge[i_atom]);
+        type_i = type[i_atom]; gid_i = global_id[i_atom];
+    }
+    const bool qi_nonzero = fabs(qi) >= PairT(1e-10);
+
+    const PairT cutoff_sq_p = static_cast<PairT>(cutoff_sq);
+    const PairT switch_distance_p = static_cast<PairT>(switch_distance);
+    const PairT switch_sq_p = static_cast<PairT>(switch_sq);
+    const PairT inv_denom_p = static_cast<PairT>(inv_denom);
+    const PairT mie_prefactor_p = static_cast<PairT>(mie_prefactor);
+    const PairT k_coulomb_p = static_cast<PairT>(k_coulomb);
+    const PairT alpha_p = static_cast<PairT>(alpha);
+    const PairT two_alpha_over_sqrt_pi = PairT(1.1283791670955126) * alpha_p;
+    const PairT box_x_p = static_cast<PairT>(box_x);
+    const PairT box_y_p = static_cast<PairT>(box_y);
+    const PairT box_z_p = static_cast<PairT>(box_z);
+    const PairT inv_box_x_p = static_cast<PairT>(inv_box_x);
+    const PairT inv_box_y_p = static_cast<PairT>(inv_box_y);
+    const PairT inv_box_z_p = static_cast<PairT>(inv_box_z);
+
+    Real fx_i_acc = 0.0, fy_i_acc = 0.0, fz_i_acc = 0.0;
+    Real pe_acc = 0.0, virial_acc = 0.0;
+
+    const int e_begin = valid_pair ? tile_pair_offsets[safe_tile_index] : 0;
+    const int e_end   = valid_pair ? tile_pair_offsets[safe_tile_index + 1] : 0;
+
+    for (int e = e_begin; e < e_end; ++e) {
+        int tile_j = tile_pair_j[e];
+        const unsigned long long verlet_mask = tile_pair_verlet_mask[e];
+        if (verlet_mask == 0) continue;
+        bool same_tile = (tile_j == safe_tile_index);
+
+        int j_atom0 = tile_atoms[tile_j * LJ_CLUSTER_SIZE + sub];
+        PairT xj0 = 0.0, yj0 = 0.0, zj0 = 0.0, qj0 = 0.0;
+        int type_j0 = 0, gid_j0 = 0;
+        if (j_atom0 >= 0) {
+            xj0 = static_cast<PairT>(x[j_atom0]);
+            yj0 = static_cast<PairT>(y[j_atom0]);
+            zj0 = static_cast<PairT>(z[j_atom0]);
+            qj0 = static_cast<PairT>(charge[j_atom0]);
+            type_j0 = type[j_atom0]; gid_j0 = global_id[j_atom0];
+        }
+
+        Real fx_j_acc = 0.0, fy_j_acc = 0.0, fz_j_acc = 0.0;
+
+        for (int shift = 0; shift < LJ_CLUSTER_SIZE; ++shift) {
+            int src = (sub + shift) & (LJ_CLUSTER_SIZE - 1);
+            int j_atom   = __shfl_sync(GROUP_MASK, j_atom0, src, LJ_CLUSTER_SIZE);
+            PairT xj     = __shfl_sync(GROUP_MASK, xj0, src, LJ_CLUSTER_SIZE);
+            PairT yj     = __shfl_sync(GROUP_MASK, yj0, src, LJ_CLUSTER_SIZE);
+            PairT zj     = __shfl_sync(GROUP_MASK, zj0, src, LJ_CLUSTER_SIZE);
+            PairT qj     = __shfl_sync(GROUP_MASK, qj0, src, LJ_CLUSTER_SIZE);
+            int type_j   = __shfl_sync(GROUP_MASK, type_j0, src, LJ_CLUSTER_SIZE);
+            int gid_j    = __shfl_sync(GROUP_MASK, gid_j0, src, LJ_CLUSTER_SIZE);
+
+            // NOTE: not gated on qi_nonzero here (unlike the electrostatic-
+            // only kernel) -- LJ must still run for an uncharged atom pair,
+            // so acceptance/half-list dedup can only depend on tile
+            // membership, exactly like the LJ-only kernel.
+            const bool in_verlet =
+                ((verlet_mask >> (src * LJ_CLUSTER_SIZE + sub)) & 1ULL) != 0;
+            bool accepted = in_verlet && valid_i && (j_atom >= 0);
+            if (accepted && same_tile) {
+                bool j_is_local = static_cast<size_t>(j_atom) < local_particles;
+                if (j_is_local && !(j_atom > i_atom)) accepted = false;
+            }
+
+            Real my_fxj = 0.0, my_fyj = 0.0, my_fzj = 0.0;
+            if (accepted) {
+                if (pair_stats) atomicAdd(&pair_stats[0], 1ULL);
+                PairT dxp = xi - xj;
+                PairT dyp = yi - yj;
+                PairT dzp = zi - zj;
+                apply_minimum_image_device(dxp, dyp, dzp, box_x_p, box_y_p, box_z_p,
+                                           inv_box_x_p, inv_box_y_p, inv_box_z_p);
+
+                PairT r2 = dxp*dxp + dyp*dyp + dzp*dzp;
+                bool j_is_local = static_cast<size_t>(j_atom) < local_particles;
+
+                if (r2 < cutoff_sq_p && r2 >= PairT(1e-10)) {
+                    if (pair_stats) atomicAdd(&pair_stats[1], 1ULL);
+                    // One shared exclusion lookup for both force terms --
+                    // see this kernel's doc comment.
+                    const bool excluded = is_excluded_pair(exclusion_offsets, exclusion_partners,
+                                                           exclusion_atom_count, gid_i, gid_j);
+                    PairT force_mag = PairT(0.0);
+                    PairT pe_pair = PairT(0.0);
+
+                    // ---- LJ (Mie), skipped for excluded pairs -- see
+                    // device_compute_lj_pair() above ----
+                    if (!excluded) {
+                        size_t type_idx = static_cast<size_t>(type_i) * max_types + type_j;
+                        PairT eps = static_cast<PairT>(epsilon_mixed[type_idx]);
+                        PairT sig = static_cast<PairT>(sigma_mixed[type_idx]);
+                        PairT lj_force, lj_pe;
+                        device_compute_lj_pair(r2, eps, sig, mie_n, mie_m, mie_prefactor_p,
+                                               cutoff_sq_p, switch_distance_p, switch_sq_p, inv_denom_p,
+                                               lj_force, lj_pe);
+                        force_mag += lj_force;
+                        pe_pair += lj_pe;
+                    }
+
+                    // ---- Real-space Ewald Coulomb -- NOT skipped for
+                    // excluded pairs, see device_compute_coulomb_pair_
+                    // ewald_real() above ----
+                    if (qi_nonzero && fabs(qj) >= PairT(1e-10)) {
+                        PairT coul_force, coul_pe;
+                        device_compute_coulomb_pair_ewald_real(r2, qi, qj, k_coulomb_p, alpha_p,
+                                                               two_alpha_over_sqrt_pi, excluded,
+                                                               coul_force, coul_pe);
+                        force_mag += coul_force;
+                        pe_pair += coul_pe;
+                    }
+
+                    Real fx_pair = static_cast<Real>(force_mag * dxp);
+                    Real fy_pair = static_cast<Real>(force_mag * dyp);
+                    Real fz_pair = static_cast<Real>(force_mag * dzp);
+
+                    fx_i_acc += fx_pair; fy_i_acc += fy_pair; fz_i_acc += fz_pair;
+                    Real virial_pair = static_cast<Real>(dxp) * fx_pair +
+                        static_cast<Real>(dyp) * fy_pair + static_cast<Real>(dzp) * fz_pair;
+
+                    if (j_is_local) {
+                        my_fxj = -fx_pair; my_fyj = -fy_pair; my_fzj = -fz_pair;
+                        pe_acc += static_cast<Real>(pe_pair);
+                        virial_acc += virial_pair;
+                    } else if (gid_i < gid_j) {
+                        pe_acc += static_cast<Real>(pe_pair);
+                        virial_acc += virial_pair;
+                    }
+                }
+            }
+
+            int recv_from = (sub - shift) & (LJ_CLUSTER_SIZE - 1);
+            fx_j_acc += __shfl_sync(GROUP_MASK, my_fxj, recv_from, LJ_CLUSTER_SIZE);
+            fy_j_acc += __shfl_sync(GROUP_MASK, my_fyj, recv_from, LJ_CLUSTER_SIZE);
+            fz_j_acc += __shfl_sync(GROUP_MASK, my_fzj, recv_from, LJ_CLUSTER_SIZE);
+        }
+
+        if (valid_pair && j_atom0 >= 0 && static_cast<size_t>(j_atom0) < local_particles) {
+            atomicAddFixed(&fx_fixed[j_atom0], fx_j_acc);
+            atomicAddFixed(&fy_fixed[j_atom0], fy_j_acc);
+            atomicAddFixed(&fz_fixed[j_atom0], fz_j_acc);
+        }
+    }
+
+    if (valid_i) {
+        atomicAddFixed(&fx_fixed[i_atom], fx_i_acc);
+        atomicAddFixed(&fy_fixed[i_atom], fy_i_acc);
+        atomicAddFixed(&fz_fixed[i_atom], fz_i_acc);
+    }
+
+    const unsigned FULL_MASK = 0xffffffffu;
+    for (int offset = LJ_CLUSTER_SIZE / 2; offset > 0; offset /= 2) {
+        pe_acc += __shfl_down_sync(FULL_MASK, pe_acc, offset, LJ_CLUSTER_SIZE);
+        virial_acc += __shfl_down_sync(FULL_MASK, virial_acc, offset, LJ_CLUSTER_SIZE);
+    }
+    if (valid_pair && sub == 0) {
+        if (pe_acc != 0.0) {
+            atomicAdd(potential_energy, pe_acc);
+        }
+        if (virial_acc != 0.0) {
+            atomicAdd(virial, virial_acc);
+        }
+    }
+}
+
+// ============================================================================
+// GPU directed atom graph
+//
+// The spatial tile graph is used only as a broad phase.  These kernels
+// compact its half-list Verlet masks into the same directed CSR used by the
+// CPU graph backend: local-local pairs produce both directions, while a
+// local-ghost pair produces only the locally-owned source row.  CSR order is
+// also valid COO order, so MLIP consumes the exact same allocation.
+// ============================================================================
+
+__global__ void count_directed_graph_degrees_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const int* __restrict__ tile_atoms,
+    const int* __restrict__ tile_pair_i, const int* __restrict__ tile_pair_j,
+    const unsigned long long* __restrict__ verlet_masks,
+    int* __restrict__ degrees, int num_tile_pairs, int num_local,
+    Real active_cutoff_sq, Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_tile_pairs) return;
+    const unsigned long long mask = verlet_masks[e];
+    if (!mask) return;
+    const int ti = tile_pair_i[e];
+    const int tj = tile_pair_j[e];
+    for (int js = 0; js < LJ_CLUSTER_SIZE; ++js) {
+        const int j = tile_atoms[tj * LJ_CLUSTER_SIZE + js];
+        if (j < 0) continue;
+        for (int is = 0; is < LJ_CLUSTER_SIZE; ++is) {
+            if (((mask >> (js * LJ_CLUSTER_SIZE + is)) & 1ULL) == 0) continue;
+            const int i = tile_atoms[ti * LJ_CLUSTER_SIZE + is];
+            if (i < 0 || i >= num_local || i == j) continue;
+            Real dx = x[i] - x[j], dy = y[i] - y[j], dz = z[i] - z[j];
+            apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z,
+                                       inv_box_x, inv_box_y, inv_box_z);
+            const Real r2 = dx*dx + dy*dy + dz*dz;
+            if (r2 >= active_cutoff_sq || r2 < 1e-10) continue;
+            atomicAdd(&degrees[i], 1);
+            if (j < num_local) atomicAdd(&degrees[j], 1);
+        }
+    }
+}
+
+__global__ void finish_graph_offsets_kernel(const int* degrees, int* offsets, int n) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        offsets[n] = n > 0 ? offsets[n - 1] + degrees[n - 1] : 0;
+    }
+}
+
+// Small-box fallback.  The fine-cell tile builder intentionally declines
+// boxes with fewer than its periodic stencil width; for those tiny systems a
+// direct O(Nlocal*Ntotal) GPU pass is both simpler and faster than building a
+// second coarse grid, and keeps graph mode fully device resident.
+__global__ void count_directed_graph_degrees_direct_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    int* __restrict__ degrees, int num_local, int num_total,
+    Real active_cutoff_sq, Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_local) return;
+    int degree = 0;
+    for (int j = 0; j < num_total; ++j) {
+        if (j == i) continue;
+        Real dx = x[i] - x[j], dy = y[i] - y[j], dz = z[i] - z[j];
         apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z,
                                    inv_box_x, inv_box_y, inv_box_z);
+        const Real r2 = dx*dx + dy*dy + dz*dz;
+        if (r2 < active_cutoff_sq && r2 >= 1e-10) ++degree;
+    }
+    degrees[i] = degree;
+}
 
-        Real r2 = dx*dx + dy*dy + dz*dz;
-
-        if (r2 >= cutoff_sq || r2 < 1e-10) continue;
-
-        bool j_is_local = (j < local_particles);
-        int gid_j = global_id[j];
-
-        Real r = sqrt(r2);
-        Real qq = k_coulomb * qi * qj;
-        const bool excluded = is_excluded_pair(exclusion_keys, num_exclusions,
-                                               gid_i, gid_j);
-        Real erf_ar = erf(alpha * r);
-        Real erfc_ar = 1.0 - erf_ar;
-        Real exp_term = exp(-alpha * alpha * r2);
-        Real u_pair;
-        Real force_mag;
-        if (excluded) {
-            // Cancel the excluded pair's erf(alpha*r)/r contribution from PME.
-            u_pair = -qq * erf_ar / r;
-            force_mag = -qq * (erf_ar / (r2 * r) -
-                two_alpha_over_sqrt_pi * exp_term / r2);
-        } else {
-            u_pair = qq * erfc_ar / r;
-            force_mag = qq * (erfc_ar / (r2 * r) +
-                two_alpha_over_sqrt_pi * exp_term / r2);
+__global__ void fill_directed_graph_direct_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const int* __restrict__ offsets, int32_t* __restrict__ src,
+    int32_t* __restrict__ dst, int num_local, int num_total,
+    Real active_cutoff_sq, Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_local) return;
+    int pos = offsets[i];
+    for (int j = 0; j < num_total; ++j) {
+        if (j == i) continue;
+        Real dx = x[i] - x[j], dy = y[i] - y[j], dz = z[i] - z[j];
+        apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z,
+                                   inv_box_x, inv_box_y, inv_box_z);
+        const Real r2 = dx*dx + dy*dy + dz*dz;
+        if (r2 < active_cutoff_sq && r2 >= 1e-10) {
+            src[pos] = i; dst[pos] = j; ++pos;
         }
+    }
+}
 
-        // Energy counting (Newton off, full list):
-        // - local-local pair: counted twice, use factor 0.5
-        // - local-ghost pair: use global_id to avoid double counting
-        if (j_is_local) {
-            pe_acc += 0.5 * u_pair;
-        } else {
-            if (gid_i < gid_j) {
-                pe_acc += u_pair;
+__global__ void fill_directed_graph_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const int* __restrict__ tile_atoms,
+    const int* __restrict__ tile_pair_i, const int* __restrict__ tile_pair_j,
+    const unsigned long long* __restrict__ verlet_masks,
+    const int* __restrict__ offsets, int* __restrict__ cursors,
+    int32_t* __restrict__ src, int32_t* __restrict__ dst,
+    int num_tile_pairs, int num_local, Real active_cutoff_sq,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_tile_pairs) return;
+    const unsigned long long mask = verlet_masks[e];
+    if (!mask) return;
+    const int ti = tile_pair_i[e];
+    const int tj = tile_pair_j[e];
+    for (int js = 0; js < LJ_CLUSTER_SIZE; ++js) {
+        const int j = tile_atoms[tj * LJ_CLUSTER_SIZE + js];
+        if (j < 0) continue;
+        for (int is = 0; is < LJ_CLUSTER_SIZE; ++is) {
+            if (((mask >> (js * LJ_CLUSTER_SIZE + is)) & 1ULL) == 0) continue;
+            const int i = tile_atoms[ti * LJ_CLUSTER_SIZE + is];
+            if (i < 0 || i >= num_local || i == j) continue;
+            Real dx = x[i] - x[j], dy = y[i] - y[j], dz = z[i] - z[j];
+            apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z,
+                                       inv_box_x, inv_box_y, inv_box_z);
+            const Real r2 = dx*dx + dy*dy + dz*dz;
+            if (r2 >= active_cutoff_sq || r2 < 1e-10) continue;
+            int pos = offsets[i] + atomicAdd(&cursors[i], 1);
+            src[pos] = i; dst[pos] = j;
+            if (j < num_local) {
+                pos = offsets[j] + atomicAdd(&cursors[j], 1);
+                src[pos] = j; dst[pos] = i;
             }
         }
+    }
+}
 
-        Real fx_ij = force_mag * dx;
-        Real fy_ij = force_mag * dy;
-        Real fz_ij = force_mag * dz;
+template <typename PairT>
+__global__ void compute_nonbonded_forces_graph_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    Real* __restrict__ fx, Real* __restrict__ fy, Real* __restrict__ fz,
+    const int* __restrict__ type, const int* __restrict__ global_id,
+    const Real* __restrict__ charge, const int* __restrict__ offsets,
+    const int32_t* __restrict__ neighbors,
+    const Real* __restrict__ epsilon_mixed, const Real* __restrict__ sigma_mixed,
+    const int* __restrict__ exclusion_offsets, const int* __restrict__ exclusion_partners,
+    size_t exclusion_atom_count, Real* __restrict__ potential_energy,
+    Real* __restrict__ virial, Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    int num_local, int num_total, int num_types,
+    int mie_n, int mie_m, Real mie_prefactor,
+    Real cutoff_sq, Real switch_distance, Real switch_sq, Real inv_denom,
+    Real k_coulomb, Real alpha, bool do_lj, bool do_coulomb)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_local) return;
+    const PairT xi = static_cast<PairT>(x[i]);
+    const PairT yi = static_cast<PairT>(y[i]);
+    const PairT zi = static_cast<PairT>(z[i]);
+    const PairT qi = static_cast<PairT>(charge[i]);
+    const int gid_i = global_id[i];
+    Real fix = 0.0, fiy = 0.0, fiz = 0.0;
+    Real pe_acc = 0.0, virial_acc = 0.0;
+    const PairT cutoff2 = static_cast<PairT>(cutoff_sq);
+    const PairT alpha_p = static_cast<PairT>(alpha);
+    const PairT two_alpha_sqrt_pi = PairT(1.1283791670955126) * alpha_p;
 
-        fx_acc += fx_ij;
-        fy_acc += fy_ij;
-        fz_acc += fz_ij;
-
-        // NEW: Virial calculation
-        // Count only local-local pairs with factor 0.5, or local-ghost with gid check
-        if (j_is_local) {
-            virial_acc += 0.5 * (dx * fx_ij + dy * fy_ij + dz * fz_ij);
-        } else {
-            if (gid_i < gid_j) {
-                virial_acc += (dx * fx_ij + dy * fy_ij + dz * fz_ij);
-            }
+    for (int e = offsets[i]; e < offsets[i + 1]; ++e) {
+        const int j = neighbors[e];
+        if (j < 0 || j >= num_total) continue;
+        PairT dx = xi - static_cast<PairT>(x[j]);
+        PairT dy = yi - static_cast<PairT>(y[j]);
+        PairT dz = zi - static_cast<PairT>(z[j]);
+        apply_minimum_image_device(dx, dy, dz,
+            static_cast<PairT>(box_x), static_cast<PairT>(box_y), static_cast<PairT>(box_z),
+            static_cast<PairT>(inv_box_x), static_cast<PairT>(inv_box_y), static_cast<PairT>(inv_box_z));
+        const PairT r2 = dx*dx + dy*dy + dz*dz;
+        if (r2 >= cutoff2 || r2 < PairT(1e-10)) continue;
+        const int gid_j = global_id[j];
+        const bool excluded = is_excluded_pair(exclusion_offsets, exclusion_partners,
+                                               exclusion_atom_count, gid_i, gid_j);
+        PairT force_mag = PairT(0.0), pair_energy = PairT(0.0);
+        if (do_lj && !excluded) {
+            const size_t t = static_cast<size_t>(type[i]) * num_types + type[j];
+            PairT lf, le;
+            device_compute_lj_pair(r2, static_cast<PairT>(epsilon_mixed[t]),
+                static_cast<PairT>(sigma_mixed[t]), mie_n, mie_m,
+                static_cast<PairT>(mie_prefactor), cutoff2,
+                static_cast<PairT>(switch_distance), static_cast<PairT>(switch_sq),
+                static_cast<PairT>(inv_denom), lf, le);
+            force_mag += lf; pair_energy += le;
         }
-
-        // Newton off: no reverse force update
+        if (do_coulomb && fabs(qi) >= PairT(1e-10) &&
+            fabs(static_cast<PairT>(charge[j])) >= PairT(1e-10)) {
+            PairT cf, ce;
+            device_compute_coulomb_pair_ewald_real(r2, qi, static_cast<PairT>(charge[j]),
+                static_cast<PairT>(k_coulomb), alpha_p, two_alpha_sqrt_pi,
+                excluded, cf, ce);
+            force_mag += cf; pair_energy += ce;
+        }
+        const Real fpair = static_cast<Real>(force_mag);
+        fix += fpair * static_cast<Real>(dx);
+        fiy += fpair * static_cast<Real>(dy);
+        fiz += fpair * static_cast<Real>(dz);
+        const Real weight = (j < num_local) ? 0.5 : (gid_i < gid_j ? 1.0 : 0.0);
+        pe_acc += weight * static_cast<Real>(pair_energy);
+        virial_acc += weight * static_cast<Real>(r2 * force_mag);
     }
-
-    atomicAdd(&fx[i], fx_acc);
-    atomicAdd(&fy[i], fy_acc);
-    atomicAdd(&fz[i], fz_acc);
-    atomicAdd(potential_energy, pe_acc);
-    if (virial_acc != 0.0) {
-        atomicAdd(virial, virial_acc);  // NEW: accumulate virial
-    }
+    fx[i] += fix; fy[i] += fiy; fz[i] += fiz;
+    if (pe_acc != 0.0) atomicAdd(potential_energy, pe_acc);
+    if (virial_acc != 0.0) atomicAdd(virial, virial_acc);
 }
 
 // ============================================================================
 // PME (Particle Mesh Ewald) reciprocal-space kernels
 //
-// Full complex-to-complex (C2C) grid layout: the charge grid is stored as
-// complex (imaginary part always 0) and transformed with a single forward/
-// inverse Z2Z FFT plan. This avoids the R2C/C2R half-spectrum packing
-// (nz/2+1) that the original implementation's indexing did not account for.
+// Real-to-complex (D2Z/Z2D) grid layout: the charge grid is a real
+// nx*ny*nz array, transformed out-of-place into a half-spectrum complex
+// buffer of nx*ny*(nz/2+1) elements (only kz in [0, nz/2] is stored; kz in
+// (nz/2, nz) is the Hermitian-conjugate mirror of an already-stored
+// frequency and is never materialized). kx and ky still range over the
+// full grid extent and use the usual wrapped wavenumber convention; only kz
+// is truncated. Every kernel that walks the frequency grid (Poisson solve,
+// virial, E-field) is launched with kz in [0, nz/2] only, and the energy/
+// virial sums double-count each stored kz to account for its unstored
+// mirror -- except kz == 0 and (when nz is even) kz == nz/2, which are
+// their own mirrors under complex conjugation and must not be doubled.
 // ============================================================================
 
 __device__ void pme_compute_bspline_weights(
@@ -476,6 +1243,38 @@ __device__ void pme_compute_bspline_weights(
     }
 }
 
+// Compute assignment weights and dB/du together.  The derivative is with
+// respect to the dimensionless grid coordinate u; the interpolation kernel
+// applies du/dx = grid_n/box_length.  Keeping weights and derivatives paired
+// also guarantees that charge spreading and force gathering use exactly the
+// same cardinal B-spline convention.
+__device__ void pme_compute_bspline_weights_and_derivatives(
+    Real u, int order, Real* weights, Real* derivatives, int* grid_indices)
+{
+    pme_compute_bspline_weights(u, order, weights, grid_indices);
+    const Real w = u - floor(u);
+
+    if (order == 4) {
+        const Real omw = 1.0 - w;
+        const Real w2 = w * w;
+        derivatives[0] = -0.5 * omw * omw;
+        derivatives[1] =  1.5 * w2 - 2.0 * w;
+        derivatives[2] = -1.5 * w2 + w + 0.5;
+        derivatives[3] =  0.5 * w2;
+    } else if (order == 6) {
+        const Real w2 = w * w;
+        const Real w3 = w2 * w;
+        const Real w4 = w2 * w2;
+        const Real omw = 1.0 - w;
+        derivatives[0] = -omw * omw * omw * omw / 24.0;
+        derivatives[1] = (25.0*w4 - 80.0*w3 + 60.0*w2 + 40.0*w - 50.0) / 120.0;
+        derivatives[2] = (-50.0*w4 + 120.0*w3 - 120.0*w) / 120.0;
+        derivatives[3] = (50.0*w4 - 120.0*w3 + 60.0*w2 + 60.0*w + 10.0) / 120.0;
+        derivatives[4] = (-25.0*w4 + 80.0*w3 - 60.0*w2 - 40.0*w + 50.0) / 120.0;
+        derivatives[5] = w4 / 24.0;
+    }
+}
+
 __device__ inline int pme_pbc_grid_index(int idx, int grid_size) {
     idx = idx % grid_size;
     if (idx < 0) idx += grid_size;
@@ -484,32 +1283,69 @@ __device__ inline int pme_pbc_grid_index(int idx, int grid_size) {
 
 constexpr int PME_MAX_SPLINE_ORDER = 8;
 
-__global__ void pme_clear_grid_kernel(cufftDoubleComplex* grid, size_t grid_size) {
+__global__ void pme_clear_grid_kernel(Real* grid, size_t grid_size) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < grid_size) {
-        grid[tid].x = 0.0;
-        grid[tid].y = 0.0;
+        grid[tid] = 0.0;
     }
 }
 
-// Spread particle charges onto the (complex, imag=0) grid via B-spline
-// interpolation (charge assignment step of P3M/PME).
+// Sum identical grid updates inside a warp before issuing one global atomic.
+// spatial_particle_order is laid out as 32-particle cell tiles, so each warp
+// handles nearby particles and commonly has overlapping B-spline supports.
+__device__ __forceinline__ void pme_warp_aggregated_atomic_add(
+    Real* grid, size_t index, Real value, bool valid)
+{
+    const unsigned active = __activemask();
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned long long key = valid
+        ? static_cast<unsigned long long>(index)
+        : ~0ull;
+    unsigned peers = __match_any_sync(active, key);
+    const int leader = __ffs(peers) - 1;
+
+    if (static_cast<int>(lane) == leader && valid) {
+        Real sum = 0.0;
+        while (peers) {
+            const int source_lane = __ffs(peers) - 1;
+            sum += __shfl_sync(active, value, source_lane);
+            peers &= peers - 1;
+        }
+        atomicAdd(&grid[index], sum);
+    }
+}
+
+// Spread particle charges onto the real grid via B-spline interpolation.
+// When the neighbor-list cell tiles are available, particle_order gives each
+// warp a spatially compact tile and enables the aggregation above.  Padding,
+// ghost particles, and neutral atoms still execute the fixed loop nest with
+// zero weight so every active lane reaches the warp collectives safely.
 __global__ void pme_spread_charges_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
-    const Real* __restrict__ charge, cufftDoubleComplex* charge_grid,
+    const Real* __restrict__ charge, Real* charge_grid,
+    const int* __restrict__ spatial_particle_order, size_t spread_work_items,
     int grid_nx, int grid_ny, int grid_nz,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     int spline_order, size_t num_particles)
 {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_particles) return;
+    const size_t work_index = blockIdx.x * blockDim.x + threadIdx.x;
+    int particle = -1;
+    if (work_index < spread_work_items) {
+        particle = spatial_particle_order
+            ? spatial_particle_order[work_index]
+            : static_cast<int>(work_index);
+    }
+    const bool valid_particle = particle >= 0 &&
+        static_cast<size_t>(particle) < num_particles;
+    const Real qi = valid_particle ? charge[particle] : 0.0;
+    const bool contributes = valid_particle && fabs(qi) >= 1e-12;
 
-    Real qi = charge[i];
-    if (fabs(qi) < 1e-12) return;
-
-    Real u_x = (x[i] * inv_box_x + 0.5) * static_cast<Real>(grid_nx);
-    Real u_y = (y[i] * inv_box_y + 0.5) * static_cast<Real>(grid_ny);
-    Real u_z = (z[i] * inv_box_z + 0.5) * static_cast<Real>(grid_nz);
+    Real u_x = contributes
+        ? (x[particle] * inv_box_x + 0.5) * static_cast<Real>(grid_nx) : 0.0;
+    Real u_y = contributes
+        ? (y[particle] * inv_box_y + 0.5) * static_cast<Real>(grid_ny) : 0.0;
+    Real u_z = contributes
+        ? (z[particle] * inv_box_z + 0.5) * static_cast<Real>(grid_nz) : 0.0;
 
     u_x = u_x - floor(u_x / grid_nx) * grid_nx;
     u_y = u_y - floor(u_y / grid_ny) * grid_ny;
@@ -538,31 +1374,201 @@ __global__ void pme_spread_charges_kernel(
                            + static_cast<size_t>(gy) * grid_nz
                            + static_cast<size_t>(gz);
 
-                atomicAdd(&charge_grid[idx].x, weight);
+                pme_warp_aggregated_atomic_add(
+                    charge_grid, idx, weight, contributes);
             }
         }
     }
 }
 
+// ============================================================================
+// Hopper (sm_90+) thread-block-cluster PME spread. See design doc "GPU 기반
+// MD Nonbonded 커널 설계" section 9.1: a cluster of blocks can access each
+// other's shared memory directly (Distributed Shared Memory), which in
+// principle lets a group of blocks jointly own a larger local sub-grid than
+// one block's shared memory allows.
+//
+// SCOPE OF THIS KERNEL / WHAT IS NOT DONE: this implementation uses the
+// cluster launch purely to get co-scheduled, SM-adjacent blocks; it does
+// NOT yet route cross-block writes through cluster.map_shared_rank (true
+// DSM). Instead, each block (one 32-atom spatial tile, matching the LJ tile
+// scheme in neighbor_list_kernels.cu) keeps its own small shared-memory
+// sub-grid window and accumulates into it with a cheap block-local shared
+// atomicAdd; any B-spline tap whose grid index falls outside that block's
+// own window (including taps that belong in a cluster sibling's window)
+// falls through to a plain global atomicAdd, exactly like the existing
+// pme_spread_charges_kernel. That fallback is what keeps this kernel
+// correct for any grid/box/cutoff combination -- the shared-memory window
+// only cuts how often the (more expensive) global atomic path is taken, it
+// is never required for correctness. Wiring the fallback path through DSM
+// to a cluster sibling instead of global memory is the natural follow-up,
+// left undone here because it needs a Hopper-class GPU to validate the
+// cross-block addressing; see set_pme_cluster_spread_enabled in
+// force_calculator_cuda.h and device_supports_clusters_ for how this stays
+// off unless a run actually has sm_90+ hardware.
+//
+// UNVERIFIED: no Hopper-class GPU was available to compile-test, run, or
+// benchmark this kernel (mirrors the honesty policy already established
+// for use_tiled_lj_kernel_ above -- off by default, opt-in only).
+//
+// No __CUDA_ARCH__ guard is needed here: nothing in this kernel's body uses
+// a Hopper-only instruction (it deliberately does not call
+// cluster.map_shared_rank -- see "SCOPE" above), so it is valid device code
+// on any architecture. The cluster launch itself is what actually requires
+// sm_90+; that is a *host-side* launch-config choice
+// (cudaLaunchAttributeClusterDimension in compute_electrostatic_forces_ewald
+// below), gated at runtime by device_supports_clusters_, not a compile-time
+// concern for this function.
+// ============================================================================
+
+// Blocks per cluster: 4 is inside the portable 1-8 block/cluster range
+// guaranteed on any sm_90+ part (up to 16 is available but non-portable).
+constexpr int PME_CLUSTER_BLOCKS = 4;
+// Half-width (grid cells) of each block's local shared sub-grid, per axis.
+// Must exceed ceil(spline_order/2) so a particle's full spline footprint
+// can land inside the window whenever its own base grid index is within
+// range of the block's window origin (see PME_MAX_SPLINE_ORDER = 8).
+constexpr int PME_CLUSTER_WINDOW_RADIUS = 5;
+constexpr int PME_CLUSTER_WINDOW = 2 * PME_CLUSTER_WINDOW_RADIUS;
+
+__global__ void pme_spread_charges_cluster_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const Real* __restrict__ charge, Real* charge_grid,
+    const int* __restrict__ spatial_particle_order, size_t spread_work_items,
+    int grid_nx, int grid_ny, int grid_nz,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    int spline_order, size_t num_particles)
+{
+    __shared__ Real local_grid[PME_CLUSTER_WINDOW * PME_CLUSTER_WINDOW * PME_CLUSTER_WINDOW];
+    __shared__ int origin_x, origin_y, origin_z;
+    const int total_cells = PME_CLUSTER_WINDOW * PME_CLUSTER_WINDOW * PME_CLUSTER_WINDOW;
+    for (int idx = threadIdx.x; idx < total_cells; idx += blockDim.x) {
+        local_grid[idx] = 0.0;
+    }
+
+    const size_t work_index = blockIdx.x * blockDim.x + threadIdx.x;
+    int particle = -1;
+    if (work_index < spread_work_items) {
+        particle = spatial_particle_order
+            ? spatial_particle_order[work_index]
+            : static_cast<int>(work_index);
+    }
+    const bool valid_particle = particle >= 0 &&
+        static_cast<size_t>(particle) < num_particles;
+    const Real qi = valid_particle ? charge[particle] : 0.0;
+    const bool contributes = valid_particle && fabs(qi) >= 1e-12;
+
+    Real u_x = contributes
+        ? (x[particle] * inv_box_x + 0.5) * static_cast<Real>(grid_nx) : 0.0;
+    Real u_y = contributes
+        ? (y[particle] * inv_box_y + 0.5) * static_cast<Real>(grid_ny) : 0.0;
+    Real u_z = contributes
+        ? (z[particle] * inv_box_z + 0.5) * static_cast<Real>(grid_nz) : 0.0;
+    u_x = u_x - floor(u_x / grid_nx) * grid_nx;
+    u_y = u_y - floor(u_y / grid_ny) * grid_ny;
+    u_z = u_z - floor(u_z / grid_nz) * grid_nz;
+
+    Real wx[PME_MAX_SPLINE_ORDER], wy[PME_MAX_SPLINE_ORDER], wz[PME_MAX_SPLINE_ORDER];
+    int ix[PME_MAX_SPLINE_ORDER], iy[PME_MAX_SPLINE_ORDER], iz[PME_MAX_SPLINE_ORDER];
+    pme_compute_bspline_weights(u_x, spline_order, wx, ix);
+    pme_compute_bspline_weights(u_y, spline_order, wy, iy);
+    pme_compute_bspline_weights(u_z, spline_order, wz, iz);
+
+    // Window origin: thread 0's own base grid index, broadcast to the whole
+    // block via shared memory. If thread 0 happens not to contribute
+    // (padding/neutral atom), the window just defaults to grid origin 0 --
+    // every other thread's taps still get evaluated correctly, they simply
+    // fall through to the global-atomic path more often for this block.
+    if (threadIdx.x == 0) {
+        origin_x = contributes ? ix[0] : 0;
+        origin_y = contributes ? iy[0] : 0;
+        origin_z = contributes ? iz[0] : 0;
+    }
+    __syncthreads();
+
+    for (int kx = 0; kx < spline_order; kx++) {
+        const int lx = ix[kx] - origin_x + PME_CLUSTER_WINDOW_RADIUS;
+        const int gx = pme_pbc_grid_index(ix[kx], grid_nx);
+        const bool x_in_window = contributes && lx >= 0 && lx < PME_CLUSTER_WINDOW;
+        const Real weight_x = wx[kx] * qi;
+        for (int ky = 0; ky < spline_order; ky++) {
+            const int ly = iy[ky] - origin_y + PME_CLUSTER_WINDOW_RADIUS;
+            const int gy = pme_pbc_grid_index(iy[ky], grid_ny);
+            const bool y_in_window = x_in_window && ly >= 0 && ly < PME_CLUSTER_WINDOW;
+            const Real weight_xy = wy[ky] * weight_x;
+            for (int kz = 0; kz < spline_order; kz++) {
+                const int lz = iz[kz] - origin_z + PME_CLUSTER_WINDOW_RADIUS;
+                const int gz = pme_pbc_grid_index(iz[kz], grid_nz);
+                const bool in_window = y_in_window && lz >= 0 && lz < PME_CLUSTER_WINDOW;
+                const Real weight = wz[kz] * weight_xy;
+                if (in_window) {
+                    const int lidx = (lx * PME_CLUSTER_WINDOW + ly) * PME_CLUSTER_WINDOW + lz;
+                    atomicAdd(&local_grid[lidx], weight);
+                } else if (contributes) {
+                    const size_t idx = static_cast<size_t>(gx) * grid_ny * grid_nz
+                               + static_cast<size_t>(gy) * grid_nz
+                               + static_cast<size_t>(gz);
+                    atomicAdd(&charge_grid[idx], weight);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Flush this block's window to the global grid. Cluster-sibling blocks
+    // may own windows whose cells overlap this one's (their tile origins
+    // can be close in space), so this has to stay a global atomicAdd, not
+    // a plain store.
+    for (int idx = threadIdx.x; idx < total_cells; idx += blockDim.x) {
+        const Real val = local_grid[idx];
+        if (val == 0.0) continue;
+        const int lx = idx / (PME_CLUSTER_WINDOW * PME_CLUSTER_WINDOW);
+        const int ly = (idx / PME_CLUSTER_WINDOW) % PME_CLUSTER_WINDOW;
+        const int lz = idx % PME_CLUSTER_WINDOW;
+        const int gx = pme_pbc_grid_index(origin_x + lx - PME_CLUSTER_WINDOW_RADIUS, grid_nx);
+        const int gy = pme_pbc_grid_index(origin_y + ly - PME_CLUSTER_WINDOW_RADIUS, grid_ny);
+        const int gz = pme_pbc_grid_index(origin_z + lz - PME_CLUSTER_WINDOW_RADIUS, grid_nz);
+        const size_t gidx = static_cast<size_t>(gx) * grid_ny * grid_nz
+                           + static_cast<size_t>(gy) * grid_nz
+                           + static_cast<size_t>(gz);
+        atomicAdd(&charge_grid[gidx], val);
+    }
+}
+
+// Frequencies kz in (0, nz/2) exclusive have their Hermitian-conjugate
+// mirror at (nx-kx, ny-ky, nz-kz), which R2C packing never stores (that kz
+// falls outside [0, nz/2]); kz == 0 and, for even nz, the Nyquist
+// kz == nz/2 are their own mirrors. Manual sums over the half-spectrum grid
+// (energy, virial) must double every other stored point to stand in for
+// its unstored mirror. FFT-based reconstruction (the inverse C2R transform
+// itself) needs no such factor -- cuFFT already knows the mirror is
+// implied.
+__device__ __forceinline__ Real pme_hermitian_weight(int kz, int grid_nz) {
+    if (kz == 0) return 1.0;
+    if ((grid_nz % 2 == 0) && kz == grid_nz / 2) return 1.0;
+    return 2.0;
+}
+
 // Solve the Poisson equation in reciprocal space: multiply rho(k) by the
 // (B-spline-corrected) Gaussian Green's function to get the potential
 // Phi(k), in place, and accumulate the reciprocal-space energy.
-// k_coulomb is folded into `prefactor` by the caller.
+// k_coulomb is folded into `prefactor` by the caller. Operates on the
+// half-spectrum grid: kz in [0, grid_nzh) where grid_nzh == grid_nz/2 + 1.
 __global__ void pme_solve_poisson_kernel(
     cufftDoubleComplex* fft_grid,
     const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
     Real* reciprocal_energy_out, Real prefactor, Real alpha,
-    int grid_nx, int grid_ny, int grid_nz,
+    int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z)
 {
     int kx = blockIdx.x * blockDim.x + threadIdx.x;
     int ky = blockIdx.y * blockDim.y + threadIdx.y;
     int kz = blockIdx.z * blockDim.z + threadIdx.z;
 
-    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nz) return;
+    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nzh) return;
 
-    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nz
-               + static_cast<size_t>(ky) * grid_nz
+    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nzh
+               + static_cast<size_t>(ky) * grid_nzh
                + static_cast<size_t>(kz);
 
     if (kx == 0 && ky == 0 && kz == 0) {
@@ -573,7 +1579,7 @@ __global__ void pme_solve_poisson_kernel(
 
     Real kx_wave = (kx <= grid_nx/2) ? static_cast<Real>(kx) : static_cast<Real>(kx - grid_nx);
     Real ky_wave = (ky <= grid_ny/2) ? static_cast<Real>(ky) : static_cast<Real>(ky - grid_ny);
-    Real kz_wave = (kz <= grid_nz/2) ? static_cast<Real>(kz) : static_cast<Real>(kz - grid_nz);
+    Real kz_wave = static_cast<Real>(kz);  // kz already in [0, nz/2], no wrap needed
 
     kx_wave *= 2.0 * M_PI * inv_box_x;
     ky_wave *= 2.0 * M_PI * inv_box_y;
@@ -596,70 +1602,20 @@ __global__ void pme_solve_poisson_kernel(
     fft_grid[idx].x = green * rho_real;
     fft_grid[idx].y = green * rho_imag;
 
-    Real energy_contrib = 0.5 * green * (rho_real * rho_real + rho_imag * rho_imag);
+    Real energy_contrib = 0.5 * pme_hermitian_weight(kz, grid_nz) *
+                           green * (rho_real * rho_real + rho_imag * rho_imag);
     atomicAdd(reciprocal_energy_out, energy_contrib);
 }
 
-// E(k) = -i * k * Phi(k) -- gradient of the potential in reciprocal space.
-// This kernel was present in the original codebase but never invoked; the
-// math checks out (verified against E = -i*k*(re + i*im) = k*im - i*k*re)
-// so it is reused as-is.
-__global__ void pme_compute_electric_field_kernel(
-    const cufftDoubleComplex* __restrict__ phi_grid,
-    cufftDoubleComplex* ex_grid, cufftDoubleComplex* ey_grid, cufftDoubleComplex* ez_grid,
-    int grid_nx, int grid_ny, int grid_nz,
-    Real box_x, Real box_y, Real box_z)
-{
-    int kx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ky = blockIdx.y * blockDim.y + threadIdx.y;
-    int kz = blockIdx.z * blockDim.z + threadIdx.z;
-
-    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nz) return;
-
-    Real kx_wave = (kx <= grid_nx/2) ? static_cast<Real>(kx) : static_cast<Real>(kx - grid_nx);
-    Real ky_wave = (ky <= grid_ny/2) ? static_cast<Real>(ky) : static_cast<Real>(ky - grid_ny);
-    Real kz_wave = (kz <= grid_nz/2) ? static_cast<Real>(kz) : static_cast<Real>(kz - grid_nz);
-
-    kx_wave *= 2.0 * M_PI / box_x;
-    ky_wave *= 2.0 * M_PI / box_y;
-    kz_wave *= 2.0 * M_PI / box_z;
-
-    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nz
-               + static_cast<size_t>(ky) * grid_nz
-               + static_cast<size_t>(kz);
-
-    Real phi_real = phi_grid[idx].x;
-    Real phi_imag = phi_grid[idx].y;
-
-    ex_grid[idx].x = phi_imag * kx_wave;
-    ex_grid[idx].y = -phi_real * kx_wave;
-
-    ey_grid[idx].x = phi_imag * ky_wave;
-    ey_grid[idx].y = -phi_real * ky_wave;
-
-    ez_grid[idx].x = phi_imag * kz_wave;
-    ez_grid[idx].y = -phi_real * kz_wave;
-}
-
-// After the inverse FFT, E(r) is complex but should be purely real (up to
-// numerical noise) since E(k) has Hermitian symmetry for a real charge
-// distribution. Keep only the real part and normalize by grid_size (cuFFT
-// does not normalize inverse transforms).
-__global__ void pme_extract_real_part_kernel(
-    const cufftDoubleComplex* complex_grid, Real* real_grid, size_t grid_size)
-{
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= grid_size) return;
-    real_grid[i] = complex_grid[i].x / static_cast<Real>(grid_size);
-}
-
-// Interpolate the (already gradient-correct) field grid back onto particles:
-// F_i = q_i * E(r_i), using the same B-spline weights as charge spreading.
+// Differentiate the B-spline interpolation of the real-space potential:
+// F_i = -q_i grad(sum_g B_g phi_g).  This replaces three spectral gradients
+// and three inverse FFTs with one inverse FFT plus additional gather math.
+// The kernel runs on force_stream after the PME-grid-ready event, so all
+// other force producers are ordered before it and plain += stores are safe.
 __global__ void pme_interpolate_forces_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     const Real* __restrict__ charge,
-    const Real* __restrict__ field_grid_x, const Real* __restrict__ field_grid_y,
-    const Real* __restrict__ field_grid_z,
+    const Real* __restrict__ potential_grid,
     Real* fx, Real* fy, Real* fz,
     int grid_nx, int grid_ny, int grid_nz,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
@@ -680,40 +1636,39 @@ __global__ void pme_interpolate_forces_kernel(
     u_z = u_z - floor(u_z / grid_nz) * grid_nz;
 
     Real wx[PME_MAX_SPLINE_ORDER], wy[PME_MAX_SPLINE_ORDER], wz[PME_MAX_SPLINE_ORDER];
+    Real dwx[PME_MAX_SPLINE_ORDER], dwy[PME_MAX_SPLINE_ORDER], dwz[PME_MAX_SPLINE_ORDER];
     int ix[PME_MAX_SPLINE_ORDER], iy[PME_MAX_SPLINE_ORDER], iz[PME_MAX_SPLINE_ORDER];
 
-    pme_compute_bspline_weights(u_x, spline_order, wx, ix);
-    pme_compute_bspline_weights(u_y, spline_order, wy, iy);
-    pme_compute_bspline_weights(u_z, spline_order, wz, iz);
+    pme_compute_bspline_weights_and_derivatives(u_x, spline_order, wx, dwx, ix);
+    pme_compute_bspline_weights_and_derivatives(u_y, spline_order, wy, dwy, iy);
+    pme_compute_bspline_weights_and_derivatives(u_z, spline_order, wz, dwz, iz);
 
-    Real ex = 0.0, ey = 0.0, ez = 0.0;
+    Real dphi_du_x = 0.0, dphi_du_y = 0.0, dphi_du_z = 0.0;
 
     for (int kx = 0; kx < spline_order; kx++) {
         int gx = pme_pbc_grid_index(ix[kx], grid_nx);
-        Real weight_x = wx[kx];
-
         for (int ky = 0; ky < spline_order; ky++) {
             int gy = pme_pbc_grid_index(iy[ky], grid_ny);
-            Real weight_xy = wy[ky] * weight_x;
 
             for (int kz = 0; kz < spline_order; kz++) {
                 int gz = pme_pbc_grid_index(iz[kz], grid_nz);
-                Real weight = wz[kz] * weight_xy;
 
                 size_t idx = static_cast<size_t>(gx) * grid_ny * grid_nz
                            + static_cast<size_t>(gy) * grid_nz
                            + static_cast<size_t>(gz);
-
-                ex += weight * field_grid_x[idx];
-                ey += weight * field_grid_y[idx];
-                ez += weight * field_grid_z[idx];
+                const Real phi = potential_grid[idx];
+                dphi_du_x += dwx[kx] * wy[ky] * wz[kz] * phi;
+                dphi_du_y += wx[kx] * dwy[ky] * wz[kz] * phi;
+                dphi_du_z += wx[kx] * wy[ky] * dwz[kz] * phi;
             }
         }
     }
 
-    atomicAdd(&fx[i], qi * ex);
-    atomicAdd(&fy[i], qi * ey);
-    atomicAdd(&fz[i], qi * ez);
+    const Real inv_grid_size = 1.0 /
+        (static_cast<Real>(grid_nx) * grid_ny * grid_nz);
+    fx[i] += -qi * dphi_du_x * (grid_nx * inv_box_x) * inv_grid_size;
+    fy[i] += -qi * dphi_du_y * (grid_ny * inv_box_y) * inv_grid_size;
+    fz[i] += -qi * dphi_du_z * (grid_nz * inv_box_z) * inv_grid_size;
 }
 
 // Self-energy correction: E_self = -k_coulomb * alpha/sqrt(pi) * sum(q_i^2)
@@ -731,23 +1686,24 @@ __global__ void pme_self_energy_kernel(
 }
 
 // Reciprocal-space virial contribution: W_recip = sum_k (1 + k^2/(2a^2)) * energy_contrib(k)
+// Operates on the half-spectrum grid; see pme_hermitian_weight.
 __global__ void pme_reciprocal_virial_kernel(
     const cufftDoubleComplex* __restrict__ fft_grid,
     const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
     Real* virial, Real prefactor, Real alpha,
-    int grid_nx, int grid_ny, int grid_nz,
+    int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z)
 {
     int kx = blockIdx.x * blockDim.x + threadIdx.x;
     int ky = blockIdx.y * blockDim.y + threadIdx.y;
     int kz = blockIdx.z * blockDim.z + threadIdx.z;
 
-    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nz) return;
+    if (kx >= grid_nx || ky >= grid_ny || kz >= grid_nzh) return;
     if (kx == 0 && ky == 0 && kz == 0) return;
 
     Real kx_wave = (kx <= grid_nx/2) ? static_cast<Real>(kx) : static_cast<Real>(kx - grid_nx);
     Real ky_wave = (ky <= grid_ny/2) ? static_cast<Real>(ky) : static_cast<Real>(ky - grid_ny);
-    Real kz_wave = (kz <= grid_nz/2) ? static_cast<Real>(kz) : static_cast<Real>(kz - grid_nz);
+    Real kz_wave = static_cast<Real>(kz);  // kz already in [0, nz/2], no wrap needed
 
     kx_wave *= 2.0 * M_PI * inv_box_x;
     ky_wave *= 2.0 * M_PI * inv_box_y;
@@ -764,8 +1720,8 @@ __global__ void pme_reciprocal_virial_kernel(
     Real gauss_screen = exp(-k_sq / (4.0 * alpha_sq));
     Real green = prefactor * gauss_screen / (k_sq * m_sq + 1e-12);
 
-    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nz
-               + static_cast<size_t>(ky) * grid_nz
+    size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nzh
+               + static_cast<size_t>(ky) * grid_nzh
                + static_cast<size_t>(kz);
 
     Real rho_real = fft_grid[idx].x;
@@ -773,7 +1729,7 @@ __global__ void pme_reciprocal_virial_kernel(
     Real rho_sq = rho_real * rho_real + rho_imag * rho_imag;
 
     Real virial_factor = 1.0 + k_sq / (2.0 * alpha_sq);
-    Real virial_contrib = virial_factor * green * rho_sq;
+    Real virial_contrib = pme_hermitian_weight(kz, grid_nz) * virial_factor * green * rho_sq;
 
     atomicAdd(virial, virial_contrib);
 }
@@ -1304,9 +2260,10 @@ ForceCalculatorCUDA::ForceCalculatorCUDA() :
     d_global_id(nullptr),
     d_x_ref(nullptr), d_y_ref(nullptr), d_z_ref(nullptr), d_max_disp_sq(nullptr),
     d_fire_reduce_(nullptr),
-    d_neighbors(nullptr), d_num_neighbors(nullptr), d_neighbor_offset(nullptr),
     d_epsilon_mixed(nullptr), d_sigma_mixed(nullptr),
     d_exclusion_keys(nullptr), num_exclusions(0),
+    d_exclusion_offsets(nullptr), d_exclusion_partners(nullptr),
+    exclusion_atom_count(0),
     d_potential_energy(nullptr), d_kinetic_energy(nullptr),
     // GPU-resident bonded topology initialization
     num_bonds_cached(0), d_bond_atom1(nullptr), d_bond_atom2(nullptr),
@@ -1326,7 +2283,7 @@ ForceCalculatorCUDA::ForceCalculatorCUDA() :
     d_constraint_distance(nullptr),
     constraint_scratch_capacity_(0), d_constraint_pre_x_(nullptr), d_constraint_pre_y_(nullptr),
     d_constraint_pre_z_(nullptr), d_constraint_max_error_(nullptr),
-    allocated_particles(0), allocated_neighbors(0),
+    allocated_particles(0),
     max_types(0),
     device_data_initialized(false),
     bonded_topology_on_device(false),
@@ -1359,6 +2316,9 @@ void ForceCalculatorCUDA::initialize() {
     std::cout << "[CUDA] MPI rank " << get_mpi_rank()
               << " using local GPU " << device_id << " (" << prop.name
               << ", cc " << prop.major << "." << prop.minor << ")\n";
+    // Thread block clusters (distributed shared memory) require Hopper or
+    // newer -- see pme_spread_charges_cluster_kernel/set_pme_cluster_spread_enabled.
+    device_supports_clusters_ = (prop.major >= 9);
 
     // Allocate energy buffers once
     CUDA_CHECK(cudaMalloc(&d_potential_energy, sizeof(Real)));
@@ -1367,6 +2327,8 @@ void ForceCalculatorCUDA::initialize() {
 
     // Create a dedicated CUDA stream for force/energy operations
     CUDA_CHECK(cudaStreamCreate(&force_stream));
+    CUDA_CHECK(cudaEventCreateWithFlags(&force_clear_event_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&pme_grid_ready_event_, cudaEventDisableTiming));
 }
 
 void ForceCalculatorCUDA::finalize() {
@@ -1387,15 +2349,35 @@ void ForceCalculatorCUDA::finalize() {
     if (d_x_ref) cudaFree(d_x_ref);
     if (d_y_ref) cudaFree(d_y_ref);
     if (d_z_ref) cudaFree(d_z_ref);
+    if (d_force_fixed_x_) cudaFree(d_force_fixed_x_);
+    if (d_force_fixed_y_) cudaFree(d_force_fixed_y_);
+    if (d_force_fixed_z_) cudaFree(d_force_fixed_z_);
     if (d_max_disp_sq) cudaFree(d_max_disp_sq);
     if (d_fire_reduce_) cudaFree(d_fire_reduce_);
+    if (d_tile_pair_stats_) cudaFree(d_tile_pair_stats_);
+    if (d_graph_offsets_) cudaFree(d_graph_offsets_);
+    if (d_graph_degrees_) cudaFree(d_graph_degrees_);
+    if (d_graph_cursors_) cudaFree(d_graph_cursors_);
+    if (d_graph_ref_x_) cudaFree(d_graph_ref_x_);
+    if (d_graph_ref_y_) cudaFree(d_graph_ref_y_);
+    if (d_graph_ref_z_) cudaFree(d_graph_ref_z_);
+    if (d_edge_src_) cudaFree(d_edge_src_);
+    if (d_edge_dst_) cudaFree(d_edge_dst_);
+    if (d_edge_coo_packed_) cudaFree(d_edge_coo_packed_);
+    if (d_tmp_edge_src_) cudaFree(d_tmp_edge_src_);
+    if (d_tmp_edge_dst_) cudaFree(d_tmp_edge_dst_);
+    if (d_pos_interleaved_) cudaFree(d_pos_interleaved_);
+    if (d_mlip_forces_) cudaFree(d_mlip_forces_);
+    if (d_edge_vectors_) cudaFree(d_edge_vectors_);
+    if (d_batch_) cudaFree(d_batch_);
+    if (d_num_atoms_) cudaFree(d_num_atoms_);
+    if (d_cell_) cudaFree(d_cell_);
+    if (d_pbc_buf_) cudaFree(d_pbc_buf_);
+    if (d_mlip_error_flag_) cudaFree(d_mlip_error_flag_);
     if (d_constraint_pre_x_) cudaFree(d_constraint_pre_x_);
     if (d_constraint_pre_y_) cudaFree(d_constraint_pre_y_);
     if (d_constraint_pre_z_) cudaFree(d_constraint_pre_z_);
     if (d_constraint_max_error_) cudaFree(d_constraint_max_error_);
-    if (d_neighbors) cudaFree(d_neighbors);
-    if (d_num_neighbors) cudaFree(d_num_neighbors);
-    if (d_neighbor_offset) cudaFree(d_neighbor_offset);
     if (d_potential_energy) cudaFree(d_potential_energy);
     if (d_kinetic_energy) cudaFree(d_kinetic_energy);
     if (d_virial) cudaFree(d_virial);  // NEW: free virial memory
@@ -1414,12 +2396,39 @@ void ForceCalculatorCUDA::finalize() {
         d_exclusion_keys = nullptr;
         num_exclusions = 0;
     }
+    if (d_exclusion_offsets) {
+        cudaFree(d_exclusion_offsets);
+        d_exclusion_offsets = nullptr;
+    }
+    if (d_exclusion_partners) {
+        cudaFree(d_exclusion_partners);
+        d_exclusion_partners = nullptr;
+    }
+    exclusion_atom_count = 0;
     
     // Free bonded topology device memory
     free_bonded_topology_device();
 
     // Cleanup Ewald/PME reciprocal-space resources
     free_ewald_resources();
+
+    if (force_clear_event_) {
+        cudaEventDestroy(force_clear_event_);
+        force_clear_event_ = nullptr;
+    }
+    if (pme_grid_ready_event_) {
+        cudaEventDestroy(pme_grid_ready_event_);
+        pme_grid_ready_event_ = nullptr;
+    }
+    if (force_timing_events_ready_) {
+        cudaEventDestroy(force_timing_event_start_);
+        cudaEventDestroy(force_timing_event_bonded_);
+        cudaEventDestroy(force_timing_event_mlip_);
+        cudaEventDestroy(force_timing_event_lj_);
+        cudaEventDestroy(force_timing_event_electrostatic_);
+        cudaEventDestroy(force_timing_event_special_);
+        force_timing_events_ready_ = false;
+    }
 
     // Destroy CUDA stream if created
     if (force_stream) {
@@ -1711,9 +2720,6 @@ bool ForceCalculatorCUDA::ensure_device_particle_capacity(size_t required,
     grow_real(d_mass,true); grow_real(d_charge,true);
     grow_int(d_type,true); grow_int(d_global_id,true);
     grow_real(d_x_ref,true); grow_real(d_y_ref,true); grow_real(d_z_ref,true);
-    grow_int(d_num_neighbors,false); grow_int(d_neighbor_offset,false);
-    CUDA_CHECK(cudaMemsetAsync(d_num_neighbors,0,new_capacity*sizeof(int),force_stream));
-    CUDA_CHECK(cudaMemsetAsync(d_neighbor_offset,0,new_capacity*sizeof(int),force_stream));
     allocated_particles = new_capacity;
     return true;
 }
@@ -1727,21 +2733,13 @@ dsdecompx::StorageResizeResult ForceCalculatorCUDA::resize_particle_info(
 
 // ============================================================================
 
-void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles, size_t max_neighbors) {
+void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
     // Safety checks
     if (num_particles == 0) {
         if (is_rank_zero()) {
             std::cerr << "WARNING: allocate_device_memory called with num_particles=0" << std::endl;
         }
         return;
-    }
-    
-    if (max_neighbors > 10000) {
-        if (is_rank_zero()) {
-            std::cerr << "WARNING: allocate_device_memory: max_neighbors=" << max_neighbors 
-                      << " seems too large, capping at 2000" << std::endl;
-        }
-        max_neighbors = 2000;
     }
     
     if (num_particles > allocated_particles) {
@@ -1759,12 +2757,13 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles, size_t ma
         if (d_charge) cudaFree(d_charge);
         if (d_type) cudaFree(d_type);
         if (d_global_id) cudaFree(d_global_id);
-        if (d_num_neighbors) cudaFree(d_num_neighbors);
-        if (d_neighbor_offset) cudaFree(d_neighbor_offset);
         if (d_x_ref) cudaFree(d_x_ref);
         if (d_y_ref) cudaFree(d_y_ref);
         if (d_z_ref) cudaFree(d_z_ref);
-        
+        if (d_force_fixed_x_) cudaFree(d_force_fixed_x_);
+        if (d_force_fixed_y_) cudaFree(d_force_fixed_y_);
+        if (d_force_fixed_z_) cudaFree(d_force_fixed_z_);
+
         // Allocate new memory
         CUDA_CHECK(cudaMalloc(&d_x, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_y, num_particles * sizeof(Real)));
@@ -1779,18 +2778,17 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles, size_t ma
         CUDA_CHECK(cudaMalloc(&d_charge, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_type, num_particles * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_global_id, num_particles * sizeof(int)));  // int, not size_t
-        CUDA_CHECK(cudaMalloc(&d_num_neighbors, num_particles * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_neighbor_offset, num_particles * sizeof(int)));
-        
-        // Initialize neighbor list arrays to zero (CRITICAL FIX)
-        CUDA_CHECK(cudaMemset(d_num_neighbors, 0, num_particles * sizeof(int)));
-        CUDA_CHECK(cudaMemset(d_neighbor_offset, 0, num_particles * sizeof(int)));
-        
         // Allocate displacement tracking arrays
         CUDA_CHECK(cudaMalloc(&d_x_ref, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_y_ref, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_z_ref, num_particles * sizeof(Real)));
-        
+
+        // Fixed-point force-accumulation scratch (LJ + Ewald real-space
+        // kernels; see atomicAddFixed above).
+        CUDA_CHECK(cudaMalloc(&d_force_fixed_x_, num_particles * sizeof(long long)));
+        CUDA_CHECK(cudaMalloc(&d_force_fixed_y_, num_particles * sizeof(long long)));
+        CUDA_CHECK(cudaMalloc(&d_force_fixed_z_, num_particles * sizeof(long long)));
+
         allocated_particles = num_particles;
     }
     
@@ -1799,22 +2797,6 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles, size_t ma
         CUDA_CHECK(cudaMalloc(&d_max_disp_sq, sizeof(Real)));
     }
     
-    // Check for overflow in neighbor allocation
-    size_t total_neighbors = num_particles * max_neighbors;
-    if (total_neighbors / num_particles != max_neighbors) {
-        // Overflow detected
-        if (is_rank_zero()) {
-            std::cerr << "ERROR: Overflow in neighbor list allocation: " 
-                      << num_particles << " * " << max_neighbors << std::endl;
-        }
-        throw std::runtime_error("Neighbor list allocation overflow");
-    }
-    
-    if (total_neighbors > allocated_neighbors) {
-        if (d_neighbors) cudaFree(d_neighbors);
-        CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors * sizeof(int)));
-        allocated_neighbors = total_neighbors;
-    }
 }
 
 void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
@@ -1858,24 +2840,8 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
         return;
     }
     
-    // Estimate max neighbors based on density and neighbor list cutoff (includes skin)
-    SimulationBox& box = system.get_box();
-    Real volume = box.lx * box.ly * box.lz;
-    Real density = static_cast<Real>(num_particles) / volume;
-    
-    // Get actual neighbor list cutoff (includes skin distance)
-    NeighborList& nlist = system.get_neighbor_list();
-    Real effective_cutoff = nlist.cutoff; // This includes skin
-    
-    Real cutoff_volume = (4.0 / 3.0) * M_PI * effective_cutoff * effective_cutoff * effective_cutoff;
-    size_t estimated_max_neighbors = static_cast<size_t>(density * cutoff_volume * 2.0); // 2x safety factor
-    
-    // Ensure reasonable bounds (minimum 100, maximum 1000 to avoid excessive initial allocation)
-    estimated_max_neighbors = std::max(size_t(100), std::min(size_t(1000), estimated_max_neighbors));
-    
-    
     // Allocate device memory if needed
-    allocate_device_memory(num_particles, estimated_max_neighbors);
+    allocate_device_memory(num_particles);
     
     // Upload all particle state data (positions, velocities, masses, types, charges)
     CUDA_CHECK(cudaMemcpyAsync(d_x, particles.x.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
@@ -1929,6 +2895,42 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
         CUDA_CHECK(cudaMemcpyAsync(d_exclusion_keys, exclusions.data(),
                                    num_exclusions * sizeof(unsigned long long),
                                    cudaMemcpyHostToDevice, force_stream));
+
+        unsigned int max_global_id = 0;
+        for (const unsigned long long key : exclusions) {
+            max_global_id = std::max(max_global_id,
+                static_cast<unsigned int>(key >> 32));
+            max_global_id = std::max(max_global_id,
+                static_cast<unsigned int>(key & 0xffffffffULL));
+        }
+        exclusion_atom_count = static_cast<size_t>(max_global_id) + 1;
+        std::vector<std::vector<int>> per_atom(exclusion_atom_count);
+        for (const unsigned long long key : exclusions) {
+            const int first = static_cast<int>(key >> 32);
+            const int second = static_cast<int>(key & 0xffffffffULL);
+            per_atom[first].push_back(second);
+            per_atom[second].push_back(first);
+        }
+        std::vector<int> offsets(exclusion_atom_count + 1, 0);
+        std::vector<int> partners;
+        partners.reserve(exclusions.size() * 2);
+        for (size_t atom = 0; atom < exclusion_atom_count; ++atom) {
+            auto& list = per_atom[atom];
+            std::sort(list.begin(), list.end());
+            list.erase(std::unique(list.begin(), list.end()), list.end());
+            partners.insert(partners.end(), list.begin(), list.end());
+            offsets[atom + 1] = static_cast<int>(partners.size());
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_exclusion_offsets),
+                              offsets.size() * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_exclusion_partners),
+                              partners.size() * sizeof(int)));
+        CUDA_CHECK(cudaMemcpyAsync(d_exclusion_offsets, offsets.data(),
+                                   offsets.size() * sizeof(int),
+                                   cudaMemcpyHostToDevice, force_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_exclusion_partners, partners.data(),
+                                   partners.size() * sizeof(int),
+                                   cudaMemcpyHostToDevice, force_stream));
     }
     
     // Synchronize to ensure all uploads complete
@@ -1953,52 +2955,259 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
     
 }
 
-void ForceCalculatorCUDA::update_neighbor_list_on_device(MDSystem& system) {
-    size_t num_particles = system.get_num_particles();
-    
-    // Only update neighbor list data on device
-    NeighborList& nlist = system.get_neighbor_list();
-    
-    // Check if neighbor list size exceeds allocated memory and reallocate if needed
-    if (!nlist.neighbors.empty()) {
-        size_t total_neighbors_needed = nlist.neighbors.size();
-        if (total_neighbors_needed > allocated_neighbors) {
-            if (is_rank_zero()) {
-                std::cout << "Reallocating neighbor list memory: " << allocated_neighbors 
-                          << " -> " << total_neighbors_needed << " neighbors" << std::endl;
-            }
-            if (d_neighbors) cudaFree(d_neighbors);
-            CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors_needed * sizeof(int)));
-            allocated_neighbors = total_neighbors_needed;
-        }
-        
-        CUDA_CHECK(cudaMemcpyAsync(d_neighbors, nlist.neighbors.data(),
-                             nlist.neighbors.size() * sizeof(int), cudaMemcpyHostToDevice, force_stream));
-    }
-    if (!nlist.num_neighbors.empty()) {
-        CUDA_CHECK(cudaMemcpyAsync(d_num_neighbors, nlist.num_neighbors.data(),
-                             num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));
-    }
-    if (!nlist.neighbor_offset.empty()) {
-        CUDA_CHECK(cudaMemcpyAsync(d_neighbor_offset, nlist.neighbor_offset.data(),
-                             num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));
-    }
-    
-    // CRITICAL: Synchronize to ensure neighbor list data is on GPU before it's used
-    CUDA_CHECK(cudaStreamSynchronize(force_stream));
-}
-
-extern "C" void launch_cuda_neighbor_list_build(
+extern "C" void launch_cuda_tile_list_build(
     const Real* d_x, const Real* d_y, const Real* d_z,
-    int* d_neighbor_list,
-    int* d_num_neighbors,
-    int* d_neighbor_offset,
-    int n_local, int n_total,
+    int n_total, int n_local,
     Real cutoff, Real verlet_skin,
     Real lx, Real ly, Real lz,
     bool periodic_x, bool periodic_y, bool periodic_z,
-    int max_neighbors_per_particle,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int** out_d_tile_atoms,
+    int** out_d_tile_pair_i,
+    int** out_d_tile_pair_j,
+    int** out_d_tile_pair_offsets,
+    unsigned long long** out_d_tile_pair_verlet_mask,
+    int* out_num_tiles,
+    int* out_num_tile_pairs,
+    unsigned long long* out_pairs_inside_rc,
+    unsigned long long* out_pairs_inside_rc_plus_skin);
+
+// See the declaration comment in force_calculator_cuda.h. Structural-only:
+// one host-side copy of d_tile_pair_offsets (num_lj_tiles_+1 ints), no kernel
+// changes -- printed every time the tile graph is actually (re)built, not
+// just once.
+void ForceCalculatorCUDA::log_tile_graph_stats(size_t local_particles) {
+    if (!is_rank_zero()) return;
+
+    std::vector<int> offsets(static_cast<size_t>(num_lj_tiles_) + 1);
+    CUDA_CHECK(cudaMemcpy(offsets.data(), d_tile_pair_offsets,
+                          offsets.size() * sizeof(int), cudaMemcpyDeviceToHost));
+
+    int max_home_degree = 0;
+    for (int t = 0; t < num_lj_tiles_; ++t) {
+        max_home_degree = std::max(max_home_degree, offsets[t + 1] - offsets[t]);
+    }
+    const double neighbor_list_inflation =
+        (local_particles > 0) ? static_cast<double>(num_lj_tile_pairs_) / static_cast<double>(local_particles) : 0.0;
+    const double interaction_density =
+        (num_lj_tiles_ > 0) ? static_cast<double>(num_lj_tile_pairs_) / static_cast<double>(num_lj_tiles_) : 0.0;
+    const double load_imbalance =
+        (interaction_density > 0.0) ? static_cast<double>(max_home_degree) / interaction_density : 0.0;
+    const unsigned long long unmasked_tested =
+        static_cast<unsigned long long>(num_lj_tile_pairs_) * 64ULL;
+    const double retained_fraction = (unmasked_tested > 0)
+        ? static_cast<double>(pairs_inside_rc_plus_skin_) / static_cast<double>(unmasked_tested)
+        : 0.0;
+
+    std::cout << "\n[ForceCalculatorCUDA][tiled] tiles=" << num_lj_tiles_
+              << " tile_pairs=" << num_lj_tile_pairs_ << "\n"
+              << "[ForceCalculatorCUDA][tiled] tile_pairs/atom(neighbor-list inflation)=" << neighbor_list_inflation
+              << " avg_tile_neighbors/home_tile(interaction density)=" << interaction_density
+              << " max/avg_tile_neighbors(load imbalance)=" << load_imbalance
+              << " (max_home_degree=" << max_home_degree << ")"
+              << "\n[ForceCalculatorCUDA][tiled] pairs_inside_rc=" << pairs_inside_rc_
+              << " pairs_inside_rc_plus_skin=" << pairs_inside_rc_plus_skin_
+              << " tested_without_mask=" << unmasked_tested
+              << " retained_fraction=" << retained_fraction
+              << "\n" << std::endl;
+}
+
+// See the declaration comment in force_calculator_cuda.h. Must run before the
+// LJ/fused-nonbonded kernel dispatch in compute_forces() so a non-null
+// d_tile_pair_stats_ is already in hand when that launch reads it -- probing
+// only lazily on read-back would miss the very first launch's counts.
+void ForceCalculatorCUDA::ensure_tile_pair_stats_enabled() {
+    if (tile_pair_stats_probed_) return;
+    tile_pair_stats_probed_ = true;
+    const char* v = std::getenv("MD_LOG_TILE_PAIR_STATS");
+    tile_pair_stats_enabled_ = (v && *v && std::string(v) != "0");
+    if (tile_pair_stats_enabled_) {
+        CUDA_CHECK(cudaMalloc(&d_tile_pair_stats_, 2 * sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(d_tile_pair_stats_, 0, 2 * sizeof(unsigned long long)));
+    }
+}
+
+// See the declaration comment in force_calculator_cuda.h. Only reads back
+// d_tile_pair_stats_ when MD_LOG_TILE_PAIR_STATS=1 (see
+// ensure_tile_pair_stats_enabled()) -- otherwise d_tile_pair_stats_ stays
+// null and the tiled kernels' `if (pair_stats)` checks are the only cost
+// paid. Called every step, right after that step's LJ/fused-nonbonded kernel
+// + flush_fixed_forces_kernel in compute_forces(); resets the device
+// counters back to 0 before returning so the next step's read-back isn't
+// cumulative.
+void ForceCalculatorCUDA::log_tile_pair_stats_gpu() {
+    if (!tile_pair_stats_enabled_) return;
+
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    unsigned long long stats[2] = {0, 0};
+    CUDA_CHECK(cudaMemcpy(stats, d_tile_pair_stats_, sizeof(stats), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemset(d_tile_pair_stats_, 0, sizeof(stats)));
+    const unsigned long long tested_pairs = stats[0];
+    const unsigned long long real_pairs = stats[1];
+
+    const double tile_pruning_efficiency =
+        (tested_pairs > 0) ? static_cast<double>(real_pairs) / static_cast<double>(tested_pairs) : 0.0;
+
+    // GPU half-list cost: every real pair costs exactly one atomicAddFixed
+    // triplet on the j side (one per tile-pair edge that has ANY accepted
+    // local-j reaction, folded via __shfl_sync -- see compute_lj_forces_
+    // tiled_kernel's doc comment) plus one triplet per home tile for the i
+    // side, regardless of how many pairs landed in it. Both counts are
+    // already known host-side from the tile graph, so only real_pairs (the
+    // denominator) needs the device counter above.
+    const double atomic_ops =
+        3.0 * (static_cast<double>(num_lj_tile_pairs_) + static_cast<double>(num_lj_tiles_));
+    const double half_list_cost =
+        (real_pairs > 0) ? atomic_ops / static_cast<double>(real_pairs) : 0.0;
+
+    if (is_rank_zero()) {
+        std::cout << "\n[ForceCalculatorCUDA] real_pairs/tested_pairs(tile pruning efficiency)="
+                  << tile_pruning_efficiency
+                  << " (real=" << real_pairs << " tested=" << tested_pairs << ")\n"
+                  << "[ForceCalculatorCUDA] atomicAdd_triplets/real_pair(half-list cost)=" << half_list_cost
+                  << " (atomic_triplets~=" << atomic_ops << ")"
+                  << "\n" << std::endl;
+    }
+}
+
+void ForceCalculatorCUDA::ensure_graph_edge_capacity(int64_t edges) {
+    if (edges <= cap_edges_ && d_edge_src_ && d_edge_dst_ && d_edge_coo_packed_) return;
+    if (d_edge_src_) cudaFree(d_edge_src_);
+    if (d_edge_dst_) cudaFree(d_edge_dst_);
+    if (d_edge_coo_packed_) cudaFree(d_edge_coo_packed_);
+    d_edge_src_ = nullptr;
+    d_edge_dst_ = nullptr;
+    d_edge_coo_packed_ = nullptr;
+    cap_edges_ = std::max<int64_t>(256, edges + edges / 4 + 256);
+    CUDA_CHECK(cudaMalloc(&d_edge_src_, sizeof(int32_t) * cap_edges_));
+    CUDA_CHECK(cudaMalloc(&d_edge_dst_, sizeof(int32_t) * cap_edges_));
+    CUDA_CHECK(cudaMalloc(&d_edge_coo_packed_, sizeof(int32_t) * cap_edges_ * 2));
+}
+
+void ForceCalculatorCUDA::rebuild_graph_from_tiles_on_device(MDSystem& system) {
+    const int num_local = static_cast<int>(system.get_local_particles());
+    const int num_total = static_cast<int>(system.get_total_particles());
+    if (num_local <= 0) {
+        num_edges_ = 0;
+        graph_dirty_ = false;
+        return;
+    }
+    const bool have_tile_broad_phase = d_tile_atoms && d_tile_pair_i && d_tile_pair_j &&
+        d_tile_pair_verlet_mask_ && num_lj_tile_pairs_ > 0;
+
+    if (num_local > graph_atom_capacity_) {
+        if (d_graph_offsets_) cudaFree(d_graph_offsets_);
+        if (d_graph_degrees_) cudaFree(d_graph_degrees_);
+        if (d_graph_cursors_) cudaFree(d_graph_cursors_);
+        graph_atom_capacity_ = std::max(num_local, num_local + num_local / 4 + 64);
+        CUDA_CHECK(cudaMalloc(&d_graph_offsets_, sizeof(int) * (graph_atom_capacity_ + 1)));
+        CUDA_CHECK(cudaMalloc(&d_graph_degrees_, sizeof(int) * graph_atom_capacity_));
+        CUDA_CHECK(cudaMalloc(&d_graph_cursors_, sizeof(int) * graph_atom_capacity_));
+    }
+    if (num_total > graph_ref_capacity_) {
+        if (d_graph_ref_x_) cudaFree(d_graph_ref_x_);
+        if (d_graph_ref_y_) cudaFree(d_graph_ref_y_);
+        if (d_graph_ref_z_) cudaFree(d_graph_ref_z_);
+        graph_ref_capacity_ = std::max(num_total, num_total + num_total / 4 + 64);
+        CUDA_CHECK(cudaMalloc(&d_graph_ref_x_, sizeof(Real) * graph_ref_capacity_));
+        CUDA_CHECK(cudaMalloc(&d_graph_ref_y_, sizeof(Real) * graph_ref_capacity_));
+        CUDA_CHECK(cudaMalloc(&d_graph_ref_z_, sizeof(Real) * graph_ref_capacity_));
+    }
+
+    const SimulationBox& box = system.get_box();
+    const Real physical_cutoff = system.get_physical_cutoff();
+    const Real outer_skin = std::max<Real>(0.0,
+        system.get_neighbor_list().search_cutoff() - physical_cutoff);
+    graph_active_skin_ = 0.5 * outer_skin;
+    const Real active_cutoff = physical_cutoff + graph_active_skin_;
+    const Real inv_x = 1.0 / box.lx, inv_y = 1.0 / box.ly, inv_z = 1.0 / box.lz;
+    const int tile_blocks = have_tile_broad_phase ? (num_lj_tile_pairs_ + 255) / 256 : 0;
+    const int atom_blocks = (num_local + 255) / 256;
+
+    CUDA_CHECK(cudaMemsetAsync(d_graph_degrees_, 0, sizeof(int) * num_local, force_stream));
+    if (have_tile_broad_phase) {
+        count_directed_graph_degrees_kernel<<<tile_blocks, 256, 0, force_stream>>>(
+            d_x, d_y, d_z, d_tile_atoms, d_tile_pair_i, d_tile_pair_j,
+            d_tile_pair_verlet_mask_, d_graph_degrees_, num_lj_tile_pairs_, num_local,
+            active_cutoff * active_cutoff, box.lx, box.ly, box.lz, inv_x, inv_y, inv_z);
+    } else {
+        count_directed_graph_degrees_direct_kernel<<<atom_blocks, 256, 0, force_stream>>>(
+            d_x, d_y, d_z, d_graph_degrees_, num_local, num_total,
+            active_cutoff * active_cutoff, box.lx, box.ly, box.lz, inv_x, inv_y, inv_z);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::device_ptr<int> degree_ptr(d_graph_degrees_);
+    thrust::device_ptr<int> offset_ptr(d_graph_offsets_);
+    thrust::exclusive_scan(thrust::cuda::par.on(force_stream),
+                           degree_ptr, degree_ptr + num_local, offset_ptr);
+    finish_graph_offsets_kernel<<<1, 1, 0, force_stream>>>(
+        d_graph_degrees_, d_graph_offsets_, num_local);
+
+    int edge_count = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&edge_count, d_graph_offsets_ + num_local,
+                               sizeof(int), cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    ensure_graph_edge_capacity(edge_count);
+    num_edges_ = edge_count;
+
+    if (edge_count > 0) {
+        CUDA_CHECK(cudaMemsetAsync(d_graph_cursors_, 0, sizeof(int) * num_local, force_stream));
+        if (have_tile_broad_phase) {
+            fill_directed_graph_kernel<<<tile_blocks, 256, 0, force_stream>>>(
+                d_x, d_y, d_z, d_tile_atoms, d_tile_pair_i, d_tile_pair_j,
+                d_tile_pair_verlet_mask_, d_graph_offsets_, d_graph_cursors_,
+                d_edge_src_, d_edge_dst_, num_lj_tile_pairs_, num_local,
+                active_cutoff * active_cutoff, box.lx, box.ly, box.lz,
+                inv_x, inv_y, inv_z);
+        } else {
+            fill_directed_graph_direct_kernel<<<atom_blocks, 256, 0, force_stream>>>(
+                d_x, d_y, d_z, d_graph_offsets_, d_edge_src_, d_edge_dst_,
+                num_local, num_total, active_cutoff * active_cutoff,
+                box.lx, box.ly, box.lz, inv_x, inv_y, inv_z);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_, d_edge_src_,
+                                   sizeof(int32_t) * edge_count,
+                                   cudaMemcpyDeviceToDevice, force_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_ + edge_count, d_edge_dst_,
+                                   sizeof(int32_t) * edge_count,
+                                   cudaMemcpyDeviceToDevice, force_stream));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d_graph_ref_x_, d_x, sizeof(Real) * num_total,
+                               cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_graph_ref_y_, d_y, sizeof(Real) * num_total,
+                               cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_graph_ref_z_, d_z, sizeof(Real) * num_total,
+                               cudaMemcpyDeviceToDevice, force_stream));
+    graph_dirty_ = false;
+    nlist_dirty_ = false;
+}
+
+void ForceCalculatorCUDA::ensure_graph_on_device(MDSystem& system) {
+    if (nonbonded_kernel_ != "graph") return;
+    const size_t num_total = system.get_total_particles();
+    if (!graph_dirty_ && num_total > 0 && d_graph_ref_x_) {
+        Real zero = 0.0;
+        CUDA_CHECK(cudaMemcpyAsync(d_max_disp_sq, &zero, sizeof(Real),
+                                   cudaMemcpyHostToDevice, force_stream));
+        const int threads = 256;
+        const int blocks = static_cast<int>((num_total + threads - 1) / threads);
+        const SimulationBox& box = system.get_box();
+        compute_max_displacement_kernel<<<blocks, threads, 0, force_stream>>>(
+            d_x, d_y, d_z, d_graph_ref_x_, d_graph_ref_y_, d_graph_ref_z_,
+            d_max_disp_sq, box.lx, box.ly, box.lz,
+            box.periodic_x, box.periodic_y, box.periodic_z, num_total);
+        Real max_disp_sq = 0.0;
+        CUDA_CHECK(cudaMemcpyAsync(&max_disp_sq, d_max_disp_sq, sizeof(Real),
+                                   cudaMemcpyDeviceToHost, force_stream));
+        CUDA_CHECK(cudaStreamSynchronize(force_stream));
+        const Real threshold = 0.5 * graph_active_skin_;
+        graph_dirty_ = graph_active_skin_ <= 0.0 ||
+                       max_disp_sq >= threshold * threshold;
+    }
+    if (graph_dirty_) rebuild_graph_from_tiles_on_device(system);
+}
 
 void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
     if (!device_data_initialized) {
@@ -2016,87 +3225,49 @@ void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
 
     SimulationBox& box = system.get_box();
     NeighborList& nlist = system.get_neighbor_list();
-    
-    // nlist.cutoff already stores (physical_cutoff + verlet_skin) per neighbor_list.cpp
-    Real search_radius = nlist.cutoff; 
+
+    // Build masks at the physical cutoff + configured Verlet skin.  The
+    // masks are reused until the normal skin/2 displacement rebuild fires.
+    Real search_radius = nlist.search_cutoff();
     if (!(search_radius > 0.0)) {
-        // Recover from missing host-side neighbor metadata in GPU-first flows.
-        Real skin = (nlist.skin_distance > 0.0) ? nlist.skin_distance : 2.0;
-        search_radius = system.get_physical_cutoff() + skin;
-        nlist.skin_distance = skin;
-        nlist.cutoff = search_radius;
+        // Defensive fallback: search_cutoff() is set once at construction
+        // from config, so this should be unreachable in practice.
+        search_radius = system.get_physical_cutoff() + 2.0;
         if (is_rank_zero()) {
             std::cerr << "[CUDA] WARNING: invalid neighbor cutoff metadata; using fallback cutoff="
-                      << search_radius << " (physical+skin)." << std::endl;
+                      << search_radius << " (physical+default skin)." << std::endl;
         }
     }
     
-    // The current GPU builder uses a padded per-particle list. Estimate a
-    // conservative capacity from density instead of silently assuming 1024,
-    // which is too small for solvated biomolecules at a 13.5 A pair-list
-    // radius (APOA1 is about 0.1 atom/A^3, or roughly 1030 neighbors).
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real density = volume > 0.0 ? static_cast<Real>(num_particles) / volume : 0.0;
-    const Real sphere = (4.0 / 3.0) * M_PI * search_radius * search_radius * search_radius;
-    const int max_neighbors_per_particle = std::clamp(
-        static_cast<int>(std::ceil(1.5 * density * sphere)), 1024, 4096);
-    
-    size_t total_neighbors_needed = (size_t)local_particles * max_neighbors_per_particle;
-    
-    // Safety: check GPU memory before allocating (1M * 1024 * 4B = ~4GB, may exceed VRAM)
-    size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
-    size_t needed_bytes = total_neighbors_needed * sizeof(int);
-    if (needed_bytes > free_mem * 8 / 10) { // Use at most 80% of free VRAM
-        if (is_rank_zero()) {
-            std::cerr << "WARNING: neighbor list would need " << needed_bytes / (1024*1024) 
-                      << " MB but only " << free_mem / (1024*1024) 
-                      << " MB free. Reducing max_neighbors_per_particle." << std::endl;
-        }
-        // Reduce max neighbors to fit in available memory (leave 20% headroom)
-        total_neighbors_needed = (free_mem * 8 / 10) / sizeof(int);
-    }
-
-    if (total_neighbors_needed > allocated_neighbors) {
-        if (d_neighbors) cudaFree(d_neighbors);
-        CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors_needed * sizeof(int)));
-        allocated_neighbors = total_neighbors_needed;
-    }
-    
-    // Compute actual max_neighbors_per_particle based on what was allocated
-    int actual_max_neighbors = (int)(allocated_neighbors / local_particles);
-    if (actual_max_neighbors < 1) {
-        actual_max_neighbors = 1;
-    }
-    
-    // Launch the neighbor list build kernel
-    launch_cuda_neighbor_list_build(
+    // Build only the rank-local spatial tile graph. CUDA no longer allocates
+    // or constructs an atom-CSR neighbor list.
+    const Real physical_cutoff = system.get_physical_cutoff();
+    const Real verlet_skin = std::max<Real>(0.0, search_radius - physical_cutoff);
+    launch_cuda_tile_list_build(
         d_x, d_y, d_z,
-        d_neighbors, d_num_neighbors, d_neighbor_offset,
-        local_particles, num_particles,
-        search_radius, 0.0, // skin is already in search_radius
+        static_cast<int>(num_particles), static_cast<int>(local_particles),
+        physical_cutoff, verlet_skin,
         box.lx, box.ly, box.lz,
         box.periodic_x, box.periodic_y, box.periodic_z,
-        actual_max_neighbors,
-        force_stream
+        force_stream,
+        &d_tile_atoms, &d_tile_pair_i, &d_tile_pair_j, &d_tile_pair_offsets,
+        &d_tile_pair_verlet_mask_,
+        &num_lj_tiles_, &num_lj_tile_pairs_,
+        &pairs_inside_rc_, &pairs_inside_rc_plus_skin_
     );
 
-    // The kernel reports the true count even when its padded output capacity
-    // is exceeded. Check before launching a force kernel so an undersized list
-    // fails loudly rather than dropping neighbors.
-    std::vector<int> host_neighbor_counts(local_particles);
-    CUDA_CHECK(cudaMemcpyAsync(host_neighbor_counts.data(), d_num_neighbors,
-                               local_particles * sizeof(int),
-                               cudaMemcpyDeviceToHost, force_stream));
-    CUDA_CHECK(cudaStreamSynchronize(force_stream));
-    const int observed_max = *std::max_element(host_neighbor_counts.begin(),
-                                                host_neighbor_counts.end());
-    if (observed_max > actual_max_neighbors) {
-        throw std::runtime_error("CUDA neighbor-list capacity exceeded: observed " +
-            std::to_string(observed_max) + " neighbors/atom but capacity is " +
-            std::to_string(actual_max_neighbors));
+    const bool tile_graph_ready = num_lj_tiles_ > 0 && num_lj_tile_pairs_ > 0 &&
+        d_tile_atoms && d_tile_pair_i && d_tile_pair_j && d_tile_pair_offsets &&
+        d_tile_pair_verlet_mask_;
+    if (!tile_graph_ready && nonbonded_kernel_ != "graph") {
+        throw std::runtime_error(
+            "CUDA spatial tile-list construction failed; atom-CSR fallback has been removed");
     }
-    
+
+    if (tile_graph_ready) log_tile_graph_stats(local_particles);
+    graph_dirty_ = true;
+    nlist_dirty_ = true;
+
     // Save reference positions for displacement tracking (LOCAL particles only)
     CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, local_particles * sizeof(Real), 
                                cudaMemcpyDeviceToDevice, force_stream));
@@ -2104,9 +3275,6 @@ void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
                                cudaMemcpyDeviceToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_z_ref, d_z, local_particles * sizeof(Real), 
                                cudaMemcpyDeviceToDevice, force_stream));
-    
-    // Synchronize to ensure list is built before force calculation
-    CUDA_CHECK(cudaStreamSynchronize(force_stream));
 }
 
 void ForceCalculatorCUDA::download_from_device(MDSystem& system) {
@@ -2172,9 +3340,6 @@ void ForceCalculatorCUDA::update_reference_positions_on_device(size_t num_local_
                                cudaMemcpyDeviceToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_z_ref, d_z, num_local_particles * sizeof(Real), 
                                cudaMemcpyDeviceToDevice, force_stream));
-    
-    // Synchronize to ensure reference positions are updated before next step
-    CUDA_CHECK(cudaStreamSynchronize(force_stream));
 }
 
 // NEW: Upload forces from host to device (for Python/ML force integration)
@@ -2323,6 +3488,9 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     // Reset energies and virial on GPU
     CUDA_CHECK(cudaMemsetAsync(d_potential_energy, 0, sizeof(Real), force_stream));
     CUDA_CHECK(cudaMemsetAsync(d_virial, 0, sizeof(Real), force_stream));  // NEW: reset virial
+    // PME runs on a second stream.  It may overlap the real-space kernels,
+    // but must never race the buffer clears above.
+    CUDA_CHECK(cudaEventRecord(force_clear_event_, force_stream));
     
     // Get force field configuration
     ForceManager& force_manager = system.get_force_manager();
@@ -2340,54 +3508,230 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     
     Real physical_cutoff = system.get_physical_cutoff();
     Real cutoff_sq = physical_cutoff * physical_cutoff;
-    
+
+    // PERF FIX: compute_lj_forces_kernel/compute_lj_forces_tiled_kernel/
+    // compute_lj_electrostatic_forces_kernel used to each recompute
+    // switch_sq/cutoff_delta/denom (with a division) from switch_distance
+    // INSIDE the kernel, i.e. redundantly on every GPU thread for every
+    // accepted pair -- despite switch_distance/cutoff being uniform across
+    // the entire launch (same CPU-side bug this mirrors: see
+    // ForceCalculatorCPU::compute_nonbonded_forces_tiled's identical fix).
+    // Unlike a uniformly-taken branch (no warp divergence since every thread
+    // agrees on the outcome), a redundant per-thread division is real
+    // wasted ALU/FPU throughput regardless of divergence, so this is worth
+    // hoisting to the host and passing down as an extra kernel argument
+    // (multiply by the precomputed reciprocal instead of dividing).
+    Real switch_sq = 0.0, inv_denom = 0.0;
+    if (params.lj_switch_distance > 0.0) {
+        switch_sq = params.lj_switch_distance * params.lj_switch_distance;
+        const Real cutoff_delta = cutoff_sq - switch_sq;
+        inv_denom = 1.0 / (cutoff_delta * cutoff_delta * cutoff_delta);
+    }
+
     // Launch kernels based on configuration
     num_blocks = (local_particles + block_size - 1) / block_size;
-    
+
+    // Diagnostic per-component force timing (set_timing_breakdown_enabled(),
+    // wired to MD_TIMING_TRACE_FORCE=1 in MDSimulation). Markers are plain
+    // cudaEventRecord calls on force_stream -- no extra synchronization, so
+    // enabling this does not perturb the deliberate LJ/PME stream overlap.
+    // All elapsed times are read back at the single cudaStreamSynchronize()
+    // this function already does below for the energy/virial download.
+    if (timing_breakdown_enabled_ && !force_timing_events_ready_) {
+        CUDA_CHECK(cudaEventCreate(&force_timing_event_start_));
+        CUDA_CHECK(cudaEventCreate(&force_timing_event_bonded_));
+        CUDA_CHECK(cudaEventCreate(&force_timing_event_mlip_));
+        CUDA_CHECK(cudaEventCreate(&force_timing_event_lj_));
+        CUDA_CHECK(cudaEventCreate(&force_timing_event_electrostatic_));
+        CUDA_CHECK(cudaEventCreate(&force_timing_event_special_));
+        force_timing_events_ready_ = true;
+    }
+    const bool time_components = timing_breakdown_enabled_ && force_timing_events_ready_;
+    if (time_components) {
+        CUDA_CHECK(cudaEventRecord(force_timing_event_start_, force_stream));
+    }
+
+    const bool ran_bonded = builtin_forces_enabled_ &&
+        (force_config.enable_bonds || force_config.enable_angles || force_config.enable_dihedrals);
     if (builtin_forces_enabled_ && force_config.enable_bonds) {
         compute_bond_forces(system);
     }
-    
+
     if (builtin_forces_enabled_ && force_config.enable_angles) {
         compute_angle_forces(system);
     }
-    
+
     if (builtin_forces_enabled_ && force_config.enable_dihedrals) {
         compute_dihedral_forces(system);
         compute_improper_forces(system);
     }
+    if (time_components) {
+        CUDA_CHECK(cudaEventRecord(force_timing_event_bonded_, force_stream));
+    }
+
+    // The graph is shared by the classical nonbonded kernel and LibTorch.
+    // Refresh it once here (only when its nested-Verlet displacement bound is
+    // exhausted) before either consumer runs.
+    if (nonbonded_kernel_ == "graph") {
+        ensure_graph_on_device(system);
+    }
 
     // LibTorch MLIP is a force component, not an exclusive replacement.
     // Built-in contributions above/below and MLIP forces therefore accumulate.
+    const bool ran_mlip = mlip_runtime_enabled_;
     if (mlip_runtime_enabled_) {
         compute_mlip_runtime_forces(system);
     }
-    if (builtin_forces_enabled_ && force_config.enable_lennard_jones) {
-        compute_lj_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
-            d_x, d_y, d_z, d_fx, d_fy, d_fz,
-            d_type, d_global_id,
-            d_neighbors, d_num_neighbors, d_neighbor_offset,
-            d_epsilon_mixed, d_sigma_mixed,
-            d_exclusion_keys, num_exclusions,
-            d_potential_energy,
-            d_virial,  // NEW: pass virial pointer
-            box_x, box_y, box_z,
+    if (time_components) {
+        CUDA_CHECK(cudaEventRecord(force_timing_event_mlip_, force_stream));
+    }
+
+    const bool ran_lj = builtin_forces_enabled_ && force_config.enable_lennard_jones;
+    const bool ran_electrostatic_cfg = builtin_forces_enabled_ && force_config.enable_coulomb;
+    const bool graph_mode = nonbonded_kernel_ == "graph";
+    const bool tile_graph_ready = num_lj_tile_pairs_ > 0 && d_tile_atoms &&
+        d_tile_pair_offsets && d_tile_pair_j && d_tile_pair_verlet_mask_;
+    if ((ran_lj || ran_electrostatic_cfg) && !graph_mode && !tile_graph_ready) {
+        throw std::runtime_error("CUDA nonbonded force requested without a spatial tile graph");
+    }
+    if ((ran_lj || ran_electrostatic_cfg) && graph_mode &&
+        (!d_graph_offsets_ || (num_edges_ > 0 && !d_edge_dst_))) {
+        throw std::runtime_error("CUDA graph nonbonded force requested without a directed device CSR");
+    }
+
+    // PERF FIX: when both LJ and Coulomb are enabled (the common case --
+    // e.g. apoa1), fuse them into one tile-pair traversal instead of two --
+    // see compute_nonbonded_forces_tiled_kernel's doc comment for why
+    // (duplicate distance/minimum-image/exclusion work otherwise paid
+    // twice, plus double the atomics). ensure_ewald_initialized() is called
+    // explicitly here since the fused path skips compute_electrostatic_
+    // forces_real_space() (which would otherwise call it) but still needs
+    // ewald_alpha_ for the Coulomb term below.
+    const bool use_fused_nonbonded = ran_lj && ran_electrostatic_cfg;
+    if (use_fused_nonbonded) {
+        ensure_ewald_initialized(system);
+    }
+    const Real k_coulomb = 332.0636;
+
+    if (!graph_mode && (ran_lj || use_fused_nonbonded)) {
+        ensure_tile_pair_stats_enabled();
+    }
+
+    if (graph_mode && (ran_lj || ran_electrostatic_cfg)) {
+        if (ran_electrostatic_cfg) ensure_ewald_initialized(system);
+        auto* graph_kernel = mixed_precision_enabled_
+            ? &compute_nonbonded_forces_graph_kernel<float>
+            : &compute_nonbonded_forces_graph_kernel<double>;
+        graph_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_fx, d_fy, d_fz, d_type, d_global_id, d_charge,
+            d_graph_offsets_, d_edge_dst_, d_epsilon_mixed, d_sigma_mixed,
+            d_exclusion_offsets, d_exclusion_partners, exclusion_atom_count,
+            d_potential_energy, d_virial, box_x, box_y, box_z,
             inv_box_x, inv_box_y, inv_box_z,
-            local_particles, num_particles,
-            max_types,
+            static_cast<int>(local_particles), static_cast<int>(num_particles), max_types,
+            params.mie_repulsive_exponent, params.mie_attractive_exponent,
+            params.mie_prefactor, cutoff_sq, params.lj_switch_distance,
+            switch_sq, inv_denom, k_coulomb, ewald_alpha_, ran_lj,
+            ran_electrostatic_cfg);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (use_fused_nonbonded) {
+        CUDA_CHECK(cudaMemsetAsync(d_force_fixed_x_, 0, local_particles * sizeof(long long), force_stream));
+        CUDA_CHECK(cudaMemsetAsync(d_force_fixed_y_, 0, local_particles * sizeof(long long), force_stream));
+        CUDA_CHECK(cudaMemsetAsync(d_force_fixed_z_, 0, local_particles * sizeof(long long), force_stream));
+
+        auto* fused_tiled_kernel = mixed_precision_enabled_
+            ? &compute_nonbonded_forces_tiled_kernel<float>
+            : &compute_nonbonded_forces_tiled_kernel<double>;
+        const int tile_block_size = 128;
+        const int warps_per_block = tile_block_size / 32;
+        const int tiles_per_block = warps_per_block * LJ_CLUSTER_GROUPS_PER_WARP;
+        const int tile_num_blocks = (num_lj_tiles_ + tiles_per_block - 1) / tiles_per_block;
+        fused_tiled_kernel<<<tile_num_blocks, tile_block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
+            d_type, d_global_id, d_charge,
+            d_tile_atoms, d_tile_pair_offsets, d_tile_pair_j, d_tile_pair_verlet_mask_,
+            d_epsilon_mixed, d_sigma_mixed,
+            d_exclusion_offsets, d_exclusion_partners, exclusion_atom_count,
+            d_potential_energy, d_virial,
+            box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z,
+            local_particles, num_particles, max_types,
             params.mie_repulsive_exponent, params.mie_attractive_exponent,
             params.mie_prefactor,
-            cutoff_sq, params.lj_switch_distance
-        );
+            cutoff_sq, params.lj_switch_distance, switch_sq, inv_denom,
+            k_coulomb, ewald_alpha_,
+            num_lj_tiles_, d_tile_pair_stats_);
+
+        flush_fixed_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
+            d_fx, d_fy, d_fz, local_particles);
+    } else if (ran_lj) {
+        // Fixed-point scratch buffers: cleared right before the racy kernel,
+        // flushed into the double d_fx/d_fy/d_fz buffers right after -- see
+        // atomicAddFixed/flush_fixed_forces_kernel above for why.
+        CUDA_CHECK(cudaMemsetAsync(d_force_fixed_x_, 0, local_particles * sizeof(long long), force_stream));
+        CUDA_CHECK(cudaMemsetAsync(d_force_fixed_y_, 0, local_particles * sizeof(long long), force_stream));
+        CUDA_CHECK(cudaMemsetAsync(d_force_fixed_z_, 0, local_particles * sizeof(long long), force_stream));
+
+        auto* lj_tiled_kernel = mixed_precision_enabled_
+            ? &compute_lj_forces_tiled_kernel<float>
+            : &compute_lj_forces_tiled_kernel<double>;
+        const int tile_block_size = 128;
+        const int warps_per_block = tile_block_size / 32;
+        const int tiles_per_block = warps_per_block * LJ_CLUSTER_GROUPS_PER_WARP;
+        const int tile_num_blocks = (num_lj_tiles_ + tiles_per_block - 1) / tiles_per_block;
+        lj_tiled_kernel<<<tile_num_blocks, tile_block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
+            d_type, d_global_id,
+            d_tile_atoms, d_tile_pair_offsets, d_tile_pair_j, d_tile_pair_verlet_mask_,
+            d_epsilon_mixed, d_sigma_mixed,
+            d_exclusion_offsets, d_exclusion_partners, exclusion_atom_count,
+            d_potential_energy, d_virial,
+            box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z,
+            local_particles, num_particles, max_types,
+            params.mie_repulsive_exponent, params.mie_attractive_exponent,
+            params.mie_prefactor,
+            cutoff_sq, params.lj_switch_distance, switch_sq, inv_denom,
+            num_lj_tiles_, d_tile_pair_stats_);
+
+        flush_fixed_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
+            d_fx, d_fy, d_fz, local_particles);
     }
-    
-    // Electrostatic forces: full Ewald summation (real-space erfc-screened
-    // neighbor sum + reciprocal-space PME grid + self-energy correction).
-    if (builtin_forces_enabled_ && force_config.enable_coulomb) {
+    if (!graph_mode && (ran_lj || use_fused_nonbonded)) {
+        log_tile_pair_stats_gpu();
+    }
+    if (time_components) {
+        CUDA_CHECK(cudaEventRecord(force_timing_event_lj_, force_stream));
+        // NOTE: do NOT synchronize here. This function is followed by the
+        // electrostatic (PME) dispatch, which deliberately overlaps its own
+        // grid-construction work on pme_stream_ with whatever's still
+        // finishing on force_stream (see compute_electrostatic_forces_
+        // reciprocal's comment: "PME grid construction and the real-space
+        // pair kernels still overlap"). Synchronizing here would serialize
+        // LJ and PME instead of letting them overlap.
+    }
+
+    // Electrostatic forces: tile-pair real-space Ewald (skipped here when
+    // use_fused_nonbonded already computed it above, combined with LJ)
+    // plus reciprocal PME (always separate -- it isn't a per-pair/tile
+    // computation).
+    const bool ran_electrostatic = ran_electrostatic_cfg;
+    if (graph_mode && ran_electrostatic) {
+        compute_electrostatic_forces_reciprocal(system);
+    } else if (use_fused_nonbonded) {
+        compute_electrostatic_forces_reciprocal(system);
+    } else if (ran_electrostatic) {
         compute_electrostatic_forces_ewald(system);
     }
+    if (time_components) {
+        CUDA_CHECK(cudaEventRecord(force_timing_event_electrostatic_, force_stream));
+    }
+    const bool ran_special = builtin_forces_enabled_;
     if (builtin_forces_enabled_) {
         compute_special_pair_forces(system);
+    }
+    if (time_components) {
+        CUDA_CHECK(cudaEventRecord(force_timing_event_special_, force_stream));
     }
 
     // GPU-resident: NO automatic download
@@ -2404,7 +3748,25 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     last_potential_energy = h_potential_energy;
     last_virial = h_virial;  // NEW: store virial
-    
+
+    if (time_components) {
+        last_force_component_timings_.clear();
+        cudaEvent_t prev = force_timing_event_start_;
+        auto add_component = [&](const char* name, cudaEvent_t ev, bool ran) {
+            float seg_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&seg_ms, prev, ev));
+            if (ran) {
+                last_force_component_timings_.push_back({name, static_cast<double>(seg_ms)});
+            }
+            prev = ev;
+        };
+        add_component("bonded", force_timing_event_bonded_, ran_bonded);
+        add_component("mlip", force_timing_event_mlip_, ran_mlip);
+        add_component("lj", force_timing_event_lj_, ran_lj);
+        add_component("electrostatic", force_timing_event_electrostatic_, ran_electrostatic);
+        add_component("special_pairs", force_timing_event_special_, ran_special);
+    }
+
     // Keep virial rank-local: MDSimulation performs the collective at the point
     // where pressure is needed.  Returning a global virial here caused a second
     // Allreduce in the barostat and multiplied it by the MPI world size.
@@ -2412,10 +3774,6 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     MPI_Allreduce(&last_potential_energy, &global_potential_energy,
                   1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     last_potential_energy = global_potential_energy;
-}
-
-void ForceCalculatorCUDA::compute_lj_forces(MDSystem& system) {
-    // Already handled in compute_forces
 }
 
 void ForceCalculatorCUDA::compute_bond_forces(MDSystem& system) {
@@ -3172,21 +4530,21 @@ void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
 
     const size_t grid_size =
         static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * ewald_grid_z_;
+    const int grid_nzh = ewald_grid_z_ / 2 + 1;
+    const size_t grid_size_freq =
+        static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * grid_nzh;
 
-    CUDA_CHECK(cudaMalloc(&d_pme_charge_grid_, grid_size * sizeof(cufftDoubleComplex)));
-    CUDA_CHECK(cudaMalloc(&d_pme_ex_grid_,     grid_size * sizeof(cufftDoubleComplex)));
-    CUDA_CHECK(cudaMalloc(&d_pme_ey_grid_,     grid_size * sizeof(cufftDoubleComplex)));
-    CUDA_CHECK(cudaMalloc(&d_pme_ez_grid_,     grid_size * sizeof(cufftDoubleComplex)));
-    CUDA_CHECK(cudaMalloc(&d_pme_force_grid_x_, grid_size * sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&d_pme_force_grid_y_, grid_size * sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&d_pme_force_grid_z_, grid_size * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_charge_grid_real_, grid_size * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_charge_grid_freq_, grid_size_freq * sizeof(cufftDoubleComplex)));
     CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_x_, ewald_grid_x_ * sizeof(Real)));
     CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_y_, ewald_grid_y_ * sizeof(Real)));
     CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_z_, ewald_grid_z_ * sizeof(Real)));
 
-    CUFFT_CHECK(cufftPlan3d(&pme_fft_plan_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, CUFFT_Z2Z));
+    CUFFT_CHECK(cufftPlan3d(&pme_fft_plan_forward_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, CUFFT_D2Z));
+    CUFFT_CHECK(cufftPlan3d(&pme_fft_plan_inverse_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, CUFFT_Z2D));
     CUDA_CHECK(cudaStreamCreate(&pme_stream_));
-    CUFFT_CHECK(cufftSetStream(pme_fft_plan_, pme_stream_));
+    CUFFT_CHECK(cufftSetStream(pme_fft_plan_forward_, pme_stream_));
+    CUFFT_CHECK(cufftSetStream(pme_fft_plan_inverse_, pme_stream_));
 
     std::vector<Real> bmx = ewald_compute_bspline_moduli(ewald_grid_x_, ewald_spline_order_);
     std::vector<Real> bmy = ewald_compute_bspline_moduli(ewald_grid_y_, ewald_spline_order_);
@@ -3206,27 +4564,31 @@ void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
 }
 
 void ForceCalculatorCUDA::free_ewald_resources() {
-    if (d_pme_charge_grid_)   { cudaFree(d_pme_charge_grid_);   d_pme_charge_grid_ = nullptr; }
-    if (d_pme_ex_grid_)       { cudaFree(d_pme_ex_grid_);       d_pme_ex_grid_ = nullptr; }
-    if (d_pme_ey_grid_)       { cudaFree(d_pme_ey_grid_);       d_pme_ey_grid_ = nullptr; }
-    if (d_pme_ez_grid_)       { cudaFree(d_pme_ez_grid_);       d_pme_ez_grid_ = nullptr; }
-    if (d_pme_force_grid_x_)  { cudaFree(d_pme_force_grid_x_);  d_pme_force_grid_x_ = nullptr; }
-    if (d_pme_force_grid_y_)  { cudaFree(d_pme_force_grid_y_);  d_pme_force_grid_y_ = nullptr; }
-    if (d_pme_force_grid_z_)  { cudaFree(d_pme_force_grid_z_);  d_pme_force_grid_z_ = nullptr; }
+    if (d_pme_charge_grid_real_) { cudaFree(d_pme_charge_grid_real_); d_pme_charge_grid_real_ = nullptr; }
+    if (d_pme_charge_grid_freq_) { cudaFree(d_pme_charge_grid_freq_); d_pme_charge_grid_freq_ = nullptr; }
     if (d_pme_b_spline_mod_x_){ cudaFree(d_pme_b_spline_mod_x_);d_pme_b_spline_mod_x_ = nullptr; }
     if (d_pme_b_spline_mod_y_){ cudaFree(d_pme_b_spline_mod_y_);d_pme_b_spline_mod_y_ = nullptr; }
     if (d_pme_b_spline_mod_z_){ cudaFree(d_pme_b_spline_mod_z_);d_pme_b_spline_mod_z_ = nullptr; }
-    if (pme_fft_plan_) { cufftDestroy(pme_fft_plan_); pme_fft_plan_ = 0; }
+    if (pme_fft_plan_forward_) { cufftDestroy(pme_fft_plan_forward_); pme_fft_plan_forward_ = 0; }
+    if (pme_fft_plan_inverse_) { cufftDestroy(pme_fft_plan_inverse_); pme_fft_plan_inverse_ = 0; }
     if (pme_stream_)   { cudaStreamDestroy(pme_stream_); pme_stream_ = nullptr; }
     ewald_initialized_ = false;
 }
 
 void ForceCalculatorCUDA::compute_electrostatic_forces_ewald(MDSystem& system) {
     ensure_ewald_initialized(system);
+    compute_electrostatic_forces_real_space(system);
+    compute_electrostatic_forces_reciprocal(system);
+}
 
-    SimulationBox& box = system.get_box();
+// Real-space (near-field, erfc-screened) half of the Ewald sum, evaluated
+// over the existing neighbor list. Split out so compute_nonbonded_forces_
+// fused() can skip it (it does the equivalent work itself, combined with LJ
+// in one pass) while still sharing compute_electrostatic_forces_reciprocal().
+void ForceCalculatorCUDA::compute_electrostatic_forces_real_space(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
     size_t num_particles = system.get_num_particles();
+    SimulationBox& box = system.get_box();
     Real physical_cutoff = system.get_physical_cutoff();
     Real cutoff_sq = physical_cutoff * physical_cutoff;
     const Real k_coulomb = 332.0636;
@@ -3234,22 +4596,56 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_ewald(MDSystem& system) {
     Real box_x = box.lx, box_y = box.ly, box_z = box.lz;
     Real inv_box_x = 1.0/box_x, inv_box_y = 1.0/box_y, inv_box_z = 1.0/box_z;
 
-    // ---- Real-space (near-field, erfc-screened) part ----
     int num_blocks = (local_particles + block_size - 1) / block_size;
-    compute_electrostatic_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
-        d_x, d_y, d_z, d_fx, d_fy, d_fz,
+    // Reuse the same fixed-point scratch buffers the LJ kernel used this
+    // step -- LJ and this kernel both run on force_stream, strictly
+    // sequentially, so LJ's flush has already completed by the time this
+    // clear runs.
+    CUDA_CHECK(cudaMemsetAsync(d_force_fixed_x_, 0, local_particles * sizeof(long long), force_stream));
+    CUDA_CHECK(cudaMemsetAsync(d_force_fixed_y_, 0, local_particles * sizeof(long long), force_stream));
+    CUDA_CHECK(cudaMemsetAsync(d_force_fixed_z_, 0, local_particles * sizeof(long long), force_stream));
+
+    auto* es_tiled_kernel = mixed_precision_enabled_
+        ? &compute_electrostatic_forces_tiled_kernel<float>
+        : &compute_electrostatic_forces_tiled_kernel<double>;
+    const int tile_block_size = 128;
+    const int warps_per_block = tile_block_size / 32;
+    const int tiles_per_block = warps_per_block * LJ_CLUSTER_GROUPS_PER_WARP;
+    const int tile_num_blocks = (num_lj_tiles_ + tiles_per_block - 1) / tiles_per_block;
+    es_tiled_kernel<<<tile_num_blocks, tile_block_size, 0, force_stream>>>(
+        d_x, d_y, d_z, d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
         d_charge, d_global_id,
-        d_neighbors, d_num_neighbors, d_neighbor_offset,
-        d_exclusion_keys, num_exclusions,
+        d_tile_atoms, d_tile_pair_offsets, d_tile_pair_j, d_tile_pair_verlet_mask_,
+        d_exclusion_offsets, d_exclusion_partners, exclusion_atom_count,
         d_potential_energy, d_virial,
         box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z,
         local_particles, num_particles,
-        cutoff_sq, k_coulomb, ewald_alpha_
-    );
+        cutoff_sq, k_coulomb, ewald_alpha_,
+        num_lj_tiles_);
+    flush_fixed_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+        d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
+        d_fx, d_fy, d_fz, local_particles);
+}
+
+// Reciprocal-space (long-range, B-spline PME grid via cuFFT) part of the
+// Ewald sum, plus the self-energy correction. Split out of
+// compute_electrostatic_forces_ewald() so compute_nonbonded_forces_fused()
+// can call this on its own after the fused real-space pass, instead of going
+// through compute_electrostatic_forces_ewald()'s real-space call too.
+void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& system) {
+    ensure_ewald_initialized(system);
+
+    CUDA_CHECK(cudaStreamWaitEvent(pme_stream_, force_clear_event_, 0));
+
+    size_t local_particles = system.get_local_particles();
+
+    Real inv_box_x = 1.0/system.get_box().lx, inv_box_y = 1.0/system.get_box().ly, inv_box_z = 1.0/system.get_box().lz;
+    const Real k_coulomb = 332.0636;
 
     // ---- Reciprocal-space (long-range) part on pme_stream_ ----
     const size_t grid_size =
         static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * ewald_grid_z_;
+    const int grid_nzh = ewald_grid_z_ / 2 + 1;
     int blocks_grid = (grid_size + 255) / 256;
     // Reciprocal-space grid operations (spread/interpolate/self-energy) must
     // use LOCAL particles only: ghosts are periodic copies of atoms owned by
@@ -3257,57 +4653,122 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_ewald(MDSystem& system) {
     // density (each rank's real-space kernel already sees its neighbors'
     // ghosts, but the reciprocal grid is a per-rank sum of owned charges).
     int blocks_particles = (local_particles + 255) / 256;
+    const bool use_spatial_spread_order = d_tile_atoms && num_lj_tiles_ > 0;
+    // d_tile_atoms is allocated/populated with stride LJ_TILE_SIZE (see
+    // neighbor_list_kernels.cu), not a hardcoded 32 -- using the wrong
+    // stride here reads spread_work_items - num_lj_tiles_*LJ_CLUSTER_SIZE
+    // slots *past* the end of that array as bogus "particle indices" for
+    // pme_spread_charges_kernel, spreading garbage charge onto the PME grid
+    // and blowing up the reciprocal-space energy by many orders of
+    // magnitude while leaving forces comparatively unaffected (matches
+    // exactly what was observed: LJ tiled mode gave PE ~ +1.97e11 instead
+    // of the correct ~ -3.5e5, while CSR mode -- which never reads
+    // d_tile_atoms -- was correct). LJ_CLUSTER_SIZE (see
+    // compute_lj_forces_tiled_kernel above) must match LJ_TILE_SIZE in
+    // neighbor_list_kernels.cu; this is the same "no shared header for this
+    // constant" caveat noted there.
+    const size_t spread_work_items = use_spatial_spread_order
+        ? static_cast<size_t>(num_lj_tiles_) * LJ_CLUSTER_SIZE
+        : local_particles;
+    const int blocks_spread = static_cast<int>((spread_work_items + 255) / 256);
 
-    pme_clear_grid_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_charge_grid_, grid_size);
-    pme_spread_charges_kernel<<<blocks_particles, 256, 0, pme_stream_>>>(
-        d_x, d_y, d_z, d_charge, d_pme_charge_grid_,
-        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
-        inv_box_x, inv_box_y, inv_box_z,
-        ewald_spline_order_, local_particles
-    );
+    pme_clear_grid_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_charge_grid_real_, grid_size);
 
-    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_charge_grid_, d_pme_charge_grid_, CUFFT_FORWARD));
+    // See pme_spread_charges_cluster_kernel above: unverified without
+    // Hopper-class hardware, so this path only fires when the user has
+    // explicitly opted in AND the running device actually reports compute
+    // capability >= 9.0 -- on any other GPU it silently falls back to the
+    // warp-aggregated kernel below, same as always.
+    // cudaLaunchKernelEx/cudaLaunchAttributeClusterDimension need CUDA 11.8+;
+    // guard on the toolkit version (this is ordinary host code, so
+    // __CUDA_ARCH__ is never defined here regardless of target GPU arch).
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+    if (pme_use_cluster_spread_ && device_supports_clusters_ && use_spatial_spread_order) {
+        const int cluster_grid_blocks =
+            ((num_lj_tiles_ + PME_CLUSTER_BLOCKS - 1) / PME_CLUSTER_BLOCKS) * PME_CLUSTER_BLOCKS;
 
-    dim3 grid_blocks((ewald_grid_x_ + 7) / 8, (ewald_grid_y_ + 7) / 8, (ewald_grid_z_ + 7) / 8);
+        cudaLaunchConfig_t cluster_config = {};
+        cluster_config.gridDim = dim3(cluster_grid_blocks, 1, 1);
+        // One block per tile, LJ_CLUSTER_SIZE (8) threads/block -- must match
+        // the tile stride in d_tile_atoms (see the spread_work_items fix
+        // above for the bug this exact mismatch caused when it was
+        // hardcoded to 32 after tiles shrank from 32 to LJ_CLUSTER_SIZE
+        // atoms). pme_spread_charges_cluster_kernel's internal shared-window
+        // clear/flush loops still cover the whole window correctly with a
+        // sub-warp block size, just with more loop iterations per thread.
+        cluster_config.blockDim = dim3(LJ_CLUSTER_SIZE, 1, 1);
+        cluster_config.stream = pme_stream_;
+        cudaLaunchAttribute cluster_attr[1];
+        cluster_attr[0].id = cudaLaunchAttributeClusterDimension;
+        cluster_attr[0].val.clusterDim.x = PME_CLUSTER_BLOCKS;
+        cluster_attr[0].val.clusterDim.y = 1;
+        cluster_attr[0].val.clusterDim.z = 1;
+        cluster_config.attrs = cluster_attr;
+        cluster_config.numAttrs = 1;
+        // cudaLaunchKernelEx's variadic forwarding takes the address of each
+        // argument to build its void* arg array, which fails to compile for
+        // a const-qualified argument (const T* won't convert to void*).
+        // spread_work_items is declared const above, so pass an explicit
+        // non-const rvalue copy here instead of the const lvalue directly.
+        CUDA_CHECK(cudaLaunchKernelEx(&cluster_config, pme_spread_charges_cluster_kernel,
+            d_x, d_y, d_z, d_charge, d_pme_charge_grid_real_,
+            d_tile_atoms, static_cast<size_t>(spread_work_items),
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+            inv_box_x, inv_box_y, inv_box_z,
+            ewald_spline_order_, static_cast<size_t>(local_particles)));
+    } else
+#endif
+    {
+        pme_spread_charges_kernel<<<blocks_spread, 256, 0, pme_stream_>>>(
+            d_x, d_y, d_z, d_charge, d_pme_charge_grid_real_,
+            use_spatial_spread_order ? d_tile_atoms : nullptr, spread_work_items,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+            inv_box_x, inv_box_y, inv_box_z,
+            ewald_spline_order_, local_particles
+        );
+    }
+
+    // Out-of-place real-to-complex forward transform: the real spread grid
+    // is left untouched (unused for the rest of this step), output is the
+    // half-spectrum rho(k).
+    CUFFT_CHECK(cufftExecD2Z(pme_fft_plan_forward_, d_pme_charge_grid_real_, d_pme_charge_grid_freq_));
+
+    dim3 grid_blocks((ewald_grid_x_ + 7) / 8, (ewald_grid_y_ + 7) / 8, (grid_nzh + 7) / 8);
     dim3 threads(8, 8, 8);
     // Poisson solve turns the charge density rho(k) into the potential
     // Phi(k) in place, and atomically accumulates reciprocal-space energy
     // directly into d_potential_energy (k_coulomb folded into ewald_prefactor_).
     pme_solve_poisson_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
-        d_pme_charge_grid_,
+        d_pme_charge_grid_freq_,
         d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
         d_potential_energy, ewald_prefactor_, ewald_alpha_,
-        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
         inv_box_x, inv_box_y, inv_box_z
     );
 
     if (d_virial) {
         pme_reciprocal_virial_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
-            d_pme_charge_grid_,
+            d_pme_charge_grid_freq_,
             d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
             d_virial, ewald_prefactor_, ewald_alpha_,
-            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
             inv_box_x, inv_box_y, inv_box_z
         );
     }
 
-    // E(k) = -i*k*Phi(k), one complex grid per Cartesian component.
-    pme_compute_electric_field_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
-        d_pme_charge_grid_, d_pme_ex_grid_, d_pme_ey_grid_, d_pme_ez_grid_,
-        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, box_x, box_y, box_z
-    );
+    // Bring Phi(k) back once.  The real spread grid is dead after the forward
+    // transform, so reuse it for Phi(r) and avoid three field grids entirely.
+    CUFFT_CHECK(cufftExecZ2D(pme_fft_plan_inverse_, d_pme_charge_grid_freq_,
+                             d_pme_charge_grid_real_));
 
-    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_ex_grid_, d_pme_ex_grid_, CUFFT_INVERSE));
-    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_ey_grid_, d_pme_ey_grid_, CUFFT_INVERSE));
-    CUFFT_CHECK(cufftExecZ2Z(pme_fft_plan_, d_pme_ez_grid_, d_pme_ez_grid_, CUFFT_INVERSE));
-
-    pme_extract_real_part_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_ex_grid_, d_pme_force_grid_x_, grid_size);
-    pme_extract_real_part_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_ey_grid_, d_pme_force_grid_y_, grid_size);
-    pme_extract_real_part_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_ez_grid_, d_pme_force_grid_z_, grid_size);
-
-    pme_interpolate_forces_kernel<<<blocks_particles, 256, 0, pme_stream_>>>(
+    // Serialize only the final force gather with the force stream.  PME grid
+    // construction and the real-space pair kernels still overlap, while the
+    // ordered += below needs neither atomics nor a second force buffer.
+    CUDA_CHECK(cudaEventRecord(pme_grid_ready_event_, pme_stream_));
+    CUDA_CHECK(cudaStreamWaitEvent(force_stream, pme_grid_ready_event_, 0));
+    pme_interpolate_forces_kernel<<<blocks_particles, 256, 0, force_stream>>>(
         d_x, d_y, d_z, d_charge,
-        d_pme_force_grid_x_, d_pme_force_grid_y_, d_pme_force_grid_z_,
+        d_pme_charge_grid_real_,
         d_fx, d_fy, d_fz,
         ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
         inv_box_x, inv_box_y, inv_box_z,
@@ -3347,11 +4808,22 @@ void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
     NeighborList& nlist = system.get_neighbor_list();
     size_t num_local   = system.get_local_particles();
     size_t num_total   = system.get_total_particles();
+    const int* nlist_offsets = nlist.get_offsets();
+    const int* nlist_neighbors = nlist.get_neighbors();
+
+    if (nonbonded_kernel_ == "graph") {
+        // ensure_graph_on_device() already produced CSR and row-major COO in
+        // device memory.  Nothing is downloaded, repacked, or uploaded here.
+        if (!d_graph_offsets_ || (num_edges_ > 0 && (!d_edge_src_ || !d_edge_dst_))) {
+            throw std::runtime_error("GPU MLIP graph requested before device graph construction");
+        }
+        return;
+    }
 
     // Count upper bound for half-list edges
     int64_t E_upper = 0;
     for (size_t i = 0; i < num_local; ++i)
-        E_upper += nlist.num_neighbors[i];
+        E_upper += (nlist_offsets[i + 1] - nlist_offsets[i]);
 
     int64_t E_upper_full = E_upper * 2;
     if (E_upper_full > cap_edges_) {
@@ -3361,17 +4833,17 @@ void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
         cap_edges_ = static_cast<int64_t>(E_upper_full * 1.25 + 256);
         CUDA_CHECK(cudaMalloc(&d_edge_src_,        sizeof(int32_t) * cap_edges_));
         CUDA_CHECK(cudaMalloc(&d_edge_dst_,        sizeof(int32_t) * cap_edges_));
-        CUDA_CHECK(cudaMalloc(&d_edge_coo_packed_, sizeof(int32_t) * cap_edges_));
+        CUDA_CHECK(cudaMalloc(&d_edge_coo_packed_, sizeof(int32_t) * cap_edges_ * 2));
     }
 
     // Build TRUE half-list COO on host (j > i for local-local; all local-ghost)
     std::vector<int32_t> h_src(E_upper), h_dst(E_upper);
     int64_t e = 0;
     for (size_t i = 0; i < num_local; ++i) {
-        int offset = nlist.neighbor_offset[i];
-        int nn     = nlist.num_neighbors[i];
+        int offset = nlist_offsets[i];
+        int nn     = nlist_offsets[i + 1] - nlist_offsets[i];
         for (int k = 0; k < nn; ++k) {
-            int32_t j = static_cast<int32_t>(nlist.neighbors[offset + k]);
+            int32_t j = static_cast<int32_t>(nlist_neighbors[offset + k]);
             if (j < 0 || j >= static_cast<int32_t>(num_total)) continue;
             if (j < static_cast<int32_t>(num_local) && j <= static_cast<int32_t>(i)) continue;
             h_src[e] = static_cast<int32_t>(i);
@@ -3444,6 +4916,16 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
     if (!d_mlip_error_flag_) { CUDA_CHECK(cudaMalloc(&d_mlip_error_flag_, sizeof(int))); }
     CUDA_CHECK(cudaMemsetAsync(d_mlip_error_flag_, 0, sizeof(int), force_stream));
 
+    // The active graph was refreshed on-device before entering the MLIP path.
+    if (nonbonded_kernel_ == "graph") {
+        if (!graph_kernel_logged_) {
+            std::cout << "[ForceCalculatorCUDA][rank " << get_mpi_rank()
+                      << "] executing nonbonded_kernel=graph for GPU MLIP"
+                      << " (compact directed active CSR)" << std::endl;
+            graph_kernel_logged_ = true;
+        }
+    }
+
     // PERF FIX: only rebuild COO edge list when neighbor list changed
     if (nlist_dirty_) {
         build_coo_edge_list_on_device(system);
@@ -3453,7 +4935,7 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
     // Build minimum-image edge vectors [E_full, 3] float32
     {
         int64_t E_full = num_edges_;
-        int64_t E_half = E_full / 2;
+        int64_t E_half = (nonbonded_kernel_ == "graph") ? E_full : E_full / 2;
         if (E_full > cap_edge_vectors_) {
             if (d_edge_vectors_) { CUDA_CHECK(cudaFree(d_edge_vectors_)); d_edge_vectors_ = nullptr; }
             cap_edge_vectors_ = static_cast<int64_t>(E_full * 1.25 + 256);
@@ -3464,10 +4946,17 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
             const int32_t* h_dst_dev = d_edge_coo_packed_ + E_half;
             SimulationBox& box = system.get_box();
             int blk = 256, grid = (int)((E_half + blk - 1) / blk);
-            k_min_image_edge_vectors<<<grid, blk, 0, force_stream>>>(
-                d_x, d_y, d_z, h_src_dev, h_dst_dev, d_edge_vectors_, E_half,
-                (float)box.lx, (float)box.ly, (float)box.lz,
-                box.periodic_x, box.periodic_y, box.periodic_z);
+            if (nonbonded_kernel_ == "graph") {
+                k_min_image_edge_vectors_directed<<<grid, blk, 0, force_stream>>>(
+                    d_x, d_y, d_z, h_src_dev, h_dst_dev, d_edge_vectors_, E_half,
+                    (float)box.lx, (float)box.ly, (float)box.lz,
+                    box.periodic_x, box.periodic_y, box.periodic_z);
+            } else {
+                k_min_image_edge_vectors<<<grid, blk, 0, force_stream>>>(
+                    d_x, d_y, d_z, h_src_dev, h_dst_dev, d_edge_vectors_, E_half,
+                    (float)box.lx, (float)box.ly, (float)box.lz,
+                    box.periodic_x, box.periodic_y, box.periodic_z);
+            }
         }
     }
 

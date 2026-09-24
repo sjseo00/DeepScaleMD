@@ -90,21 +90,32 @@ struct SimulationBox {
             else if (dz < -0.5 * lz) dz += lz;
         }
     }
+
+    // True when [xlo,xhi] is a proper subset of the full periodic box, i.e.
+    // this rank owns an MPI subdomain rather than the whole box. Only safe
+    // to use for skipping apply_minimum_image() on pairs whose partner index
+    // came from a spatial (cell-list) neighbor search: ghost coordinates
+    // there arrive already shifted (unwrapped) to be continuous with this
+    // rank's local frame -- see dsDecompX's ParticleRecord packing
+    // (make_record: record.x = particles.x[index] + shift[0]) -- and cell
+    // search only ever finds a candidate by its actual, already-correct
+    // coordinate. Mirrors the identical check used when *building* the
+    // neighbor list (CpuSpatialVerletList::build, src/neighbor_list_cpu.cpp).
+    // Do NOT use this to skip minimum-image for a pair looked up
+    // by global_id (bonds/angles/dihedrals/special pairs): that lookup can
+    // land on an arbitrary (not necessarily nearest-image) ghost copy of an
+    // atom when more than one exists, and minimum-image is what corrects
+    // for that -- skipping it there caused an immediate, catastrophic
+    // energy blowup.
+    inline bool is_mpi_subdomain() const {
+        const bool split_x = (xhi > xlo) && ((xhi - xlo) < lx - 1e-6);
+        const bool split_y = (yhi > ylo) && ((yhi - ylo) < ly - 1e-6);
+        const bool split_z = (zhi > zlo) && ((zhi - zlo) < lz - 1e-6);
+        return split_x || split_y || split_z;
+    }
 };
 
-// Neighbor list structure
-struct NeighborList {
-    std::vector<int> neighbors;
-    std::vector<int> num_neighbors;
-    std::vector<int> neighbor_offset;
-    Real cutoff = 0.0;
-    std::string list_type; // "cell_list" or "morton_hilbert" for identification
-    
-    // Displacement tracking for rebuild decisions
-    std::vector<Real> last_build_x, last_build_y, last_build_z;
-    Real skin_distance = 0.0;
-    bool needs_rebuild = true;
-};
+// NeighborList is now an abstract interface -- see include/neighbor_list.h.
 
 // Force field parameters
 struct ForceFieldParams {

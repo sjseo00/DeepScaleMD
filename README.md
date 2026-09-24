@@ -44,6 +44,7 @@ separate build directories and separate dsDecompX installation prefixes.
 | `ENABLE_LIBTORCH` | `ON`, `OFF` | Enables the native LibTorch/TorchScript MLIP runtime; requires `BACKEND=CUDA`. |
 | `NATIVE_OPTIMIZATION` | `ON`, `OFF` | Enables native CPU optimization flags for Release builds; enabled by default. |
 | `ENABLE_ADIOS2` | `ON`, `OFF` | Enables the ADIOS2 BP parallel trajectory writer (`trajectory_format: bp`); requires an MPI-enabled ADIOS2 install; off by default. |
+| `ENABLE_HDF5` | `ON`, `OFF` | Enables the H5MD parallel trajectory writer (`trajectory_format: h5md`); requires a parallel HDF5 install (built with `--enable-parallel`); off by default. |
 
 ### CPU + MPI
 
@@ -98,6 +99,14 @@ For the ADIOS2 BP parallel trajectory writer (`trajectory_format: bp`), add
 `adios2::cxx11_mpi` and needs the MPI-aware bindings, not the serial ones.
 This option works with either `BACKEND=CPU` or `BACKEND=CUDA` and is off by
 default, so builds without ADIOS2 installed are unaffected.
+
+For the H5MD parallel trajectory writer (`trajectory_format: h5md`), add
+`-DENABLE_HDF5=ON` and put a **parallel** HDF5 install (built with
+`--enable-parallel` / `HDF5_ENABLE_PARALLEL=ON`) on `CMAKE_PREFIX_PATH` — the
+writer opens the file with `H5Pset_fapl_mpio()`, which a serial HDF5 build
+does not provide. This option works with either `BACKEND=CPU` or
+`BACKEND=CUDA` and is off by default, so builds without HDF5 installed are
+unaffected.
 
 ### Make compatibility targets
 
@@ -154,7 +163,7 @@ YAML input files select the force-calculation route and expose the following MD 
 
 | Control | Available methods |
 | --- | --- |
-| Neighbor list | `verlet_cell_list` (recommended) or `morton_code` |
+| Neighbor list | `auto` (recommended), `cpu_spatial_verlet`, or `gpu_tile_verlet` |
 | Integrator | `velocity_verlet`, `verlet`, or `leap_frog` |
 | Thermostat | `none`, `langevin`, `nose_hoover`, or `berendsen` |
 | Barostat | `none`, `berendsen`, or `parrinello_rahman` |
@@ -169,6 +178,7 @@ YAML input files select the force-calculation route and expose the following MD 
 | LAMMPS dump | `dump` | Gathered to rank 0, LAMMPS dump text format |
 | DCD | `dcd` | Gathered to rank 0, single binary file readable by VMD/MDAnalysis |
 | ADIOS2 BP | `bp` | **Parallel** — every rank writes only the particles it owns, no gather; recommended for large-scale, many-node runs |
+| H5MD | `h5md` | **Parallel** — every rank writes only the particles it owns via collective MPI-IO hyperslabs, no gather; standard HDF5 file readable by h5py/MDAnalysis/VMD |
 
 See the [input guide](docs/04_Input_Script_Guide.md#7-output-settings) for the full
 option reference and I/O-pattern details.

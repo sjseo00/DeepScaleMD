@@ -12,6 +12,8 @@
 #include <vector>
 #include <mpi.h>
 
+class NeighborList;
+
 class MDSystem {
 public:
     struct LocalBond {
@@ -40,7 +42,10 @@ private:
     ParticleData particles;
     SimulationBox box;
     ForceFieldParams ff_params;
-    NeighborList neighbor_list;
+    // Non-owning: MDSimulation owns the NeighborList (constructed via the
+    // factory once the config-selected backend is known) and points us at
+    // it with set_neighbor_list().
+    NeighborList* neighbor_list_ptr_ = nullptr;
 
     std::unique_ptr<Topology> topology;
     std::unique_ptr<ForceManager> force_manager;
@@ -50,17 +55,10 @@ private:
 
     int rank;
     int size;
-    int local_start;
-    int local_end;
-    size_t num_local_particles_;
     std::vector<std::string> coordinate_elements_;
 
     std::unique_ptr<dsdecompx::Decomp> decomp_runtime_;
 
-    void* d_particles;
-    bool use_gpu;
-    bool cuda_direct_halo_;
-    size_t ghost_count_ = 0;
     std::vector<LocalBond> local_bonds_;
     std::vector<LocalAngle> local_angles_;
     std::vector<LocalDihedral> local_dihedrals_;
@@ -87,9 +85,6 @@ public:
     void initialize_velocities(Real temperature);
     void initialize_distributed_velocities(Real temperature);
     void setup_domain_decomposition();
-    void allocate_device_memory();
-    void copy_to_device();
-    void copy_from_device();
 
     void load_standard_xyz(const std::string& coord_file);
     void assign_masses_from_topology();
@@ -103,7 +98,8 @@ public:
     SimulationBox& get_simulation_box() { return box; }
     SimulationBox& get_box() { return box; }
     ForceFieldParams& get_ff_params() { return ff_params; }
-    NeighborList& get_neighbor_list() { return neighbor_list; }
+    NeighborList& get_neighbor_list() { return *neighbor_list_ptr_; }
+    void set_neighbor_list(NeighborList* nlist) { neighbor_list_ptr_ = nlist; }
     Topology& get_topology() { return *topology; }
     bool has_topology() const { return static_cast<bool>(topology); }
     const std::vector<LocalBond>& get_local_bonds() const { return local_bonds_; }
@@ -114,28 +110,24 @@ public:
     const std::vector<LocalConstraint>& get_local_constraints() const { return local_constraints_; }
     ForceManager& get_force_manager() { return *force_manager; }
 
-    size_t get_num_particles() const { return particles.num_particles; }
-    size_t get_local_particles() const { return static_cast<size_t>(local_end - local_start); }
-    size_t get_ghost_count() const { return ghost_count_; }
-    size_t get_total_particles() const { return get_local_particles() + ghost_count_; }
+    size_t get_num_particles() const { return particles.size(); }
+    size_t get_local_particles() const { return particles.owned_count(); }
+    size_t get_ghost_count() const { return particles.ghost_count(); }
+    size_t get_total_particles() const { return particles.size(); }
 
     int get_rank() const { return rank; }
     int get_size() const { return size; }
-    bool using_gpu() const { return use_gpu; }
-
     Real get_physical_cutoff() const { return physical_cutoff; }
     void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
     void set_verlet_skin(Real skin) { verlet_skin_ = skin; }
-    int get_local_start() const { return local_start; }
 
     void sync_decomposition_domain();
     void invalidate_halo_cache();
     void refresh_local_bonded_topology();
 
     dsdecompx::HaloResult perform_halo_exchange(bool rebuild = false);
-    bool sync_halo_particles(bool rebuild_halo, NeighborList* nlist = nullptr);
-    bool sync_distributed_particles(bool local_rebuild_hint,
-                                    NeighborList* nlist = nullptr);
+    bool sync_halo_particles(bool rebuild_halo);
+    bool sync_distributed_particles(bool local_rebuild_hint);
     bool unify_rebuild_decision(bool local_rebuild_flag) const;
     void perform_reverse_halo_exchange();
 

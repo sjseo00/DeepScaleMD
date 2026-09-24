@@ -41,20 +41,24 @@ void VelocityVerletIntegrator::integrate(ParticleData& particles, const Simulati
     // This is a purely LOCAL operation - no MPI communication needed
     // Each rank integrates its own domain independently
     Real half_dt = 0.5 * dt;
-        
-    for (size_t i = 0; i < n; i++) {
+
+    // Each atom i only ever touches its own slot (x/y/z/vx/vy/vz[i]), so
+    // this is race-free without any reduction or synchronization.
+    #pragma omp parallel for schedule(static)
+    for (long ii = 0; ii < static_cast<long>(n); ii++) {
+        size_t i = static_cast<size_t>(ii);
         Real inv_m = 1.0 / particles.mass[i];
-        
+
         // a(t) = F(t) / m (with unit conversion)
         Real ax = particles.fx[i] * inv_m * FORCE_TO_ACCEL;
         Real ay = particles.fy[i] * inv_m * FORCE_TO_ACCEL;
         Real az = particles.fz[i] * inv_m * FORCE_TO_ACCEL;
-        
+
         // v(t+dt/2) = v(t) + 0.5 * a(t) * dt
         particles.vx[i] += half_dt * ax;
         particles.vy[i] += half_dt * ay;
         particles.vz[i] += half_dt * az;
-        
+
         // x(t+dt) = x(t) + v(t+dt/2) * dt
         particles.x[i] += dt * particles.vx[i];
         particles.y[i] += dt * particles.vy[i];
@@ -77,22 +81,24 @@ void VelocityVerletIntegrator::complete_velocity_update(ParticleData& particles,
     // This is a purely LOCAL operation - no MPI communication needed
     // Forces have been accumulated via reverse halo exchange before calling this
     
-    for (size_t i = 0; i < n; i++) {
+    Real half_dt = 0.5 * dt;
+    #pragma omp parallel for schedule(static)
+    for (long ii = 0; ii < static_cast<long>(n); ii++) {
+        size_t i = static_cast<size_t>(ii);
         Real inv_m = 1.0 / particles.mass[i];
-        Real half_dt = 0.5 * dt;
-        
+
         // a(t+dt) = F(t+dt) / m (with unit conversion)
         // CRITICAL FIX: FORCE_TO_ACCEL must be applied in BOTH velocity update stages
         Real ax = particles.fx[i] * inv_m * FORCE_TO_ACCEL;
         Real ay = particles.fy[i] * inv_m * FORCE_TO_ACCEL;
         Real az = particles.fz[i] * inv_m * FORCE_TO_ACCEL;
-        
+
         // v(t+dt) = v(t+dt/2) + 0.5 * a(t+dt) * dt
         particles.vx[i] += half_dt * ax;
         particles.vy[i] += half_dt * ay;
         particles.vz[i] += half_dt * az;
     }
-    
+
     // NOTE: No MPI communication needed for velocities
     // Each rank exclusively owns the velocities of its local particles
 }
@@ -115,17 +121,19 @@ void LeapFrogIntegrator::integrate(ParticleData& particles, const SimulationBox&
     // This is the standard leap-frog position update. After this, positions are
     // at time t+dt, while velocities remain at t+dt/2 until complete_velocity_update().
     
-    for (size_t i = 0; i < n; i++) {
+    #pragma omp parallel for schedule(static)
+    for (long ii = 0; ii < static_cast<long>(n); ii++) {
+        size_t i = static_cast<size_t>(ii);
         // Update positions using half-step-ahead velocities
         particles.x[i] += particles.vx[i] * dt;
         particles.y[i] += particles.vy[i] * dt;
         particles.z[i] += particles.vz[i] * dt;
-        
+
         // Apply periodic boundary conditions (wrap coordinates into [0, L))
         // Using box method for consistency with VelocityVerlet integrator
         box.apply_pbc(particles.x[i], particles.y[i], particles.z[i]);
     }
-    
+
 }
 
 void LeapFrogIntegrator::complete_velocity_update(ParticleData& particles, Real dt, size_t local_particles) {
@@ -139,15 +147,17 @@ void LeapFrogIntegrator::complete_velocity_update(ParticleData& particles, Real 
     // for leap-frog. The half-step offset is maintained throughout the simulation.
     
     size_t n = local_particles;
-    
-    for (size_t i = 0; i < n; i++) {
+
+    #pragma omp parallel for schedule(static)
+    for (long ii = 0; ii < static_cast<long>(n); ii++) {
+        size_t i = static_cast<size_t>(ii);
         Real inv_m = 1.0 / particles.mass[i];
-        
+
         // Compute acceleration from force: a = F/m (with unit conversion)
         Real ax = particles.fx[i] * inv_m * FORCE_TO_ACCEL;
         Real ay = particles.fy[i] * inv_m * FORCE_TO_ACCEL;
         Real az = particles.fz[i] * inv_m * FORCE_TO_ACCEL;
-        
+
         // Full timestep velocity update
         particles.vx[i] += ax * dt;
         particles.vy[i] += ay * dt;

@@ -5,6 +5,7 @@
 #include "../include/md_types.h"
 #include <dsdecompx.hpp>
 #include <vector>
+#include <string>
 #include <stdexcept>
 
 #ifdef USE_CUDA
@@ -54,8 +55,7 @@ public:
     // GPU-resident data management (public for external access)
     void initial_upload_to_device(MDSystem& system);     // Initial 1-time upload
     void download_from_device(MDSystem& system);         // Download for output/checkpoint
-    void update_neighbor_list_on_device(MDSystem& system); // Only update neighbor list
-    void build_neighbor_list_on_device(MDSystem& system); // Build neighbor list directly on GPU
+    void build_neighbor_list_on_device(MDSystem& system); // Build rank-local spatial tile graph on GPU
     // Rebuild global-ID -> current owned/ghost-slot bonded lists after a
     // dsDecompX halo or migration changes the device particle layout.
     void refresh_bonded_topology_on_device(MDSystem& system);
@@ -155,8 +155,41 @@ public:
     // Controls the built-in bonded/non-bonded component independently from an
     // attached LibTorch MLIP component.
     void set_builtin_forces_enabled(bool enabled) { builtin_forces_enabled_ = enabled; }
+    // Mixed precision: the LJ and Ewald real-space pair kernels do their
+    // per-pair math (distance, r^-2, erf/exp, force magnitude) in float
+    // instead of double. Positions are still differenced in double and
+    // forces/energy/virial still accumulate in double, so this trades a
+    // little per-pair accuracy for throughput
+    void set_mixed_precision(bool enabled) { mixed_precision_enabled_ = enabled; }
+    bool is_mixed_precision() const { return mixed_precision_enabled_; }
+    // Hopper (sm_90+) thread-block-cluster PME charge-spread path (see
+    // pme_spread_charges_cluster_kernel in the .cu file). UNVERIFIED: no
+    // Hopper-class GPU was available to run or benchmark it. Only takes
+    // effect when the runtime device is actually compute capability >= 9.0
+    // (device_supports_clusters_, detected in initialize()); on any older
+    // GPU this flag is silently ignored and the existing warp-aggregated
+    // kernel runs instead.
+    void set_pme_cluster_spread_enabled(bool enabled) { pme_use_cluster_spread_ = enabled; }
+    bool is_pme_cluster_spread_enabled() const { return pme_use_cluster_spread_; }
     // Run the C++ MLIP runtime for one MD step.
     void compute_mlip_runtime_forces(MDSystem& system);
+
+    // Diagnostic per-force-component timing (MD_TIMING_TRACE_FORCE=1, wired
+    // up in MDSimulation). Uses cudaEvent markers on force_stream rather than
+    // extra cudaStreamSynchronize calls, so turning it on does not perturb
+    // the deliberate LJ/PME stream overlap it's trying to measure -- the
+    // elapsed times are all read back at the single synchronization point
+    // compute_forces() already does at the end for the energy/virial
+    // download. Off by default (near-zero cost when disabled: skipped event
+    // creation, no extra kernel launches).
+    void set_timing_breakdown_enabled(bool enabled) override { timing_breakdown_enabled_ = enabled; }
+    bool is_timing_breakdown_enabled() const override { return timing_breakdown_enabled_; }
+    // Only the components that actually ran this step are present (e.g. no
+    // "mlip" entry when no LibTorch runtime is attached). Empty when
+    // set_timing_breakdown_enabled(false) or before the first compute_forces().
+    const std::vector<ForceComponentTiming>& get_last_force_component_timings() const override {
+        return last_force_component_timings_;
+    }
 
     // PERF FIX: Track whether the neighbor list was rebuilt since the last
     // COO edge-list construction (only relevant for the LibTorch MLIP path).
@@ -167,9 +200,18 @@ public:
 
 protected:
     // Internal force computation methods
-    void compute_lj_forces(MDSystem& system);
-    // Full Ewald summation: real-space (erfc-screened, neighbor list) +
-    // reciprocal-space (B-spline PME grid via cuFFT) + self-energy correction.
+    // Real-space (erfc-screened) half of the Ewald sum, evaluated over the
+    // existing neighbor list. Split out of compute_electrostatic_forces_ewald()
+    // so compute_nonbonded_forces_fused() can skip it (it does the equivalent
+    // work itself, fused with LJ) while still sharing compute_electrostatic_
+    // forces_reciprocal() below.
+    void compute_electrostatic_forces_real_space(MDSystem& system);
+    // Reciprocal-space (B-spline PME grid via cuFFT) part + self-energy
+    // correction. Split out of compute_electrostatic_forces_ewald() so the
+    // fused LJ+Coulomb real-space path (below) can call it standalone.
+    void compute_electrostatic_forces_reciprocal(MDSystem& system);
+    // Full Ewald summation: real-space + reciprocal-space + self-energy
+    // correction. Used when Coulomb is enabled without LJ (see compute_forces()).
     void compute_electrostatic_forces_ewald(MDSystem& system);
     void ensure_ewald_initialized(MDSystem& system);
     void free_ewald_resources();
@@ -183,9 +225,33 @@ protected:
     // MLIP COO edge-list and position helpers (mlip_runtime path)
     void build_coo_edge_list_on_device(MDSystem& system);
     void interleave_positions_on_device(int num_total);
+    // Build/reuse the compact directed atom graph entirely on the GPU.  The
+    // spatial tile list remains the broad-phase accelerator; this method
+    // compacts its Verlet masks into atom CSR/COO at rc + skin/2.  The CSR is
+    // consumed by the classical graph kernel and the same COO storage is
+    // handed directly to LibTorch, avoiding the old D2H -> CPU prune -> H2D
+    // path.
+    void ensure_graph_on_device(MDSystem& system);
+    void rebuild_graph_from_tiles_on_device(MDSystem& system);
+    void ensure_graph_edge_capacity(int64_t edges);
 
     // Device memory management
-    void allocate_device_memory(size_t num_particles, size_t max_neighbors);
+    void allocate_device_memory(size_t num_particles);
+
+    // Per-(re)build/per-step diagnostics for the GPU tile-pair graph:
+    // neighbor-list inflation, interaction density, load imbalance (purely
+    // structural, computed from num_lj_tiles_/num_lj_tile_pairs_/
+    // d_tile_pair_offsets_, no kernel changes needed) and, when
+    // MD_LOG_TILE_PAIR_STATS=1, tile-pruning efficiency and half-list atomic
+    // cost (needs the opt-in d_tile_pair_stats_ counters populated by the
+    // tiled LJ/nonbonded kernels). See force_calculator_cuda.cu.
+    void log_tile_graph_stats(size_t local_particles);
+    // Probes MD_LOG_TILE_PAIR_STATS and allocates d_tile_pair_stats_ on first
+    // call; must run BEFORE the LJ/fused-nonbonded kernel launch that reads
+    // d_tile_pair_stats_, since a null pointer at launch time means that
+    // launch's counts are lost.
+    void ensure_tile_pair_stats_enabled();
+    void log_tile_pair_stats_gpu();
     
     // Bonded topology management (GPU-resident for efficiency)
     void upload_bonded_topology_to_device(MDSystem& system);
@@ -213,16 +279,42 @@ protected:
     Real* d_max_disp_sq;    // Device scalar for max displacement squared
     Real* d_fire_reduce_;   // [power, f_norm_sq, v_norm_sq, f_max_sq], lazily allocated
 
-    // Device memory for neighbor list
-    int* d_neighbors;       // Neighbor list
-    int* d_num_neighbors;   // Number of neighbors per particle
-    int* d_neighbor_offset; // Offset into neighbor list for each particle
+    // Owned by the persistent buffers inside launch_cuda_tile_list_build
+    // (neighbor_list_kernels.cu); these are just the current pointers/counts
+    // handed back after each build.
+    int* d_tile_atoms = nullptr;    // [num_lj_tiles_ * LJ_TILE_SIZE], atom index per slot (-1 = padding)
+    int* d_tile_pair_i = nullptr;   // [num_lj_tile_pairs_], tile id in the "i" role (sorted by this key)
+    int* d_tile_pair_j = nullptr;   // [num_lj_tile_pairs_], tile id in the "j" role, grouped by d_tile_pair_offsets
+    int* d_tile_pair_offsets = nullptr; // [num_lj_tiles_ + 1] CSR offsets into d_tile_pair_j, keyed by home tile
+    unsigned long long* d_tile_pair_verlet_mask_ = nullptr; // [num_lj_tile_pairs_], bit=(j_slot*8+i_lane)
+    int  num_lj_tiles_ = 0;
+    int  num_lj_tile_pairs_ = 0;
+    unsigned long long pairs_inside_rc_ = 0;
+    unsigned long long pairs_inside_rc_plus_skin_ = 0;
+
+    // Opt-in (MD_LOG_TILE_PAIR_STATS=1) diagnostic counters for the tiled LJ
+    // kernels: d_tile_pair_stats_[0] = candidate atom pairs tested (accepted
+    // slot, before the cutoff/exclusion check), [1] = real atom pairs (passed
+    // it). Left null when the env var isn't set, so the kernels' extra
+    // `if (pair_stats)` branch is the only cost paid by default. See
+    // log_tile_pair_stats_gpu() in force_calculator_cuda.cu.
+    unsigned long long* d_tile_pair_stats_ = nullptr;
+    bool tile_pair_stats_probed_ = false;
+    bool tile_pair_stats_enabled_ = false;
+
+
+    long long* d_force_fixed_x_ = nullptr;
+    long long* d_force_fixed_y_ = nullptr;
+    long long* d_force_fixed_z_ = nullptr;
 
     // Device memory for force field parameters
     Real* d_epsilon_mixed; // LJ epsilon mixing rules (1D row-major array)
     Real* d_sigma_mixed;   // LJ sigma mixing rules (1D row-major array)
     unsigned long long* d_exclusion_keys; // sorted global atom-pair keys
     size_t num_exclusions;
+    int* d_exclusion_offsets;  // global-ID indexed CSR offsets
+    int* d_exclusion_partners; // short per-atom exclusion lists
+    size_t exclusion_atom_count;
 
     // Device memory for energies
     Real* d_potential_energy;
@@ -297,7 +389,6 @@ protected:
 
     // Memory allocation tracking
     size_t allocated_particles;
-    size_t allocated_neighbors;
     int max_types;
     bool device_data_initialized;  // Track if initial upload completed
     bool bonded_topology_on_device; // Track if bonded topology is uploaded
@@ -333,17 +424,36 @@ protected:
     void*    mlip_runtime_raw_      = nullptr;  // non-owning ptr to MlipRuntime
     bool     mlip_runtime_enabled_  = false;
     bool     builtin_forces_enabled_ = true;
+    bool     mixed_precision_enabled_ = false;
+
     int      num_local_cached_      = 0;
     int      num_ghost_cached_      = 0;
 
     // COO half-list edge buffers (half → full directed)
     int32_t* d_edge_src_         = nullptr;
     int32_t* d_edge_dst_         = nullptr;
-    int32_t* d_edge_coo_packed_  = nullptr;  // [src(E_half) | dst(E_half)]
+    // Packed edge_index storage. Tiled conversion stores the source/dest
+    // half-list here; graph mode stores [src(E_active) | dst(E_active)].
+    int32_t* d_edge_coo_packed_  = nullptr;
     int32_t* d_tmp_edge_src_     = nullptr;
     int32_t* d_tmp_edge_dst_     = nullptr;
     int64_t  num_edges_          = 0;
     int64_t  cap_edges_          = 0;
+
+    // Directed graph CSR.  d_edge_dst_ is also the CSR column array because
+    // graph fill writes COO in row-major order.  Separate degree/cursor
+    // scratch is retained and reused so active-graph refreshes allocate no
+    // memory in the steady state.
+    int*     d_graph_offsets_     = nullptr; // [num_local + 1]
+    int*     d_graph_degrees_     = nullptr; // [num_local]
+    int*     d_graph_cursors_     = nullptr; // [num_local]
+    int      graph_atom_capacity_ = 0;
+    Real*    d_graph_ref_x_       = nullptr;
+    Real*    d_graph_ref_y_       = nullptr;
+    Real*    d_graph_ref_z_       = nullptr;
+    int      graph_ref_capacity_  = 0;
+    bool     graph_dirty_         = true;
+    Real     graph_active_skin_   = 0.0;
 
     // Interleaved position buffer [N,3] float64
     double* d_pos_interleaved_   = nullptr;
@@ -387,21 +497,49 @@ protected:
     int ewald_spline_order_ = 4;
     Real ewald_prefactor_ = 0.0;  // 4*pi*k_coulomb / box_volume (updated on box change)
 
-    // Charge density grid, reused in place to hold Phi(k) after the Poisson
-    // solve. Full complex-to-complex (C2C) layout -- see plan notes on why
-    // R2C/C2R half-spectrum packing was dropped.
-    cufftDoubleComplex* d_pme_charge_grid_ = nullptr;
-    cufftDoubleComplex* d_pme_ex_grid_     = nullptr;
-    cufftDoubleComplex* d_pme_ey_grid_     = nullptr;
-    cufftDoubleComplex* d_pme_ez_grid_     = nullptr;
-    Real* d_pme_force_grid_x_ = nullptr;   // real part of ifft(Ex(k)) etc.
-    Real* d_pme_force_grid_y_ = nullptr;
-    Real* d_pme_force_grid_z_ = nullptr;
+    // Charge density: real-valued spread grid (nx*ny*nz) transformed by an
+    // out-of-place D2Z (real-to-complex) plan into the half-spectrum
+    // frequency-domain buffer (nx*ny*(nz/2+1)), which is then overwritten in
+    // place to hold Phi(k) after the Poisson solve. R2C/C2R halves both the
+    // FFT work and the grid memory versus a full complex-to-complex
+    // transform by exploiting the Hermitian symmetry of a real charge
+    // density -- see compute_electrostatic_forces_ewald for the energy/
+    // virial double-counting this packing requires.
+    // The real grid is reused as the inverse-transformed potential grid after
+    // the forward transform; this keeps the reciprocal path to one real grid.
+    Real* d_pme_charge_grid_real_          = nullptr;
+    cufftDoubleComplex* d_pme_charge_grid_freq_ = nullptr;
     Real* d_pme_b_spline_mod_x_ = nullptr;
     Real* d_pme_b_spline_mod_y_ = nullptr;
     Real* d_pme_b_spline_mod_z_ = nullptr;
-    cufftHandle pme_fft_plan_ = 0;   // single Z2Z plan, direction chosen at exec time
+    cufftHandle pme_fft_plan_forward_ = 0;   // D2Z: real charge grid -> half-spectrum
+    cufftHandle pme_fft_plan_inverse_ = 0;   // Z2D: half-spectrum -> real field grid
     cudaStream_t pme_stream_ = nullptr;
+    cudaEvent_t force_clear_event_ = nullptr;
+    cudaEvent_t pme_grid_ready_event_ = nullptr;
+
+    // Runtime capability/opt-in for the Hopper cluster PME spread kernel
+    // (see set_pme_cluster_spread_enabled above). device_supports_clusters_
+    // is detected once from the actual GPU in initialize(); a fat binary
+    // built with sm_90 in CMAKE_CUDA_ARCHITECTURES still runs fine on older
+    // GPUs, it just never takes this path.
+    bool device_supports_clusters_ = false;
+    bool pme_use_cluster_spread_ = false;
+
+    // Per-force-component timing (see set_timing_breakdown_enabled above).
+    // force_clear_event_ can't be reused as the start marker: it's created
+    // with cudaEventDisableTiming (cheaper for its actual job, gating
+    // pme_stream_), which makes it unusable with cudaEventElapsedTime.
+    bool timing_breakdown_enabled_ = false;
+    bool graph_kernel_logged_ = false;
+    bool force_timing_events_ready_ = false;
+    cudaEvent_t force_timing_event_start_ = nullptr;
+    cudaEvent_t force_timing_event_bonded_ = nullptr;
+    cudaEvent_t force_timing_event_mlip_ = nullptr;
+    cudaEvent_t force_timing_event_lj_ = nullptr;
+    cudaEvent_t force_timing_event_electrostatic_ = nullptr;
+    cudaEvent_t force_timing_event_special_ = nullptr;
+    std::vector<ForceComponentTiming> last_force_component_timings_;
 #else
     // Stub implementation when CUDA is not enabled
     ForceCalculatorCUDA() {
@@ -435,57 +573,25 @@ protected:
  */
 __global__ void clear_forces_kernel(Real* fx, Real* fy, Real* fz, size_t n);
 
-/**
- * @brief Compute Lennard-Jones forces
- */
-__global__ void compute_lj_forces_kernel(
-    Real* x, Real* y, Real* z, 
-    Real* fx, Real* fy, Real* fz,
-    int* type, int* global_id,
-    int* neighbors, int* num_neighbors, int* neighbor_offset,
-    Real* epsilon_mixed, Real* sigma_mixed,
-    Real* potential_energy,
-    Real box_x, Real box_y, Real box_z,
-    Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    size_t local_particles, size_t total_particles,
-    int max_types,
-    Real cutoff_sq);
-
-/**
- * @brief Compute real-space (erfc-screened) Ewald electrostatic forces.
- *
- * This is the near-field half of the Ewald sum: U = k_coulomb * qi*qj *
- * erfc(alpha*r) / r, evaluated over the existing neighbor list. It must
- * always be paired with the reciprocal-space PME grid contribution
- * (see compute_electrostatic_forces_ewald) -- neither half is physically
- * meaningful alone.
- */
-__global__ void compute_electrostatic_forces_kernel(
-    Real* x, Real* y, Real* z,
-    Real* fx, Real* fy, Real* fz,
-    Real* charge, int* global_id,
-    int* neighbors, int* num_neighbors, int* neighbor_offset,
-    Real* potential_energy,
-    Real* virial,  // NEW: virial for pressure calculation
-    Real box_x, Real box_y, Real box_z,
-    Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    size_t local_particles, size_t total_particles,
-    Real cutoff_sq, Real k_coulomb, Real alpha);
-
 // ============================================================================
 // PME (Particle Mesh Ewald) reciprocal-space kernels.
-// Full complex-to-complex (C2C) grid layout throughout -- see
+// Real-to-complex (D2Z/Z2D) half-spectrum grid layout -- see
 // force_calculator_cuda.cu for the driving routine
-// (ForceCalculatorCUDA::compute_electrostatic_forces_ewald).
+// (ForceCalculatorCUDA::compute_electrostatic_forces_ewald) and the packing
+// notes above the kernel definitions.
 // ============================================================================
 
 __device__ void pme_compute_bspline_weights(Real u, int order, Real* weights, int* grid_indices);
 
-__global__ void pme_clear_grid_kernel(cufftDoubleComplex* grid, size_t grid_size);
+__device__ void pme_compute_bspline_weights_and_derivatives(
+    Real u, int order, Real* weights, Real* derivatives, int* grid_indices);
+
+__global__ void pme_clear_grid_kernel(Real* grid, size_t grid_size);
 
 __global__ void pme_spread_charges_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
-    const Real* __restrict__ charge, cufftDoubleComplex* charge_grid,
+    const Real* __restrict__ charge, Real* charge_grid,
+    const int* __restrict__ spatial_particle_order, size_t spread_work_items,
     int grid_nx, int grid_ny, int grid_nz,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     int spline_order, size_t num_particles);
@@ -494,23 +600,13 @@ __global__ void pme_solve_poisson_kernel(
     cufftDoubleComplex* fft_grid,
     const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
     Real* reciprocal_energy_out, Real prefactor, Real alpha,
-    int grid_nx, int grid_ny, int grid_nz,
+    int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z);
-
-__global__ void pme_compute_electric_field_kernel(
-    const cufftDoubleComplex* __restrict__ phi_grid,
-    cufftDoubleComplex* ex_grid, cufftDoubleComplex* ey_grid, cufftDoubleComplex* ez_grid,
-    int grid_nx, int grid_ny, int grid_nz,
-    Real box_x, Real box_y, Real box_z);
-
-__global__ void pme_extract_real_part_kernel(const cufftDoubleComplex* complex_grid,
-                                              Real* real_grid, size_t grid_size);
 
 __global__ void pme_interpolate_forces_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     const Real* __restrict__ charge,
-    const Real* __restrict__ field_grid_x, const Real* __restrict__ field_grid_y,
-    const Real* __restrict__ field_grid_z,
+    const Real* __restrict__ potential_grid,
     Real* fx, Real* fy, Real* fz,
     int grid_nx, int grid_ny, int grid_nz,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
@@ -524,7 +620,7 @@ __global__ void pme_reciprocal_virial_kernel(
     const cufftDoubleComplex* __restrict__ fft_grid,
     const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
     Real* virial, Real prefactor, Real alpha,
-    int grid_nx, int grid_ny, int grid_nz,
+    int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z);
 
 /**
@@ -581,11 +677,14 @@ __global__ void calculate_kinetic_energy_kernel(
 
 /**
  * @brief Device helper function for minimum image convention
+ * (templated so callers can wrap in float on the mixed-precision hot path --
+ * see the definition in force_calculator_cuda.cu)
  */
+template <typename T>
 __device__ inline void apply_minimum_image_device(
-    Real& dx, Real& dy, Real& dz,
-    Real box_x, Real box_y, Real box_z,
-    Real inv_box_x, Real inv_box_y, Real inv_box_z);
+    T& dx, T& dy, T& dz,
+    T box_x, T box_y, T box_z,
+    T inv_box_x, T inv_box_y, T inv_box_z);
 
 #endif // USE_CUDA
 

@@ -334,9 +334,9 @@ void PythonForceInterface::compute_force(ParticleData& particles, const ForceFie
     }
     
     try {
+#ifdef ENABLE_PYTHON_INTERFACE
         const size_t n_particles = particles.x.size();
 
-#ifdef ENABLE_PYTHON_INTERFACE
         // ============================================================
         // [STEP 0] Cache the single user-force ABI.
         //          (PyImport_ImportModule is expensive; do it once)
