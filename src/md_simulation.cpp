@@ -856,6 +856,39 @@ void MDSimulation::handle_force_phase(ForceCalculatorCUDA* cuda_calc, double& fo
 
         compute_forces_with_mode(true);
         reverse_halo_for_bonded_if_needed();
+
+        // Opt-in diagnostic: for an isolated PBC system every pairwise force
+        // is Newton's-third-law balanced, so the sum of ALL owned-atom
+        // forces across ALL ranks must be ~0 every step. A nonzero, growing
+        // total pinpoints an asymmetric force bug (e.g. a missed cross-rank
+        // pair or a reverse-halo term that isn't wired up) at the exact step
+        // it starts, instead of waiting for the resulting NVE blow-up.
+        if (!cuda_calc && comm_backend_->is_distributed() &&
+            env_flag_enabled("MD_CHECK_FORCE_BALANCE")) {
+            const ParticleData& p = system->get_particles();
+            const size_t n_local = system->get_local_particles();
+            Real local_sum[3] = {0.0, 0.0, 0.0};
+            for (size_t i = 0; i < n_local; ++i) {
+                local_sum[0] += p.fx[i];
+                local_sum[1] += p.fy[i];
+                local_sum[2] += p.fz[i];
+            }
+            Real global_sum[3] = {0.0, 0.0, 0.0};
+            MPI_Reduce(local_sum, global_sum, 3, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+            int mpi_rank = 0;
+            MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+            if (mpi_rank == 0) {
+                const Real net = std::sqrt(global_sum[0] * global_sum[0] +
+                                           global_sum[1] * global_sum[1] +
+                                           global_sum[2] * global_sum[2]);
+                if (net > 1e-3) {
+                    std::cerr << "[MD_CHECK_FORCE_BALANCE] step " << current_step
+                              << ": |sum(F)| = " << net
+                              << " (expected ~0) -- asymmetric cross-rank force"
+                              << std::endl;
+                }
+            }
+        }
     });
 }
 

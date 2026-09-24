@@ -676,11 +676,11 @@ void ForceCalculatorCPU::ensure_mixed_precision_tables() {
         for (size_t i = 0; i < ewald_rs_table_.size(); ++i)
             ewald_rs_table_f_[i] = static_cast<float>(ewald_rs_table_[i]);
     }
-    if (ewald_rs_table_excl_f_.size() != ewald_rs_table_excl_.size()) {
-        ewald_rs_table_excl_f_.resize(ewald_rs_table_excl_.size());
-        for (size_t i = 0; i < ewald_rs_table_excl_.size(); ++i)
-            ewald_rs_table_excl_f_[i] = static_cast<float>(ewald_rs_table_excl_[i]);
-    }
+    // ewald_rs_table_excl_f_ (the excl-table float mirror) is intentionally
+    // NOT built here any more -- compute_pme_avx2_f() derives the excluded-
+    // pair factors analytically from the normal table via the erf+erfc==1
+    // identity instead of a second gather (see that function's PERF FIX
+    // comment), so nothing reads this mirror any more.
 }
 
 // See the tile_pair_excl_ comment in force_calculator_cpu.h. Call after
@@ -1133,7 +1133,6 @@ struct TiledNonbondedTileCtx {
     const float* lj_c6_f = nullptr;
     const float* lj_c12_f = nullptr;
     const float* rs_table_f = nullptr;
-    const float* rs_table_excl_f = nullptr;
     float rs_r2_min_f = 0.0f;
     float rs_inv_spacing_f = 0.0f;
     float k_coulomb_f = 0.0f;
@@ -1190,25 +1189,17 @@ inline __m256 mask8_from_bits_ps(unsigned bits8) {
 // of int64 like the double kernel): a per-pair count only ever needs to
 // reach a few hundred, well within int32, and 8 lanes is the natural width
 // for a 256-bit register of 32-bit ints.
+// PERF FIX: c6/c12 used to be gathered HERE, fresh, for every edge. Callers
+// now resolve them (see process_tile_avx2_mixed()'s lj_type_row cache) and
+// pass the already-selected 8-wide vectors in, along with the already-
+// computed lj_mask (= andnot(excl_mask, cutoff_mask), unchanged from what
+// this function used to compute internally) -- see the call site's PERF FIX
+// comment for why gathering per-edge was wasteful and what replaces it.
 inline __m256 compute_lj_avx2_f(
-        __m256 r2, __m256 cutoff_mask, __m256 excl_mask,
-        __m256i type_i_vec, __m256i vlj_num_types, int j_type,
-        const float* lj_c6, const float* lj_c12,
+        __m256 r2, __m256 lj_mask, __m256 c6, __m256 c12,
         __m256 vone, __m256 v12, __m256 v6,
         float cutoff_sq, bool lj_switching_enabled, float switch_sq, float inv_denom,
-        __m256i& lj_cnt_vec, __m256i lj_cnt_one,
         __m256& force_mag, __m256& pe_pair) {
-    const __m256 lj_mask = _mm256_andnot_ps(excl_mask, cutoff_mask);
-    if (_mm256_movemask_ps(lj_mask) == 0) {
-        force_mag = _mm256_setzero_ps();
-        pe_pair = _mm256_setzero_ps();
-        return lj_mask;
-    }
-
-    const __m256i idx = _mm256_add_epi32(
-        _mm256_mullo_epi32(type_i_vec, vlj_num_types), _mm256_set1_epi32(j_type));
-    const __m256 c6 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), lj_c6, idx, lj_mask, 4);
-    const __m256 c12 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), lj_c12, idx, lj_mask, 4);
     // NOTE: tried rcp_nr_ps() (Newton-Raphson reciprocal) here instead of an
     // exact divide -- measured a net REGRESSION together with the
     // compute_pme_avx2_f() exclusion-skip branch below, reverted pending
@@ -1223,40 +1214,70 @@ inline __m256 compute_lj_avx2_f(
         _mm256_sub_ps(_mm256_mul_ps(v12, repulsive), _mm256_mul_ps(v6, attractive)));
     pe_pair = _mm256_sub_ps(repulsive, attractive);
 
+    // PERF FIX: dropped the `if (movemask(sw) != 0)` group-skip that used to
+    // wrap this. A 10-12 A switching shell covers ~42% of the cutoff
+    // sphere's volume, so whether any of the 8 lanes in a given group falls
+    // in it is close to a coin flip -- exactly the branch misprediction
+    // profile that cost the compute_pme_avx2_f() exclusion-skip branch its
+    // net win (see that function's PERF FIX comment). blendv_ps is already
+    // branch-free and a no-op when sw is all-zero, so unconditionally paying
+    // for the switch-value/force-correction arithmetic removes the
+    // mispredict risk at the cost of a fixed handful of extra FLOPs.
     if (lj_switching_enabled) {
         const __m256 sw = _mm256_and_ps(lj_mask, _mm256_cmp_ps(r2, _mm256_set1_ps(switch_sq), _CMP_GT_OQ));
-        if (_mm256_movemask_ps(sw) != 0) {
-            const __m256 a = _mm256_sub_ps(_mm256_set1_ps(cutoff_sq), r2);
-            const __m256 b = _mm256_sub_ps(
-                _mm256_add_ps(_mm256_set1_ps(cutoff_sq), _mm256_mul_ps(_mm256_set1_ps(2.0f), r2)),
-                _mm256_set1_ps(3.0f * switch_sq));
-            const __m256 switch_value = _mm256_mul_ps(
-                _mm256_mul_ps(a, a), _mm256_mul_ps(b, _mm256_set1_ps(inv_denom)));
-            const __m256 force_correction = _mm256_mul_ps(
-                _mm256_set1_ps(12.0f), _mm256_mul_ps(pe_pair,
-                _mm256_mul_ps(a, _mm256_mul_ps(
-                    _mm256_sub_ps(r2, _mm256_set1_ps(switch_sq)),
-                    _mm256_set1_ps(inv_denom)))));
-            force_mag = _mm256_blendv_ps(force_mag,
-                _mm256_add_ps(_mm256_mul_ps(switch_value, force_mag), force_correction), sw);
-            pe_pair = _mm256_blendv_ps(pe_pair, _mm256_mul_ps(pe_pair, switch_value), sw);
-        }
+        const __m256 a = _mm256_sub_ps(_mm256_set1_ps(cutoff_sq), r2);
+        const __m256 b = _mm256_sub_ps(
+            _mm256_add_ps(_mm256_set1_ps(cutoff_sq), _mm256_mul_ps(_mm256_set1_ps(2.0f), r2)),
+            _mm256_set1_ps(3.0f * switch_sq));
+        const __m256 switch_value = _mm256_mul_ps(
+            _mm256_mul_ps(a, a), _mm256_mul_ps(b, _mm256_set1_ps(inv_denom)));
+        const __m256 force_correction = _mm256_mul_ps(
+            _mm256_set1_ps(12.0f), _mm256_mul_ps(pe_pair,
+            _mm256_mul_ps(a, _mm256_mul_ps(
+                _mm256_sub_ps(r2, _mm256_set1_ps(switch_sq)),
+                _mm256_set1_ps(inv_denom)))));
+        force_mag = _mm256_blendv_ps(force_mag,
+            _mm256_add_ps(_mm256_mul_ps(switch_value, force_mag), force_correction), sw);
+        pe_pair = _mm256_blendv_ps(pe_pair, _mm256_mul_ps(pe_pair, switch_value), sw);
     }
 
-    lj_cnt_vec = _mm256_add_epi32(lj_cnt_vec,
-        _mm256_and_si256(_mm256_castps_si256(lj_mask), lj_cnt_one));
     return lj_mask;
 }
 
 // Float, 8-wide analogue of compute_pme_avx2() above -- see its comment for
-// the shared table-lookup algorithm. The float mirror tables
-// (ForceCalculatorCPU::ewald_rs_table_f_/_excl_f_) use the SAME interleaved
-// [e0,f0,e1,f1,...] layout as the double tables, just as float instead of
+// the shared table-lookup algorithm. The float mirror table
+// (ForceCalculatorCPU::ewald_rs_table_f_) uses the SAME interleaved
+// [e0,f0,e1,f1,...] layout as the double table, just as float instead of
 // double, so the index arithmetic is identical -- only the gather scale (4
 // bytes, not 8) and the arithmetic type change.
+//
+// PERF FIX: this used to gather from a SECOND table (ewald_rs_table_excl_f_)
+// for excluded lanes -- 4 more gathers on top of the 4 below, unconditional
+// because an earlier attempt to branch on "does this 8-lane group have any
+// excluded pair" regressed (see the reverted NOTE this replaced). Gathers
+// are the expensive part of this kernel, so removing 4 of them per 8-pair
+// group outright, with no branch at all, is a clear win over either the old
+// unconditional-8-gather form or the reverted branchy one.
+//
+// build_real_space_ewald_table()'s excl table used erf(alpha*r) where the
+// normal table uses erfc(alpha*r) -- and erf+erfc==1 identically, so as an
+// EXACT (continuous-function) identity, excl_energy(r) = erfc(z)/r - 1/r =
+// normal_energy(r) - 1/r, and by the same substitution in the force
+// derivative, excl_force(r) = normal_force(r) - 1/r^3. Applying this after
+// interpolating the (erfc-based) normal factor -- i.e. interp_erfc(r2) minus
+// the EXACT 1/r(r2) below, rather than a second independently-interpolated
+// erf table -- carries exactly the interpolation error already present in
+// the normal-table lookup and nothing more (the 1/r term is computed exactly,
+// not interpolated), so this is at least as accurate as the two-table form
+// it replaces, not merely an approximation of it. 1/r and 1/r^3 come from
+// one rsqrt+Newton-Raphson pass
+// (cheap relative to a gather), applied to every lane and then masked onto
+// just the excluded ones via a single blend-free and/sub, matching this
+// kernel's existing float precision budget (only pair PHYSICS is float; see
+// process_tile_avx2_mixed()'s file comment).
 inline void compute_pme_avx2_f(
         __m256 r2, __m256 cutoff_mask, __m256 excl_mask,
-        const float* rs_table, const float* rs_table_excl,
+        const float* rs_table,
         __m256 v_rs_r2_min, __m256 v_rs_inv_spacing,
         __m256 vk_coulomb, __m256 qi_vec, float qj,
         __m256& force_mag_c, __m256& pe_c) {
@@ -1268,25 +1289,29 @@ inline void compute_pme_avx2_f(
     const __m256i idx2p1 = _mm256_add_epi32(idx2, _mm256_set1_epi32(1));
     const __m256i idx2p2 = _mm256_add_epi32(idx2, _mm256_set1_epi32(2));
     const __m256i idx2p3 = _mm256_add_epi32(idx2, _mm256_set1_epi32(3));
-    const __m256 non_excl_mask = _mm256_andnot_ps(excl_mask, cutoff_mask);
-    const __m256 excl_only_mask = _mm256_and_ps(excl_mask, cutoff_mask);
 
-    __m256 e0 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2, non_excl_mask, 4);
-    __m256 f0 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2p1, non_excl_mask, 4);
-    __m256 e1 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2p2, non_excl_mask, 4);
-    __m256 f1 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2p3, non_excl_mask, 4);
-    // NOTE: tried branching on excl_only_mask here to skip these four
-    // gathers when this 8-lane group has no excluded pair -- measured a net
-    // REGRESSION (branch misprediction cost apparently outweighing the
-    // skipped-gather savings), reverted to the unconditional form pending
-    // isolated re-measurement.
-    e0 = _mm256_mask_i32gather_ps(e0, rs_table_excl, idx2, excl_only_mask, 4);
-    f0 = _mm256_mask_i32gather_ps(f0, rs_table_excl, idx2p1, excl_only_mask, 4);
-    e1 = _mm256_mask_i32gather_ps(e1, rs_table_excl, idx2p2, excl_only_mask, 4);
-    f1 = _mm256_mask_i32gather_ps(f1, rs_table_excl, idx2p3, excl_only_mask, 4);
+    const __m256 e0 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2, cutoff_mask, 4);
+    const __m256 f0 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2p1, cutoff_mask, 4);
+    const __m256 e1 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2p2, cutoff_mask, 4);
+    const __m256 f1 = _mm256_mask_i32gather_ps(_mm256_setzero_ps(), rs_table, idx2p3, cutoff_mask, 4);
 
-    const __m256 energy_factor = _mm256_add_ps(e0, _mm256_mul_ps(frac, _mm256_sub_ps(e1, e0)));
-    const __m256 force_factor  = _mm256_add_ps(f0, _mm256_mul_ps(frac, _mm256_sub_ps(f1, f0)));
+    // One rsqrt + Newton-Raphson refinement gives 1/r; 1/r^3 falls out of
+    // that with one more multiply. Computed for every lane (branchless) --
+    // the excl_mask and below discards it for non-excluded lanes, and any
+    // out-of-cutoff lane is masked to zero further down by the caller
+    // regardless of what this function returns for it.
+    const __m256 rsqrt0 = _mm256_rsqrt_ps(r2);
+    const __m256 rinv = _mm256_mul_ps(rsqrt0,
+        _mm256_fnmadd_ps(_mm256_set1_ps(0.5f),
+            _mm256_mul_ps(r2, _mm256_mul_ps(rsqrt0, rsqrt0)), _mm256_set1_ps(1.5f)));
+    const __m256 rinv3 = _mm256_mul_ps(rinv, _mm256_mul_ps(rinv, rinv));
+    const __m256 excl_correction_e = _mm256_and_ps(excl_mask, rinv);
+    const __m256 excl_correction_f = _mm256_and_ps(excl_mask, rinv3);
+
+    const __m256 energy_factor = _mm256_sub_ps(
+        _mm256_add_ps(e0, _mm256_mul_ps(frac, _mm256_sub_ps(e1, e0))), excl_correction_e);
+    const __m256 force_factor = _mm256_sub_ps(
+        _mm256_add_ps(f0, _mm256_mul_ps(frac, _mm256_sub_ps(f1, f0))), excl_correction_f);
     const __m256 qq = _mm256_mul_ps(vk_coulomb, _mm256_mul_ps(qi_vec, _mm256_set1_ps(qj)));
     force_mag_c = _mm256_mul_ps(qq, force_factor);
     pe_c = _mm256_mul_ps(qq, energy_factor);
@@ -1323,6 +1348,33 @@ inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx&
     const __m256 qi_vec = ctx.do_coulomb ? _mm256_loadu_ps(iq) : _mm256_setzero_ps();
     const __m256i type_i_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(i_type_s));
     const __m256i gid_i_vec  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(i_gid_s));
+
+    // PERF FIX (LJ type-row cache): compute_lj_avx2_f used to gather c6/c12
+    // fresh, every edge, indexed by (type_i[lane], j_type). type_i_vec is
+    // FIXED for this whole tile (it's the home tile's own 8 atoms), so the
+    // only thing that varies edge-to-edge is j_type -- meaning the gathered
+    // 8-wide c6/c12 row for a given j_type is IDENTICAL every time that
+    // j_type reappears among this tile's edges, which is common (nearby
+    // atoms cluster by residue/solvent, so a handful of types repeat across
+    // many neighbor slots). Cache each j_type's row the first time it's seen
+    // THIS tile and reuse it via a plain load on every repeat -- turns "1
+    // gather per LJ-eligible edge" into "1 gather per distinct j_type per
+    // tile" plus an O(1) load. thread_local keeps the cache's storage across
+    // tiles/rebuilds (only the "valid" flags reset per tile, the same reuse
+    // idiom as nb_visit_token_tl in neighbor_list_cpu.cpp's tile-pair scan);
+    // safe under OpenMP since each thread only ever touches its own
+    // thread_local copy and tiles are dynamically scheduled one-per-thread.
+    thread_local std::vector<uint8_t> lj_type_row_valid_tl;
+    thread_local std::vector<float> lj_c6_row_tl, lj_c12_row_tl;
+    if (ctx.do_lj) {
+        if (static_cast<int>(lj_type_row_valid_tl.size()) != ctx.lj_num_types) {
+            lj_type_row_valid_tl.assign(static_cast<size_t>(ctx.lj_num_types), 0);
+            lj_c6_row_tl.assign(static_cast<size_t>(ctx.lj_num_types) * TILE_SIZE, 0.0f);
+            lj_c12_row_tl.assign(static_cast<size_t>(ctx.lj_num_types) * TILE_SIZE, 0.0f);
+        } else {
+            std::fill(lj_type_row_valid_tl.begin(), lj_type_row_valid_tl.end(), 0);
+        }
+    }
 
     // Double accumulators (two 4-wide halves, like process_tile_avx2()) --
     // see the file comment above: pair PHYSICS runs in float, every SUM
@@ -1395,15 +1447,36 @@ inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx&
             __m256 force_mag = _mm256_setzero_ps(), pe_pair = _mm256_setzero_ps();
             __m256 lj_mask = _mm256_setzero_ps();
             if (ctx.do_lj) {
-                lj_mask = compute_lj_avx2_f(r2, cutoff_mask, excl_mask,
-                    type_i_vec, ctx.vlj_num_types_f, j_type_s[slot], ctx.lj_c6_f, ctx.lj_c12_f,
-                    ctx.vone_f, ctx.v12_f, ctx.v6_f, ctx.cutoff_sq_f, ctx.lj_switching_enabled,
-                    ctx.switch_sq_f, ctx.inv_denom_f, lj_cnt_vec, lj_cnt_one, force_mag, pe_pair);
+                lj_mask = _mm256_andnot_ps(excl_mask, cutoff_mask);
+                if (_mm256_movemask_ps(lj_mask) != 0) {
+                    const int jt = j_type_s[slot];
+                    const size_t row = static_cast<size_t>(jt) * TILE_SIZE;
+                    if (!lj_type_row_valid_tl[static_cast<size_t>(jt)]) {
+                        const __m256i idx = _mm256_add_epi32(
+                            _mm256_mullo_epi32(type_i_vec, ctx.vlj_num_types_f), _mm256_set1_epi32(jt));
+                        // Unmasked: idx is always in-bounds (padding lanes
+                        // carry atom 0's real type, never -1 -- see
+                        // repack_tile_soa()), and any lane this jtype's row
+                        // ends up unused for is masked out downstream by
+                        // lj_mask regardless, exactly as the old masked
+                        // gather's zero-fill was.
+                        _mm256_storeu_ps(&lj_c6_row_tl[row], _mm256_i32gather_ps(ctx.lj_c6_f, idx, 4));
+                        _mm256_storeu_ps(&lj_c12_row_tl[row], _mm256_i32gather_ps(ctx.lj_c12_f, idx, 4));
+                        lj_type_row_valid_tl[static_cast<size_t>(jt)] = 1;
+                    }
+                    const __m256 c6v = _mm256_loadu_ps(&lj_c6_row_tl[row]);
+                    const __m256 c12v = _mm256_loadu_ps(&lj_c12_row_tl[row]);
+                    lj_mask = compute_lj_avx2_f(r2, lj_mask, c6v, c12v,
+                        ctx.vone_f, ctx.v12_f, ctx.v6_f, ctx.cutoff_sq_f, ctx.lj_switching_enabled,
+                        ctx.switch_sq_f, ctx.inv_denom_f, force_mag, pe_pair);
+                    lj_cnt_vec = _mm256_add_epi32(lj_cnt_vec,
+                        _mm256_and_si256(_mm256_castps_si256(lj_mask), lj_cnt_one));
+                }
             }
 
             __m256 force_mag_c = _mm256_setzero_ps(), pe_c = _mm256_setzero_ps();
             if (ctx.do_coulomb) {
-                compute_pme_avx2_f(r2, cutoff_mask, excl_mask, ctx.rs_table_f, ctx.rs_table_excl_f,
+                compute_pme_avx2_f(r2, cutoff_mask, excl_mask, ctx.rs_table_f,
                     ctx.v_rs_r2_min_f, ctx.v_rs_inv_spacing_f, ctx.vk_coulomb_f, qi_vec, jq[slot],
                     force_mag_c, pe_c);
             }
@@ -2076,8 +2149,6 @@ void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, b
     }
     const float* __restrict__ rs_table_f =
         (use_mixed_precision && do_coulomb) ? ewald_rs_table_f_.data() : nullptr;
-    const float* __restrict__ rs_table_excl_f =
-        (use_mixed_precision && do_coulomb) ? ewald_rs_table_excl_f_.data() : nullptr;
 
     size_t local_particles = system.get_local_particles();
 
@@ -2218,7 +2289,6 @@ void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, b
         ctx.lj_c6_f = lj_c6_f;
         ctx.lj_c12_f = lj_c12_f;
         ctx.rs_table_f = rs_table_f;
-        ctx.rs_table_excl_f = rs_table_excl_f;
         ctx.rs_r2_min_f = static_cast<float>(rs_r2_min);
         ctx.rs_inv_spacing_f = static_cast<float>(rs_inv_spacing);
         ctx.k_coulomb_f = static_cast<float>(k_coulomb);
@@ -2691,13 +2761,45 @@ void ForceCalculatorCPU::ensure_ewald_initialized(MDSystem& system) {
 
     // PERF FIX: see the ewald_rs_*_table_ member comment in force_calculator_
     // cpu.h -- replaces the per-pair sqrt+exp+erfc/erf approximation in the
-    // real-space Ewald hot loops with a table lookup. Fine, uniform spacing
-    // in r^2 (0.005 A^2 -- e.g. ~28.8k points for a 12 A cutoff, ~230KB/
-    // table) keeps interpolation error far below the fast_erfc_from_exp
-    // approximation's own ~1.5e-7 error it replaces, while entirely
-    // eliminating sqrt/exp/the rational approximation from the pair loop.
+    // real-space Ewald hot loops with a table lookup.
+    //
+    // PERF FIX (table size vs cache): the old fixed 0.005 A^2 spacing gives
+    // ~28.8k points for a 12 A cutoff, i.e. ~230KB for the float mirror
+    // table that compute_pme_avx2_f() (the mixed-precision hot path) gathers
+    // from -- bigger than L1 (32-48KB on most cores) and, on many parts,
+    // uncomfortably close to L2, while the LJ side of the SAME fused kernel
+    // gathers from a c6/c12 row cache of at most a few KB (num_types^2) that
+    // stays L1-resident all the time. Each pair's r2 lands essentially at a
+    // random offset into this table (it tracks actual interatomic distance,
+    // not anything spatially coherent across neighbors), so a table this
+    // size turns every Coulomb pair's 4 gathers into likely L1 misses that
+    // LJ never pays -- a plausible reason the fused "LJ+PME" real-space
+    // kernel skews so much slower than a pure-LJ kernel would. The
+    // interpolation error budget here was never tight (it was already far
+    // below the fast_erfc_from_exp approximation's ~1.5e-7 error it
+    // replaced). First cut relaxed spacing 4x to 0.02 (~57KB, fits L2) and
+    // measured a real win (LJ+PME 13.93s -> 12.41s on the apoa1 8-thread
+    // benchmark), confirming the gather-into-an-oversized-table theory.
+    // Pushed further here to 0.04 (~3.6k points, ~28KB float mirror) to
+    // target sitting inside a typical 32KB L1d with headroom to spare for
+    // everything else L1 is holding (tile SoA, LJ c6/c12 row cache, etc.),
+    // one more step down from "fits L2" to "fits L1" -- re-measure from
+    // here: if the win from 0.02->0.04 is much smaller than 0.005->0.02 was,
+    // that's the signal this axis has hit diminishing returns and the next
+    // lever is removing the gather instruction itself (polynomial erfc
+    // approximation), not shrinking the table further.
+    //
+    // MD_PME_RS_TABLE_SPACING overrides it (in Angstrom^2) for sweeping this
+    // cache-size/accuracy tradeoff without a rebuild, or reverting to a
+    // smaller value (0.02, or the original 0.005) if this regresses on a
+    // given machine's cache hierarchy -- the reciprocal AND real-space
+    // energies should both be checked for drift when changing it.
     ewald_rs_table_r2_min_ = 1e-4;
-    const Real ewald_rs_table_spacing = 0.005;
+    Real ewald_rs_table_spacing = 0.04;
+    if (const char* rs_spacing_env = std::getenv("MD_PME_RS_TABLE_SPACING")) {
+        const Real v = static_cast<Real>(std::atof(rs_spacing_env));
+        if (v > 0.0) ewald_rs_table_spacing = v;
+    }
     ewald_rs_table_inv_spacing_ = 1.0 / ewald_rs_table_spacing;
     ewald_rs_table_size_ = build_real_space_ewald_table(
         cutoff, ewald_alpha_, ewald_rs_table_r2_min_,
@@ -2808,6 +2910,10 @@ void ForceCalculatorCPU::ensure_ewald_initialized(MDSystem& system) {
         std::cout << "[Ewald/PME][CPU] grid " << ewald_grid_x_ << "x" << ewald_grid_y_ << "x" << ewald_grid_z_
                   << " (r2c), alpha=" << ewald_alpha_ << " 1/A, spline_order=" << ewald_spline_order_
                   << ", spacing<=" << target_spacing << " A, cutoff=" << cutoff << " A" << std::endl;
+        std::cout << "[Ewald/PME][CPU] real-space table: " << ewald_rs_table_size_
+                  << " nodes, spacing=" << ewald_rs_table_spacing << " A^2, "
+                  << (ewald_rs_table_size_ * 2 * sizeof(float)) / 1024
+                  << "KB float mirror (MD_PME_RS_TABLE_SPACING overrides)" << std::endl;
     }
 }
 

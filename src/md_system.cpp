@@ -874,23 +874,8 @@ bool MDSystem::migrate_particles_check() {
     if (size == 1) return false;
     if (!decomp_runtime_) return false;
 
-    // Robustness-first MPI path: run dsDecompX migration every step.
-    // The cheap pre-check based on owner_rank() can miss edge cases near
-    // periodic wrap/subdomain cuts; invoking migrate() directly lets dsDecompX
-    // perform canonical wrap + owner classification in one place.
     const auto result = decomp_runtime_->migrate(particles);
-    // BUG FIX: migrate() reassigns which particles this rank owns (and how
-    // many), returned in result.new_owned_count -- this MUST be applied to
-    // `particles` (resize + reset_counts) before anything else runs this
-    // step. get_local_particles()/get_num_particles()/get_ghost_count() all
-    // read straight from `particles.owned_count()`/`ghost_count()`/`size()`
-    // now (see include/md_system.h), so leaving them stale here meant every
-    // downstream consumer (neighbor list build, bonded topology, force
-    // calculation) kept using the PRE-migration local/ghost split for the
-    // rest of the step -- exactly the kind of corruption that produces a
-    // sudden, localized force blowup once a real cross-rank migration
-    // occurs. Mirrors migrate_particles_on_device()'s CUDA-path handling of
-    // this same MigrationResult.
+
     resize_particle_storage(result.new_owned_count);
     particles.reset_counts(result.new_owned_count, 0);
 
@@ -1093,17 +1078,22 @@ bool MDSystem::sync_distributed_particles(bool local_rebuild_hint) {
         return local_rebuild_hint;
     }
 
-    bool should_rebuild = unify_rebuild_decision(local_rebuild_hint);
+    bool should_rebuild = local_rebuild_hint;
+    if (local_rebuild_hint) {
+        // rebuild step: run full unification across all ranks
+        should_rebuild = unify_rebuild_decision(local_rebuild_hint);
+    }
 
-    // Migration check follows neighbor-rebuild cadence: only run the owner
-    // reclassification path when a rebuild is already due.
-    const bool migrated = should_rebuild ? migrate_particles_check() : false;
+    const bool migrated = migrate_particles_check();
     if (migrated) {
         should_rebuild = true;
     }
 
-    const bool layout_changed = sync_halo_particles(should_rebuild);
-    if (layout_changed) should_rebuild = true;
+    bool layout_changed = false;
+    if (should_rebuild) {
+        layout_changed = sync_halo_particles(should_rebuild);
+        if (layout_changed) should_rebuild = true;
+    }
 
     return should_rebuild;
 }

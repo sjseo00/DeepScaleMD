@@ -332,7 +332,12 @@ private:
     bool mixed_precision_probed_ = false;
     std::vector<float> tile_fx_, tile_fy_, tile_fz_, tile_fq_;
     std::vector<float> lj_c6c12_f_;
-    std::vector<float> ewald_rs_table_f_, ewald_rs_table_excl_f_;
+    // ewald_rs_table_excl_f_ (float mirror of the excl table) was removed:
+    // compute_pme_avx2_f() derives the excluded-pair factors analytically
+    // from ewald_rs_table_f_ via the erf+erfc==1 identity instead of
+    // gathering a second table -- see that function's PERF FIX comment in
+    // force_calculator_cpu.cpp.
+    std::vector<float> ewald_rs_table_f_;
 
     // ===== BAKED PER-TILE-PAIR EXCLUSION MASKS =====
     // PERF FIX: one 64-bit mask per tile pair, bit (lane*kCpuTileSize + slot)
