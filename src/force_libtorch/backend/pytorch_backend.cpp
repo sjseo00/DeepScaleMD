@@ -1,22 +1,4 @@
-/**
- * // Include mlip_types BEFORE LibTorch to ensure mlip types are defined.
-// DO NOT use "using namespace mlip" here — it would cause ScalarType ambiguity
-// with c10::ScalarType when torch headers are processed.
-#include "force_libtorch/mlip_types.h"
-#include "force_libtorch/backend/pytorch_backend.h"
 
-#ifdef USE_LIBTORCH
-#  include <torch/torch.h>
-#  include <torch/script.h>
-#  include <ATen/cuda/CUDAContext.h>
-#  include <c10/cuda/CUDAGuard.h>
-#endifckend.cpp
- *
- * PyTorch / TorchScript backend implementation.
- * All torch:: code is confined to this translation unit.
- */
-
-// Include mlip_types BEFORE LibTorch to define ::ScalarType before c10::ScalarType
 #include "force_libtorch/mlip_types.h"
 #include "force_libtorch/backend/pytorch_backend.h"
 
@@ -44,13 +26,7 @@
 
 namespace mlip {
 
-// Self-register is intentionally NOT done here because pytorch_backend.cpp is
-// compiled with _GLIBCXX_USE_CXX11_ABI=0 (to match LibTorch), while the
-// BackendRegistry singleton lives in ABI=1 TUs (execution_plan.cpp, etc.).
-// Cross-ABI registration is performed by pytorch_backend_register.cpp (ABI=1)
-// via the C-linkage factory below.
 
-// ─────────────────────── Pimpl ───────────────────────────────────────────────
 
 struct PyTorchBackend::Impl {
 #ifdef USE_LIBTORCH
@@ -59,14 +35,11 @@ struct PyTorchBackend::Impl {
     c10::DeviceType device_type = c10::kCUDA;
     int device_id = 0;
     CallStyle call_style = CallStyle::Positional;
-    // Keep last result alive so tv.data pointers remain valid until next execute()
     torch::jit::IValue last_result;
-    // Keep contiguous output tensors alive across execute() → postprocessing
     std::vector<at::Tensor> output_tensors;
 #endif
 };
 
-// ─────────────────────── helpers ─────────────────────────────────────────────
 
 #ifdef USE_LIBTORCH
 static c10::ScalarType to_torch_dtype(ScalarType dt) {
@@ -87,10 +60,6 @@ static ScalarType from_torch_dtype(c10::ScalarType dt) {
     return ScalarType::Float32;
 }
 
-/// Wrap a BackendTensorView as a non-owning torch::Tensor on the GPU.
-/// Wrap a BackendTensorView as a torch::Tensor.
-/// model_device_id < 0 means CPU model — data is on CUDA, so cudaMemcpy to CPU tensor.
-/// model_device_id >= 0 means CUDA model — use from_blob (no copy).
 static torch::Tensor wrap_tensor(const BackendTensorView& tv, int model_device_id) {
     if (!tv.data)
         throw std::runtime_error(std::string("[PyTorchBackend] Null data pointer in BackendTensorView '") +
@@ -98,7 +67,6 @@ static torch::Tensor wrap_tensor(const BackendTensorView& tv, int model_device_i
 
     c10::ScalarType dtype = to_torch_dtype(tv.dtype);
 
-    // Build shape
     std::vector<int64_t> shape(tv.ndim);
     size_t elems = 1;
     for (int i = 0; i < tv.ndim; ++i) { shape[i] = tv.shape[i]; elems *= shape[i]; }
@@ -106,14 +74,12 @@ static torch::Tensor wrap_tensor(const BackendTensorView& tv, int model_device_i
 
     torch::Tensor t;
     if (model_device_id < 0) {
-        // CPU model: check if source data is CUDA or CPU memory
         auto cpu_opts = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
         t = torch::empty(shape, cpu_opts);
 
         cudaPointerAttributes attr;
         cudaError_t qerr = cudaPointerGetAttributes(&attr, tv.data);
         if (qerr == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
-            // Source is device (CUDA) memory → cudaMemcpy DtoH
             cudaError_t sync_err = cudaDeviceSynchronize();
             if (sync_err != cudaSuccess)
                 throw std::runtime_error(std::string("[PyTorchBackend] cudaDeviceSynchronize failed for '") +
@@ -123,11 +89,9 @@ static torch::Tensor wrap_tensor(const BackendTensorView& tv, int model_device_i
                 throw std::runtime_error(std::string("[PyTorchBackend] cudaMemcpy DtoH failed for '") +
                                           tv.name + "': " + cudaGetErrorString(err));
         } else {
-            // Source is host (CPU) memory → plain memcpy
             std::memcpy(t.data_ptr(), tv.data, bytes);
         }
     } else {
-        // CUDA model: zero-copy from_blob on the correct GPU
         torch::Device dev(torch::kCUDA, model_device_id);
         auto opts = torch::TensorOptions().dtype(dtype).device(dev);
         t = torch::from_blob(tv.data, shape, opts);
@@ -140,7 +104,6 @@ static torch::Tensor wrap_tensor(const BackendTensorView& tv, int model_device_i
 }
 #endif // USE_LIBTORCH
 
-// ─────────────────────── constructor / destructor ────────────────────────────
 
 PyTorchBackend::PyTorchBackend()
     : impl_(std::make_unique<Impl>())
@@ -148,7 +111,6 @@ PyTorchBackend::PyTorchBackend()
 
 PyTorchBackend::~PyTorchBackend() = default;
 
-// ─────────────────────── initialize ──────────────────────────────────────────
 
 void PyTorchBackend::initialize(
     const BackendConfiguration& config,
@@ -158,7 +120,6 @@ void PyTorchBackend::initialize(
     ctx_ = context;
 
 #ifdef USE_LIBTORCH
-    // Determine target device from spec's model.device field (stored in config.device_id=-1 for CPU)
     const bool use_cpu = (config.device_id < 0);
     torch::Device dev = use_cpu ? torch::Device(torch::kCPU)
                                  : torch::Device(torch::kCUDA, config.device_id);
@@ -174,30 +135,17 @@ void PyTorchBackend::initialize(
     }
 
     impl_->model.eval();
-    // Disable parameter gradients
     for (const auto& p : impl_->model.parameters())
         const_cast<at::Tensor&>(p).set_requires_grad(false);
 
-    // NOTE: optimize_for_inference is intentionally skipped here.
-    // MLIP models such as MACE and NequIP use torch.autograd.grad internally
-    // to compute atomic forces from the energy. optimize_for_inference may fold
-    // constant operations in a way that breaks the autograd graph (e.g., dtype
-    // mismatches after constant-folding on CUDA). Running eval() + disabling
-    // parameter gradients above is sufficient for inference performance.
-    // torch::jit::optimize_for_inference(impl_->model);  // intentionally disabled
 
     impl_->loaded     = true;
     impl_->device_id  = config.device_id;
     impl_->call_style = config.call_style;
 
     if (!use_cpu) {
-        // Release any temporary GPU memory allocated during model loading
-        // (e.g. JIT kernel compilation buffers) back to the CUDA driver.
         c10::cuda::CUDACachingAllocator::emptyCache();
 
-        // For GPU inference, limit CPU-side PyTorch threads to 1.
-        // With 56 OMP threads, PyTorch's CPU dispatch overhead dominates
-        // the hot path even when the model runs entirely on CUDA.
         torch::set_num_threads(1);
         torch::set_num_interop_threads(1);
     }
@@ -210,11 +158,9 @@ void PyTorchBackend::initialize(
 #endif
 }
 
-// ─────────────────────── inspect_model ───────────────────────────────────────
 
 BackendModelMetadata PyTorchBackend::inspect_model() {
     BackendModelMetadata meta;
-    // TorchScript does not expose named I/O by default; return empty metadata.
     meta.supports_positional   = true;
     meta.supports_dict_input   = true;
     meta.supports_named_output = true;
@@ -222,7 +168,6 @@ BackendModelMetadata PyTorchBackend::inspect_model() {
     return meta;
 }
 
-// ─────────────────────── execute ─────────────────────────────────────────────
 
 void PyTorchBackend::execute(
     const std::vector<BackendTensorView>& inputs,
@@ -233,7 +178,6 @@ void PyTorchBackend::execute(
     if (!impl_->loaded)
         throw std::runtime_error("[PyTorchBackend] Model not loaded.");
 
-    // Connect MD CUDA stream to PyTorch (only for CUDA model)
     std::optional<at::cuda::CUDAStreamGuard> guard;
     if (impl_->device_id >= 0 && cfg_.share_cuda_stream && stream) {
         at::cuda::CUDAStream ts =
@@ -242,11 +186,9 @@ void PyTorchBackend::execute(
         guard.emplace(ts);
     }
 
-    // Build forward inputs
     std::vector<torch::jit::IValue> jit_inputs;
 
     if (impl_->call_style == CallStyle::Dictionary) {
-        // Build IDict<string, Tensor>
         c10::Dict<std::string, torch::Tensor> d;
         for (auto& tv : inputs) {
             if (tv.name[0] != '\0')
@@ -254,15 +196,11 @@ void PyTorchBackend::execute(
         }
         jit_inputs.push_back(d);
     } else {
-        // Positional
         for (auto& tv : inputs) {
             jit_inputs.push_back(wrap_tensor(tv, impl_->device_id));
         }
     }
 
-    // Forward pass
-    // NOTE: All supported models (DeePMD, MACE, NequIP) use torch.autograd.grad
-    // internally to compute forces from energy. Do NOT use NoGradGuard here.
     try {
         impl_->last_result = impl_->model.forward(jit_inputs);
     } catch (const c10::Error& e) {
@@ -271,23 +209,18 @@ void PyTorchBackend::execute(
     torch::jit::IValue& result = impl_->last_result;
     impl_->output_tensors.clear();  // release previous step's tensors
 
-    // Helper: ensure output tensor is on the correct device (CUDA) for the
-    // MD postprocess ops which write into CUDA buffers.
     const int out_device = (impl_->device_id >= 0) ? impl_->device_id : 0;
     auto ensure_cuda = [&](torch::Tensor t) -> torch::Tensor {
         if (!t.is_contiguous()) t = t.contiguous();
         if (impl_->device_id < 0) {
-            // CPU model — move outputs to CUDA so postprocess CUDA ops can use them
             t = t.to(torch::Device(torch::kCUDA, out_device));
         }
-        // Upcast float32 → float64 so postprocess ops (copy_forces, copy_energy) get float64
         if (t.scalar_type() == torch::kFloat32) {
             t = t.to(torch::kFloat64);
         }
         return t;
     };
 
-    // Extract outputs
     if (result.isGenericDict()) {
         auto d = result.toGenericDict();
         for (size_t i = 0; i < outputs.size(); ++i) {
@@ -335,7 +268,6 @@ void PyTorchBackend::execute(
 #endif
 }
 
-// ─────────────────────── synchronize ─────────────────────────────────────────
 
 void PyTorchBackend::synchronize() {
 #ifdef USE_CUDA
@@ -345,8 +277,6 @@ void PyTorchBackend::synchronize() {
 
 } // namespace mlip
 
-// C-linkage factory: callable from ABI=1 TUs (pytorch_backend_register.cpp)
-// without depending on mangled C++ names.
 extern "C" mlip::IMlipBackend* mlip_create_pytorch_backend_c() {
     return new mlip::PyTorchBackend();
 }

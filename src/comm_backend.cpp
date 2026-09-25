@@ -3,8 +3,18 @@
 #include "md_system.h"
 #include "force_calculator.h"
 #include "force_calculator_cuda.h"
+#include "pme_rank_split.h"
 
 #include <mpi.h>
+
+// CommBackend is only ever constructed/used on PP ranks: when a PP/PME rank
+// split is active (force_calculation.pme_ranks > 0), the PME group's ranks
+// take an early return in MDSimulation::initialize_impl before any of these
+// objects are constructed. Every collective here MUST therefore be scoped to
+// PmePpSplit::instance().pp_comm() (== MPI_COMM_WORLD when no split is
+// configured, so this is a no-op change for the legacy path) rather than
+// MPI_COMM_WORLD -- otherwise a world-scoped collective issued only by the
+// PP ranks would hang forever waiting for the (non-participating) PME ranks.
 
 namespace {
 
@@ -73,7 +83,7 @@ public:
         int local_rebuild = should_rebuild ? 1 : 0;
         int global_rebuild = 0;
         MPI_Allreduce(&local_rebuild, &global_rebuild, 1, MPI_INT, MPI_MAX,
-                      MPI_COMM_WORLD);
+                      PmePpSplit::instance().pp_comm());
         should_rebuild = global_rebuild != 0;
     }
 
@@ -96,28 +106,28 @@ public:
     bool is_gpu_single_rank(bool using_cuda) const override {
         if (!using_cuda) return false;
         int mpi_world_size = 1;
-        MPI_Comm_size(MPI_COMM_WORLD, &mpi_world_size);
+        MPI_Comm_size(PmePpSplit::instance().pp_comm(), &mpi_world_size);
         return mpi_world_size == 1;
     }
 
     Real max_reduce(Real local_value) const override {
         Real global_value = local_value;
         MPI_Allreduce(&local_value, &global_value, 1, MPI_DOUBLE, MPI_MAX,
-                      MPI_COMM_WORLD);
+                      PmePpSplit::instance().pp_comm());
         return global_value;
     }
 
     Real sum_reduce(Real local_value) const override {
         Real global_value = local_value;
         MPI_Allreduce(&local_value, &global_value, 1, MPI_DOUBLE, MPI_SUM,
-                      MPI_COMM_WORLD);
+                      PmePpSplit::instance().pp_comm());
         return global_value;
     }
 
     int sum_int(int local_value) const override {
         int global_value = local_value;
         MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_SUM,
-                      MPI_COMM_WORLD);
+                      PmePpSplit::instance().pp_comm());
         return global_value;
     }
 
@@ -125,7 +135,7 @@ public:
         int local_ok = local_value ? 1 : 0;
         int global_ok = 0;
         MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN,
-                      MPI_COMM_WORLD);
+                      PmePpSplit::instance().pp_comm());
         return global_ok != 0;
     }
 
@@ -143,12 +153,12 @@ public:
         local_max.rank = local_rank;
 
         MPI_Allreduce(&local_max, &global_max, 1, MPI_DOUBLE_INT, MPI_MAXLOC,
-                      MPI_COMM_WORLD);
+                      PmePpSplit::instance().pp_comm());
         global_force = global_max.value;
 
         unsigned long long particle_id = static_cast<unsigned long long>(local_particle_id);
         MPI_Bcast(&particle_id, 1, MPI_UNSIGNED_LONG_LONG, global_max.rank,
-                  MPI_COMM_WORLD);
+                  PmePpSplit::instance().pp_comm());
         global_particle_id = static_cast<size_t>(particle_id);
     }
 };

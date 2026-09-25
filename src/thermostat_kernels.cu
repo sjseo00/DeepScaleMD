@@ -2,13 +2,10 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-// Helper for type-safe sqrt
 __device__ __forceinline__ float sqrt_real(float x) { return sqrtf(x); }
 __device__ __forceinline__ double sqrt_real(double x) { return sqrt(x); }
 
-// atomicAdd for double (if not natively supported, e.g., compute capability < 6.0)
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
-// Native double atomicAdd available
 #else
 __device__ double atomicAdd(double* address, double val) {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
@@ -22,10 +19,6 @@ __device__ double atomicAdd(double* address, double val) {
 }
 #endif
 
-// ============================================================================
-// Kinetic Energy Reduction Kernel (for Nose-Hoover)
-// ============================================================================
-// Block-wide reduction using shared memory
 __global__ void compute_kinetic_energy_kernel(const Real * __restrict__ vx,
                                              const Real * __restrict__ vy,
                                              const Real * __restrict__ vz,
@@ -37,7 +30,6 @@ __global__ void compute_kinetic_energy_kernel(const Real * __restrict__ vx,
     size_t tid = threadIdx.x;
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Each thread computes local KE
     Real local_ke = 0.0;
     if (idx < n) {
         Real v2 = vx[idx]*vx[idx] + vy[idx]*vy[idx] + vz[idx]*vz[idx];
@@ -46,7 +38,6 @@ __global__ void compute_kinetic_energy_kernel(const Real * __restrict__ vx,
     sdata[tid] = local_ke;
     __syncthreads();
     
-    // Block reduction
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             sdata[tid] += sdata[tid + s];
@@ -54,15 +45,11 @@ __global__ void compute_kinetic_energy_kernel(const Real * __restrict__ vx,
         __syncthreads();
     }
     
-    // First thread writes block result
     if (tid == 0) {
         atomicAdd(ke_out, sdata[0]);
     }
 }
 
-// ============================================================================
-// Thermostat Kernels
-// ============================================================================
 
 __global__ void langevin_thermostat_kernel(Real * __restrict__ vx, Real * __restrict__ vy, Real * __restrict__ vz,
                                           const Real * __restrict__ mass, 
@@ -78,7 +65,6 @@ __global__ void langevin_thermostat_kernel(Real * __restrict__ vx, Real * __rest
     vz[idx] = c1 * vz[idx] + c2 * rand_z[idx];
 }
 
-// Nose-Hoover: uniform velocity scaling (mass-independent)
 __global__ void nose_hoover_thermostat_kernel(Real * __restrict__ vx, Real * __restrict__ vy, Real * __restrict__ vz,
                                             Real scaling_factor, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -96,7 +82,6 @@ __global__ void andersen_thermostat_kernel(Real * __restrict__ vx, Real * __rest
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     
-    // Apply collision if random number is less than collision probability
     if (collision_flags[idx] < collision_prob) {
         Real sigma = sigma_factor / sqrt_real(mass[idx]);
         vx[idx] = sigma * rand_x[idx];
@@ -105,7 +90,6 @@ __global__ void andersen_thermostat_kernel(Real * __restrict__ vx, Real * __rest
     }
 }
 
-// C++ wrapper functions for kernel launches
 extern "C" {
     void launch_compute_kinetic_energy_kernel(const Real *d_vx, const Real *d_vy, const Real *d_vz,
                                              const Real *d_mass, Real *d_ke_out, size_t num_particles,
@@ -114,7 +98,6 @@ extern "C" {
         int grid_size = (num_particles + block_size - 1) / block_size;
         size_t shared_mem = block_size * sizeof(Real);
         
-        // Zero out result first
         cudaMemsetAsync(d_ke_out, 0, sizeof(Real), stream);
         
         compute_kinetic_energy_kernel<<<grid_size, block_size, shared_mem, stream>>>(
@@ -132,7 +115,6 @@ extern "C" {
         
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-            // Error will be caught by subsequent cudaDeviceSynchronize() in host code
         }
     }
     
@@ -146,7 +128,6 @@ extern "C" {
         
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-            // Error will be caught by subsequent cudaDeviceSynchronize() in host code
         }
     }
     
@@ -161,7 +142,6 @@ extern "C" {
         
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-            // Error will be caught by subsequent cudaDeviceSynchronize() in host code
         }
     }
 }

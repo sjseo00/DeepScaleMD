@@ -9,8 +9,6 @@
 #include <thrust/transform.h>
 #include <cstdio>
 
-// GPU kernel to compute max squared displacement per particle between two position arrays
-// Output: d_disp_sq[i] = displacement^2 for particle i
 __global__ void compute_displacement_sq_kernel(
     const Real* __restrict__ x_new,
     const Real* __restrict__ y_new,
@@ -30,7 +28,6 @@ __global__ void compute_displacement_sq_kernel(
     Real dy = y_new[i] - y_old[i];
     Real dz = z_new[i] - z_old[i];
 
-    // Minimum image convention
     if (periodic_x) {
         if (dx >  lx * 0.5) dx -= lx;
         if (dx < -lx * 0.5) dx += lx;
@@ -47,8 +44,6 @@ __global__ void compute_displacement_sq_kernel(
     d_disp_sq[i] = dx*dx + dy*dy + dz*dz;
 }
 
-// Compute max displacement on GPU between current and last-build positions.
-// Returns true if rebuild is needed (max_disp > threshold)
 extern "C" bool morton_gpu_needs_rebuild(
     const Real* d_x_new, const Real* d_y_new, const Real* d_z_new,  // current positions
     const Real* d_x_old, const Real* d_y_old, const Real* d_z_old,  // last-build positions
@@ -73,7 +68,6 @@ extern "C" bool morton_gpu_needs_rebuild(
         periodic_x, periodic_y, periodic_z
     );
 
-    // Use thrust::reduce to find max displacement^2 on GPU
     Real max_disp_sq = thrust::reduce(
         thrust::cuda::par.on(stream),
         thrust::device_pointer_cast(d_disp_sq_tmp),
@@ -85,8 +79,6 @@ extern "C" bool morton_gpu_needs_rebuild(
     return (max_disp_sq > threshold_sq);
 }
 
-// Expand bits for Morton code calculation (30-bit code from 10-bit coordinates)
-// Used for 32-bit Morton codes
 __device__ inline uint32_t expand_bits32(uint32_t v) {
     v = (v * 0x00010001u) & 0xFF0000FFu;
     v = (v * 0x00000101u) & 0x0F00F00Fu;
@@ -95,7 +87,6 @@ __device__ inline uint32_t expand_bits32(uint32_t v) {
     return v;
 }
 
-// Expand bits for 64-bit Morton codes (21 bits per dimension)
 __device__ inline unsigned long long expand_bits64(unsigned int v) {
     unsigned long long x = v & 0x1fffff;
     x = (x | x << 32) & 0x1f00000000ffff;
@@ -128,17 +119,14 @@ __global__ void compute_morton_codes_kernel(
     Real py = y[i];
     Real pz = z[i];
 
-    // Apply periodic wrapping
     if (periodic_x) px = px - floor(px / lx) * lx;
     if (periodic_y) py = py - floor(py / ly) * ly;
     if (periodic_z) pz = pz - floor(pz / lz) * lz;
 
-    // Calculate cell index
     int cx = min(max(0, (int)(px * inv_cell_x)), nx - 1);
     int cy = min(max(0, (int)(py * inv_cell_y)), ny - 1);
     int cz = min(max(0, (int)(pz * inv_cell_z)), nz - 1);
 
-    // Compute Morton code based on cell index
     morton_codes[i] = morton3D_64(cx, cy, cz);
 }
 
@@ -172,7 +160,6 @@ __global__ void compute_cell_ranges_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    // Get cell of particle i (which is in sorted order)
     Real px = x[i];
     Real py = y[i];
     Real pz = z[i];
@@ -187,17 +174,7 @@ __global__ void compute_cell_ranges_kernel(
     
     int cell_idx = cz * nx * ny + cy * nx + cx;
 
-    // Check if this is the start or end of a cell block
-    // Since particles are sorted by Morton code, and Morton code maps uniquely to cell_idx (if grid matches),
-    // particles in the same cell are contiguous.
-    // However, we sorted by Morton code, but we are computing linear cell index here.
-    // Does sorting by Morton code guarantee contiguous linear cell indices? NO.
-    // But we need cell_start[linear_idx] to point to the range in the sorted array.
-    // Wait. If we sort by Morton code, particles in cell C are contiguous.
-    // So we can find the range for cell C.
     
-    // We need to use atomicMin/Max or check boundaries.
-    // Boundary check is better.
     
     int prev_cell_idx = -1;
     if (i > 0) {
@@ -258,9 +235,6 @@ __global__ void build_neighbor_list_sorted_kernel(
     int i_sorted = blockIdx.x * blockDim.x + threadIdx.x;
     if (i_sorted >= n_total) return;
 
-    // We need to build neighbor list for LOCAL particles.
-    // But i_sorted iterates over ALL particles (including ghosts).
-    // We need to check if the original particle is local.
     int i_orig = sorted_to_orig[i_sorted];
     if (i_orig >= n_local) return; // Skip ghost particles
 
@@ -268,7 +242,6 @@ __global__ void build_neighbor_list_sorted_kernel(
     Real yi = y[i_sorted];
     Real zi = z[i_sorted];
 
-    // Get cell of particle i
     Real px = xi;
     Real py = yi;
     Real pz = zi;
@@ -283,7 +256,6 @@ __global__ void build_neighbor_list_sorted_kernel(
     int count = 0;
     int base_offset = i_orig * max_neighbors;
 
-    // Search 3x3x3 neighbors
     for (int dz = -1; dz <= 1; dz++) {
         for (int dy = -1; dy <= 1; dy++) {
             for (int dx = -1; dx <= 1; dx++) {
@@ -351,9 +323,6 @@ __global__ void build_neighbor_list_sorted_kernel(
     neighbor_offset[i_orig] = base_offset;
 }
 
-// GPU kernel to compact padded neighbor list into dense CSR format
-// Input: padded_list[i_orig * max_neighbors + k] for k < num_neighbors[i_orig]
-// Output: compact_list[compact_offset[i_orig] + k]
 __global__ void compact_neighbor_list_kernel(
     const int* __restrict__ padded_list,
     int* __restrict__ compact_list,
@@ -405,14 +374,12 @@ extern "C" void launch_cuda_morton_neighbor_list_build(
     
     int total_cells = nx * ny * nz;
     
-    // Initialize cell arrays
     cudaMemsetAsync(d_cell_start, -1, total_cells * sizeof(int), stream);
     cudaMemsetAsync(d_cell_end, -1, total_cells * sizeof(int), stream);
     
     int block_size = 256;
     int num_blocks = (n_total + block_size - 1) / block_size;
     
-    // 1. Compute Morton codes
     compute_morton_codes_kernel<<<num_blocks, block_size, 0, stream>>>(
         d_x, d_y, d_z,
         d_morton_codes,
@@ -423,18 +390,15 @@ extern "C" void launch_cuda_morton_neighbor_list_build(
         periodic_x, periodic_y, periodic_z
     );
     
-    // 2. Initialize indices (thrust fills 0, 1, 2, ... n_total-1)
     thrust::sequence(thrust::cuda::par.on(stream), 
                      thrust::device_pointer_cast(d_sorted_indices), 
                      thrust::device_pointer_cast(d_sorted_indices + n_total));
     
-    // 3. Sort indices by Morton code (GPU radix sort via Thrust)
     thrust::sort_by_key(thrust::cuda::par.on(stream),
                         thrust::device_pointer_cast(d_morton_codes),
                         thrust::device_pointer_cast(d_morton_codes + n_total),
                         thrust::device_pointer_cast(d_sorted_indices));
                         
-    // 4. Reorder particle positions to Morton order
     reorder_particles_kernel<<<num_blocks, block_size, 0, stream>>>(
         d_sorted_indices,
         d_x, d_y, d_z,
@@ -442,7 +406,6 @@ extern "C" void launch_cuda_morton_neighbor_list_build(
         n_total
     );
     
-    // 5. Compute contiguous cell ranges in the sorted array
     compute_cell_ranges_kernel<<<num_blocks, block_size, 0, stream>>>(
         d_sorted_x, d_sorted_y, d_sorted_z,
         d_cell_start, d_cell_end,
@@ -453,8 +416,6 @@ extern "C" void launch_cuda_morton_neighbor_list_build(
         periodic_x, periodic_y, periodic_z
     );
     
-    // 6. Build padded neighbor list: d_neighbor_list[i_orig * max_neighbors + k]
-    // d_num_neighbors[i_orig] = count, d_neighbor_offset[i_orig] = i_orig * max_neighbors
     build_neighbor_list_sorted_kernel<<<num_blocks, block_size, 0, stream>>>(
         d_sorted_x, d_sorted_y, d_sorted_z,
         d_sorted_indices,
@@ -469,14 +430,11 @@ extern "C" void launch_cuda_morton_neighbor_list_build(
         inv_cell_x, inv_cell_y, inv_cell_z
     );
 
-    // 7. GPU exclusive prefix scan: d_num_neighbors → d_neighbor_offset (compact CSR offsets)
-    // After this: d_neighbor_offset[i] = sum(d_num_neighbors[0..i-1])
     thrust::exclusive_scan(thrust::cuda::par.on(stream),
                            thrust::device_pointer_cast(d_num_neighbors),
                            thrust::device_pointer_cast(d_num_neighbors + n_local),
                            thrust::device_pointer_cast(d_neighbor_offset));
 
-    // 8. GPU compaction: copy neighbors from padded layout to compact CSR layout
     {
         int compact_blocks = (n_local + block_size - 1) / block_size;
         compact_neighbor_list_kernel<<<compact_blocks, block_size, 0, stream>>>(

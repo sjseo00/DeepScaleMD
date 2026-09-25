@@ -267,7 +267,7 @@ void MDSystem::initialize_distributed_velocities(Real temperature) {
         local_moments[3] += mass;
     }
     Real global_moments[4] = {0.0, 0.0, 0.0, 0.0};
-    MPI_Allreduce(local_moments, global_moments, 4, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(local_moments, global_moments, 4, MPI_DOUBLE, MPI_SUM, pp_comm_);
     if (global_moments[3] <= 0.0) {
         throw std::runtime_error("Cannot initialize velocities: total mass is not positive");
     }
@@ -288,11 +288,11 @@ void MDSystem::initialize_distributed_velocities(Real temperature) {
 
     Real global_ke_unscaled = 0.0;
     MPI_Allreduce(&local_ke_unscaled, &global_ke_unscaled, 1,
-                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                  MPI_DOUBLE, MPI_SUM, pp_comm_);
     unsigned long long local_atoms = static_cast<unsigned long long>(local_count);
     unsigned long long global_atoms = 0;
     MPI_Allreduce(&local_atoms, &global_atoms, 1,
-                  MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+                  MPI_UNSIGNED_LONG_LONG, MPI_SUM, pp_comm_);
 
     const Real dof = global_atoms > 1 ? static_cast<Real>(3 * global_atoms - 3) : 0.0;
     const Real target_ke = 0.5 * dof * kB * temperature;
@@ -343,18 +343,18 @@ void MDSystem::load_topology(const std::string& topo_file,
             ? (topology->load_topology(clean_filename, rank) ? 1 : 0)
             : (topology->load_canonical(clean_filename, parameter_file, rank) ? 1 : 0);
     }
-    MPI_Bcast(&load_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&load_ok, 1, MPI_INT, 0, pp_comm_);
     if (!load_ok) {
         throw std::runtime_error("Failed to load topology file: " + clean_filename);
     }
 
-    topology->broadcast(MPI_COMM_WORLD, 0);
+    topology->broadcast(pp_comm_, 0);
 
     int atom_count_matches = 1;
     if (rank == 0) {
         atom_count_matches = topology->get_num_atoms() == static_cast<int>(particles.num_particles) ? 1 : 0;
     }
-    MPI_Bcast(&atom_count_matches, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&atom_count_matches, 1, MPI_INT, 0, pp_comm_);
     if (!atom_count_matches) {
         throw std::runtime_error("Coordinate/topology atom-count mismatch: XYZ has " +
             std::to_string(particles.num_particles) + ", topology has " +
@@ -374,7 +374,7 @@ void MDSystem::load_topology(const std::string& topo_file,
             }
         }
     }
-    MPI_Bcast(&element_mismatch, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&element_mismatch, 1, MPI_INT, 0, pp_comm_);
     if (element_mismatch >= 0) {
         throw std::runtime_error("Coordinate/topology element-order mismatch at atom " +
                                  std::to_string(element_mismatch));
@@ -405,7 +405,7 @@ void MDSystem::setup_domain_decomposition() {
     // slices.  Non-root ranks never allocate the global particle set.
     std::uint64_t total_particles_u64 =
         (rank == 0) ? static_cast<std::uint64_t>(particles.num_particles) : 0;
-    MPI_Bcast(&total_particles_u64, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&total_particles_u64, 1, MPI_UINT64_T, 0, pp_comm_);
     const size_t total_particles = static_cast<size_t>(total_particles_u64);
 
     std::vector<int> counts(size, 0), displacements(size, 0);
@@ -435,7 +435,7 @@ void MDSystem::setup_domain_decomposition() {
 
     int local_count = 0;
     MPI_Scatter(rank == 0 ? counts.data() : nullptr, 1, MPI_INT,
-                &local_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                &local_count, 1, MPI_INT, 0, pp_comm_);
 
     auto scatter_real = [&](std::vector<Real>& values) {
         std::vector<Real> local(static_cast<size_t>(local_count));
@@ -443,7 +443,7 @@ void MDSystem::setup_domain_decomposition() {
                      rank == 0 ? counts.data() : nullptr,
                      rank == 0 ? displacements.data() : nullptr,
                      MPI_DOUBLE, local.data(), local_count, MPI_DOUBLE,
-                     0, MPI_COMM_WORLD);
+                     0, pp_comm_);
         values.swap(local);
     };
     auto scatter_int = [&](std::vector<int>& values) {
@@ -452,7 +452,7 @@ void MDSystem::setup_domain_decomposition() {
                      rank == 0 ? counts.data() : nullptr,
                      rank == 0 ? displacements.data() : nullptr,
                      MPI_INT, local.data(), local_count, MPI_INT,
-                     0, MPI_COMM_WORLD);
+                     0, pp_comm_);
         values.swap(local);
     };
     scatter_real(particles.x); scatter_real(particles.y); scatter_real(particles.z);
@@ -681,16 +681,16 @@ void MDSystem::setup_force_field_params() {
         }
     }
 
-    MPI_Bcast(&ff_params.num_atom_types, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&ff_params.num_atom_types, 1, MPI_INT, 0, pp_comm_);
     if (rank != 0) {
         ff_params.epsilon.resize(static_cast<size_t>(ff_params.num_atom_types));
         ff_params.sigma.resize(static_cast<size_t>(ff_params.num_atom_types));
     }
-    MPI_Bcast(ff_params.epsilon.data(), ff_params.num_atom_types, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Bcast(ff_params.sigma.data(), ff_params.num_atom_types, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(ff_params.epsilon.data(), ff_params.num_atom_types, MPI_DOUBLE, 0, pp_comm_);
+    MPI_Bcast(ff_params.sigma.data(), ff_params.num_atom_types, MPI_DOUBLE, 0, pp_comm_);
 
     int explicit_pairs = (rank == 0 && ff_params.explicit_pair_parameters) ? 1 : 0;
-    MPI_Bcast(&explicit_pairs, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&explicit_pairs, 1, MPI_INT, 0, pp_comm_);
     ff_params.explicit_pair_parameters = explicit_pairs != 0;
     if (ff_params.explicit_pair_parameters) {
         if (rank != 0) {
@@ -701,9 +701,9 @@ void MDSystem::setup_force_field_params() {
         }
         for (int i = 0; i < ff_params.num_atom_types; ++i) {
             MPI_Bcast(ff_params.sigma_mixed[i].data(), ff_params.num_atom_types,
-                      MPI_DOUBLE, 0, MPI_COMM_WORLD);
+                      MPI_DOUBLE, 0, pp_comm_);
             MPI_Bcast(ff_params.epsilon_mixed[i].data(), ff_params.num_atom_types,
-                      MPI_DOUBLE, 0, MPI_COMM_WORLD);
+                      MPI_DOUBLE, 0, pp_comm_);
         }
     } else {
         ff_params.initialize_mixing_tables();
@@ -817,7 +817,7 @@ void MDSystem::initialize_decomposition_runtime() {
     config.execution = dsdecompx::ExecutionMode::Host;
 #endif
 
-    decomp_runtime_ = std::make_unique<dsdecompx::Decomp>(MPI_COMM_WORLD, config);
+    decomp_runtime_ = std::make_unique<dsdecompx::Decomp>(pp_comm_, config);
 
     const auto& topology = decomp_runtime_->topology();
     if (rank==0) {
@@ -1078,22 +1078,11 @@ bool MDSystem::sync_distributed_particles(bool local_rebuild_hint) {
         return local_rebuild_hint;
     }
 
-    bool should_rebuild = local_rebuild_hint;
-    if (local_rebuild_hint) {
-        // rebuild step: run full unification across all ranks
-        should_rebuild = unify_rebuild_decision(local_rebuild_hint);
-    }
-
-    const bool migrated = migrate_particles_check();
-    if (migrated) {
-        should_rebuild = true;
-    }
-
-    bool layout_changed = false;
+    const bool should_rebuild = unify_rebuild_decision(local_rebuild_hint);
     if (should_rebuild) {
-        layout_changed = sync_halo_particles(should_rebuild);
-        if (layout_changed) should_rebuild = true;
+        migrate_particles_check();
     }
+    sync_halo_particles(should_rebuild);
 
     return should_rebuild;
 }

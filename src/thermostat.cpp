@@ -6,53 +6,7 @@
 #include <iostream>
 #include <random>
 
-#ifdef USE_MPI
-#include <mpi.h>
-
-bool is_rank_zero_thermostat() {
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    return rank == 0;
-}
-
-// Helper function to get MPI datatype for Real (float or double)
-inline MPI_Datatype mpi_type_for_real() {
-    if constexpr (std::is_same<Real, double>::value) {
-        return MPI_DOUBLE;
-    } else if constexpr (std::is_same<Real, float>::value) {
-        return MPI_FLOAT;
-    } else {
-        static_assert(std::is_same<Real, double>::value || std::is_same<Real, float>::value,
-                      "Real must be float or double");
-    }
-}
-
-Real mpi_allreduce_sum(Real local_value) {
-    // Fast path: single-rank MPI — avoid MPI stack overhead (~1ms/call)
-    static int world_size = -1;
-    if (world_size == -1) MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-    if (world_size == 1) return local_value;
-    Real global_value;
-    MPI_Allreduce(&local_value, &global_value, 1, mpi_type_for_real(), MPI_SUM, MPI_COMM_WORLD);
-    return global_value;
-}
-
-int mpi_allreduce_sum_int(int local_value) {
-    static int world_size = -1;
-    if (world_size == -1) MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-    if (world_size == 1) return local_value;
-    int global_value;
-    MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    return global_value;
-}
-#else
-bool is_rank_zero_thermostat() { return true; }
-Real mpi_allreduce_sum(Real local_value) { return local_value; }
-int mpi_allreduce_sum_int(int local_value) { return local_value; }
-#endif
-
 #ifdef USE_CUDA
-// CUDA kernel wrapper function declarations
 extern "C" {
     void launch_langevin_thermostat_kernel(Real *d_vx, Real *d_vy, Real *d_vz,
                                           Real *d_mass, Real *d_rand_x, Real *d_rand_y, Real *d_rand_z,
@@ -70,8 +24,6 @@ extern "C" {
                                              cudaStream_t stream);
 }
 
-// Helper to generate random numbers with correct type (float vs double)
-// Template specialization to avoid type conversion issues
 template<typename T>
 inline void curand_generate_normal_typed(curandGenerator_t gen, T* output, size_t n, T mean, T stddev);
 
@@ -106,51 +58,46 @@ inline void curand_generate_uniform_real(curandGenerator_t gen, Real* output, si
     curand_generate_uniform_typed<Real>(gen, output, n);
 }
 
-// Note: CUDA kernels are defined in thermostat_kernels.cu
+inline size_t curand_normal_count(size_t particle_count) {
+    return particle_count + (particle_count & 1U);
+}
+
 #endif
 
-// Common helper for Langevin thermostat coefficients
 struct LangevinCoeffs {
     Real c1;
     Real c2_factor;
 };
 
 inline LangevinCoeffs compute_langevin_coeffs(Real gamma, Real dt, Real T) {
-    // Exact Ornstein-Uhlenbeck velocity update in LAMMPS "real" units:
-    // v' = c1*v + sqrt(kBT/m/mvv2e * (1-c1^2))*R.
     Real c1 = std::exp(-gamma * dt);
     Real c2_factor = std::sqrt((kB * T / mvv2e) * (1.0 - c1 * c1));
     return {c1, c2_factor};
 }
 
-inline Real nose_hoover_scale(Real global_ke, int global_particles,
+inline Real nose_hoover_scale(Real kinetic_energy, size_t particle_count,
                               Real target_temperature, Real tau,
                               Real dt, Real& xi) {
-    if (global_particles <= 0 || target_temperature <= 0.0 || tau <= 0.0) return 1.0;
-    const Real dof = 3.0 * static_cast<Real>(global_particles);
+    if (particle_count == 0 || target_temperature <= 0.0 || tau <= 0.0) return 1.0;
+    const Real dof = 3.0 * static_cast<Real>(particle_count);
     const Real target_twice_ke = dof * kB * target_temperature;
     const Real thermostat_mass = target_twice_ke * tau * tau;
     if (!(thermostat_mass > 0.0)) return 1.0;
 
-    // Symmetric second-order update of the single Nose-Hoover friction variable.
-    xi += 0.5 * dt * (2.0 * global_ke - target_twice_ke) / thermostat_mass;
+    xi += 0.5 * dt * (2.0 * kinetic_energy - target_twice_ke) / thermostat_mass;
     const Real scale = std::exp(-xi * dt);
-    const Real scaled_ke = global_ke * scale * scale;
+    const Real scaled_ke = kinetic_energy * scale * scale;
     xi += 0.5 * dt * (2.0 * scaled_ke - target_twice_ke) / thermostat_mass;
     return scale;
 }
 
-// Nose-Hoover Thermostat
 NoseHooverThermostat::NoseHooverThermostat(Real temp, Real mass) 
     : Thermostat(temp), Q(mass), xi(0.0) {}
 
 void NoseHooverThermostat::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
+    if (num_particles == 0) return;
     
-    // Calculate local kinetic energy.
-    // Velocities are in Å/fs and masses in amu (g/mol), so
-    //   0.5 * m * v² is in  amu·(Å/fs)² = (1/mvv2e) kcal/mol.
-    // Multiply by mvv2e so the result is in kcal/mol, consistent with kB.
     Real local_ke = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i] * particles.vx[i] + 
@@ -159,14 +106,9 @@ void NoseHooverThermostat::apply(ParticleData& particles, Real dt, size_t local_
         local_ke += 0.5 * particles.mass[i] * v2 * mvv2e;  // [kcal/mol]
     }
     
-    // Get global kinetic energy and total particles via MPI reduction
-    Real global_ke = mpi_allreduce_sum(local_ke);
-    int global_particles = mpi_allreduce_sum_int((int)num_particles);
-    
-    Real lambda = nose_hoover_scale(global_ke, global_particles,
+    Real lambda = nose_hoover_scale(local_ke, num_particles,
                                      target_temperature, Q, dt, xi);
     
-    // Scale velocities
     for (size_t i = 0; i < num_particles; i++) {
         particles.vx[i] *= lambda;
         particles.vy[i] *= lambda;
@@ -174,14 +116,12 @@ void NoseHooverThermostat::apply(ParticleData& particles, Real dt, size_t local_
     }
 }
 
-// Langevin Thermostat
 LangevinThermostat::LangevinThermostat(Real temp, Real friction) 
     : Thermostat(temp), gamma(friction), rng(std::random_device{}()), normal_dist(0.0, 1.0) {}
 
 void LangevinThermostat::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
     
-    // Compute Langevin coefficients using shared helper
     auto coeffs = compute_langevin_coeffs(gamma, dt, target_temperature);
     
     for (size_t i = 0; i < num_particles; i++) {
@@ -193,13 +133,12 @@ void LangevinThermostat::apply(ParticleData& particles, Real dt, size_t local_pa
     }
 }
 
-// Andersen Thermostat
 AndersenThermostat::AndersenThermostat(Real temp, Real freq) 
     : Thermostat(temp), collision_freq(freq), rng(std::random_device{}()), 
       uniform_dist(0.0, 1.0), normal_dist(0.0, 1.0) {}
 
 void AndersenThermostat::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
     
     Real collision_prob = 1.0 - std::exp(-collision_freq * dt);
     Real sigma = std::sqrt(kB * target_temperature / mvv2e);
@@ -215,18 +154,12 @@ void AndersenThermostat::apply(ParticleData& particles, Real dt, size_t local_pa
 }
 
 #ifdef USE_CUDA
-// CUDA Langevin Thermostat Implementation
 LangevinThermostatCUDA::LangevinThermostatCUDA(Real temp, Real friction)
     : Thermostat(temp), gamma(friction), d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
       d_mass(nullptr), d_random_x(nullptr), d_random_y(nullptr), d_random_z(nullptr),
       allocated_size(0) {
-    // Initialize curand with rank-based seed to avoid correlated noise in MPI
-    int rank = 0;
-    #ifdef USE_MPI
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    #endif
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, time(NULL) + rank * 1000);
+    curandSetPseudoRandomGeneratorSeed(gen, std::random_device{}());
 }
 
 LangevinThermostatCUDA::~LangevinThermostatCUDA() {
@@ -243,7 +176,8 @@ LangevinThermostatCUDA::~LangevinThermostatCUDA() {
 }
 
 void LangevinThermostatCUDA::allocate_gpu_memory(size_t num_particles) {
-    if (allocated_size < num_particles) {
+    const size_t allocation_size = curand_normal_count(num_particles);
+    if (allocated_size < allocation_size) {
         if (d_vx) {
             cudaFree(d_vx);
             cudaFree(d_vy);
@@ -254,19 +188,15 @@ void LangevinThermostatCUDA::allocate_gpu_memory(size_t num_particles) {
             cudaFree(d_random_z);
         }
         
-        cudaMalloc(&d_vx, num_particles * sizeof(Real));
-        cudaMalloc(&d_vy, num_particles * sizeof(Real));
-        cudaMalloc(&d_vz, num_particles * sizeof(Real));
-        cudaMalloc(&d_mass, num_particles * sizeof(Real));
-        cudaMalloc(&d_random_x, num_particles * sizeof(Real));
-        cudaMalloc(&d_random_y, num_particles * sizeof(Real));
-        cudaMalloc(&d_random_z, num_particles * sizeof(Real));
+        cudaMalloc(&d_vx, allocation_size * sizeof(Real));
+        cudaMalloc(&d_vy, allocation_size * sizeof(Real));
+        cudaMalloc(&d_vz, allocation_size * sizeof(Real));
+        cudaMalloc(&d_mass, allocation_size * sizeof(Real));
+        cudaMalloc(&d_random_x, allocation_size * sizeof(Real));
+        cudaMalloc(&d_random_y, allocation_size * sizeof(Real));
+        cudaMalloc(&d_random_z, allocation_size * sizeof(Real));
         
-        allocated_size = num_particles;
-        
-        if (is_rank_zero_thermostat()) {
-            std::cout << "Allocated CUDA memory for Langevin thermostat: " << num_particles << " particles" << std::endl;
-        }
+        allocated_size = allocation_size;
     }
 }
 
@@ -284,69 +214,52 @@ void LangevinThermostatCUDA::copy_from_device(ParticleData& particles, size_t lo
 }
 
 void LangevinThermostatCUDA::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
+    if (num_particles == 0) return;
     
     allocate_gpu_memory(num_particles);
     copy_to_device(particles, num_particles);
     
-    // Generate random numbers with correct type
-    curand_generate_normal_real(gen, d_random_x, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_y, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_z, num_particles, 0.0, 1.0);
+    const size_t random_count = curand_normal_count(num_particles);
+    curand_generate_normal_real(gen, d_random_x, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_y, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_z, random_count, 0.0, 1.0);
     
-    // Compute Langevin coefficients using shared helper
     auto coeffs = compute_langevin_coeffs(gamma, dt, target_temperature);
     
-    // Launch kernel
     launch_langevin_thermostat_kernel(d_vx, d_vy, d_vz, d_mass, d_random_x, d_random_y, d_random_z,
                                      coeffs.c1, coeffs.c2_factor, num_particles);
     
     cudaDeviceSynchronize();
     
     copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero_thermostat()) {
-        std::cout << "CUDA Langevin thermostat applied to " << num_particles << " particles" << std::endl;
-    }
 }
 
-// GPU-resident version: no host copy, works directly with device pointers
 void LangevinThermostatCUDA::apply_device(Real* dev_vx, Real* dev_vy, Real* dev_vz, Real* dev_mass,
                                          size_t num_particles, Real dt, cudaStream_t stream) {
-    // Allocate internal random buffers if needed
+    if (num_particles == 0) return;
     allocate_gpu_memory(num_particles);
     
-    // Generate random numbers on device with correct type
-    curand_generate_normal_real(gen, d_random_x, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_y, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_z, num_particles, 0.0, 1.0);
+    const size_t random_count = curand_normal_count(num_particles);
+    curand_generate_normal_real(gen, d_random_x, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_y, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_z, random_count, 0.0, 1.0);
     
-    // Compute Langevin coefficients
     auto coeffs = compute_langevin_coeffs(gamma, dt, target_temperature);
     
-    // Apply directly to provided device pointers (no sync)
     launch_langevin_thermostat_kernel(dev_vx, dev_vy, dev_vz, dev_mass,
                                      d_random_x, d_random_y, d_random_z,
                                      coeffs.c1, coeffs.c2_factor, num_particles);
     
-    // No cudaDeviceSynchronize - caller controls ordering via stream/events
 }
 #endif
 
 #ifdef USE_SYCL
-// SYCL Langevin Thermostat Implementation
 LangevinThermostatSYCL::LangevinThermostatSYCL(Real temp, Real friction)
     : Thermostat(temp), gamma(friction), queue(sycl::default_selector{}),
       d_vx(nullptr), d_vy(nullptr), d_vz(nullptr), d_mass(nullptr),
       d_random_x(nullptr), d_random_y(nullptr), d_random_z(nullptr),
-      allocated_size(0), rng(std::random_device{}()), normal_dist(0.0, 1.0) {
-    // Initialize RNG with rank-based seed for MPI
-    int rank = 0;
-    #ifdef USE_MPI
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    #endif
-    rng.seed(std::random_device{}() + rank * 1000);
-}
+      allocated_size(0), rng(std::random_device{}()), normal_dist(0.0, 1.0) {}
 
 LangevinThermostatSYCL::~LangevinThermostatSYCL() {
     if (d_vx) {
@@ -381,10 +294,6 @@ void LangevinThermostatSYCL::allocate_device_memory(size_t num_particles) {
         d_random_z = sycl::malloc_device<Real>(num_particles, queue);
         
         allocated_size = num_particles;
-        
-        if (is_rank_zero_thermostat()) {
-            std::cout << "Allocated SYCL memory for Langevin thermostat: " << num_particles << " particles" << std::endl;
-        }
     }
 }
 
@@ -404,7 +313,6 @@ void LangevinThermostatSYCL::copy_from_device(ParticleData& particles, size_t lo
 }
 
 void LangevinThermostatSYCL::generate_random_numbers(size_t num_particles) {
-    // Use member RNG engine instead of creating new one each time
     std::vector<Real> h_random_x(num_particles), h_random_y(num_particles), h_random_z(num_particles);
     
     for (size_t i = 0; i < num_particles; i++) {
@@ -420,16 +328,15 @@ void LangevinThermostatSYCL::generate_random_numbers(size_t num_particles) {
 }
 
 void LangevinThermostatSYCL::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
+    if (num_particles == 0) return;
     
     allocate_device_memory(num_particles);
     copy_to_device(particles, num_particles);
     generate_random_numbers(num_particles);
     
-    // Compute Langevin coefficients using shared helper
     auto coeffs = compute_langevin_coeffs(gamma, dt, target_temperature);
     
-    // Copy device pointers to local variables for kernel capture
     Real* dev_vx = d_vx;
     Real* dev_vy = d_vy;
     Real* dev_vz = d_vz;
@@ -438,7 +345,6 @@ void LangevinThermostatSYCL::apply(ParticleData& particles, Real dt, size_t loca
     Real* dev_random_y = d_random_y;
     Real* dev_random_z = d_random_z;
     
-    // SYCL kernel for Langevin thermostat
     Real c1 = coeffs.c1;
     Real c2_factor = coeffs.c2_factor;
     queue.parallel_for(sycl::range<1>(num_particles), [=](sycl::id<1> idx) {
@@ -453,15 +359,10 @@ void LangevinThermostatSYCL::apply(ParticleData& particles, Real dt, size_t loca
     queue.wait();
     
     copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero_thermostat()) {
-        std::cout << "SYCL Langevin thermostat applied to " << num_particles << " particles" << std::endl;
-    }
 }
 #endif
 
 #ifdef USE_CUDA
-// CUDA NoseHoover Thermostat Implementation
 NoseHooverThermostatCUDA::NoseHooverThermostatCUDA(Real temp, Real mass)
     : Thermostat(temp), Q(mass), xi(0.0), d_vx(nullptr), d_vy(nullptr), d_vz(nullptr),
       d_mass(nullptr), d_ke(nullptr), allocated_size(0) {}
@@ -491,7 +392,6 @@ void NoseHooverThermostatCUDA::allocate_gpu_memory(size_t num_particles) {
         allocated_size = num_particles;
     }
     
-    // Allocate KE buffer (once)
     if (!d_ke) {
         cudaMalloc(&d_ke, sizeof(Real));
     }
@@ -511,75 +411,54 @@ void NoseHooverThermostatCUDA::copy_from_device(ParticleData& particles, size_t 
 }
 
 void NoseHooverThermostatCUDA::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
+    if (num_particles == 0) return;
     
     allocate_gpu_memory(num_particles);
     copy_to_device(particles, num_particles);
     
-    // Calculate current kinetic energy from host data in kcal/mol.
     Real kinetic_energy = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
         kinetic_energy += 0.5 * particles.mass[i] * v2 * mvv2e;
     }
     
-    Real global_kinetic = mpi_allreduce_sum(kinetic_energy);
-    int global_particles = mpi_allreduce_sum_int((int)num_particles);
-    
-    Real scaling_factor = nose_hoover_scale(global_kinetic, global_particles,
+    Real scaling_factor = nose_hoover_scale(kinetic_energy, num_particles,
                                              target_temperature, Q, dt, xi);
     
     launch_nose_hoover_thermostat_kernel(d_vx, d_vy, d_vz, scaling_factor, num_particles);
     
     cudaDeviceSynchronize();
     copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero_thermostat()) {
-        std::cout << "CUDA Nose-Hoover thermostat applied" << std::endl;
-    }
 }
 
-// GPU-resident version: compute KE on device, use MPI directly (or async)
 void NoseHooverThermostatCUDA::apply_device(Real* dev_vx, Real* dev_vy, Real* dev_vz, Real* dev_mass,
                                            size_t num_particles, Real dt, cudaStream_t stream) {
+    if (num_particles == 0) return;
     allocate_gpu_memory(num_particles);
     
-    // Compute kinetic energy on device
     launch_compute_kinetic_energy_kernel(dev_vx, dev_vy, dev_vz, dev_mass, d_ke, num_particles, stream);
     
-    // Copy KE to host for MPI reduction (TODO: CUDA-aware MPI can skip this)
     Real local_ke;
     cudaMemcpyAsync(&local_ke, d_ke, sizeof(Real), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream); // Wait for KE computation + copy
     
-    Real global_ke = mpi_allreduce_sum(local_ke);
-    int global_particles = mpi_allreduce_sum_int((int)num_particles);
+    local_ke *= mvv2e;
     
-    // GPU KE kernel accumulates 0.5*m*v² in amu·(Å/fs)² → convert to kcal/mol
-    // (same conversion as CPU path and force_calculator output)
-    global_ke *= mvv2e;
-    
-    Real lambda = nose_hoover_scale(global_ke, global_particles,
+    Real lambda = nose_hoover_scale(local_ke, num_particles,
                                      target_temperature, Q, dt, xi);
     
     launch_nose_hoover_thermostat_kernel(dev_vx, dev_vy, dev_vz, lambda, num_particles);
     
-    // No sync - caller controls ordering
 }
 
-// CUDA Andersen Thermostat Implementation
 AndersenThermostatCUDA::AndersenThermostatCUDA(Real temp, Real freq)
     : Thermostat(temp), collision_freq(freq),
       d_vx(nullptr), d_vy(nullptr), d_vz(nullptr), d_mass(nullptr),
       d_random_x(nullptr), d_random_y(nullptr), d_random_z(nullptr),
       d_collision_flags(nullptr), allocated_size(0) {
-    // Initialize curand with rank-based seed to avoid correlated noise in MPI
-    int rank = 0;
-    #ifdef USE_MPI
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    #endif
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, 1234ULL + rank * 1000);
+    curandSetPseudoRandomGeneratorSeed(gen, std::random_device{}());
 }
 
 AndersenThermostatCUDA::~AndersenThermostatCUDA() {
@@ -593,7 +472,8 @@ AndersenThermostatCUDA::~AndersenThermostatCUDA() {
 }
 
 void AndersenThermostatCUDA::allocate_gpu_memory(size_t num_particles) {
-    if (allocated_size < num_particles) {
+    const size_t allocation_size = curand_normal_count(num_particles);
+    if (allocated_size < allocation_size) {
         if (d_vx) {
             cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
             cudaFree(d_mass);
@@ -601,16 +481,16 @@ void AndersenThermostatCUDA::allocate_gpu_memory(size_t num_particles) {
             cudaFree(d_collision_flags);
         }
         
-        cudaMalloc(&d_vx, num_particles * sizeof(Real));
-        cudaMalloc(&d_vy, num_particles * sizeof(Real));
-        cudaMalloc(&d_vz, num_particles * sizeof(Real));
-        cudaMalloc(&d_mass, num_particles * sizeof(Real));
-        cudaMalloc(&d_random_x, num_particles * sizeof(Real));
-        cudaMalloc(&d_random_y, num_particles * sizeof(Real));
-        cudaMalloc(&d_random_z, num_particles * sizeof(Real));
-        cudaMalloc(&d_collision_flags, num_particles * sizeof(Real));
+        cudaMalloc(&d_vx, allocation_size * sizeof(Real));
+        cudaMalloc(&d_vy, allocation_size * sizeof(Real));
+        cudaMalloc(&d_vz, allocation_size * sizeof(Real));
+        cudaMalloc(&d_mass, allocation_size * sizeof(Real));
+        cudaMalloc(&d_random_x, allocation_size * sizeof(Real));
+        cudaMalloc(&d_random_y, allocation_size * sizeof(Real));
+        cudaMalloc(&d_random_z, allocation_size * sizeof(Real));
+        cudaMalloc(&d_collision_flags, allocation_size * sizeof(Real));
         
-        allocated_size = num_particles;
+        allocated_size = allocation_size;
     }
 }
 
@@ -628,76 +508,65 @@ void AndersenThermostatCUDA::copy_from_device(ParticleData& particles, size_t lo
 }
 
 void AndersenThermostatCUDA::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
+    if (num_particles == 0) return;
     
     allocate_gpu_memory(num_particles);
     copy_to_device(particles, num_particles);
     
-    // Generate random collision flags (uniform [0,1])
     curand_generate_uniform_real(gen, d_collision_flags, num_particles);
     
-    // Generate random velocities (normal distribution)
-    curand_generate_normal_real(gen, d_random_x, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_y, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_z, num_particles, 0.0, 1.0);
+    const size_t random_count = curand_normal_count(num_particles);
+    curand_generate_normal_real(gen, d_random_x, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_y, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_z, random_count, 0.0, 1.0);
     
     Real sigma_factor = std::sqrt(kB * target_temperature / mvv2e);
     Real collision_prob = 1.0 - std::exp(-collision_freq * dt);
     
-    // Apply thermostat where collision_flag < collision_prob
     launch_andersen_thermostat_kernel(d_vx, d_vy, d_vz, d_mass, d_random_x, d_random_y, d_random_z,
                                      d_collision_flags, collision_prob, sigma_factor, num_particles);
     
     cudaDeviceSynchronize();
     copy_from_device(particles, num_particles);
-    
-    if (is_rank_zero_thermostat()) {
-        std::cout << "CUDA Andersen thermostat applied to " << num_particles << " particles" << std::endl;
-    }
 }
 
-// GPU-resident version
 void AndersenThermostatCUDA::apply_device(Real* dev_vx, Real* dev_vy, Real* dev_vz, Real* dev_mass,
                                          size_t num_particles, Real dt, cudaStream_t stream) {
+    if (num_particles == 0) return;
     allocate_gpu_memory(num_particles);
     
-    // Generate random numbers
     curand_generate_uniform_real(gen, d_collision_flags, num_particles);
-    curand_generate_normal_real(gen, d_random_x, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_y, num_particles, 0.0, 1.0);
-    curand_generate_normal_real(gen, d_random_z, num_particles, 0.0, 1.0);
+    const size_t random_count = curand_normal_count(num_particles);
+    curand_generate_normal_real(gen, d_random_x, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_y, random_count, 0.0, 1.0);
+    curand_generate_normal_real(gen, d_random_z, random_count, 0.0, 1.0);
     
     Real sigma_factor = std::sqrt(kB * target_temperature / mvv2e);
     Real collision_prob = 1.0 - std::exp(-collision_freq * dt);
     
-    // Apply directly to device pointers
     launch_andersen_thermostat_kernel(dev_vx, dev_vy, dev_vz, dev_mass,
                                      d_random_x, d_random_y, d_random_z,
                                      d_collision_flags, collision_prob, sigma_factor, num_particles);
     
-    // No sync - caller controls ordering
 }
 #endif
 
 #ifdef USE_SYCL
-// SYCL NoseHoover Thermostat Implementation
 NoseHooverThermostatSYCL::NoseHooverThermostatSYCL(Real temp, Real mass)
     : Thermostat(temp), Q(mass), xi(0.0), queue(sycl::default_selector{}) {}
 
 void NoseHooverThermostatSYCL::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
+    if (num_particles == 0) return;
     
-    // Calculate current kinetic energy
     Real kinetic_energy = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
         kinetic_energy += 0.5 * particles.mass[i] * v2 * mvv2e;
     }
     
-    Real global_kinetic = mpi_allreduce_sum(kinetic_energy);
-    int global_particles = mpi_allreduce_sum_int((int)num_particles);
-    
-    Real scaling_factor = nose_hoover_scale(global_kinetic, global_particles,
+    Real scaling_factor = nose_hoover_scale(kinetic_energy, num_particles,
                                              target_temperature, Q, dt, xi);
     
     try {
@@ -717,38 +586,23 @@ void NoseHooverThermostatSYCL::apply(ParticleData& particles, Real dt, size_t lo
                 vz[i] *= scaling_factor;
             });
         }).wait();
-        
-        if (is_rank_zero_thermostat()) {
-            std::cout << "SYCL Nose-Hoover thermostat applied" << std::endl;
-        }
-        
     } catch (const sycl::exception& e) {
-        if (is_rank_zero_thermostat()) {
-            std::cerr << "SYCL exception in Nose-Hoover thermostat: " << e.what() << std::endl;
-        }
+        std::cerr << "SYCL exception in Nose-Hoover thermostat: " << e.what() << std::endl;
         throw;
     }
 }
 
-// SYCL Andersen Thermostat Implementation
 AndersenThermostatSYCL::AndersenThermostatSYCL(Real temp, Real freq)
     : Thermostat(temp), collision_freq(freq), queue(sycl::default_selector{}),
-      rng(std::random_device{}()), normal_dist(0.0, 1.0), uniform_dist(0.0, 1.0) {
-    // Initialize RNG with rank-based seed for MPI
-    int rank = 0;
-    #ifdef USE_MPI
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    #endif
-    rng.seed(std::random_device{}() + rank * 1000);
-}
+      rng(std::random_device{}()), normal_dist(0.0, 1.0), uniform_dist(0.0, 1.0) {}
 
 void AndersenThermostatSYCL::apply(ParticleData& particles, Real dt, size_t local_particles) {
-    size_t num_particles = (local_particles > 0) ? local_particles : particles.num_particles;
+    const size_t num_particles = local_particles;
+    if (num_particles == 0) return;
     
     Real collision_prob = 1.0 - std::exp(-collision_freq * dt);
     Real sigma_factor = std::sqrt(kB * target_temperature / mvv2e);
     
-    // Generate random numbers using member RNG engine
     std::vector<Real> random_x(num_particles), random_y(num_particles), random_z(num_particles);
     std::vector<Real> collision_flags(num_particles);
     
@@ -789,15 +643,8 @@ void AndersenThermostatSYCL::apply(ParticleData& particles, Real dt, size_t loca
                 }
             });
         }).wait();
-        
-        if (is_rank_zero_thermostat()) {
-            std::cout << "SYCL Andersen thermostat applied to " << num_particles << " particles" << std::endl;
-        }
-        
     } catch (const sycl::exception& e) {
-        if (is_rank_zero_thermostat()) {
-            std::cerr << "SYCL exception in Andersen thermostat: " << e.what() << std::endl;
-        }
+        std::cerr << "SYCL exception in Andersen thermostat: " << e.what() << std::endl;
         throw;
     }
 }

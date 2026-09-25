@@ -1,9 +1,3 @@
-/**
- * yaml_parser.cpp
- *
- * MLIP YAML model spec parser using yaml-cpp.
- * Strict schema validation — unknown keys throw, missing required keys throw.
- */
 
 #include "force_libtorch/config/yaml_parser.h"
 #include <yaml-cpp/yaml.h>
@@ -16,13 +10,11 @@
 namespace mlip {
 namespace {
 
-// ─────────────────────── small helpers ───────────────────────────────────────
 
 [[noreturn]] static void err(const std::string& ctx, const std::string& msg) {
     throw std::runtime_error("[MLIP YAML] " + ctx + ": " + msg);
 }
 
-/// Reject any key in `node` that isn't in `allowed`.
 static void reject_unknown_keys(const YAML::Node& node,
                                  const std::set<std::string>& allowed,
                                  const std::string& context)
@@ -64,7 +56,6 @@ static int opt_int(const YAML::Node& n, const std::string& key, int def = -1) {
     return n[key].as<int>();
 }
 
-// ─────────────────────── enum parsers ────────────────────────────────────────
 
 static BackendType parse_backend_type(const std::string& s, const std::string& ctx) {
     if (s == "pytorch")       return BackendType::PyTorch;
@@ -125,7 +116,6 @@ static SpeciesInputType parse_species_input(const std::string& s, const std::str
     err(ctx, "Unknown species input type '" + s + "'");
 }
 
-// ─────────────────────── shape parser ────────────────────────────────────────
 
 static ShapeDim parse_shape_dim(const std::string& s, const std::string& ctx) {
     ShapeDim d;
@@ -134,7 +124,6 @@ static ShapeDim parse_shape_dim(const std::string& s, const std::string& ctx) {
     else if (s == "nall")    { d.symbol = ShapeSymbol::Nall;   }
     else if (s == "nedges")  { d.symbol = ShapeSymbol::Nedges; }
     else {
-        // Try integer literal
         try {
             d.symbol = ShapeSymbol::Literal;
             d.value  = std::stoll(s);
@@ -153,7 +142,6 @@ static ShapeSpec parse_shape(const YAML::Node& n, const std::string& ctx) {
     for (auto& el : n) {
         std::string s;
         if (el.IsScalar()) {
-            // Could be int or string
             try { s = std::to_string(el.as<int>()); }
             catch (...) { s = el.as<std::string>(); }
         } else {
@@ -164,7 +152,6 @@ static ShapeSpec parse_shape(const YAML::Node& n, const std::string& ctx) {
     return shape;
 }
 
-// ─────────────────────── section parsers ─────────────────────────────────────
 
 static BackendConfig parse_backend(const YAML::Node& model_n,
                                     const YAML::Node& backend_n)
@@ -213,7 +200,6 @@ static SpeciesMapSpec parse_species_map(const YAML::Node& n) {
     SpeciesMapSpec sm;
     if (!n) return sm;
     sm.input_type  = parse_species_input(opt_str(n, "input", "md_type"), "species_map.input");
-    // output is always model_index for now
     if (n["values"] && n["values"].IsMap()) {
         for (auto it = n["values"].begin(); it != n["values"].end(); ++it) {
             int idx = it->second.as<int>();
@@ -279,7 +265,6 @@ static OutputSpec parse_output_entry(const std::string& name, const YAML::Node& 
         for (auto& op : n["operations"])
             s.operations.push_back(op.as<std::string>());
     }
-    // Legacy single operation field
     if (n["operation"])
         s.operations.push_back(n["operation"].as<std::string>());
 
@@ -315,13 +300,11 @@ static void parse_capabilities(const YAML::Node& n, MlipModelSpec& spec) {
         "external_neighbor_list","external_cuda_stream"}, "capabilities");
 }
 
-// ─────────────────────── main parser ─────────────────────────────────────────
 
 static MlipModelSpec parse_root(const YAML::Node& root, const std::string& source_name) {
     if (!root.IsMap())
         err(source_name, "Root YAML node must be a mapping");
 
-    // schema_version
     if (!root["schema_version"])
         err(source_name, "Missing required key 'schema_version'");
     int sv = root["schema_version"].as<int>();
@@ -336,7 +319,6 @@ static MlipModelSpec parse_root(const YAML::Node& root, const std::string& sourc
     MlipModelSpec spec;
     spec.schema_version = sv;
 
-    // model section
     {
         auto& m = root["model"];
         if (!m) err(source_name, "Missing required section 'model'");
@@ -351,17 +333,13 @@ static MlipModelSpec parse_root(const YAML::Node& root, const std::string& sourc
             err("model.precision", "Must be 'float32' or 'float64'");
     }
 
-    // backend section
     spec.backend = parse_backend(root["model"],
                                   root["backend"] ? root["backend"] : YAML::Node(YAML::NodeType::Map));
 
-    // neighbor section
     spec.neighbor = parse_neighbor(root["neighbor"]);
 
-    // species_map
     spec.species_map = parse_species_map(root["species_map"]);
 
-    // units
     if (root["units"]) {
         auto& u = root["units"];
         reject_unknown_keys(u, {"md","model"}, "units");
@@ -369,10 +347,8 @@ static MlipModelSpec parse_root(const YAML::Node& root, const std::string& sourc
         if (u["model"]) spec.model_units = parse_units(u["model"]);
     }
 
-    // autograd
     spec.autograd = parse_autograd(root["autograd"]);
 
-    // inputs
     if (root["inputs"] && root["inputs"].IsMap()) {
         for (auto it = root["inputs"].begin(); it != root["inputs"].end(); ++it) {
             std::string name = it->first.as<std::string>();
@@ -380,7 +356,6 @@ static MlipModelSpec parse_root(const YAML::Node& root, const std::string& sourc
         }
     }
 
-    // outputs
     if (root["outputs"] && root["outputs"].IsMap()) {
         for (auto it = root["outputs"].begin(); it != root["outputs"].end(); ++it) {
             std::string name = it->first.as<std::string>();
@@ -388,10 +363,8 @@ static MlipModelSpec parse_root(const YAML::Node& root, const std::string& sourc
         }
     }
 
-    // capabilities
     parse_capabilities(root["capabilities"], spec);
 
-    // Basic cross-validation
     if (spec.cap_forces && spec.inputs.empty())
         err(source_name, "Model declares forces capability but has no inputs defined");
 
@@ -400,7 +373,6 @@ static MlipModelSpec parse_root(const YAML::Node& root, const std::string& sourc
 
 } // anonymous namespace
 
-// ─────────────────────── public API ──────────────────────────────────────────
 
 MlipModelSpec parse_model_spec(const std::string& yaml_path) {
     YAML::Node root;

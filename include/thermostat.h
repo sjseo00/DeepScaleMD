@@ -5,7 +5,6 @@
 
 #include <random>
 #include <stdexcept>
-#include <mpi.h>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -48,7 +47,7 @@ public:
     explicit Thermostat(Real temp) : target_temperature(temp) {}
     virtual ~Thermostat() = default;
 
-    virtual void apply(ParticleData& particles, Real dt, size_t local_particles = 0) = 0;
+    virtual void apply(ParticleData& particles, Real dt, size_t local_particles) = 0;
     virtual void set_temperature(Real temp) { target_temperature = temp; }
 
 #ifdef USE_CUDA
@@ -69,7 +68,7 @@ private:
 
 public:
     NoseHooverThermostat(Real temp, Real mass);
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
 };
 
 class LangevinThermostat : public Thermostat {
@@ -80,7 +79,7 @@ private:
 
 public:
     LangevinThermostat(Real temp, Real friction);
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
 };
 
 class AndersenThermostat : public Thermostat {
@@ -92,7 +91,7 @@ private:
 
 public:
     AndersenThermostat(Real temp, Real freq);
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
 };
 
 #ifdef USE_CUDA
@@ -110,7 +109,7 @@ private:
 public:
     NoseHooverThermostatCUDA(Real temp, Real mass);
     ~NoseHooverThermostatCUDA();
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
     void apply_device(Real* d_vx, Real* d_vy, Real* d_vz,
                       Real* d_mass, size_t num_particles,
                       Real dt, cudaStream_t stream = 0) override;
@@ -135,7 +134,7 @@ private:
 public:
     LangevinThermostatCUDA(Real temp, Real friction);
     ~LangevinThermostatCUDA();
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
     void apply_device(Real* d_vx, Real* d_vy, Real* d_vz,
                       Real* d_mass, size_t num_particles,
                       Real dt, cudaStream_t stream = 0) override;
@@ -161,7 +160,7 @@ private:
 public:
     AndersenThermostatCUDA(Real temp, Real freq);
     ~AndersenThermostatCUDA();
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
     void apply_device(Real* d_vx, Real* d_vy, Real* d_vz,
                       Real* d_mass, size_t num_particles,
                       Real dt, cudaStream_t stream = 0) override;
@@ -180,7 +179,7 @@ private:
 
 public:
     NoseHooverThermostatSYCL(Real temp, Real mass);
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
 };
 
 class LangevinThermostatSYCL : public Thermostat {
@@ -201,7 +200,7 @@ private:
 public:
     LangevinThermostatSYCL(Real temp, Real friction);
     ~LangevinThermostatSYCL();
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
     void allocate_device_memory(size_t num_particles);
     void copy_to_device(ParticleData& particles, size_t local_particles);
     void copy_from_device(ParticleData& particles, size_t local_particles);
@@ -218,7 +217,7 @@ private:
 
 public:
     AndersenThermostatSYCL(Real temp, Real freq);
-    void apply(ParticleData& particles, Real dt, size_t local_particles = 0) override;
+    void apply(ParticleData& particles, Real dt, size_t local_particles) override;
 };
 #endif
 

@@ -1,14 +1,3 @@
-/**
- * operation_registry_singletons.cpp
- *
- * Defines the out-of-line singleton instance() functions for the MLIP
- * operation registries and backend registry.
- *
- * These MUST be defined in exactly ONE translation unit.  Keeping them
- * inline in the header caused NVCC to emit multiple copies of the
- * function-local static (one per .cu/.cpp TU), which led to duplicate
- * singleton initialisation and heap corruption.
- */
 
 #include "force_libtorch/operations/operation_registry.h"
 #include "force_libtorch/backend/backend_interface.h"

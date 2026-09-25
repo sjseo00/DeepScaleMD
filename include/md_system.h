@@ -42,9 +42,6 @@ private:
     ParticleData particles;
     SimulationBox box;
     ForceFieldParams ff_params;
-    // Non-owning: MDSimulation owns the NeighborList (constructed via the
-    // factory once the config-selected backend is known) and points us at
-    // it with set_neighbor_list().
     NeighborList* neighbor_list_ptr_ = nullptr;
 
     std::unique_ptr<Topology> topology;
@@ -55,6 +52,13 @@ private:
 
     int rank;
     int size;
+    // The communicator this MDSystem's collectives run on. Defaults to
+    // MPI_COMM_WORLD (legacy, no PP/PME split); set_pp_communicator()
+    // repoints it (and rank/size) at the PP sub-communicator once
+    // PmePpSplit has run (see MDSimulation::initialize_impl). MDSystem is
+    // only ever constructed/used on PP ranks -- PME-group ranks never reach
+    // any code that touches this.
+    MPI_Comm pp_comm_ = MPI_COMM_WORLD;
     std::vector<std::string> coordinate_elements_;
 
     std::unique_ptr<dsdecompx::Decomp> decomp_runtime_;
@@ -114,6 +118,16 @@ public:
     size_t get_local_particles() const { return particles.owned_count(); }
     size_t get_ghost_count() const { return particles.ghost_count(); }
     size_t get_total_particles() const { return particles.size(); }
+
+    // Repoints this system's collectives at pp_comm (and refreshes rank/size
+    // to be pp_comm-relative). Must be called before load_coordinates() /
+    // load_topology() / setup_domain_decomposition(), i.e. right after
+    // PmePpSplit::instance().initialize() runs, on PP ranks only.
+    void set_pp_communicator(MPI_Comm pp_comm) {
+        pp_comm_ = pp_comm;
+        MPI_Comm_rank(pp_comm_, &rank);
+        MPI_Comm_size(pp_comm_, &size);
+    }
 
     int get_rank() const { return rank; }
     int get_size() const { return size; }

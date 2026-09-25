@@ -11,12 +11,10 @@ class HaloBackend {
 public:
     virtual ~HaloBackend() = default;
 
-    // Returns true when a GPU-direct halo path has fully handled the refresh.
     virtual bool try_gpu_direct_halo(MDSystem& system,
                                      ForceCalculator* force_calc,
                                      bool& should_rebuild) = 0;
 
-    // Called after fallback host halo exchange path.
     virtual void on_post_halo(MDSystem& system,
                               ForceCalculator* force_calc,
                               bool should_rebuild,

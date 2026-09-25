@@ -1,10 +1,3 @@
-/**
- * pytorch_backend.h
- *
- * PyTorch / TorchScript backend for MlipRuntime.
- * Implements IMlipBackend.
- * Only this header and pytorch_backend.cpp may include <torch/torch.h>.
- */
 
 #pragma once
 #ifndef MLIP_PYTORCH_BACKEND_H

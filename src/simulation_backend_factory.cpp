@@ -98,13 +98,14 @@ std::unique_ptr<Thermostat> create_andersen_thermostat_for_build(Real target_tem
 #endif
 }
 
-std::unique_ptr<Barostat> create_parrinello_rahman_barostat_for_build(Real target_pressure, Real w) {
+std::unique_ptr<Barostat> create_parrinello_rahman_barostat_for_build(Real target_pressure, Real w,
+                                                                       Real gamma, Real piston_temp) {
 #ifdef USE_SYCL
-    return std::make_unique<ParrinelloRahmanBarostatSYCL>(target_pressure, w);
+    return std::make_unique<ParrinelloRahmanBarostatSYCL>(target_pressure, w, gamma, piston_temp);
 #elif defined(USE_CUDA)
-    return std::make_unique<ParrinelloRahmanBarostatCUDA>(target_pressure, w);
+    return std::make_unique<ParrinelloRahmanBarostatCUDA>(target_pressure, w, gamma, piston_temp);
 #else
-    return std::make_unique<ParrinelloRahmanBarostat>(target_pressure, w);
+    return std::make_unique<ParrinelloRahmanBarostat>(target_pressure, w, gamma, piston_temp);
 #endif
 }
 
@@ -115,5 +116,15 @@ std::unique_ptr<Barostat> create_andersen_barostat_for_build(Real target_pressur
     return std::make_unique<AndersenBarostatCUDA>(target_pressure, compressibility);
 #else
     return std::make_unique<AndersenBarostat>(target_pressure, compressibility);
+#endif
+}
+
+std::unique_ptr<Barostat> create_berendsen_barostat_for_build(Real target_pressure, Real tau_p) {
+#ifdef USE_SYCL
+    return std::make_unique<BerendsenBarostatSYCL>(target_pressure, tau_p);
+#elif defined(USE_CUDA)
+    return std::make_unique<BerendsenBarostatCUDA>(target_pressure, tau_p);
+#else
+    return std::make_unique<BerendsenBarostat>(target_pressure, tau_p);
 #endif
 }

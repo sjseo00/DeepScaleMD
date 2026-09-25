@@ -2,21 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 
 project(DeepScaleMD VERSION 0.1.0 LANGUAGES CXX)
 
-# PERF: every optimization flag below (-O3, -march=native, -mtune=native) is
-# gated on `$<CONFIG:Release>`, which is CMake's per-target check against
-# CMAKE_BUILD_TYPE. A single-config generator (Makefiles, Ninja) with no
-# -DCMAKE_BUILD_TYPE on the cmake command line leaves that variable EMPTY --
-# not some sane default -- so all three flags silently evaporate and the
-# build falls back to whatever the compiler does with no -O flag at all
-# (GCC/Clang: -O0, no vectorization, no inlining). This is indistinguishable
-# from a "successful" build: it configures, compiles and runs, just at a
-# fraction of the speed, and is a common way for a plain `cmake ..` on an
-# HPC login node to silently produce a debug-speed binary. Default it to
-# Release here so that failure mode requires deliberately overriding this,
-# not deliberately opting in. Skipped for multi-config generators (Visual
-# Studio, Ninja Multi-Config), where CMAKE_BUILD_TYPE has no meaning and the
-# per-target config is chosen at build time instead (e.g. `cmake --build .
-# --config Release`).
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING
         "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
@@ -165,6 +151,29 @@ else()
                     "FFTW3_OMP_LIBRARY manually) to fix this.")
 endif()
 
+# Optional: FFTW's MPI-parallel transform, needed only when
+# force_calculation.pme_ranks > 1 (a distributed FFT *within* the dedicated
+# PME rank group -- see PmeReciprocalEngine::ensure_initialized_distributed).
+# pme_ranks 0 or 1 never touch this; purely additive like FFTW3_OMP above.
+find_path(FFTW3_MPI_INCLUDE_DIR fftw3-mpi.h)
+find_library(FFTW3_MPI_LIBRARY NAMES fftw3_mpi)
+if(FFTW3_MPI_INCLUDE_DIR AND FFTW3_MPI_LIBRARY)
+    add_library(deepscalemd_fftw3_mpi UNKNOWN IMPORTED)
+    set_target_properties(deepscalemd_fftw3_mpi PROPERTIES
+        IMPORTED_LOCATION "${FFTW3_MPI_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFTW3_MPI_INCLUDE_DIR}")
+    set(_fftw_mpi_target deepscalemd_fftw3_mpi)
+    set(DEEPSCALEMD_HAVE_FFTW_MPI TRUE)
+    message(STATUS "DeepScaleMD: found libfftw3_mpi (${FFTW3_MPI_LIBRARY}) -- "
+                    "force_calculation.pme_ranks > 1 is available")
+else()
+    set(_fftw_mpi_target "")
+    set(DEEPSCALEMD_HAVE_FFTW_MPI FALSE)
+    message(STATUS "DeepScaleMD: libfftw3_mpi NOT found -- "
+                    "force_calculation.pme_ranks must stay 0 or 1 "
+                    "(distributed-FFT-within-the-PME-group unavailable)")
+endif()
+
 set(DEEPSCALEMD_COMMON_SOURCES
     src/md_system.cpp
     src/topology.cpp
@@ -183,6 +192,9 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/force_calculator_cpu.cpp
     src/force_manager.cpp
     src/mpi_utils.cpp
+    src/pme_rank_split.cpp
+    src/pme_reciprocal_engine.cpp
+    src/pme_server.cpp
     src/main.cpp)
 
 set(DEEPSCALEMD_HOST_SOURCES
@@ -222,11 +234,15 @@ target_compile_definitions(deepscalemd PRIVATE USE_MPI)
 if(DEEPSCALEMD_HAVE_FFTW_OMP)
     target_compile_definitions(deepscalemd PRIVATE DEEPSCALEMD_HAVE_FFTW_OMP)
 endif()
+if(DEEPSCALEMD_HAVE_FFTW_MPI)
+    target_compile_definitions(deepscalemd PRIVATE DEEPSCALEMD_HAVE_FFTW_MPI)
+endif()
 target_link_libraries(deepscalemd PRIVATE
     dsdecompx::dsdecompx
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
     ${_fftw_omp_target}
+    ${_fftw_mpi_target}
     ${_fftw_target}
     ${CMAKE_DL_LIBS})
 
@@ -302,48 +318,14 @@ else()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
-    # PERF: applied to RelWithDebInfo too, not just Release -- RelWithDebInfo
-    # is the build type people actually reach for when profiling (e.g. `perf
-    # stat`/`perf record` want symbols), and a profile taken from an
-    # unoptimized-but-symbolized binary tells you nothing about where the
-    # optimized binary spends time.
     set(_deepscalemd_opt_configs "$<CONFIG:Release,RelWithDebInfo>")
     target_compile_options(deepscalemd PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-Wall>
         $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-O3>
-        # PERF: safe, ISA-independent vectorization unlock. By default GCC/
-        # Clang treat sqrt/pow/exp/etc as having the side effect of setting
-        # `errno` on a domain error (glibc's libm behavior), which the
-        # standard permits them to assume the caller might check. Nothing in
-        # this codebase ever reads errno after a math call, but the compiler
-        # can't know that, so it refuses to vectorize (or even inline as a
-        # single hardware instruction) any loop containing sqrt/exp/erfc --
-        # exactly the loops that matter here: the tile bounding-sphere cull,
-        # minimum-image distance checks, and the Ewald table build all call
-        # sqrt or exp per iteration. -fno-math-errno tells the compiler no
-        # caller depends on errno from these, which is true here, and changes
-        # NO rounding behavior or numerical result -- it only unlocks
-        # instruction selection/vectorization the standard otherwise forbids.
-        # -fno-trapping-math is the same kind of unlock for FP exceptions,
-        # which this codebase never traps on. Neither flag is -ffast-math:
-        # they do not permit reassociation, do not assume no NaN/Inf, and do
-        # not change any energy/virial computation's result.
+
         $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-fno-math-errno>
         $<$<AND:${_deepscalemd_opt_configs},$<COMPILE_LANGUAGE:CXX>>:-fno-trapping-math>)
     if(NATIVE_OPTIMIZATION)
-        # PERF: -march=native only helps if the CPU that builds the binary is
-        # the same as the CPU that runs it -- NOT guaranteed on an HPC
-        # cluster, where a login/build node can be a different (often older)
-        # generation than the compute nodes jobs actually run on. That
-        # mismatch fails in one of two silent-ish ways: built-for-older-CPU
-        # leaves AVX-512/newer-AVX2 features unused on the compute node
-        # (correct but slow, exactly this ticket's symptom), or
-        # built-for-newer-CPU raises SIGILL the moment an unsupported
-        # instruction executes on the compute node. Override with
-        # -DDEEPSCALEMD_TARGET_ARCH=<gcc -march value> (e.g. skylake-avx512,
-        # znver3, x86-64-v3) when building on a node that does not match
-        # where the binary will actually run; this defaults to the historical
-        # "native" behavior when left unset.
         set(DEEPSCALEMD_TARGET_ARCH "native" CACHE STRING
             "-march/-mtune value for NATIVE_OPTIMIZATION (default: native, i.e. the build machine's own CPU -- override on HPC systems where the build node differs from the compute node, e.g. skylake-avx512, znver3, x86-64-v3)")
         target_compile_options(deepscalemd PRIVATE
@@ -360,17 +342,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
                         "performance than the same run built with NATIVE_OPTIMIZATION=ON.")
     endif()
 
-    # PERF (opt-in): cross-translation-unit inlining/optimization. Off by
-    # default -- it materially increases link time and, on some toolchains,
-    # can interact awkwardly with a CUDA build's split host/device linking --
-    # but the CPU-only build is dominated by one large hot translation unit
-    # (force_calculator_cpu.cpp) calling into small helpers defined in
-    # neighbor_list_cpu.cpp (tile graph accessors) and md_types.h; LTO lets
-    # the compiler inline and specialize across that boundary the way a
-    # single-TU build already can. Enable with -DENABLE_LTO=ON; verify the
-    # exact-PE regression tests (ctest) still pass after enabling it, since
-    # LTO's more aggressive inlining can occasionally change floating-point
-    # evaluation order at -O3.
+
     option(ENABLE_LTO "Enable interprocedural (link-time) optimization for Release/RelWithDebInfo builds" OFF)
     if(ENABLE_LTO)
         include(CheckIPOSupported)
@@ -397,11 +369,8 @@ if(BUILD_TESTING)
         COMMAND deepscalemd "${CMAKE_CURRENT_SOURCE_DIR}/examples/dsMD_input_lj/input.yaml")
     set_tests_properties(dsMD_input_mie_12_6_smoke PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        PASS_REGULAR_EXPRESSION "Nonbonded Mie potential: [(]12,6[)]")
+        PASS_REGULAR_EXPRESSION "Nonbonded potential[ ]*: Mie [(]12, 6[)]")
 
-    # The 20 A periodic box produces only two bins per dimension at the
-    # 10 A neighbor cutoff. This catches both wrapped-stencil duplication and
-    # a missing F(r0) evaluation before the first velocity-Verlet half-kick.
     add_test(
         NAME dsMD_input_initial_force_small_cell_regression
         COMMAND deepscalemd "${CMAKE_CURRENT_SOURCE_DIR}/examples/dsMD_input_lj/input.yaml")
@@ -414,11 +383,8 @@ if(BUILD_TESTING)
         COMMAND deepscalemd "${CMAKE_CURRENT_SOURCE_DIR}/examples/dsMD_input_lj/input_mie96.yaml")
     set_tests_properties(dsMD_input_mie_9_6_smoke PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        PASS_REGULAR_EXPRESSION "Nonbonded Mie potential: [(]9,6[)]")
+        PASS_REGULAR_EXPRESSION "Nonbonded potential[ ]*: Mie [(]9, 6[)]")
 
-    # A zero-temperature 90-degree angle with a 120-degree target must move
-    # downhill. This catches a sign reversal between harmonic angle energy
-    # and force on both CPU and CUDA backends.
     add_test(
         NAME dsMD_input_harmonic_angle_force_sign
         COMMAND deepscalemd "${CMAKE_CURRENT_SOURCE_DIR}/examples/dsMD_input_angle/input.yaml")
@@ -426,9 +392,6 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         PASS_REGULAR_EXPRESSION "Step: 1, KE: [^,]+, PE: 13[.]6")
 
-    # Exercises the shared signed-dihedral gradient with both a periodic
-    # proper term and a CHARMM-style harmonic improper term. Starting from
-    # rest, their combined potential must move downhill.
     add_test(
         NAME dsMD_input_torsion_force_sign
         COMMAND deepscalemd "${CMAKE_CURRENT_SOURCE_DIR}/examples/dsMD_input_torsion/input.yaml")
@@ -441,7 +404,7 @@ if(BUILD_TESTING)
         COMMAND deepscalemd "${CMAKE_CURRENT_SOURCE_DIR}/examples/dsMD_input_angle/input_minimize.yaml")
     set_tests_properties(dsMD_input_fire_minimizer PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        PASS_REGULAR_EXPRESSION "Reinitialized post-minimization velocities at T = 300[.]000 K")
+        PASS_REGULAR_EXPRESSION "Reinitialized post-minimization velocities at T = 300([.]000)? K")
 
     add_test(
         NAME dsMD_input_xyz_dcd_output

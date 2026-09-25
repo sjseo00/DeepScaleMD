@@ -1,9 +1,3 @@
-/**
- * mlip_cuda_utils.cuh
- *
- * Small, self-contained CUDA device utilities shared across MLIP-related kernels.
- * Include only from .cu files.
- */
 
 #pragma once
 #include <cuda_runtime.h>

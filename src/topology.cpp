@@ -292,10 +292,8 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
     canonical_format = false;
     mie_repulsive_exponent = 12;
     mie_attractive_exponent = 6;
-    // Clean the filename - remove quotes and trim whitespace/control characters
     std::string clean_filename = filename;
     
-    // First, trim whitespace and control characters from both ends
     auto start = clean_filename.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) {
         clean_filename = "";
@@ -304,7 +302,6 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
         clean_filename = clean_filename.substr(start, end - start + 1);
     }
     
-    // Then remove quotes if present
     if (!clean_filename.empty() && clean_filename.front() == '"' && clean_filename.back() == '"') {
         clean_filename = clean_filename.substr(1, clean_filename.length() - 2);
     }
@@ -322,19 +319,15 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
     std::string current_section = "";
     
     while (std::getline(file, line)) {
-        // Skip empty lines and comments
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
         
-        // Remove leading/trailing whitespace
         line.erase(0, line.find_first_not_of(" \t"));
         line.erase(line.find_last_not_of(" \t") + 1);
         if (line.empty()) continue;
         
-        // Check for section headers
         if (line[0] == '[' && line.back() == ']') {
             current_section = line.substr(1, line.length() - 2);
             
-            // Remove leading/trailing whitespace from section name
             current_section.erase(0, current_section.find_first_not_of(" \t"));
             current_section.erase(current_section.find_last_not_of(" \t") + 1);
             
@@ -352,7 +345,6 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
         
         if (tokens.empty()) continue;
         
-        // Parse different sections
         if (current_section == "atomtypes") {
             if (tokens.size() >= 5) {
                 AtomType atom_type;
@@ -397,7 +389,6 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
                 int atom_id = std::stoi(tokens[0]) - 1;  // Convert to 0-based indexing
                 std::string type_name = tokens[1];
                 
-                // Resize vector if necessary
                 if (static_cast<size_t>(atom_id) >= atom_type_names.size()) {
                     atom_type_names.resize(atom_id + 1);
                 }
@@ -436,8 +427,6 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
         }
     }
 
-    // Materialize the same per-atom arrays used by the dsMD_input reader. This
-    // keeps MPI broadcast and downstream type assignment format-independent.
     std::map<std::string, int> legacy_type_ids;
     for (size_t i = 0; i < atom_type_names.size(); ++i) {
         const std::string& name = atom_type_names[i];
@@ -592,8 +581,6 @@ bool Topology::load_canonical(const std::string& topology_filename,
                     fail("duplicate torsion parameter ID '" + tokens[0] + "'");
                 }
             } else if (section == "improper_parameters") {
-                // "ip" prefix keeps improper IDs distinct from proper torsion
-                // IDs, since both number their params independently from 0.
                 const std::string name = "ip" + tokens[0];
                 if (tokens.size() < 4 || (tokens[1] != "periodic" && tokens[1] != "harmonic")) {
                     fail("improper requires either 'param_id periodic k phase_deg multiplicity' or 'param_id harmonic k phi0_deg'");
@@ -787,9 +774,6 @@ bool Topology::load_canonical(const std::string& topology_filename,
             validate_atom(static_cast<int>(key & 0xffffffffu), "exclusion");
         }
 
-        // Robustness: always exclude directly bonded (1-2), angle-endpoint
-        // (1-3), and dihedral-endpoint (1-4) pairs even if the input
-        // [exclusions] list is incomplete.
         for (const Bond& b : bonds) {
             exclusion_keys.push_back(pair_key(b.atom1, b.atom2));
         }

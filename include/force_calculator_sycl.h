@@ -10,13 +10,11 @@ class ForceCalculatorSYCL : public ForceCalculator {
 private:
     sycl::queue queue;
     
-    // Device pointers
     Real *d_x, *d_y, *d_z;
     Real *d_fx, *d_fy, *d_fz;
     Real *d_charge, *d_mass;
     int *d_neighbors, *d_num_neighbors;
     
-    // CSR neighbor list support  
     int *d_csr_neighbors;      // All neighbor indices in CSR format
     int *d_csr_row_ptr;        // Row pointers for CSR format
     int *d_neighbor_offset;    // Offset array for neighbor access

@@ -13,15 +13,6 @@
 #include <climits>
 #include <algorithm>
 
-// Kernel launches in this file were previously left unchecked: a fault in
-// build_cell_list_kernel/populate_cells_kernel/build_neighbor_list_kernel
-// (illegal memory access, bad launch config, NaN-driven out-of-range index,
-// etc.) would silently poison the CUDA context, and the failure would only
-// surface later at whatever CUDA API call happened to check errors next --
-// in practice thrust::exclusive_scan's internal CUB temp-storage query,
-// which then misreports the stale fault as "cudaErrorInvalidDevice: invalid
-// device ordinal". Checking immediately after each launch surfaces the real
-// error at the kernel that actually caused it.
 #ifndef NEIGHBOR_LIST_CUDA_CHECK
 #define NEIGHBOR_LIST_CUDA_CHECK(call) do { \
     cudaError_t nlk_err = (call); \
@@ -33,7 +24,6 @@
 } while (0)
 #endif
 
-// CUDA kernel for building cell list on GPU
 __global__ void build_cell_list_kernel(
     const Real* __restrict__ x,
     const Real* __restrict__ y,
@@ -50,17 +40,14 @@ __global__ void build_cell_list_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_particles) return;
     
-    // Get particle position
     Real px = x[i];
     Real py = y[i];
     Real pz = z[i];
     
-    // Apply periodic wrapping
     if (periodic_x) px = px - floor(px / lx) * lx;
     if (periodic_y) py = py - floor(py / ly) * ly;
     if (periodic_z) pz = pz - floor(pz / lz) * lz;
     
-    // Calculate cell indices
     int cx = min(max(0, (int)(px * inv_cell_x)), nx - 1);
     int cy = min(max(0, (int)(py * inv_cell_y)), ny - 1);
     int cz = min(max(0, (int)(pz * inv_cell_z)), nz - 1);
@@ -68,11 +55,9 @@ __global__ void build_cell_list_kernel(
     int cell_idx = cz * nx * ny + cy * nx + cx;
     particle_cell_id[i] = cell_idx;
     
-    // Atomic increment for cell count
     atomicAdd(&cell_count[cell_idx], 1);
 }
 
-// CUDA kernel for populating cell particle lists
 __global__ void populate_cells_kernel(
     const int* __restrict__ particle_cell_id,
     int* __restrict__ cell_start,
@@ -89,40 +74,9 @@ __global__ void populate_cells_kernel(
     cell_particles[cell_offset + pos] = i;
 }
 
-// CUDA kernel for building neighbor list using Warp-per-Particle strategy
-// ============================================================================
-// LJ interaction-tile construction (warp/tile nonbonded scheme)
-//
-// The CSR neighbor list above forces one thread (or warp) per atom to gather
-// an arbitrary, unrelated set of neighbor atoms: every load of
-// x[j]/y[j]/z[j]/type[j] is effectively a random gather with no reuse across
-// threads. Grouping atoms into fixed LJ_TILE_SIZE-atom "tiles" -- contiguous
-// chunks of the same spatially-compact cell list built above -- lets a
-// group of lanes load one tile of J positions/parameters once and rotate
-// them across lanes with __shfl_sync, so each loaded J atom is reused by
-// every I atom in the tile instead of being gathered redundantly by
-// whichever single thread happened to have it in its own neighbor list. See
-// compute_lj_forces_tiled_kernel in force_calculator_cuda.cu for how a warp
-// packs several tile-pairs at once to stay fully occupied despite the small
-// tile size.
-// ============================================================================
 
-// MUST match LJ_CLUSTER_SIZE in force_calculator_cuda.cu (no shared header
-// for this constant -- keep both in sync by hand if either changes). 8, not
-// 32: a 32-atom chunk of a cutoff+skin-sized cell spans nearly the whole
-// cell at typical MD density, so its bounding box barely prunes anything
-// tighter than the coarse per-cell test -- measured on real GPU hardware to
-// be the dominant cost of the tiled LJ kernel (worse than the CSR kernel it
-// was meant to beat). An 8-atom chunk of the SAME Morton-sorted per-cell
-// sequence spans a genuinely smaller sub-volume, so the tile-pair
-// bbox-vs-bbox prune (build_lj_tile_pairs_fine_kernel) is proportionally tighter.
 constexpr int LJ_TILE_SIZE = 8;
 
-// 21-bit-per-axis bit interleave, same magic-number construction as (and
-// verified against) the CPU-side morton_encode_3d in
-// neighbor_list.cpp -- used here only for the low bits of a per-particle
-// sort key (see compute_tile_sort_keys_kernel), so 13 significant bits/axis
-// is plenty; the extra headroom just means the unused high bits are zero.
 __device__ inline unsigned long long lj_tile_local_morton(uint32_t x, uint32_t y, uint32_t z) {
     auto split_by_3 = [](uint32_t a) -> unsigned long long {
         unsigned long long v = a & 0x1fffffull;
@@ -136,19 +90,6 @@ __device__ inline unsigned long long lj_tile_local_morton(uint32_t x, uint32_t y
     return split_by_3(x) | (split_by_3(y) << 1) | (split_by_3(z) << 2);
 }
 
-// One thread per particle. Builds a single 64-bit sort key = (cell_id <<
-// 40) | local_morton, so that sorting ALL particles by this key groups them
-// by cell_id first (matching the cell_start/cell_count layout already
-// computed by build_cell_list_kernel + exclusive_scan) and, within each
-// cell, orders them by a fine (13 bits/axis) Morton code of their position
-// relative to that cell's own origin. The resulting per-cell segment is a
-// genuinely spatially-coherent sequence, so chunking it into fixed 32-atom
-// tiles (see scatter_lj_tile_atoms_kernel) produces tiles that are small,
-// compact clusters instead of an arbitrary subset of the whole cell -- that
-// spatial coherence is what makes the per-tile bounding box in
-// compute_tile_bboxes_kernel tight enough to actually prune candidates in
-// build_lj_tile_pairs_fine_kernel, unlike chunking the cell's raw
-// insertion-race order from populate_cells_kernel.
 __global__ void compute_tile_sort_keys_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     const int* __restrict__ particle_cell_id,
@@ -193,9 +134,6 @@ __global__ void compute_cell_tile_counts_kernel(
     tile_count[c] = (cell_count[c] + LJ_TILE_SIZE - 1) / LJ_TILE_SIZE;
 }
 
-// One thread per cell; writes which cell owns each of its tiles. Small
-// (num_tiles total writes across all cells) -- run once per neighbor
-// rebuild, not per force-eval step.
 __global__ void scatter_tile_cell_id_kernel(
     const int* __restrict__ tile_offset, const int* __restrict__ tile_count,
     int* __restrict__ tile_cell_id, long long n_cells)
@@ -207,11 +145,6 @@ __global__ void scatter_tile_cell_id_kernel(
     for (int k = 0; k < n; ++k) tile_cell_id[base + k] = (int)c;
 }
 
-// One thread per (cell, slot-in-cell) entry of the sort produced by
-// compute_tile_sort_keys_kernel + thrust::sort_by_key; scatters atom
-// indices into fixed-stride LJ_TILE_SIZE-atom tiles. Slots past a cell's
-// atom count that round a tile up to LJ_TILE_SIZE are left at -1 (padding,
-// set by the caller's cudaMemset before this kernel runs).
 __global__ void scatter_lj_tile_atoms_kernel(
     const int* __restrict__ tile_sorted_indices,
     const int* __restrict__ particle_cell_id,
@@ -231,14 +164,6 @@ __global__ void scatter_lj_tile_atoms_kernel(
     tile_atoms[(long long)global_tile * LJ_TILE_SIZE + slot] = p;
 }
 
-// One warp per tile: computes that tile's real axis-aligned bounding box
-// from its actual (up to LJ_TILE_SIZE) member atoms, expressed relative to the
-// tile's own owning cell's origin (see compute_tile_sort_keys_kernel for
-// the same relative-coordinate convention) -- kept cell-relative rather
-// than absolute so build_lj_tile_pairs_fine_kernel's distance test stays valid
-// across a periodic wrap (the cell-to-cell integer offset already encodes
-// the periodic image unambiguously; comparing absolute wrapped coordinates
-// across a wrap boundary would not).
 __global__ void compute_tile_bboxes_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     const int* __restrict__ tile_atoms,
@@ -261,11 +186,6 @@ __global__ void compute_tile_bboxes_kernel(
     int cy = rem / nx;
     int cx = rem % nx;
 
-    // tile_atoms is stored with stride LJ_TILE_SIZE (8), not WARP_SIZE (32)
-    // -- this kernel still launches one full 32-lane warp per tile (simpler
-    // than a packed launch, and this only runs at neighbor-rebuild
-    // frequency, not every force step, so the 24 idle lanes/tile are cheap),
-    // but lanes >= LJ_TILE_SIZE must not read into the NEXT tile's slots.
     int atom = (lane < LJ_TILE_SIZE) ? tile_atoms[tile * LJ_TILE_SIZE + lane] : -1;
     Real rel_x = (Real)1e30, rel_y = (Real)1e30, rel_z = (Real)1e30;      // for min-reduce
     Real rel_x2 = (Real)-1e30, rel_y2 = (Real)-1e30, rel_z2 = (Real)-1e30; // for max-reduce
@@ -293,54 +213,11 @@ __global__ void compute_tile_bboxes_kernel(
     }
 }
 
-// ============================================================================
-// Fine-grid tile-pair build.
-//
-// Root cause this addresses: chunking tiles out of a cutoff+skin-sized cell
-// (~13.5 A) means an LJ_TILE_SIZE-atom chunk of that cell can still span a
-// large fraction of the cell's volume at ordinary MD density, so the
-// tile-pair bbox prune above degenerates towards a coarse per-CELL test --
-// measured on a real 92k-atom system: candidate/actual-neighbor ratio ~6.8x
-// even with an 8-atom tile (see the tile-size history next to
-// ForceCalculatorCUDA::use_tiled_lj_kernel_ in force_calculator_cuda.h).
-// A cell sized for the tile itself (a few atoms' worth of volume, not the
-// whole cutoff+skin sphere) makes each tile's real bounding box close to
-// that cell's own size, which is what actually tightens the prune.
-//
-// The cost of a smaller cell is a bigger stencil: a cutoff+skin extended
-// radius that fit in one ring of 27 cutoff-sized cells needs
-// FINE_STENCIL_RADIUS rings of a cell sized cutoff_extended/
-// FINE_STENCIL_RADIUS, i.e. a (2R+1)^3 = 125-cell stencil for R=2 --
-// build_lj_tile_pairs_fine_kernel below. This fine grid is the ONLY spatial
-// grid launch_cuda_tile_list_build builds: there is no separate coarse/CSR
-// cell grid anywhere in the CUDA nonbonded path any more (see that
-// function's own doc comment). The cell-binning kernels this section calls
-// (build_cell_list_kernel, populate_cells_kernel, compute_tile_sort_keys_kernel,
-// compute_cell_tile_counts_kernel, scatter_tile_cell_id_kernel,
-// scatter_lj_tile_atoms_kernel, compute_tile_bboxes_kernel) are written
-// generically in terms of nx/ny/nz/cell_size precisely so this single fine
-// grid could reuse them instead of needing bespoke fine-grid variants.
-// ============================================================================
 
 constexpr int FINE_STENCIL_RADIUS = 2;
 constexpr int FINE_STENCIL_SIDE = 2 * FINE_STENCIL_RADIUS + 1;                    // 5
 constexpr int FINE_STENCIL_OFFSETS = FINE_STENCIL_SIDE * FINE_STENCIL_SIDE * FINE_STENCIL_SIDE; // 125
 
-// AABB-vs-AABB tile-pair prune over a radius-FINE_STENCIL_RADIUS (125-cell)
-// stencil sized for the fine grid; every tile pair produced by this build
-// (see this file's header comment) goes through this kernel.
-//
-// This has NO periodic-wrap duplicate-offset guard: the host only builds
-// the fine grid, and only launches this
-// kernel, when fine_nx/ny/nz are all >= FINE_STENCIL_SIDE (see
-// launch_cuda_tile_list_build) -- a standard fact of modular
-// arithmetic guarantees that FINE_STENCIL_SIDE consecutive integers mod n
-// are pairwise distinct whenever n >= FINE_STENCIL_SIDE, so every one of
-// the 125 stencil offsets always maps to a distinct physical cell and
-// there is nothing to deduplicate. If the box is too small for that (a
-// handful of fine cells per axis), the host skips fine-grid tiling
-// entirely for that step rather than risk a subtly wrong dedup here; the
-// caller falls back to the CSR kernel in that case (num_lj_tile_pairs_==0).
 __global__ void build_lj_tile_pairs_fine_kernel(
     const int* __restrict__ tile_offset,
     const int* __restrict__ tile_count,
@@ -371,9 +248,6 @@ __global__ void build_lj_tile_pairs_fine_kernel(
     if (n_tiles_home == 0) return;
     int home_tile_base = tile_offset[home];
 
-    // 125 offsets, 32 lanes/warp -> ceil(125/32) = 4 batches. The last
-    // batch has offset_idx up to 127, so lanes 29-31 there are simply
-    // marked invalid (neighbor_cell = -1) and skipped below.
     for (int base = 0; base < FINE_STENCIL_OFFSETS; base += WARP_SIZE) {
         int offset_idx = base + lane;
         int neighbor_cell = -1;
@@ -417,17 +291,6 @@ __global__ void build_lj_tile_pairs_fine_kernel(
                 int home_tile = home_tile_base + ti;
                 int nb_tile = nb_tile_base + tj;
 
-                // Canonical direction only: the home<->neighbor cell stencil
-                // is visited from BOTH sides (home=A finds B, home=B finds
-                // A), so every unordered tile pair {A,B} is generated
-                // twice, once as (A,B) and once as (B,A). Emitting only
-                // home_tile<=nb_tile keeps exactly one direction per pair
-                // (self-tile pairs, home_tile==nb_tile, still pass and are
-                // emitted once). The force kernel
-                // (compute_lj_forces_tiled_kernel) relies on this: for
-                // tile_i != tile_j it trusts every candidate as a unique
-                // pair with no atom-index filtering, and only applies the
-                // j>i half-list rule when tile_i == tile_j.
                 if (home_tile > nb_tile) continue;
 
                 Real hmin_x = tile_bbox_min[home_tile*3+0], hmax_x = tile_bbox_max[home_tile*3+0];
@@ -453,9 +316,6 @@ __global__ void build_lj_tile_pairs_fine_kernel(
     }
 }
 
-// Build the rank-local spatial tile graph used by CUDA nonbonded kernels.
-// Atom-CSR output is intentionally absent: tiles are the sole CUDA neighbor
-// representation.
 __global__ void build_tile_pair_verlet_masks_kernel(
     const Real* __restrict__ x,
     const Real* __restrict__ y,
@@ -571,11 +431,6 @@ extern "C" void launch_cuda_tile_list_build(
         Real fine_inv_cell_z = fine_nz / lz;
         long long fine_total_cells = (long long)fine_nx * fine_ny * fine_nz;
 
-        // ---- Fine cell list (separate persistent buffers from the coarse
-        // ---- grid's d_cell_start/d_cell_count/d_particle_cell_id/
-        // ---- d_cell_particles above; build_cell_list_kernel/
-        // ---- populate_cells_kernel are reused unchanged, just pointed at
-        // ---- these fine arrays and fine_nx/ny/nz/cell_size). ----
         static int* s_d_fine_cell_start   = nullptr;
         static int* s_d_fine_cell_count   = nullptr;
         static int* s_d_fine_particle_cell_id = nullptr;
@@ -632,8 +487,6 @@ extern "C" void launch_cuda_tile_list_build(
         );
         NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
 
-        // ---- Morton-sort + tile chunking within each FINE cell (same
-        // ---- kernels as before, now pointed at the fine grid). ----
         static unsigned long long* s_d_sort_keys = nullptr;
         static int* s_d_tile_sorted_indices = nullptr;
         static long long s_sort_capacity = 0;
@@ -678,12 +531,6 @@ extern "C" void launch_cuda_tile_list_build(
         static unsigned long long* s_d_tile_pair_verlet_mask = nullptr;
         static long long s_tile_pairs_capacity = 0;
 
-        // CSR grouping of the (unordered) tile-pair list by home tile: after
-        // the build+sort below, tile_pair_j[offsets[t] .. offsets[t+1]) holds
-        // every neighbor tile of home tile t. This lets the force kernel
-        // accumulate a home tile's i-side force across ALL of its neighbor
-        // tiles in registers and issue one atomicAddFixed per atom instead
-        // of one per tile-pair (see compute_lj_forces_tiled_kernel).
         static int* s_d_tile_pair_offsets = nullptr;
         static long long s_tile_pair_offsets_capacity = 0;
 
@@ -729,7 +576,6 @@ extern "C" void launch_cuda_tile_list_build(
             s_tile_atoms_capacity = new_cap;
         }
         if (atoms_needed > 0) {
-            // 0xFF pattern -> -1 for int32, marks padding slots as invalid.
             cudaMemsetAsync(s_d_tile_atoms, 0xFF, atoms_needed * sizeof(int), stream);
             int scat_block = 256;
             int scat_grid = (n_total + scat_block - 1) / scat_block;
@@ -761,10 +607,6 @@ extern "C" void launch_cuda_tile_list_build(
         int threads_per_block_t = WARPS_PER_BLOCK_T * WARP_SIZE_T;
         int num_blocks_t = (int)((fine_total_cells + WARPS_PER_BLOCK_T - 1) / WARPS_PER_BLOCK_T);
 
-        // First pass counts (capacity may be 0 on the very first build, or a
-        // stale value from a smaller system); if the count exceeds capacity,
-        // grow once and rerun -- this is only expensive on rebuild events
-        // where the system's local structure changed enough to need it.
         int host_pair_count = 0;
         for (int attempt = 0; attempt < 2; ++attempt) {
             cudaMemsetAsync(s_d_pair_counter, 0, sizeof(int), stream);
@@ -792,7 +634,6 @@ extern "C" void launch_cuda_tile_list_build(
             cudaMalloc(&s_d_tile_pair_j, s_tile_pairs_capacity * sizeof(int));
             cudaMalloc(&s_d_tile_pair_verlet_mask,
                        s_tile_pairs_capacity * sizeof(unsigned long long));
-            // loop again now that capacity is sufficient to actually fill in.
         }
 
         if (total_tiles + 1 > s_tile_pair_offsets_capacity) {
@@ -801,13 +642,6 @@ extern "C" void launch_cuda_tile_list_build(
             cudaMalloc(&s_d_tile_pair_offsets, s_tile_pair_offsets_capacity * sizeof(int));
         }
         if (total_tiles > 0 && host_pair_count > 0) {
-            // Group tile_pair_j by home tile (tile_pair_i) so the force
-            // kernel can walk one home tile's full neighbor-tile list
-            // contiguously. sort_by_key reorders tile_pair_j to match the
-            // now-sorted tile_pair_i; lower_bound then turns the sorted key
-            // array into CSR offsets in one batched call (offsets[t] = index
-            // of the first pair with home tile >= t, so offsets[total_tiles]
-            // naturally comes out as host_pair_count).
             thrust::device_ptr<int> key_ptr(s_d_tile_pair_i);
             thrust::device_ptr<int> val_ptr(s_d_tile_pair_j);
             thrust::sort_by_key(thrust::cuda::par.on(stream), key_ptr, key_ptr + host_pair_count, val_ptr);
@@ -849,5 +683,4 @@ extern "C" void launch_cuda_tile_list_build(
         if (out_pairs_inside_rc)      *out_pairs_inside_rc      = host_pair_counts[0];
         if (out_pairs_inside_rc_plus_skin) *out_pairs_inside_rc_plus_skin = host_pair_counts[1];
     }
-    // (persistent arrays freed at program exit by CUDA runtime)
 }

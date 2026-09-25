@@ -1,13 +1,3 @@
-/**
- * mlip_force_bridge.cpp
- *
- * C++ bridge between ForceCalculatorCUDA (compiled as CUDA TU) and the
- * full MlipRuntime / md_data_sources API (compiled as a regular C++ TU).
- *
- * Isolates operation_registry / execution_plan Meyers singletons from
- * force_calculator_cuda.cu, preventing heap corruption from duplicate
- * static-local variable initialisation across CUDA TUs.
- */
 
 #include "force_calculator_cuda.h"
 #include "force_libtorch/mlip_types.h"

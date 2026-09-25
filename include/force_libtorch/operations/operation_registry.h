@@ -1,14 +1,3 @@
-/**
- * operation_registry.h
- *
- * Registry for preprocessing and postprocessing GPU operations.
- * Each operation is identified by a string name that matches YAML "transform"
- * and "operations" entries.
- *
- * Operations are resolved once at initialization into PreprocessOperation /
- * PostprocessOperation objects and cached in the execution plan.
- * The hot path uses direct function calls — no string lookup.
- */
 
 #pragma once
 #ifndef MLIP_OPERATION_REGISTRY_H
@@ -25,7 +14,6 @@
 
 namespace mlip {
 
-// ─────────────── context passed to every operation at execution time ──────────
 
 struct OpContext {
     int          num_local  = 0;
@@ -36,16 +24,13 @@ struct OpContext {
     cudaStream_t stream     = nullptr;
 };
 
-// ─────────────── preprocessing operation ─────────────────────────────────────
 
 struct PreprocessOperation {
     std::string name;
 
-    // Called once at plan compile time to verify dtypes, shapes, allocate scratch.
     std::function<void(const DeviceArrayView& in, DeviceArrayView& out,
                        const OpContext& ctx)> prepare;
 
-    // Called every MD step on the GPU; must NOT allocate.
     std::function<void(const DeviceArrayView& in, DeviceArrayView& out,
                        BackendTensorView& tv, const OpContext& ctx)> execute;
 
@@ -55,7 +40,6 @@ struct PreprocessOperation {
     mlip::ScalarType output_dtype   = mlip::ScalarType::Float32;
 };
 
-// ─────────────── postprocessing operation ────────────────────────────────────
 
 struct PostprocessOperation {
     std::string name;
@@ -68,7 +52,6 @@ struct PostprocessOperation {
     bool   graph_compatible = true;
 };
 
-// ─────────────── registries ──────────────────────────────────────────────────
 
 class PreprocessRegistry {
 public:
@@ -128,9 +111,7 @@ private:
     std::unordered_map<std::string, PostprocessOperation> ops_;
 };
 
-// ─────────────── source / target registries ──────────────────────────────────
 
-/// Resolves MD source names (e.g. "md.positions") to DeviceArrayView at runtime.
 using PointerResolver   = std::function<void*(const OpContext&)>;
 using ShapeResolverFn   = std::function<ShapeSpec(const OpContext&)>;
 
@@ -197,7 +178,6 @@ private:
     std::unordered_map<std::string, PointerResolver> targets_;
 };
 
-// ─────────────── helper macros ───────────────────────────────────────────────
 
 #define REGISTER_MLIP_PREPROCESS_OP(name, ...)                                 \
     static int _mlip_preop_##__COUNTER__ = [](){                                \

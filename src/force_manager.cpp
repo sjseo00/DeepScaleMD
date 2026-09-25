@@ -15,7 +15,6 @@
 #include <map>
 #include <mpi.h>
 
-// Helper function to check if this is rank 0
 static bool is_rank_zero() {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -99,7 +98,6 @@ std::unique_ptr<ForceCalculator> ForceManager::create_python_calculator() {
         std::cout << "Creating Python force calculator interface" << std::endl;
     }
     
-    // Select appropriate Python-interfaced calculator based on backend
     if (backend_type == "cpu") {
         return std::make_unique<ForceCalculatorCPU>();
     }
@@ -124,7 +122,6 @@ std::unique_ptr<ForceCalculator> ForceManager::create_python_calculator() {
 ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std::string, std::string>& config_map) {
     ForceConfig config;
     
-    // Parse force calculation mode
     auto mode_it = config_map.find("force_calculation_mode");
     if (mode_it != config_map.end()) {
         if (mode_it->second == "builtin") {
@@ -134,18 +131,15 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
         }
     }
     
-    // New format: type-based configuration (comma-separated list)
     auto type_it = config_map.find("force_calculation_type");
     if (type_it != config_map.end()) {
         std::string types_str = type_it->second;
-        // Parse comma-separated list: "bonds, angles, lj, PME"
         size_t start = 0;
         while (start < types_str.length()) {
             size_t comma_pos = types_str.find(',', start);
             size_t end = (comma_pos == std::string::npos) ? types_str.length() : comma_pos;
             std::string type_name = types_str.substr(start, end - start);
             
-            // Trim whitespace and quotes
             type_name.erase(0, type_name.find_first_not_of(" \t\r\n\""));
             type_name.erase(type_name.find_last_not_of(" \t\r\n\"") + 1);
             
@@ -156,7 +150,6 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
             start = end + 1;
         }
         
-        // If type list was provided, disable all forces by default, then enable only those in the list
         if (!config.force_types.empty()) {
             config.enable_bonds = false;
             config.enable_angles = false;
@@ -179,7 +172,6 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
             }
         }
     } else {
-        // Old format: individual enable flags (backward compatibility)
         auto bonds_it = config_map.find("force_calculation_enable_bonds");
         if (bonds_it != config_map.end()) {
             config.enable_bonds = (bonds_it->second == "true");
@@ -206,14 +198,12 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
         }
     }
     
-    // Python path (new format)
     auto path_it = config_map.find("force_calculation_path");
     if (path_it != config_map.end()) {
         config.python_path = path_it->second;
         config.python_force_path = path_it->second;  // Also set old field
     }
     
-    // Parse Python interface configuration (old format - backward compatibility)
     auto python_enabled_it = config_map.find("python_enabled");
     if (python_enabled_it != config_map.end()) {
         config.python_enabled = (python_enabled_it->second == "true");

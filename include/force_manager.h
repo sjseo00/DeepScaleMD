@@ -8,17 +8,8 @@
 #include <map>
 #include <vector>
 
-// Forward declaration
 class MDSystem;
 
-/**
- * @class ForceManager
- * @brief Manages force calculation selection between built-in and Python interfaces
- * 
- * This class provides a unified interface for force calculations, allowing users
- * to choose between high-performance built-in force modules or flexible Python
- * force interfaces at runtime through configuration.
- */
 class ForceManager {
 public:
     enum class ForceMode {
@@ -29,17 +20,14 @@ public:
     struct ForceConfig {
         ForceMode mode = ForceMode::BUILTIN;
         
-        // Built-in force field configuration (simplified)
         bool enable_bonds = true;
         bool enable_angles = true; 
         bool enable_dihedrals = true;
         bool enable_lennard_jones = true;
         bool enable_coulomb = true;
         
-        // New type-based configuration (alternative to individual enable flags)
         std::vector<std::string> force_types;  // e.g., {"bonds", "angles", "lj", "PME"}
         
-        // Python interface configuration
         bool python_enabled = false;
         std::string python_force_path = "../python_force";
         std::string python_path = "";  // New: direct path for python mode
@@ -68,7 +56,6 @@ public:
     ForceMode get_mode() const { return config.mode; }
     const ForceConfig& get_config() const { return config; }
     
-    // Configuration parsing from YAML-like input
     static ForceConfig parse_config_from_map(const std::map<std::string, std::string>& config_map);
 };
 

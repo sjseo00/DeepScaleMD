@@ -1,21 +1,10 @@
-// End-of-run timing report: a small fixed tree (init / minimize / md_loop ->
-// its per-phase buckets -> optional per-force-component sub-buckets),
-// printed once. Percentages are relative to each row's immediate parent
-// (top-level rows against the grand total, md_loop's children against
-// md_loop, force's children against force), not a single flat denominator.
-//
-// USE_MPI is unconditionally defined for every build of this target (see
-// CMakeLists.txt), so there is no meaningful single-process code path to
-// special-case; MPI_COMM_WORLD with size 1 already covers that. The extra
-// [min/max/var] columns are only printed when mpi_size > 1, so a single-GPU
-// run (the common case) gets one clean column instead of three identical
-// ones plus a permanently-zero variance figure.
 #include "md_simulation.h"
 #include <iostream>
 #include <iomanip>
 #include <string>
 #include <vector>
 #include <mpi.h>
+#include "pme_rank_split.h"
 
 namespace {
 
@@ -41,12 +30,9 @@ void print_row(const TimingRow& row, double denom_seconds, int mpi_size,
 
 void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     int mpi_size = 1;
-    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+    MPI_Comm_size(PmePpSplit::instance().pp_comm(), &mpi_size);
     const int rank = system->get_rank();
 
-    // Fixed layout. Indices of the three top-level rows and "force" are
-    // relied on below (they're always present, regardless of how many
-    // force sub-components get appended between "force" and "comm").
     std::vector<TimingRow> rows;
     const int idx_init     = static_cast<int>(rows.size());
     rows.push_back({"init", 0, cumulative_timing.init_time});
@@ -58,8 +44,6 @@ void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     rows.push_back({"integrate", 1, cumulative_timing.integration_time});
     const int idx_force     = static_cast<int>(rows.size());
     rows.push_back({"force", 1, cumulative_timing.force_time});
-    // Only present when MD_TIMING_TRACE_FORCE=1 was set for this run; empty
-    // otherwise, so these rows just don't appear.
     for (const auto& component : cumulative_timing.force_component_time) {
         rows.push_back({component.first, 2, component.second});
     }
@@ -74,9 +58,9 @@ void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     std::vector<double> local(n), min_v(n), max_v(n), sum_v(n);
     for (int i = 0; i < n; ++i) local[i] = rows[i].seconds;
 
-    MPI_Reduce(local.data(), min_v.data(), n, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local.data(), max_v.data(), n, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(local.data(), sum_v.data(), n, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local.data(), min_v.data(), n, MPI_DOUBLE, MPI_MIN, 0, PmePpSplit::instance().pp_comm());
+    MPI_Reduce(local.data(), max_v.data(), n, MPI_DOUBLE, MPI_MAX, 0, PmePpSplit::instance().pp_comm());
+    MPI_Reduce(local.data(), sum_v.data(), n, MPI_DOUBLE, MPI_SUM, 0, PmePpSplit::instance().pp_comm());
 
     if (rank != 0) {
         return;
@@ -105,12 +89,6 @@ void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     std::cout << std::left << std::setw(26) << "total (init+minimize+loop)" << std::right
                << std::fixed << std::setprecision(4) << std::setw(11) << grand_total_avg << " s\n";
 
-    // program_wallclock_ms comes from main.cpp's own chrono span around the
-    // whole run (the only place that can see time spent before this object
-    // existed, and after finalize() starts). Comparing it against the sum of
-    // the buckets above surfaces exactly the kind of "where did the other
-    // N seconds go" gap that used to require manual arithmetic across three
-    // separately-printed numbers.
     if (program_wallclock_ms >= 0.0) {
         const double program_total_s = program_wallclock_ms / 1000.0;
         std::cout << std::left << std::setw(26) << "total (wall clock)" << std::right
@@ -128,11 +106,6 @@ void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     const double natoms = system->get_num_particles();
     const double time_per_step = (nsteps > 0.0) ? (md_loop_avg / nsteps) : 0.0;
     const double atom_steps_per_sec = (md_loop_avg > 0.0) ? (natoms * nsteps / md_loop_avg) : 0.0;
-    // ns/day, the standard MD throughput figure (NAMD/GROMACS/LAMMPS all
-    // report it): how much simulated time (at this run's timestep, dt in
-    // fs) a full day of wall clock buys, extrapolated from the measured
-    // md_loop steady-state rate. Comparable across codes/systems/timesteps
-    // in a way ms/step alone isn't.
     const double ns_per_day = (time_per_step > 0.0)
         ? (dt * 1e-6) * (86400.0 / time_per_step)
         : 0.0;

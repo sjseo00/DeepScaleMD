@@ -1,8 +1,3 @@
-/**
- * execution_plan.cpp
- *
- * Compiles a MlipModelSpec into a hot-path-friendly MlipExecutionPlan.
- */
 
 #include "force_libtorch/runtime/execution_plan.h"
 #include "force_libtorch/operations/operation_registry.h"
@@ -22,7 +17,6 @@
 
 namespace mlip {
 
-// ─────────────────────── unit conversion ─────────────────────────────────────
 
 static double length_factor(const std::string& s) {
     if (s == "angstrom") return 1.0;
@@ -48,7 +42,6 @@ UnitConversion compute_unit_conversion(const UnitSystem& md, const UnitSystem& m
     double e_md    = energy_factor(md.energy);
     double e_model = energy_factor(model.energy);
 
-    // How to scale model output to MD units:
     uc.position_scale = l_md / l_model;      // rarely != 1 since we pass positions in MD units
     uc.energy_scale   = e_model / e_md;      // model_energy -> md_energy
     uc.force_scale    = (e_model / l_model) / (e_md / l_md);
@@ -57,7 +50,6 @@ UnitConversion compute_unit_conversion(const UnitSystem& md, const UnitSystem& m
     return uc;
 }
 
-// ─────────────────────── scratch allocator ───────────────────────────────────
 
 void MlipScratchAllocator::reserve(size_t bytes) {
     if (bytes <= capacity_) return;
@@ -94,7 +86,6 @@ MlipScratchAllocator::~MlipScratchAllocator() {
 #endif
 }
 
-// ─────────────────────── helper: dtype element size ──────────────────────────
 
 static size_t dtype_bytes(ScalarType d) {
     switch (d) {
@@ -121,7 +112,6 @@ static size_t shape_elems(const ShapeSpec& shape, const OpContext& ctx) {
     return n;
 }
 
-// ─────────────────────── species lookup table ────────────────────────────────
 
 static void build_species_lut(
     const MlipModelSpec& spec,
@@ -129,7 +119,6 @@ static void build_species_lut(
     const MlipExecutionContext& ctx)
 {
     const auto& sm = spec.species_map;
-    // Determine max key to size the table
     int max_key = 0;
     if (sm.input_type == SpeciesInputType::AtomicSymbol) {
         for (auto& [sym, idx] : sm.symbol_to_index)
@@ -144,8 +133,6 @@ static void build_species_lut(
 
     std::vector<int32_t> h_lut(lut_size, -1);
     if (sm.input_type == SpeciesInputType::AtomicSymbol) {
-        // Symbol-based: caller must have provided a way to map symbol→int externally.
-        // For now fill with symbol_to_index directly (index = model index).
         for (auto& [sym, idx] : sm.symbol_to_index) {
             (void)sym;
             if (idx < lut_size) h_lut[idx] = idx;
@@ -164,23 +151,19 @@ static void build_species_lut(
     plan.d_species_lut = d_lut;
 #endif
 
-    // Also fill the SpeciesMapping struct used by the IMlipPotential path
     plan.species_mapping.md_type_to_atomic_number.resize(lut_size);
     for (int i = 0; i < lut_size; ++i)
         plan.species_mapping.md_type_to_atomic_number[i] = h_lut[i];
 }
 
-// ─────────────────────── validate registries ─────────────────────────────────
 
 static void validate_registries(const MlipModelSpec& spec) {
-    // source registry
     for (auto& [name, inp] : spec.inputs) {
         if (!SourceRegistry::instance().has(inp.source))
             throw std::runtime_error(
                 "[MLIP] YAML input '" + name + "' references unknown source '" +
                 inp.source + "'. Registered sources: " +
                 SourceRegistry::instance().list());
-        // transforms
         for (auto& t : inp.transforms) {
             if (!PreprocessRegistry::instance().has(t))
                 throw std::runtime_error(
@@ -188,7 +171,6 @@ static void validate_registries(const MlipModelSpec& spec) {
                     t + "'. Registered: " + PreprocessRegistry::instance().list());
         }
     }
-    // target registry
     for (auto& [name, out] : spec.outputs) {
         if (!TargetRegistry::instance().has(out.target))
             throw std::runtime_error(
@@ -200,7 +182,6 @@ static void validate_registries(const MlipModelSpec& spec) {
                     "[MLIP] YAML output '" + name + "' uses unknown operation '" + op + "'");
         }
     }
-    // backend
     std::string backend_name;
     switch (spec.backend.backend) {
         case BackendType::PyTorch:      backend_name = "pytorch"; break;
@@ -215,7 +196,6 @@ static void validate_registries(const MlipModelSpec& spec) {
             "Available: " + BackendRegistry::instance().list());
 }
 
-// ─────────────────────── main compile function ───────────────────────────────
 
 MlipExecutionPlan compile_execution_plan(
     const MlipModelSpec&       spec,
@@ -223,13 +203,10 @@ MlipExecutionPlan compile_execution_plan(
 {
     MlipExecutionPlan plan;
 
-    // 1. Validate registries first (gives clear errors before any allocation)
     validate_registries(spec);
 
-    // 2. Unit conversion
     plan.unit_conversion = compute_unit_conversion(spec.md_units, spec.model_units);
 
-    // 3. Neighbor requirements
     plan.neighbor_requirements.cutoff               = spec.neighbor.cutoff;
     plan.neighbor_requirements.requires_full_list   = (spec.neighbor.list == NeighborListKind::Full);
     plan.neighbor_requirements.requires_directed_edges = spec.neighbor.directed;
@@ -239,18 +216,13 @@ MlipExecutionPlan compile_execution_plan(
     plan.neighbor_requirements.requires_cell_shifts  = spec.neighbor.require_cell_shifts;
     plan.neighbor_requirements.supports_ghost_atoms  = spec.neighbor.include_ghost;
 
-    // 4. Species lookup table
     build_species_lut(spec, plan, ctx);
 
-    // 5. Autograd flag
     plan.requires_autograd = spec.autograd.enabled;
     plan.share_cuda_stream = spec.backend.share_cuda_stream;
 
-    // 6. Estimate scratch size (conservative upper bound at plan compile time)
-    // We use a fixed capacity; the scratch grows at step time if needed.
     size_t scratch_estimate = 0;
 
-    // 7. Resolve input bindings
     plan.input_bindings.reserve(spec.inputs.size());
     for (auto& [iname, ispec] : spec.inputs) {
         ResolvedInputBinding b;
@@ -263,13 +235,10 @@ MlipExecutionPlan compile_execution_plan(
         b.source_dtype     = SourceRegistry::instance().get(ispec.source).dtype;
         b.source_ndim      = SourceRegistry::instance().get(ispec.source).rank;
 
-        // Compile preprocess op chain
         for (auto& tname : ispec.transforms) {
             b.preprocess_ops.push_back(PreprocessRegistry::instance().get(tname));
         }
 
-        // Estimate scratch for this input (rough: shape * dtype_bytes * 2)
-        // Actual allocation happens on first step via scratch.reserve().
         OpContext est_ctx{ 1000, 200, 1200, 10000, ctx.device_id };
         if (!b.target_shape.empty()) {
             size_t elems = shape_elems(b.target_shape, est_ctx);
@@ -279,7 +248,6 @@ MlipExecutionPlan compile_execution_plan(
         plan.input_bindings.push_back(std::move(b));
     }
 
-    // Sort by argument_index for positional style
     if (spec.backend.call_style == CallStyle::Positional) {
         std::sort(plan.input_bindings.begin(), plan.input_bindings.end(),
             [](const ResolvedInputBinding& a, const ResolvedInputBinding& b) {
@@ -287,7 +255,6 @@ MlipExecutionPlan compile_execution_plan(
             });
     }
 
-    // 8. Resolve output bindings
     plan.output_bindings.reserve(spec.outputs.size());
     for (auto& [oname, ospec] : spec.outputs) {
         ResolvedOutputBinding b;
@@ -308,7 +275,6 @@ MlipExecutionPlan compile_execution_plan(
         plan.output_bindings.push_back(std::move(b));
     }
 
-    // 9. Reserve scratch
     plan.scratch.reserve(scratch_estimate > 0 ? scratch_estimate : 64 * 1024 * 1024);
 
     std::cout << "[MlipRuntime] Execution plan compiled for model '" << spec.name

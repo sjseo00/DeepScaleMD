@@ -4,14 +4,10 @@
 #include "../include/neighbor_list.h"
 #include "../include/topology.h"
 #include "../include/mpi_utils.h"
+#include "../include/pme_rank_split.h"
 #include "../include/md_types.h"
 #include "../include/integrator.h"  // For integrator kernel declarations
 
-// ── C++ LibTorch MLIP path ───────────────────────────────────────────────────
-// Only include mlip_types.h here (no operation_registry/execution_plan deps).
-// The full MlipRuntime + register_md_sources calls are bridged via C++ functions
-// in src/force_libtorch/mlip_force_bridge.cpp to avoid Meyers-singleton duplication across
-// multiple CUDA translation units.
 #include "../include/force_libtorch/mlip_types.h"
 using namespace mlip;
 #include <algorithm>   // std::sort, std::unique, std::distance
@@ -21,14 +17,11 @@ using namespace mlip;
 #include <cstdlib>
 #include <iostream>
 
-// C bridge functions (defined in src/force_libtorch/mlip_force_bridge.cpp):
 void mlip_bridge_register_md_sources(void* fc_cuda_ptr);
 void mlip_bridge_compute(void* runtime_ptr,
                          const mlip::MlipInputView* in_view,
                          mlip::MlipOutputView* out_view);
 
-// Forward declarations of CUDA kernel launchers defined in
-// force_libtorch/cuda/edge_conversion.cu and force_accumulation.cu
 extern "C" {
     void launch_half_to_full_edges(
         const int32_t* src, const int32_t* dst,
@@ -46,7 +39,6 @@ extern "C" {
         int* d_error_flag, cudaStream_t stream);
 }
 
-// Minimum-image edge vector kernel
 __global__ void k_min_image_edge_vectors(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -98,7 +90,6 @@ __global__ void k_min_image_edge_vectors_directed(
 #include <cmath>
 #include <cufft.h>
 
-// CUDA error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t error = call; \
     if (error != cudaSuccess) { \
@@ -108,7 +99,6 @@ __global__ void k_min_image_edge_vectors_directed(
     } \
 } while(0)
 
-// cuFFT error checking macro
 #define CUFFT_CHECK(call) do { \
     cufftResult_t error = call; \
     if (error != CUFFT_SUCCESS) { \
@@ -118,10 +108,7 @@ __global__ void k_min_image_edge_vectors_directed(
     } \
 } while(0)
 
-// Custom atomicAdd implementation for double precision
-// (needed for older CUDA architectures < 6.0)
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
-// Native double atomicAdd is available
 #else
 __device__ double atomicAdd(double* address, double val) {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
@@ -137,13 +124,11 @@ __device__ double atomicAdd(double* address, double val) {
 }
 #endif
 
-// Device constants for performance
 __constant__ Real d_cutoff_sq;
 __constant__ Real d_k_coulomb;
 __constant__ size_t d_local_particles;
 __constant__ size_t d_total_particles;
 
-// CUDA kernels
 
 __global__ void clear_forces_kernel(Real* fx, Real* fy, Real* fz, size_t n) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -154,16 +139,10 @@ __global__ void clear_forces_kernel(Real* fx, Real* fy, Real* fz, size_t n) {
     }
 }
 
-// Templated so callers on the mixed-precision (PairT=float) hot path can
-// wrap in float instead of paying double round()/multiply throughput: the
-// wrap only has to pick the correct periodic image, a decision box>>cutoff
-// makes trivially tolerant of float's ~1e-7 relative error, so there is no
-// accuracy reason to force this through double.
 template <typename T>
 __device__ inline void apply_minimum_image_device(T& dx, T& dy, T& dz,
                                                     T box_x, T box_y, T box_z,
                                                     T inv_box_x, T inv_box_y, T inv_box_z) {
-    // Branchless optimization using round
     dx -= box_x * round(dx * inv_box_x);
     dy -= box_y * round(dy * inv_box_y);
     dz -= box_z * round(dz * inv_box_z);
@@ -181,9 +160,6 @@ __device__ inline bool is_excluded_pair(const int* offsets,
                                         int atom1, int atom2) {
     if (!offsets || !partners || atom1 < 0 ||
         static_cast<size_t>(atom1) >= atom_count) return false;
-    // Molecular exclusion degree is small (normally bonded 1-2/1-3/1-4
-    // neighbors), so a short contiguous scan is much cheaper than a binary
-    // search through the run-wide pair-key array for every nonbonded pair.
     const int begin = offsets[atom1];
     const int end = offsets[atom1 + 1];
     for (int index = begin; index < end; ++index) {
@@ -194,16 +170,6 @@ __device__ inline bool is_excluded_pair(const int* offsets,
     return false;
 }
 
-// Fixed-point force accumulation for the LJ and Ewald real-space pair
-// kernels. atomicAdd on a native double force buffer is race-safe but not
-// bit-reproducible: the summation order concurrent threads happen to apply
-// their atomics in is scheduling-dependent, so results can drift slightly
-// run to run. Scaling each contribution to a 64-bit integer before the
-// atomic add makes 64-bit integer addition commutative/associative in
-// hardware, so the reduction becomes order-independent. Scale chosen to
-// leave headroom for the largest forces seen near LJ-repulsive-wall
-// contacts while keeping sub-part-per-billion rounding error for typical
-// pair forces (int64 range / scale ~= 8.8e12 in force units).
 #define FORCE_FIXED_SCALE 1048576.0  // 2^20
 
 __device__ __forceinline__ long long real_to_fixed_force(Real val) {
@@ -219,10 +185,6 @@ __device__ __forceinline__ void atomicAddFixed(long long* addr, Real val) {
               static_cast<unsigned long long>(real_to_fixed_force(val)));
 }
 
-// Converts the fixed-point scratch buffers back into the double force
-// buffers. One thread per particle, no atomics needed: this always runs on
-// force_stream strictly after the racy kernel that filled the fixed buffers
-// (stream-ordered), so there is no concurrent writer left when it executes.
 __global__ void flush_fixed_forces_kernel(
     const long long* __restrict__ fx_fixed,
     const long long* __restrict__ fy_fixed,
@@ -247,11 +209,6 @@ __global__ void compute_max_displacement_kernel(
     Real box_x, Real box_y, Real box_z,
     bool periodic_x, bool periodic_y, bool periodic_z, size_t n);
 
-// Device-shared Mie-potential (LJ, n=12 special-cased) pair force/energy,
-// with optional switching -- the math core of compute_lj_forces_tiled_kernel
-// and compute_nonbonded_forces_tiled_kernel below, extracted so both call one
-// copy instead of duplicating it (mirrors compute_lj_pair() on the CPU side,
-// force_calculator_cpu.cpp).
 template <typename PairT>
 __device__ __forceinline__ void device_compute_lj_pair(
         PairT r2, PairT eps, PairT sig, int mie_n, int mie_m, PairT mie_prefactor,
@@ -302,10 +259,6 @@ __global__ void compute_lj_forces_tiled_kernel(
     int mie_n, int mie_m, Real mie_prefactor,
     Real cutoff_sq, Real switch_distance, Real switch_sq, Real inv_denom,
     int num_tiles,
-    // Opt-in diagnostic counters (see d_tile_pair_stats_'s comment in
-    // force_calculator_cuda.h): [0] += 1 per candidate atom pair actually
-    // tested against the cutoff, [1] += 1 per pair that passes it (real
-    // pair). Null (the default) skips both atomicAdds entirely.
     unsigned long long* __restrict__ pair_stats)
 {
     const int global_lane = threadIdx.x % 32;
@@ -332,7 +285,6 @@ __global__ void compute_lj_forces_tiled_kernel(
 
     const PairT cutoff_sq_p = static_cast<PairT>(cutoff_sq);
     const PairT switch_distance_p = static_cast<PairT>(switch_distance);
-    // PERF FIX: see compute_lj_forces_kernel above.
     const PairT switch_sq_p = static_cast<PairT>(switch_sq);
     const PairT inv_denom_p = static_cast<PairT>(inv_denom);
     const PairT mie_prefactor_p = static_cast<PairT>(mie_prefactor);
@@ -343,9 +295,6 @@ __global__ void compute_lj_forces_tiled_kernel(
     const PairT inv_box_y_p = static_cast<PairT>(inv_box_y);
     const PairT inv_box_z_p = static_cast<PairT>(inv_box_z);
 
-    // Accumulated across EVERY neighbor tile of this home tile (the whole
-    // point of this restructuring): one atomicAddFixed triplet at the very
-    // end instead of one per neighbor tile.
     Real fx_i_acc = 0.0, fy_i_acc = 0.0, fz_i_acc = 0.0;
     Real pe_acc = 0.0, virial_acc = 0.0;
 
@@ -353,8 +302,6 @@ __global__ void compute_lj_forces_tiled_kernel(
     const int e_end   = valid_pair ? tile_pair_offsets[safe_tile_index + 1] : 0;
 
     for (int e = e_begin; e < e_end; ++e) {
-        // Same address for all 8 lanes of this sub-group -- an ordinary
-        // (broadcast/cached) global load, no shuffle needed.
         int tile_j = tile_pair_j[e];
         const unsigned long long verlet_mask = tile_pair_verlet_mask[e];
         if (verlet_mask == 0) continue;
@@ -434,24 +381,12 @@ __global__ void compute_lj_forces_tiled_kernel(
                 }
             }
 
-            // Route this step's j-side reaction force back to the lane that
-            // actually owns j_atom0 *within this sub-group*: at shift s, the
-            // lane at local offset M computed a contribution intended for the
-            // atom currently at local offset (M+s)&7, so local offset L must
-            // pick up the contribution computed by local offset (L-s)&7 this
-            // step. width=LJ_CLUSTER_SIZE keeps this confined to the sub-group.
             int recv_from = (sub - shift) & (LJ_CLUSTER_SIZE - 1);
             fx_j_acc += __shfl_sync(GROUP_MASK, my_fxj, recv_from, LJ_CLUSTER_SIZE);
             fy_j_acc += __shfl_sync(GROUP_MASK, my_fyj, recv_from, LJ_CLUSTER_SIZE);
             fz_j_acc += __shfl_sync(GROUP_MASK, my_fzj, recv_from, LJ_CLUSTER_SIZE);
         }
 
-        // j_atom0 may be a ghost slot (valid index, but outside
-        // local_particles). fx_j_acc is guaranteed 0 for a ghost j_atom0
-        // (my_fxj is only ever set non-zero when j_is_local above), so
-        // skipping the write for ghosts changes nothing numerically -- it
-        // just avoids an atomic add of zero. Written per-e (not deferred)
-        // since tile_j -- and therefore j_atom0 -- changes every iteration.
         if (valid_pair && j_atom0 >= 0 && static_cast<size_t>(j_atom0) < local_particles) {
             atomicAddFixed(&fx_fixed[j_atom0], fx_j_acc);
             atomicAddFixed(&fy_fixed[j_atom0], fy_j_acc);
@@ -459,20 +394,12 @@ __global__ void compute_lj_forces_tiled_kernel(
         }
     }
 
-    // One atomicAddFixed triplet per home-tile atom, regardless of how many
-    // neighbor tiles it took to accumulate fx_i_acc above.
     if (valid_i) {
         atomicAddFixed(&fx_fixed[i_atom], fx_i_acc);
         atomicAddFixed(&fy_fixed[i_atom], fy_i_acc);
         atomicAddFixed(&fz_fixed[i_atom], fz_i_acc);
     }
 
-    // Energy/virial reduction: pe_acc/virial_acc here are only valid WITHIN
-    // each 8-lane sub-group (each sub-group owns an independent home tile),
-    // so this must be a width-8 reduction, not a full-warp one -- otherwise
-    // sub-groups would sum each other's energies. This happens after the
-    // divergent e-loop above, at the warp's natural reconvergence point, so
-    // all 32 lanes are back together here and FULL_MASK is safe again.
     const unsigned FULL_MASK = 0xffffffffu;
     for (int offset = LJ_CLUSTER_SIZE / 2; offset > 0; offset /= 2) {
         pe_acc += __shfl_down_sync(FULL_MASK, pe_acc, offset, LJ_CLUSTER_SIZE);
@@ -488,21 +415,6 @@ __global__ void compute_lj_forces_tiled_kernel(
     }
 }
 
-// Fast erfc(x) via the Abramowitz & Stegun 7.1.26 rational/exponential
-// minimax approximation (max absolute error ~1.5e-7, uniform over x>=0) --
-// see design doc "GPU 기반 MD Nonbonded 커널 설계" 5.2 ("erfc는 내장함수 대신
-// 다항식 근사"). Two wins over calling the library erf()/erfc():
-//   1. A native double erf()/erfc() call has no fast hardware path on any
-//      current GPU architecture -- it's a long software emulation sequence.
-//      This is a handful of FMAs plus one exp(), which the emulation itself
-//      would need anyway.
-//   2. The Ewald real-space force term separately needs exp(-alpha^2*r^2);
-//      this approximation computes exp(-x*x) as an internal step, so the
-//      caller reuses it via `exp_out` instead of paying for a second
-//      exp() call.
-// 1.5e-7 absolute error in erfc is well below the polynomial's own headroom
-// against Real (double)'s ~1e-15 precision, and is the standard tolerance
-// production MD codes (GROMACS, AMBER) accept for exactly this trade.
 template <typename T>
 __device__ __forceinline__ T fast_erfc(T x, T& exp_out) {
     const T p  = T(0.3275911);
@@ -516,14 +428,6 @@ __device__ __forceinline__ T fast_erfc(T x, T& exp_out) {
     return ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * exp_out;
 }
 
-// Device-shared real-space (erfc-screened) Ewald Coulomb pair force/energy --
-// the math core of compute_electrostatic_forces_tiled_kernel and
-// compute_nonbonded_forces_tiled_kernel below, extracted so both call one
-// copy instead of duplicating it (mirrors compute_coulomb_pair_real_space()
-// on the CPU side, force_calculator_cpu.cpp, modulo fast_erfc() replacing the
-// CPU's table lookup -- see fast_erfc's comment for why). The excluded-pair
-// branch is NOT a skip: it applies the erf(alpha*r) cancellation term needed
-// to remove PME's reciprocal-space contribution for excluded pairs.
 template <typename PairT>
 __device__ __forceinline__ void device_compute_coulomb_pair_ewald_real(
         PairT r2, PairT qi, PairT qj, PairT k_coulomb, PairT alpha,
@@ -543,43 +447,6 @@ __device__ __forceinline__ void device_compute_coulomb_pair_ewald_real(
     }
 }
 
-// Real-space (near-field) half of the Ewald sum: erfc(alpha*r)-screened
-// Coulomb interaction over the neighbor list. Must always be combined with
-// the reciprocal-space PME grid contribution (see
-// ForceCalculatorCUDA::compute_electrostatic_forces_ewald) -- together they
-// reproduce the exact 1/r Coulomb sum over all periodic images.
-// PairT: see compute_lj_forces_kernel above for the mixed-precision contract.
-// Note: the excluded-pair branch below cancels PME's reciprocal-space
-// contribution via erf(alpha*r); the fast_erfc approximation's ~1.5e-7
-// absolute error becomes the accuracy floor for that cancellation
-// regardless of PairT, slightly larger than full double erf()'s residual
-// but still far below the switch/cutoff/parameter-derived error budget
-// elsewhere in this kernel.
-// PERF FIX: warp/tile version of compute_electrostatic_forces_kernel above,
-// mirroring compute_lj_forces_tiled_kernel's structure exactly (same tile
-// layout, same GROUP_MASK/shuffle scheme, same half-list dedup rule) but
-// with the Mie/switching math swapped for real-space Ewald erfc/erf. nsys
-// profiling showed the plain CSR compute_electrostatic_forces_kernel taking
-// ~15.7ms/step -- the second-largest GPU cost after LJ -- despite doing
-// less arithmetic per pair than LJ, which pointed at atomic contention
-// rather than compute: that CSR kernel does one atomicAddFixed(&fx_fixed[j],
-// ...) triplet PER PAIR, so spatially close atoms (the common case, being
-// each other's neighbors) repeatedly target the same few memory addresses
-// from many concurrent threads. The tiled LJ kernel already solves this by
-// accumulating a whole neighbor-tile's worth of j-reaction-force via
-// __shfl_sync before a single atomic write per tile-pair iteration (8x
-// fewer atomics for the j side, and the i side collapses to exactly one
-// atomic for the whole kernel instead of one per accepted pair) -- this
-// kernel reuses that same scheme for Coulomb. Dispatched from
-// ForceCalculatorCUDA::compute_electrostatic_forces_real_space() only when
-// tile data is available (same condition as the LJ kernel's own tiled/CSR
-// choice), falling back to the plain CSR kernel above otherwise.
-//
-// TRIED AND REVERTED: __launch_bounds__(128, 8), applied here for
-// consistency with compute_lj_forces_tiled_kernel above, measured even
-// worse -- 34.9% SLOWER (13.1ms -> 17.7ms/step). Same conclusion: forcing
-// lower register usage here spills more than it helps. Do not re-add
-// without a measured win.
 template <typename PairT>
 __global__ void compute_electrostatic_forces_tiled_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
@@ -750,27 +617,6 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
     }
 }
 
-// PERF FIX (rank-local spatial-tile roadmap, phase 2): compute_lj_forces_
-// tiled_kernel and compute_electrostatic_forces_tiled_kernel above each walk
-// the EXACT SAME tile-pair list independently -- same distance calc, same
-// apply_minimum_image_device, same is_excluded_pair lookup, same half-list
-// dedup, same j-side shuffle-then-atomic pattern -- just to add two
-// different force terms. That is the GPU-tiled-era equivalent of the old
-// CSR-era compute_lj_forces_kernel/compute_electrostatic_forces_kernel
-// duplication that compute_lj_electrostatic_forces_kernel used to fix (see
-// its comment, now stale history -- that kernel no longer exists, CSR having
-// been removed entirely). This kernel re-applies the same fusion to the tile
-// path: one traversal of the tile-pair list, one exclusion lookup, one
-// minimum-image/distance calc, LJ and Coulomb force/energy accumulated into
-// the SAME fx_pair/pe_pair before a single combined atomic write per tile-
-// pair iteration (half as many atomics as running both kernels separately).
-// Math for each term is byte-for-byte identical to the two source kernels:
-//  - LJ (Mie + optional switching): skipped entirely for excluded pairs.
-//  - Real-space Ewald: NOT skipped for excluded pairs -- applies the
-//    erf(alpha*r) cancellation term instead, exactly as before.
-// Dispatched from ForceCalculatorCUDA::compute_forces() only when both LJ
-// and Coulomb are enabled (see use_fused_nonbonded there); either term alone
-// still uses its own standalone tiled kernel above.
 template <typename PairT>
 __global__ void compute_nonbonded_forces_tiled_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
@@ -792,8 +638,6 @@ __global__ void compute_nonbonded_forces_tiled_kernel(
     Real cutoff_sq, Real switch_distance, Real switch_sq, Real inv_denom,
     Real k_coulomb, Real alpha,
     int num_tiles,
-    // See the matching parameter's comment on compute_lj_forces_tiled_kernel
-    // above; same convention here.
     unsigned long long* __restrict__ pair_stats)
 {
     const int global_lane = threadIdx.x % 32;
@@ -870,10 +714,6 @@ __global__ void compute_nonbonded_forces_tiled_kernel(
             int type_j   = __shfl_sync(GROUP_MASK, type_j0, src, LJ_CLUSTER_SIZE);
             int gid_j    = __shfl_sync(GROUP_MASK, gid_j0, src, LJ_CLUSTER_SIZE);
 
-            // NOTE: not gated on qi_nonzero here (unlike the electrostatic-
-            // only kernel) -- LJ must still run for an uncharged atom pair,
-            // so acceptance/half-list dedup can only depend on tile
-            // membership, exactly like the LJ-only kernel.
             const bool in_verlet =
                 ((verlet_mask >> (src * LJ_CLUSTER_SIZE + sub)) & 1ULL) != 0;
             bool accepted = in_verlet && valid_i && (j_atom >= 0);
@@ -896,15 +736,11 @@ __global__ void compute_nonbonded_forces_tiled_kernel(
 
                 if (r2 < cutoff_sq_p && r2 >= PairT(1e-10)) {
                     if (pair_stats) atomicAdd(&pair_stats[1], 1ULL);
-                    // One shared exclusion lookup for both force terms --
-                    // see this kernel's doc comment.
                     const bool excluded = is_excluded_pair(exclusion_offsets, exclusion_partners,
                                                            exclusion_atom_count, gid_i, gid_j);
                     PairT force_mag = PairT(0.0);
                     PairT pe_pair = PairT(0.0);
 
-                    // ---- LJ (Mie), skipped for excluded pairs -- see
-                    // device_compute_lj_pair() above ----
                     if (!excluded) {
                         size_t type_idx = static_cast<size_t>(type_i) * max_types + type_j;
                         PairT eps = static_cast<PairT>(epsilon_mixed[type_idx]);
@@ -917,9 +753,6 @@ __global__ void compute_nonbonded_forces_tiled_kernel(
                         pe_pair += lj_pe;
                     }
 
-                    // ---- Real-space Ewald Coulomb -- NOT skipped for
-                    // excluded pairs, see device_compute_coulomb_pair_
-                    // ewald_real() above ----
                     if (qi_nonzero && fabs(qj) >= PairT(1e-10)) {
                         PairT coul_force, coul_pe;
                         device_compute_coulomb_pair_ewald_real(r2, qi, qj, k_coulomb_p, alpha_p,
@@ -982,15 +815,6 @@ __global__ void compute_nonbonded_forces_tiled_kernel(
     }
 }
 
-// ============================================================================
-// GPU directed atom graph
-//
-// The spatial tile graph is used only as a broad phase.  These kernels
-// compact its half-list Verlet masks into the same directed CSR used by the
-// CPU graph backend: local-local pairs produce both directions, while a
-// local-ghost pair produces only the locally-owned source row.  CSR order is
-// also valid COO order, so MLIP consumes the exact same allocation.
-// ============================================================================
 
 __global__ void count_directed_graph_degrees_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
@@ -1031,10 +855,6 @@ __global__ void finish_graph_offsets_kernel(const int* degrees, int* offsets, in
     }
 }
 
-// Small-box fallback.  The fine-cell tile builder intentionally declines
-// boxes with fewer than its periodic stencil width; for those tiny systems a
-// direct O(Nlocal*Ntotal) GPU pass is both simpler and faster than building a
-// second coarse grid, and keeps graph mode fully device resident.
 __global__ void count_directed_graph_degrees_direct_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     int* __restrict__ degrees, int num_local, int num_total,
@@ -1192,21 +1012,6 @@ __global__ void compute_nonbonded_forces_graph_kernel(
     if (virial_acc != 0.0) atomicAdd(virial, virial_acc);
 }
 
-// ============================================================================
-// PME (Particle Mesh Ewald) reciprocal-space kernels
-//
-// Real-to-complex (D2Z/Z2D) grid layout: the charge grid is a real
-// nx*ny*nz array, transformed out-of-place into a half-spectrum complex
-// buffer of nx*ny*(nz/2+1) elements (only kz in [0, nz/2] is stored; kz in
-// (nz/2, nz) is the Hermitian-conjugate mirror of an already-stored
-// frequency and is never materialized). kx and ky still range over the
-// full grid extent and use the usual wrapped wavenumber convention; only kz
-// is truncated. Every kernel that walks the frequency grid (Poisson solve,
-// virial, E-field) is launched with kz in [0, nz/2] only, and the energy/
-// virial sums double-count each stored kz to account for its unstored
-// mirror -- except kz == 0 and (when nz is even) kz == nz/2, which are
-// their own mirrors under complex conjugation and must not be doubled.
-// ============================================================================
 
 __device__ void pme_compute_bspline_weights(
     Real u, int order, Real* weights, int* grid_indices)
@@ -1243,11 +1048,6 @@ __device__ void pme_compute_bspline_weights(
     }
 }
 
-// Compute assignment weights and dB/du together.  The derivative is with
-// respect to the dimensionless grid coordinate u; the interpolation kernel
-// applies du/dx = grid_n/box_length.  Keeping weights and derivatives paired
-// also guarantees that charge spreading and force gathering use exactly the
-// same cardinal B-spline convention.
 __device__ void pme_compute_bspline_weights_and_derivatives(
     Real u, int order, Real* weights, Real* derivatives, int* grid_indices)
 {
@@ -1290,9 +1090,6 @@ __global__ void pme_clear_grid_kernel(Real* grid, size_t grid_size) {
     }
 }
 
-// Sum identical grid updates inside a warp before issuing one global atomic.
-// spatial_particle_order is laid out as 32-particle cell tiles, so each warp
-// handles nearby particles and commonly has overlapping B-spline supports.
 __device__ __forceinline__ void pme_warp_aggregated_atomic_add(
     Real* grid, size_t index, Real value, bool valid)
 {
@@ -1315,11 +1112,6 @@ __device__ __forceinline__ void pme_warp_aggregated_atomic_add(
     }
 }
 
-// Spread particle charges onto the real grid via B-spline interpolation.
-// When the neighbor-list cell tiles are available, particle_order gives each
-// warp a spatially compact tile and enables the aggregation above.  Padding,
-// ghost particles, and neutral atoms still execute the fixed loop nest with
-// zero weight so every active lane reaches the warp collectives safely.
 __global__ void pme_spread_charges_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     const Real* __restrict__ charge, Real* charge_grid,
@@ -1381,53 +1173,8 @@ __global__ void pme_spread_charges_kernel(
     }
 }
 
-// ============================================================================
-// Hopper (sm_90+) thread-block-cluster PME spread. See design doc "GPU 기반
-// MD Nonbonded 커널 설계" section 9.1: a cluster of blocks can access each
-// other's shared memory directly (Distributed Shared Memory), which in
-// principle lets a group of blocks jointly own a larger local sub-grid than
-// one block's shared memory allows.
-//
-// SCOPE OF THIS KERNEL / WHAT IS NOT DONE: this implementation uses the
-// cluster launch purely to get co-scheduled, SM-adjacent blocks; it does
-// NOT yet route cross-block writes through cluster.map_shared_rank (true
-// DSM). Instead, each block (one 32-atom spatial tile, matching the LJ tile
-// scheme in neighbor_list_kernels.cu) keeps its own small shared-memory
-// sub-grid window and accumulates into it with a cheap block-local shared
-// atomicAdd; any B-spline tap whose grid index falls outside that block's
-// own window (including taps that belong in a cluster sibling's window)
-// falls through to a plain global atomicAdd, exactly like the existing
-// pme_spread_charges_kernel. That fallback is what keeps this kernel
-// correct for any grid/box/cutoff combination -- the shared-memory window
-// only cuts how often the (more expensive) global atomic path is taken, it
-// is never required for correctness. Wiring the fallback path through DSM
-// to a cluster sibling instead of global memory is the natural follow-up,
-// left undone here because it needs a Hopper-class GPU to validate the
-// cross-block addressing; see set_pme_cluster_spread_enabled in
-// force_calculator_cuda.h and device_supports_clusters_ for how this stays
-// off unless a run actually has sm_90+ hardware.
-//
-// UNVERIFIED: no Hopper-class GPU was available to compile-test, run, or
-// benchmark this kernel (mirrors the honesty policy already established
-// for use_tiled_lj_kernel_ above -- off by default, opt-in only).
-//
-// No __CUDA_ARCH__ guard is needed here: nothing in this kernel's body uses
-// a Hopper-only instruction (it deliberately does not call
-// cluster.map_shared_rank -- see "SCOPE" above), so it is valid device code
-// on any architecture. The cluster launch itself is what actually requires
-// sm_90+; that is a *host-side* launch-config choice
-// (cudaLaunchAttributeClusterDimension in compute_electrostatic_forces_ewald
-// below), gated at runtime by device_supports_clusters_, not a compile-time
-// concern for this function.
-// ============================================================================
 
-// Blocks per cluster: 4 is inside the portable 1-8 block/cluster range
-// guaranteed on any sm_90+ part (up to 16 is available but non-portable).
 constexpr int PME_CLUSTER_BLOCKS = 4;
-// Half-width (grid cells) of each block's local shared sub-grid, per axis.
-// Must exceed ceil(spline_order/2) so a particle's full spline footprint
-// can land inside the window whenever its own base grid index is within
-// range of the block's window origin (see PME_MAX_SPLINE_ORDER = 8).
 constexpr int PME_CLUSTER_WINDOW_RADIUS = 5;
 constexpr int PME_CLUSTER_WINDOW = 2 * PME_CLUSTER_WINDOW_RADIUS;
 
@@ -1474,11 +1221,6 @@ __global__ void pme_spread_charges_cluster_kernel(
     pme_compute_bspline_weights(u_y, spline_order, wy, iy);
     pme_compute_bspline_weights(u_z, spline_order, wz, iz);
 
-    // Window origin: thread 0's own base grid index, broadcast to the whole
-    // block via shared memory. If thread 0 happens not to contribute
-    // (padding/neutral atom), the window just defaults to grid origin 0 --
-    // every other thread's taps still get evaluated correctly, they simply
-    // fall through to the global-atomic path more often for this block.
     if (threadIdx.x == 0) {
         origin_x = contributes ? ix[0] : 0;
         origin_y = contributes ? iy[0] : 0;
@@ -1515,10 +1257,6 @@ __global__ void pme_spread_charges_cluster_kernel(
     }
     __syncthreads();
 
-    // Flush this block's window to the global grid. Cluster-sibling blocks
-    // may own windows whose cells overlap this one's (their tile origins
-    // can be close in space), so this has to stay a global atomicAdd, not
-    // a plain store.
     for (int idx = threadIdx.x; idx < total_cells; idx += blockDim.x) {
         const Real val = local_grid[idx];
         if (val == 0.0) continue;
@@ -1535,25 +1273,12 @@ __global__ void pme_spread_charges_cluster_kernel(
     }
 }
 
-// Frequencies kz in (0, nz/2) exclusive have their Hermitian-conjugate
-// mirror at (nx-kx, ny-ky, nz-kz), which R2C packing never stores (that kz
-// falls outside [0, nz/2]); kz == 0 and, for even nz, the Nyquist
-// kz == nz/2 are their own mirrors. Manual sums over the half-spectrum grid
-// (energy, virial) must double every other stored point to stand in for
-// its unstored mirror. FFT-based reconstruction (the inverse C2R transform
-// itself) needs no such factor -- cuFFT already knows the mirror is
-// implied.
 __device__ __forceinline__ Real pme_hermitian_weight(int kz, int grid_nz) {
     if (kz == 0) return 1.0;
     if ((grid_nz % 2 == 0) && kz == grid_nz / 2) return 1.0;
     return 2.0;
 }
 
-// Solve the Poisson equation in reciprocal space: multiply rho(k) by the
-// (B-spline-corrected) Gaussian Green's function to get the potential
-// Phi(k), in place, and accumulate the reciprocal-space energy.
-// k_coulomb is folded into `prefactor` by the caller. Operates on the
-// half-spectrum grid: kz in [0, grid_nzh) where grid_nzh == grid_nz/2 + 1.
 __global__ void pme_solve_poisson_kernel(
     cufftDoubleComplex* fft_grid,
     const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
@@ -1607,11 +1332,6 @@ __global__ void pme_solve_poisson_kernel(
     atomicAdd(reciprocal_energy_out, energy_contrib);
 }
 
-// Differentiate the B-spline interpolation of the real-space potential:
-// F_i = -q_i grad(sum_g B_g phi_g).  This replaces three spectral gradients
-// and three inverse FFTs with one inverse FFT plus additional gather math.
-// The kernel runs on force_stream after the PME-grid-ready event, so all
-// other force producers are ordered before it and plain += stores are safe.
 __global__ void pme_interpolate_forces_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     const Real* __restrict__ charge,
@@ -1671,7 +1391,6 @@ __global__ void pme_interpolate_forces_kernel(
     fz[i] += -qi * dphi_du_z * (grid_nz * inv_box_z) * inv_grid_size;
 }
 
-// Self-energy correction: E_self = -k_coulomb * alpha/sqrt(pi) * sum(q_i^2)
 __global__ void pme_self_energy_kernel(
     const Real* __restrict__ charge, Real* potential_energy,
     Real k_coulomb, Real alpha, size_t num_particles)
@@ -1685,8 +1404,6 @@ __global__ void pme_self_energy_kernel(
     atomicAdd(potential_energy, self_contrib);
 }
 
-// Reciprocal-space virial contribution: W_recip = sum_k (1 + k^2/(2a^2)) * energy_contrib(k)
-// Operates on the half-spectrum grid; see pme_hermitian_weight.
 __global__ void pme_reciprocal_virial_kernel(
     const cufftDoubleComplex* __restrict__ fft_grid,
     const Real* __restrict__ b_mod_x, const Real* __restrict__ b_mod_y, const Real* __restrict__ b_mod_z,
@@ -1752,18 +1469,14 @@ __global__ void compute_bond_forces_kernel(
     size_t i = bond_atom1[bond_idx];
     size_t j = bond_atom2[bond_idx];
     
-    // MPI ownership rule: only compute if at least one atom is local
     bool i_is_local = (i < local_particles);
     bool j_is_local = (j < local_particles);
     
     if (!i_is_local && !j_is_local) return;  // Neither is local, skip
     
-    // Avoid double-counting: only the rank that owns the atom with smaller global_id computes
-    // This ensures each bond is computed exactly once across all ranks
     int gid_i = global_id[i];
     int gid_j = global_id[j];
     
-    // Only compute if owner atom is local on this rank
     bool owner_is_i = (gid_i < gid_j);
     bool should_compute = (owner_is_i && i_is_local) || (!owner_is_i && j_is_local);
     
@@ -1783,11 +1496,6 @@ __global__ void compute_bond_forces_kernel(
     Real r0 = bond_r0[bond_idx];
     Real dr = r - r0;
 
-    // Harmonic bond potential: V = 0.5 * k * (r - r0)^2 -- matches
-    // ForceCalculatorCPU::compute_bond_forces() exactly. (Previously this
-    // kernel used the LAMMPS convention V = k*(r-r0)^2, which silently gave
-    // CUDA runs bond energies/forces exactly 2x the CPU backend for the same
-    // topology file.)
     Real force_mag = -k * dr / r;
     Real pe = 0.5 * k * dr * dr;
     
@@ -1795,8 +1503,6 @@ __global__ void compute_bond_forces_kernel(
     Real fy_bond = force_mag * dy;
     Real fz_bond = force_mag * dz;
     
-    // Apply forces to both atoms (use atomicAdd for thread safety)
-    // Forces on ghost atoms will be collected via reverse halo exchange
     atomicAdd(&fx[i], fx_bond);
     atomicAdd(&fy[i], fy_bond);
     atomicAdd(&fz[i], fz_bond);
@@ -1805,7 +1511,6 @@ __global__ void compute_bond_forces_kernel(
     atomicAdd(&fy[j], -fy_bond);
     atomicAdd(&fz[j], -fz_bond);
     
-    // Only accumulate energy once (ownership ensures no double-counting)
     atomicAdd(potential_energy, pe);
 }
 
@@ -1828,15 +1533,12 @@ __global__ void compute_angle_forces_kernel(
     size_t j = angle_atom2[angle_idx];  // center atom
     size_t k = angle_atom3[angle_idx];
     
-    // MPI ownership rule: only compute if at least one atom is local
     bool i_is_local = (i < local_particles);
     bool j_is_local = (j < local_particles);
     bool k_is_local = (k < local_particles);
     
     if (!i_is_local && !j_is_local && !k_is_local) return;
     
-    // Ownership: angle belongs to the rank that owns the center atom (j)
-    // This is a natural choice since j is geometrically central
     if (!j_is_local) return;  // Only compute if center atom is local
     
     Real dx_ij = x[i] - x[j];
@@ -1867,11 +1569,6 @@ __global__ void compute_angle_forces_kernel(
     Real theta0 = angle_theta0[angle_idx];
     Real dtheta = theta - theta0;
 
-    // Harmonic angle potential: V = 0.5 * k * (theta - theta0)^2 -- matches
-    // ForceCalculatorCPU::compute_angle_forces() exactly. (Previously this
-    // kernel used the LAMMPS convention V = k*(theta-theta0)^2, which
-    // silently gave CUDA runs angle energies/forces exactly 2x the CPU
-    // backend for the same topology file.)
     Real pe = 0.5 * k_angle * dtheta * dtheta;
 
     if (fabs(dtheta) < 1e-10) return;
@@ -1879,8 +1576,6 @@ __global__ void compute_angle_forces_kernel(
     Real sin_theta = sqrt(1.0 - cos_theta * cos_theta);
     if (sin_theta < 1e-10) return;
 
-    // The vectors below are the negative gradient of theta; multiplying by
-    // +dV/dtheta therefore gives F = -grad(V).
     Real force_constant = k_angle * dtheta / sin_theta;
     
     Real r_ij_inv = 1.0 / r_ij;
@@ -1901,7 +1596,6 @@ __global__ void compute_angle_forces_kernel(
     Real fy_j = -(fy_i + fy_k);
     Real fz_j = -(fz_i + fz_k);
     
-    // Apply forces (atomicAdd handles both local and ghost atoms)
     atomicAdd(&fx[i], fx_i);
     atomicAdd(&fy[i], fy_i);
     atomicAdd(&fz[i], fz_i);
@@ -1914,19 +1608,9 @@ __global__ void compute_angle_forces_kernel(
     atomicAdd(&fy[k], fy_k);
     atomicAdd(&fz[k], fz_k);
     
-    // Energy accumulation (only once per angle since we enforce ownership)
     atomicAdd(potential_energy, pe);
 }
 
-// ============================================================================
-// DIHEDRAL FORCES KERNEL (Proper dihedral: CHARMM/OPLS style)
-// ============================================================================
-// Shared by compute_dihedral_forces_kernel and compute_improper_forces_kernel:
-// proper and improper torsions use the identical periodic functional form and
-// analytical gradient, just over different atom-quadruple lists. Keeping a
-// single implementation avoids the two kernels drifting apart if edited
-// separately later. See ForceCalculatorCPU::compute_torsion_forces() (CPU
-// side) for the full derivation of the force formula.
 __device__ __forceinline__ void dihedral_torsion_body(
     size_t i, size_t j, size_t k, size_t l,
     Real* x, Real* y, Real* z,
@@ -1937,8 +1621,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z) {
 
-    // MPI ownership rule: torsion belongs to the rank that owns the central
-    // bond. Use the atom with smaller global_id among j and k as the owner.
     bool j_is_local = (j < local_particles);
     bool k_is_local = (k < local_particles);
 
@@ -1951,11 +1633,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
 
     if (!should_compute) return;
 
-    // Compute vectors for dihedral i-j-k-l.  Convention matches
-    // ForceCalculatorCPU::compute_dihedral_forces() exactly (r_i - r_j,
-    // r_j - r_k, r_k - r_l) so both backends evaluate the identical
-    // analytical formula on the identical angle-sign convention -- do not
-    // change these signs without updating the CPU kernel to match.
     Real dx_ij = x[i] - x[j];
     Real dy_ij = y[i] - y[j];
     Real dz_ij = z[i] - z[j];
@@ -1972,8 +1649,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
     apply_minimum_image_device(dx_jk, dy_jk, dz_jk, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
     apply_minimum_image_device(dx_kl, dy_kl, dz_kl, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
 
-    // Cross products for plane normals -- kept UNNORMALIZED, the exact
-    // analytical force formula below needs the raw vectors and |.|^2.
     Real n1_x = dy_ij * dz_jk - dz_ij * dy_jk;  // ij x jk
     Real n1_y = dz_ij * dx_jk - dx_ij * dz_jk;
     Real n1_z = dx_ij * dy_jk - dy_ij * dx_jk;
@@ -1990,8 +1665,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
 
     Real jk_mag = sqrt(jk_sq);
 
-    // Dihedral angle via atan2(sin, cos) computed directly from the
-    // unnormalized cross products (matches the CPU kernel bit-for-bit).
     Real cos_phi_num = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
     Real sin_phi_num = (n1_y*n2_z - n1_z*n2_y) * dx_jk +
                         (n1_z*n2_x - n1_x*n2_z) * dy_jk +
@@ -2001,8 +1674,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
     Real pe;
     Real dVdphi;
     if (n_mult == 0) {
-        // CHARMM harmonic improper. remainder() keeps phi-phi0 in the
-        // principal periodic interval while preserving its sign.
         Real dphi = remainder(phi - phi0, 2.0 * M_PI);
         pe = k_dih * dphi * dphi;
         dVdphi = 2.0 * k_dih * dphi;
@@ -2014,9 +1685,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
 
     if (fabs(dVdphi) < 1e-12) return;
 
-    // Exact analytical gradient (Blondel-Karplus / Bekker formula),
-    // momentum- and torque-conserving by construction.  See
-    // ForceCalculatorCPU::compute_dihedral_forces() for the full derivation.
     Real fi_scale = -dVdphi * jk_mag / n1_sq;
     Real fl_scale =  dVdphi * jk_mag / n2_sq;
 
@@ -2028,8 +1696,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
     Real fy_l = fl_scale * n2_y;
     Real fz_l = fl_scale * n2_z;
 
-    // p, q are the fractional projections of r_ij and r_kl onto r_kj
-    // (= -dx_jk here, but the sign cancels in the dot-product ratio).
     Real p = -(dx_ij*dx_jk + dy_ij*dy_jk + dz_ij*dz_jk) / jk_sq;
     Real q = -(dx_kl*dx_jk + dy_kl*dy_jk + dz_kl*dz_jk) / jk_sq;
 
@@ -2041,7 +1707,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
     Real fy_k = -p * fy_i + (q - 1.0) * fy_l;
     Real fz_k = -p * fz_i + (q - 1.0) * fz_l;
 
-    // Apply forces
     atomicAdd(&fx[i], fx_i);
     atomicAdd(&fy[i], fy_i);
     atomicAdd(&fz[i], fz_i);
@@ -2058,7 +1723,6 @@ __device__ __forceinline__ void dihedral_torsion_body(
     atomicAdd(&fy[l], fy_l);
     atomicAdd(&fz[l], fz_l);
 
-    // Energy accumulation
     atomicAdd(potential_energy, pe);
 }
 
@@ -2085,8 +1749,6 @@ __global__ void compute_dihedral_forces_kernel(
         potential_energy, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
 }
 
-// Improper torsions: identical functional form/kernel as propers above, just
-// over a separate atom-quadruple list (see Topology::impropers).
 __global__ void compute_improper_forces_kernel(
     Real* x, Real* y, Real* z,
     Real* fx, Real* fy, Real* fz,
@@ -2110,12 +1772,6 @@ __global__ void compute_improper_forces_kernel(
         potential_energy, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
 }
 
-// Scaled 1-4 (or FF-specific) nonbonded pairs, re-added on top of
-// [exclusions] as direct, unscreened LJ + Coulomb (never subject to the
-// normal neighbor-list cutoff). See ForceCalculatorCPU::compute_special_pair_forces()
-// (CPU side) for why the direct Coulomb term is correct under Ewald/PME:
-// the reciprocal-space sum and the real-space excluded-pair correction
-// cancel exactly for an excluded pair, leaving only this term.
 __global__ void compute_special_pair_forces_kernel(
     Real* x, Real* y, Real* z,
     Real* fx, Real* fy, Real* fz,
@@ -2139,7 +1795,6 @@ __global__ void compute_special_pair_forces_kernel(
     size_t i = pair_atom1[idx];
     size_t j = pair_atom2[idx];
 
-    // MPI ownership rule: same convention as bonds (a direct atom-pair term).
     bool i_is_local = (i < local_particles);
     bool j_is_local = (j < local_particles);
     if (!i_is_local && !j_is_local) return;
@@ -2237,7 +1892,6 @@ __global__ void calculate_kinetic_energy_kernel(
     sdata[tid] = ke_local;
     __syncthreads();
     
-    // Block-level reduction
     for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
         if (tid < s) {
             sdata[tid] += sdata[tid + s];
@@ -2250,7 +1904,6 @@ __global__ void calculate_kinetic_energy_kernel(
     }
 }
 
-// ForceCalculatorCUDA class implementation
 
 ForceCalculatorCUDA::ForceCalculatorCUDA() :
     d_x(nullptr), d_y(nullptr), d_z(nullptr),
@@ -2265,7 +1918,6 @@ ForceCalculatorCUDA::ForceCalculatorCUDA() :
     d_exclusion_offsets(nullptr), d_exclusion_partners(nullptr),
     exclusion_atom_count(0),
     d_potential_energy(nullptr), d_kinetic_energy(nullptr),
-    // GPU-resident bonded topology initialization
     num_bonds_cached(0), d_bond_atom1(nullptr), d_bond_atom2(nullptr),
     d_bond_k(nullptr), d_bond_r0(nullptr),
     num_angles_cached(0), d_angle_atom1(nullptr), d_angle_atom2(nullptr), d_angle_atom3(nullptr),
@@ -2300,10 +1952,8 @@ void ForceCalculatorCUDA::initialize() {
     CUDA_CHECK(cudaGetDeviceCount(&device_count));
     if (device_count <= 0) throw std::runtime_error("No CUDA device is visible");
 
-    // Map ranks by node-local rank, not MPI_COMM_WORLD rank.  World-rank modulo
-    // only works accidentally for uniform process placement across nodes.
     MPI_Comm local_comm = MPI_COMM_NULL;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0,
+    MPI_Comm_split_type(PmePpSplit::instance().pp_comm(), MPI_COMM_TYPE_SHARED, 0,
                         MPI_INFO_NULL, &local_comm);
     int local_rank = 0;
     MPI_Comm_rank(local_comm, &local_rank);
@@ -2316,23 +1966,18 @@ void ForceCalculatorCUDA::initialize() {
     std::cout << "[CUDA] MPI rank " << get_mpi_rank()
               << " using local GPU " << device_id << " (" << prop.name
               << ", cc " << prop.major << "." << prop.minor << ")\n";
-    // Thread block clusters (distributed shared memory) require Hopper or
-    // newer -- see pme_spread_charges_cluster_kernel/set_pme_cluster_spread_enabled.
     device_supports_clusters_ = (prop.major >= 9);
 
-    // Allocate energy buffers once
     CUDA_CHECK(cudaMalloc(&d_potential_energy, sizeof(Real)));
     CUDA_CHECK(cudaMalloc(&d_kinetic_energy, sizeof(Real)));
     CUDA_CHECK(cudaMalloc(&d_virial, sizeof(Real)));  // NEW: virial for pressure calculation
 
-    // Create a dedicated CUDA stream for force/energy operations
     CUDA_CHECK(cudaStreamCreate(&force_stream));
     CUDA_CHECK(cudaEventCreateWithFlags(&force_clear_event_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&pme_grid_ready_event_, cudaEventDisableTiming));
 }
 
 void ForceCalculatorCUDA::finalize() {
-    // Free device memory
     if (d_x) cudaFree(d_x);
     if (d_y) cudaFree(d_y);
     if (d_z) cudaFree(d_z);
@@ -2382,7 +2027,6 @@ void ForceCalculatorCUDA::finalize() {
     if (d_kinetic_energy) cudaFree(d_kinetic_energy);
     if (d_virial) cudaFree(d_virial);  // NEW: free virial memory
     
-    // Free 1D arrays for mixing rules
     if (d_epsilon_mixed) {
         cudaFree(d_epsilon_mixed);
         d_epsilon_mixed = nullptr;
@@ -2406,10 +2050,8 @@ void ForceCalculatorCUDA::finalize() {
     }
     exclusion_atom_count = 0;
     
-    // Free bonded topology device memory
     free_bonded_topology_device();
 
-    // Cleanup Ewald/PME reciprocal-space resources
     free_ewald_resources();
 
     if (force_clear_event_) {
@@ -2430,19 +2072,14 @@ void ForceCalculatorCUDA::finalize() {
         force_timing_events_ready_ = false;
     }
 
-    // Destroy CUDA stream if created
     if (force_stream) {
         cudaStreamDestroy(force_stream);
         force_stream = nullptr;
     }
 }
 
-// ============================================================================
-// GPU-RESIDENT BONDED TOPOLOGY MANAGEMENT
-// ============================================================================
 
 void ForceCalculatorCUDA::upload_bonded_topology_to_device(MDSystem& system) {
-    // MDSystem owns the rank-local global-ID -> owned/ghost-slot mapping.
     free_bonded_topology_device();
     Topology& topology = system.get_topology();
 
@@ -2609,20 +2246,17 @@ void ForceCalculatorCUDA::refresh_bonded_topology_on_device(MDSystem& system) {
 }
 
 void ForceCalculatorCUDA::free_bonded_topology_device() {
-    // Free bond topology
     if (d_bond_atom1) { cudaFree(d_bond_atom1); d_bond_atom1 = nullptr; }
     if (d_bond_atom2) { cudaFree(d_bond_atom2); d_bond_atom2 = nullptr; }
     if (d_bond_k) { cudaFree(d_bond_k); d_bond_k = nullptr; }
     if (d_bond_r0) { cudaFree(d_bond_r0); d_bond_r0 = nullptr; }
     
-    // Free angle topology
     if (d_angle_atom1) { cudaFree(d_angle_atom1); d_angle_atom1 = nullptr; }
     if (d_angle_atom2) { cudaFree(d_angle_atom2); d_angle_atom2 = nullptr; }
     if (d_angle_atom3) { cudaFree(d_angle_atom3); d_angle_atom3 = nullptr; }
     if (d_angle_k) { cudaFree(d_angle_k); d_angle_k = nullptr; }
     if (d_angle_theta0) { cudaFree(d_angle_theta0); d_angle_theta0 = nullptr; }
     
-    // Free dihedral topology
     if (d_dihedral_atom1) { cudaFree(d_dihedral_atom1); d_dihedral_atom1 = nullptr; }
     if (d_dihedral_atom2) { cudaFree(d_dihedral_atom2); d_dihedral_atom2 = nullptr; }
     if (d_dihedral_atom3) { cudaFree(d_dihedral_atom3); d_dihedral_atom3 = nullptr; }
@@ -2631,7 +2265,6 @@ void ForceCalculatorCUDA::free_bonded_topology_device() {
     if (d_dihedral_phi0) { cudaFree(d_dihedral_phi0); d_dihedral_phi0 = nullptr; }
     if (d_dihedral_n) { cudaFree(d_dihedral_n); d_dihedral_n = nullptr; }
 
-    // Free improper torsion topology
     if (d_improper_atom1) { cudaFree(d_improper_atom1); d_improper_atom1 = nullptr; }
     if (d_improper_atom2) { cudaFree(d_improper_atom2); d_improper_atom2 = nullptr; }
     if (d_improper_atom3) { cudaFree(d_improper_atom3); d_improper_atom3 = nullptr; }
@@ -2640,7 +2273,6 @@ void ForceCalculatorCUDA::free_bonded_topology_device() {
     if (d_improper_phi0) { cudaFree(d_improper_phi0); d_improper_phi0 = nullptr; }
     if (d_improper_n) { cudaFree(d_improper_n); d_improper_n = nullptr; }
 
-    // Free scaled 1-4 special-pair topology
     if (d_special_pair_atom1) { cudaFree(d_special_pair_atom1); d_special_pair_atom1 = nullptr; }
     if (d_special_pair_atom2) { cudaFree(d_special_pair_atom2); d_special_pair_atom2 = nullptr; }
     if (d_special_pair_lj_scale) { cudaFree(d_special_pair_lj_scale); d_special_pair_lj_scale = nullptr; }
@@ -2648,9 +2280,6 @@ void ForceCalculatorCUDA::free_bonded_topology_device() {
     if (d_special_pair_sigma) { cudaFree(d_special_pair_sigma); d_special_pair_sigma = nullptr; }
     if (d_special_pair_epsilon) { cudaFree(d_special_pair_epsilon); d_special_pair_epsilon = nullptr; }
 
-    // Free SHAKE/RATTLE constraint topology (the per-step scratch buffers --
-    // d_constraint_pre_*, d_constraint_max_error_ -- are freed in finalize()
-    // instead, since they are sized by particle count, not bonded topology).
     if (d_constraint_atom1) { cudaFree(d_constraint_atom1); d_constraint_atom1 = nullptr; }
     if (d_constraint_atom2) { cudaFree(d_constraint_atom2); d_constraint_atom2 = nullptr; }
     if (d_constraint_distance) { cudaFree(d_constraint_distance); d_constraint_distance = nullptr; }
@@ -2664,7 +2293,6 @@ void ForceCalculatorCUDA::free_bonded_topology_device() {
     bonded_topology_on_device = false;
 }
 
-// ============================================================================
 
 dsdecompx::ParticleView ForceCalculatorCUDA::particle_info_view(size_t count) {
     if (!device_data_initialized || count > allocated_particles) {
@@ -2731,10 +2359,8 @@ dsdecompx::StorageResizeResult ForceCalculatorCUDA::resize_particle_info(
     return {particle_info_view(required), reallocated};
 }
 
-// ============================================================================
 
 void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
-    // Safety checks
     if (num_particles == 0) {
         if (is_rank_zero()) {
             std::cerr << "WARNING: allocate_device_memory called with num_particles=0" << std::endl;
@@ -2743,7 +2369,6 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
     }
     
     if (num_particles > allocated_particles) {
-        // Free old memory
         if (d_x) cudaFree(d_x);
         if (d_y) cudaFree(d_y);
         if (d_z) cudaFree(d_z);
@@ -2764,7 +2389,6 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
         if (d_force_fixed_y_) cudaFree(d_force_fixed_y_);
         if (d_force_fixed_z_) cudaFree(d_force_fixed_z_);
 
-        // Allocate new memory
         CUDA_CHECK(cudaMalloc(&d_x, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_y, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_z, num_particles * sizeof(Real)));
@@ -2778,13 +2402,10 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
         CUDA_CHECK(cudaMalloc(&d_charge, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_type, num_particles * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_global_id, num_particles * sizeof(int)));  // int, not size_t
-        // Allocate displacement tracking arrays
         CUDA_CHECK(cudaMalloc(&d_x_ref, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_y_ref, num_particles * sizeof(Real)));
         CUDA_CHECK(cudaMalloc(&d_z_ref, num_particles * sizeof(Real)));
 
-        // Fixed-point force-accumulation scratch (LJ + Ewald real-space
-        // kernels; see atomicAddFixed above).
         CUDA_CHECK(cudaMalloc(&d_force_fixed_x_, num_particles * sizeof(long long)));
         CUDA_CHECK(cudaMalloc(&d_force_fixed_y_, num_particles * sizeof(long long)));
         CUDA_CHECK(cudaMalloc(&d_force_fixed_z_, num_particles * sizeof(long long)));
@@ -2792,7 +2413,6 @@ void ForceCalculatorCUDA::allocate_device_memory(size_t num_particles) {
         allocated_particles = num_particles;
     }
     
-    // Allocate scalar for max displacement (if not already allocated)
     if (!d_max_disp_sq) {
         CUDA_CHECK(cudaMalloc(&d_max_disp_sq, sizeof(Real)));
     }
@@ -2804,7 +2424,6 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
     size_t num_particles = system.get_num_particles();
     size_t local_particles = system.get_local_particles();
     
-    // Comprehensive safety check: verify ALL arrays have sufficient size
     size_t min_size = num_particles;
     min_size = std::min(min_size, particles.x.size());
     min_size = std::min(min_size, particles.y.size());
@@ -2829,7 +2448,6 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
                       << " type:" << particles.type.size()
                       << " global_id:" << particles.global_id.size() << std::endl;
         }
-        // Use actual minimum size to avoid segfault
         num_particles = min_size;
     }
     
@@ -2840,10 +2458,8 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
         return;
     }
     
-    // Allocate device memory if needed
     allocate_device_memory(num_particles);
     
-    // Upload all particle state data (positions, velocities, masses, types, charges)
     CUDA_CHECK(cudaMemcpyAsync(d_x, particles.x.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_y, particles.y.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_z, particles.z.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
@@ -2851,18 +2467,14 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
     CUDA_CHECK(cudaMemcpyAsync(d_vy, particles.vy.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_vz, particles.vz.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
     
-    // Upload particle properties (masses, types, charges) - these are typically constant
     CUDA_CHECK(cudaMemcpyAsync(d_mass, particles.mass.data(), num_particles * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_type, particles.type.data(), num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_global_id, particles.global_id.data(), num_particles * sizeof(int), cudaMemcpyHostToDevice, force_stream));  // int, not size_t
 
-    // ParticleData is already global-ID aware after decomposition; indexing the
-    // global topology by a local slot would assign another atom's charge.
     CUDA_CHECK(cudaMemcpyAsync(d_charge, particles.charge.data(),
                                num_particles * sizeof(Real),
                                cudaMemcpyHostToDevice, force_stream));
     
-    // Upload force field parameters (mixing rules) - these are constant
     ForceFieldParams& params = system.get_ff_params();
     if (!d_epsilon_mixed && !params.epsilon_mixed.empty()) {
         max_types = static_cast<int>(params.epsilon_mixed.size());
@@ -2933,13 +2545,10 @@ void ForceCalculatorCUDA::initial_upload_to_device(MDSystem& system) {
                                    cudaMemcpyHostToDevice, force_stream));
     }
     
-    // Synchronize to ensure all uploads complete
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     
-    // Upload bonded topology to GPU (ONCE - GPU-resident strategy)
     upload_bonded_topology_to_device(system);
     
-    // Initialize reference positions for displacement tracking (for Verlet list rebuild check)
     size_t num_local_particles = system.get_local_particles();
     if (d_x_ref && d_y_ref && d_z_ref) {
         CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, num_local_particles * sizeof(Real), 
@@ -2972,50 +2581,6 @@ extern "C" void launch_cuda_tile_list_build(
     unsigned long long* out_pairs_inside_rc,
     unsigned long long* out_pairs_inside_rc_plus_skin);
 
-// See the declaration comment in force_calculator_cuda.h. Structural-only:
-// one host-side copy of d_tile_pair_offsets (num_lj_tiles_+1 ints), no kernel
-// changes -- printed every time the tile graph is actually (re)built, not
-// just once.
-void ForceCalculatorCUDA::log_tile_graph_stats(size_t local_particles) {
-    if (!is_rank_zero()) return;
-
-    std::vector<int> offsets(static_cast<size_t>(num_lj_tiles_) + 1);
-    CUDA_CHECK(cudaMemcpy(offsets.data(), d_tile_pair_offsets,
-                          offsets.size() * sizeof(int), cudaMemcpyDeviceToHost));
-
-    int max_home_degree = 0;
-    for (int t = 0; t < num_lj_tiles_; ++t) {
-        max_home_degree = std::max(max_home_degree, offsets[t + 1] - offsets[t]);
-    }
-    const double neighbor_list_inflation =
-        (local_particles > 0) ? static_cast<double>(num_lj_tile_pairs_) / static_cast<double>(local_particles) : 0.0;
-    const double interaction_density =
-        (num_lj_tiles_ > 0) ? static_cast<double>(num_lj_tile_pairs_) / static_cast<double>(num_lj_tiles_) : 0.0;
-    const double load_imbalance =
-        (interaction_density > 0.0) ? static_cast<double>(max_home_degree) / interaction_density : 0.0;
-    const unsigned long long unmasked_tested =
-        static_cast<unsigned long long>(num_lj_tile_pairs_) * 64ULL;
-    const double retained_fraction = (unmasked_tested > 0)
-        ? static_cast<double>(pairs_inside_rc_plus_skin_) / static_cast<double>(unmasked_tested)
-        : 0.0;
-
-    std::cout << "\n[ForceCalculatorCUDA][tiled] tiles=" << num_lj_tiles_
-              << " tile_pairs=" << num_lj_tile_pairs_ << "\n"
-              << "[ForceCalculatorCUDA][tiled] tile_pairs/atom(neighbor-list inflation)=" << neighbor_list_inflation
-              << " avg_tile_neighbors/home_tile(interaction density)=" << interaction_density
-              << " max/avg_tile_neighbors(load imbalance)=" << load_imbalance
-              << " (max_home_degree=" << max_home_degree << ")"
-              << "\n[ForceCalculatorCUDA][tiled] pairs_inside_rc=" << pairs_inside_rc_
-              << " pairs_inside_rc_plus_skin=" << pairs_inside_rc_plus_skin_
-              << " tested_without_mask=" << unmasked_tested
-              << " retained_fraction=" << retained_fraction
-              << "\n" << std::endl;
-}
-
-// See the declaration comment in force_calculator_cuda.h. Must run before the
-// LJ/fused-nonbonded kernel dispatch in compute_forces() so a non-null
-// d_tile_pair_stats_ is already in hand when that launch reads it -- probing
-// only lazily on read-back would miss the very first launch's counts.
 void ForceCalculatorCUDA::ensure_tile_pair_stats_enabled() {
     if (tile_pair_stats_probed_) return;
     tile_pair_stats_probed_ = true;
@@ -3027,14 +2592,6 @@ void ForceCalculatorCUDA::ensure_tile_pair_stats_enabled() {
     }
 }
 
-// See the declaration comment in force_calculator_cuda.h. Only reads back
-// d_tile_pair_stats_ when MD_LOG_TILE_PAIR_STATS=1 (see
-// ensure_tile_pair_stats_enabled()) -- otherwise d_tile_pair_stats_ stays
-// null and the tiled kernels' `if (pair_stats)` checks are the only cost
-// paid. Called every step, right after that step's LJ/fused-nonbonded kernel
-// + flush_fixed_forces_kernel in compute_forces(); resets the device
-// counters back to 0 before returning so the next step's read-back isn't
-// cumulative.
 void ForceCalculatorCUDA::log_tile_pair_stats_gpu() {
     if (!tile_pair_stats_enabled_) return;
 
@@ -3048,13 +2605,6 @@ void ForceCalculatorCUDA::log_tile_pair_stats_gpu() {
     const double tile_pruning_efficiency =
         (tested_pairs > 0) ? static_cast<double>(real_pairs) / static_cast<double>(tested_pairs) : 0.0;
 
-    // GPU half-list cost: every real pair costs exactly one atomicAddFixed
-    // triplet on the j side (one per tile-pair edge that has ANY accepted
-    // local-j reaction, folded via __shfl_sync -- see compute_lj_forces_
-    // tiled_kernel's doc comment) plus one triplet per home tile for the i
-    // side, regardless of how many pairs landed in it. Both counts are
-    // already known host-side from the tile graph, so only real_pairs (the
-    // denominator) needs the device counter above.
     const double atomic_ops =
         3.0 * (static_cast<double>(num_lj_tile_pairs_) + static_cast<double>(num_lj_tiles_));
     const double half_list_cost =
@@ -3226,12 +2776,8 @@ void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
     SimulationBox& box = system.get_box();
     NeighborList& nlist = system.get_neighbor_list();
 
-    // Build masks at the physical cutoff + configured Verlet skin.  The
-    // masks are reused until the normal skin/2 displacement rebuild fires.
     Real search_radius = nlist.search_cutoff();
     if (!(search_radius > 0.0)) {
-        // Defensive fallback: search_cutoff() is set once at construction
-        // from config, so this should be unreachable in practice.
         search_radius = system.get_physical_cutoff() + 2.0;
         if (is_rank_zero()) {
             std::cerr << "[CUDA] WARNING: invalid neighbor cutoff metadata; using fallback cutoff="
@@ -3239,8 +2785,6 @@ void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
         }
     }
     
-    // Build only the rank-local spatial tile graph. CUDA no longer allocates
-    // or constructs an atom-CSR neighbor list.
     const Real physical_cutoff = system.get_physical_cutoff();
     const Real verlet_skin = std::max<Real>(0.0, search_radius - physical_cutoff);
     launch_cuda_tile_list_build(
@@ -3264,11 +2808,9 @@ void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
             "CUDA spatial tile-list construction failed; atom-CSR fallback has been removed");
     }
 
-    if (tile_graph_ready) log_tile_graph_stats(local_particles);
     graph_dirty_ = true;
     nlist_dirty_ = true;
 
-    // Save reference positions for displacement tracking (LOCAL particles only)
     CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, local_particles * sizeof(Real), 
                                cudaMemcpyDeviceToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_y_ref, d_y, local_particles * sizeof(Real), 
@@ -3292,12 +2834,8 @@ void ForceCalculatorCUDA::download_from_device(MDSystem& system) {
         return;
     }
     
-    // CRITICAL FIX: Ensure all GPU operations are complete before downloading
-    // This is especially important when output_freq > 1, as multiple steps
-    // of computation may have occurred since the last download
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     
-    // Download only requested data (positions, velocities, forces)
     CUDA_CHECK(cudaMemcpyAsync(particles.x.data(), d_x, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(particles.y.data(), d_y, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(particles.z.data(), d_z, num_particles * sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
@@ -3312,18 +2850,13 @@ void ForceCalculatorCUDA::download_from_device(MDSystem& system) {
     CUDA_CHECK(cudaMemcpyAsync(particles.type.data(), d_type, num_particles * sizeof(int), cudaMemcpyDeviceToHost, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(particles.global_id.data(), d_global_id, num_particles * sizeof(int), cudaMemcpyDeviceToHost, force_stream));
     
-    // Download energies
     Real h_potential_energy = 0.0;
     CUDA_CHECK(cudaMemcpyAsync(&h_potential_energy, d_potential_energy, sizeof(Real), cudaMemcpyDeviceToHost, force_stream));
     
-    // Synchronize to ensure all downloads complete
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     last_potential_energy = h_potential_energy;
 }
 
-// NEW: Update reference positions on device after neighbor list rebuild
-// This is critical for GPU-resident architecture to track particle displacements
-// without copying data to host
 void ForceCalculatorCUDA::update_reference_positions_on_device(size_t num_local_particles) {
     if (!device_data_initialized) {
         if (is_rank_zero()) {
@@ -3332,8 +2865,6 @@ void ForceCalculatorCUDA::update_reference_positions_on_device(size_t num_local_
         return;
     }
     
-    // Copy current positions to reference positions (Device-to-Device, no host involved)
-    // This resets the displacement tracking for the next neighbor list rebuild check
     CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, num_local_particles * sizeof(Real), 
                                cudaMemcpyDeviceToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_y_ref, d_y, num_local_particles * sizeof(Real), 
@@ -3342,7 +2873,6 @@ void ForceCalculatorCUDA::update_reference_positions_on_device(size_t num_local_
                                cudaMemcpyDeviceToDevice, force_stream));
 }
 
-// NEW: Upload forces from host to device (for Python/ML force integration)
 void ForceCalculatorCUDA::upload_forces_to_device(const ParticleData& particles, size_t num_particles) {
     if (!device_data_initialized) {
         if (is_rank_zero()) {
@@ -3351,7 +2881,6 @@ void ForceCalculatorCUDA::upload_forces_to_device(const ParticleData& particles,
         return;
     }
     
-    // Validate sizes
     if (particles.fx.size() < num_particles || 
         particles.fy.size() < num_particles || 
         particles.fz.size() < num_particles) {
@@ -3361,7 +2890,6 @@ void ForceCalculatorCUDA::upload_forces_to_device(const ParticleData& particles,
         return;
     }
     
-    // Upload force arrays from host to device
     CUDA_CHECK(cudaMemcpyAsync(d_fx, particles.fx.data(), num_particles * sizeof(Real), 
                                cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_fy, particles.fy.data(), num_particles * sizeof(Real), 
@@ -3369,21 +2897,14 @@ void ForceCalculatorCUDA::upload_forces_to_device(const ParticleData& particles,
     CUDA_CHECK(cudaMemcpyAsync(d_fz, particles.fz.data(), num_particles * sizeof(Real), 
                                cudaMemcpyHostToDevice, force_stream));
     
-    // Synchronize to ensure upload completes before force is used in integrator
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MLP-efficient helpers: positions D→H  and  forces H→D
-// These use the existing force_stream so no extra synchronization is required
-// between the integration kernel and the ML inference call.
-// ─────────────────────────────────────────────────────────────────────────────
 
 void ForceCalculatorCUDA::download_positions_for_ml(ParticleData& particles,
                                                      size_t num_particles) {
     if (!device_data_initialized) return;
 
-    // Ensure the integration kernel has finished writing d_x/y/z
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
 
     CUDA_CHECK(cudaMemcpyAsync(particles.x.data(), d_x,
@@ -3429,9 +2950,6 @@ void ForceCalculatorCUDA::download_forces_for_ml(ParticleData& particles,
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
 }
 
-// Register host position & force vectors as CUDA pinned (page-locked) memory.
-// DMA engines can then transfer directly without an intermediate staging buffer,
-// giving ~2× bandwidth for small-to-medium systems.
 void ForceCalculatorCUDA::register_ml_pinned_buffers(ParticleData& particles,
                                                        size_t num_particles) {
     if (ml_buffers_pinned) return;  // already done
@@ -3472,8 +2990,6 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     size_t num_particles = system.get_num_particles();
     size_t local_particles = system.get_local_particles();
     
-    // GPU-resident architecture: NO per-step Host→Device copy
-    // Data should already be on GPU from initial_upload_to_device()
     if (!device_data_initialized) {
         if (is_rank_zero()) {
             std::cerr << "ERROR: GPU data not initialized. Call initial_upload_to_device() first." << std::endl;
@@ -3481,24 +2997,18 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
         return;
     }
 
-    // Clear forces on GPU
     int num_blocks = (num_particles + block_size - 1) / block_size;
     clear_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(d_fx, d_fy, d_fz, num_particles);
 
-    // Reset energies and virial on GPU
     CUDA_CHECK(cudaMemsetAsync(d_potential_energy, 0, sizeof(Real), force_stream));
     CUDA_CHECK(cudaMemsetAsync(d_virial, 0, sizeof(Real), force_stream));  // NEW: reset virial
-    // PME runs on a second stream.  It may overlap the real-space kernels,
-    // but must never race the buffer clears above.
     CUDA_CHECK(cudaEventRecord(force_clear_event_, force_stream));
     
-    // Get force field configuration
     ForceManager& force_manager = system.get_force_manager();
     const auto& force_config = force_manager.get_config();
     ForceFieldParams& params = system.get_ff_params();
     SimulationBox& box = system.get_box();
     
-    // Box parameters for periodic boundary conditions
     Real box_x = box.lx;
     Real box_y = box.ly;
     Real box_z = box.lz;
@@ -3509,18 +3019,6 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     Real physical_cutoff = system.get_physical_cutoff();
     Real cutoff_sq = physical_cutoff * physical_cutoff;
 
-    // PERF FIX: compute_lj_forces_kernel/compute_lj_forces_tiled_kernel/
-    // compute_lj_electrostatic_forces_kernel used to each recompute
-    // switch_sq/cutoff_delta/denom (with a division) from switch_distance
-    // INSIDE the kernel, i.e. redundantly on every GPU thread for every
-    // accepted pair -- despite switch_distance/cutoff being uniform across
-    // the entire launch (same CPU-side bug this mirrors: see
-    // ForceCalculatorCPU::compute_nonbonded_forces_tiled's identical fix).
-    // Unlike a uniformly-taken branch (no warp divergence since every thread
-    // agrees on the outcome), a redundant per-thread division is real
-    // wasted ALU/FPU throughput regardless of divergence, so this is worth
-    // hoisting to the host and passing down as an extra kernel argument
-    // (multiply by the precomputed reciprocal instead of dividing).
     Real switch_sq = 0.0, inv_denom = 0.0;
     if (params.lj_switch_distance > 0.0) {
         switch_sq = params.lj_switch_distance * params.lj_switch_distance;
@@ -3528,15 +3026,8 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
         inv_denom = 1.0 / (cutoff_delta * cutoff_delta * cutoff_delta);
     }
 
-    // Launch kernels based on configuration
     num_blocks = (local_particles + block_size - 1) / block_size;
 
-    // Diagnostic per-component force timing (set_timing_breakdown_enabled(),
-    // wired to MD_TIMING_TRACE_FORCE=1 in MDSimulation). Markers are plain
-    // cudaEventRecord calls on force_stream -- no extra synchronization, so
-    // enabling this does not perturb the deliberate LJ/PME stream overlap.
-    // All elapsed times are read back at the single cudaStreamSynchronize()
-    // this function already does below for the energy/virial download.
     if (timing_breakdown_enabled_ && !force_timing_events_ready_) {
         CUDA_CHECK(cudaEventCreate(&force_timing_event_start_));
         CUDA_CHECK(cudaEventCreate(&force_timing_event_bonded_));
@@ -3569,15 +3060,10 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
         CUDA_CHECK(cudaEventRecord(force_timing_event_bonded_, force_stream));
     }
 
-    // The graph is shared by the classical nonbonded kernel and LibTorch.
-    // Refresh it once here (only when its nested-Verlet displacement bound is
-    // exhausted) before either consumer runs.
     if (nonbonded_kernel_ == "graph") {
         ensure_graph_on_device(system);
     }
 
-    // LibTorch MLIP is a force component, not an exclusive replacement.
-    // Built-in contributions above/below and MLIP forces therefore accumulate.
     const bool ran_mlip = mlip_runtime_enabled_;
     if (mlip_runtime_enabled_) {
         compute_mlip_runtime_forces(system);
@@ -3599,14 +3085,6 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
         throw std::runtime_error("CUDA graph nonbonded force requested without a directed device CSR");
     }
 
-    // PERF FIX: when both LJ and Coulomb are enabled (the common case --
-    // e.g. apoa1), fuse them into one tile-pair traversal instead of two --
-    // see compute_nonbonded_forces_tiled_kernel's doc comment for why
-    // (duplicate distance/minimum-image/exclusion work otherwise paid
-    // twice, plus double the atomics). ensure_ewald_initialized() is called
-    // explicitly here since the fused path skips compute_electrostatic_
-    // forces_real_space() (which would otherwise call it) but still needs
-    // ewald_alpha_ for the Coulomb term below.
     const bool use_fused_nonbonded = ran_lj && ran_electrostatic_cfg;
     if (use_fused_nonbonded) {
         ensure_ewald_initialized(system);
@@ -3665,9 +3143,6 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
             d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
             d_fx, d_fy, d_fz, local_particles);
     } else if (ran_lj) {
-        // Fixed-point scratch buffers: cleared right before the racy kernel,
-        // flushed into the double d_fx/d_fy/d_fz buffers right after -- see
-        // atomicAddFixed/flush_fixed_forces_kernel above for why.
         CUDA_CHECK(cudaMemsetAsync(d_force_fixed_x_, 0, local_particles * sizeof(long long), force_stream));
         CUDA_CHECK(cudaMemsetAsync(d_force_fixed_y_, 0, local_particles * sizeof(long long), force_stream));
         CUDA_CHECK(cudaMemsetAsync(d_force_fixed_z_, 0, local_particles * sizeof(long long), force_stream));
@@ -3702,19 +3177,8 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     }
     if (time_components) {
         CUDA_CHECK(cudaEventRecord(force_timing_event_lj_, force_stream));
-        // NOTE: do NOT synchronize here. This function is followed by the
-        // electrostatic (PME) dispatch, which deliberately overlaps its own
-        // grid-construction work on pme_stream_ with whatever's still
-        // finishing on force_stream (see compute_electrostatic_forces_
-        // reciprocal's comment: "PME grid construction and the real-space
-        // pair kernels still overlap"). Synchronizing here would serialize
-        // LJ and PME instead of letting them overlap.
     }
 
-    // Electrostatic forces: tile-pair real-space Ewald (skipped here when
-    // use_fused_nonbonded already computed it above, combined with LJ)
-    // plus reciprocal PME (always separate -- it isn't a per-pair/tile
-    // computation).
     const bool ran_electrostatic = ran_electrostatic_cfg;
     if (graph_mode && ran_electrostatic) {
         compute_electrostatic_forces_reciprocal(system);
@@ -3734,9 +3198,6 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
         CUDA_CHECK(cudaEventRecord(force_timing_event_special_, force_stream));
     }
 
-    // GPU-resident: NO automatic download
-    // Forces remain on GPU for integrator to use
-    // Only download energies and virial for reporting/barostat
     Real h_potential_energy = 0.0;
     Real h_virial = 0.0;
     CUDA_CHECK(cudaMemcpyAsync(&h_potential_energy, d_potential_energy, sizeof(Real), 
@@ -3744,7 +3205,6 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
     CUDA_CHECK(cudaMemcpyAsync(&h_virial, d_virial, sizeof(Real), 
                          cudaMemcpyDeviceToHost, force_stream));  // NEW: download virial
     
-    // Single synchronization point - wait for both kernel and memcpy to complete
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     last_potential_energy = h_potential_energy;
     last_virial = h_virial;  // NEW: store virial
@@ -3767,23 +3227,18 @@ void ForceCalculatorCUDA::compute_forces(MDSystem& system) {
         add_component("special_pairs", force_timing_event_special_, ran_special);
     }
 
-    // Keep virial rank-local: MDSimulation performs the collective at the point
-    // where pressure is needed.  Returning a global virial here caused a second
-    // Allreduce in the barostat and multiplied it by the MPI world size.
     Real global_potential_energy = 0.0;
     MPI_Allreduce(&last_potential_energy, &global_potential_energy,
-                  1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+                  1, MPI_DOUBLE, MPI_SUM, PmePpSplit::instance().pp_comm());
     last_potential_energy = global_potential_energy;
 }
 
 void ForceCalculatorCUDA::compute_bond_forces(MDSystem& system) {
-    // GPU-resident strategy: topology is already on device, no malloc/free per step
     if (num_bonds_cached == 0) return;  // No bonds
     
     size_t local_particles = system.get_local_particles();
     SimulationBox& box = system.get_box();
     
-    // Launch kernel using cached device pointers (NO malloc/copy/free!)
     int num_blocks = (num_bonds_cached + block_size - 1) / block_size;
     compute_bond_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
@@ -3798,13 +3253,11 @@ void ForceCalculatorCUDA::compute_bond_forces(MDSystem& system) {
 }
 
 void ForceCalculatorCUDA::compute_angle_forces(MDSystem& system) {
-    // GPU-resident strategy: topology is already on device
     if (num_angles_cached == 0) return;  // No angles
     
     size_t local_particles = system.get_local_particles();
     SimulationBox& box = system.get_box();
     
-    // Launch kernel using cached device pointers (NO malloc/copy/free!)
     int num_blocks = (num_angles_cached + block_size - 1) / block_size;
     compute_angle_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
@@ -3820,14 +3273,11 @@ void ForceCalculatorCUDA::compute_angle_forces(MDSystem& system) {
 }
 
 void ForceCalculatorCUDA::compute_dihedral_forces(MDSystem& system) {
-    // GPU-resident strategy: topology is already on device
-    // Now with FULL CUDA implementation (no longer skipped!)
     if (num_dihedrals_cached == 0) return;  // No dihedrals
     
     size_t local_particles = system.get_local_particles();
     SimulationBox& box = system.get_box();
     
-    // Launch kernel using cached device pointers
     int num_blocks = (num_dihedrals_cached + block_size - 1) / block_size;
     compute_dihedral_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
         d_x, d_y, d_z, d_fx, d_fy, d_fz,
@@ -3896,9 +3346,7 @@ void ForceCalculatorCUDA::compute_special_pair_forces(MDSystem& system) {
 void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
 
-    // GPU-resident: velocities and masses already on device
     if (!device_data_initialized) {
-        // Self-heal startup ordering issues by uploading once on first KE request.
         initial_upload_to_device(system);
         if (!device_data_initialized) {
             if (is_rank_zero()) {
@@ -3912,15 +3360,13 @@ void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
         last_kinetic_energy = 0.0;
         Real local_ke = 0.0;
         Real global_ke = 0.0;
-        MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, PmePpSplit::instance().pp_comm());
         last_kinetic_energy = global_ke;
         return;
     }
 
-    // Reset kinetic energy on GPU
     CUDA_CHECK(cudaMemsetAsync(d_kinetic_energy, 0, sizeof(Real), force_stream));
 
-    // Launch kernel with shared memory
     int num_blocks = (local_particles + block_size - 1) / block_size;
     size_t shared_mem_size = block_size * sizeof(Real);
 
@@ -3928,7 +3374,6 @@ void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
         d_vx, d_vy, d_vz, d_mass, d_kinetic_energy, local_particles
     );
 
-    // Download result to host
     Real h_kinetic_energy = 0.0;
     CUDA_CHECK(cudaMemcpyAsync(&h_kinetic_energy, d_kinetic_energy, sizeof(Real), 
                          cudaMemcpyDeviceToHost, force_stream));
@@ -3936,10 +3381,9 @@ void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
     
     last_kinetic_energy = h_kinetic_energy;
 
-    // MPI reduction for kinetic energy
     Real local_ke = last_kinetic_energy;
     Real global_ke = 0.0;
-    MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, PmePpSplit::instance().pp_comm());
     last_kinetic_energy = global_ke;
 }
 
@@ -3954,15 +3398,12 @@ void ForceCalculatorCUDA::integrate_on_device(MDSystem& system, Real dt, const s
     size_t local_particles = system.get_local_particles();
     SimulationBox& box = system.get_box();
     
-    // Call appropriate integrator kernel based on type
     if (integrator_type == "verlet" || integrator_type == "velocity_verlet") {
-        // Velocity Verlet Step 1: position update + half-step velocity update
         launch_vv_step1_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
                               d_fx, d_fy, d_fz, d_mass, dt, local_particles,
                               box.lx, box.ly, box.lz,
                               box.periodic_x, box.periodic_y, box.periodic_z);
     } else if (integrator_type == "leap_frog" || integrator_type == "leapfrog") {
-        // Leap-frog: position update using half-step-ahead velocities
         launch_leap_frog_kernel(d_x, d_y, d_z, d_vx, d_vy, d_vz,
                                d_fx, d_fy, d_fz, d_mass, dt, local_particles,
                                box.lx, box.ly, box.lz,
@@ -3990,13 +3431,10 @@ void ForceCalculatorCUDA::complete_velocity_update_on_device(MDSystem& system, R
     
     size_t local_particles = system.get_local_particles();
     
-    // Call appropriate velocity update kernel based on type
     if (integrator_type == "verlet" || integrator_type == "velocity_verlet") {
-        // Velocity Verlet Step 2: second half-step velocity update
         launch_vv_step2_kernel(d_vx, d_vy, d_vz, d_fx, d_fy, d_fz,
                               d_mass, dt, local_particles);
     } else if (integrator_type == "leap_frog" || integrator_type == "leapfrog") {
-        // Leap-frog: full timestep velocity update
         launch_leap_frog_velocity_update_kernel(d_vx, d_vy, d_vz,
                                                d_fx, d_fy, d_fz,
                                                d_mass, dt, local_particles);
@@ -4010,9 +3448,7 @@ void ForceCalculatorCUDA::complete_velocity_update_on_device(MDSystem& system, R
     }
 }
 
-// ==================== GPU-resident Neighbor List Management ====================
 
-// Helper: atomic max for Real (double or float) - must be declared before use
 __device__ inline void atomicMax_real(Real* address, Real val) {
     if constexpr (sizeof(Real) == sizeof(double)) {
         unsigned long long* address_as_ull = reinterpret_cast<unsigned long long*>(address);
@@ -4035,21 +3471,6 @@ __device__ inline void atomicMax_real(Real* address, Real val) {
     }
 }
 
-// ============================================================================
-// SHAKE / RATTLE distance constraints (GPU-resident)
-//
-// One thread per constraint, corrections applied via atomicAdd rather than
-// a plain read-modify-write: an atom (e.g. a water oxygen) can appear in
-// more than one constraint processed by different threads in the SAME
-// kernel launch, so a direct += would race. Each launch is therefore one
-// Jacobi sweep (every correction computed from the position/velocity state
-// at launch entry, then applied atomically) rather than the CPU
-// ConstraintSolver's sequential Gauss-Seidel sweep -- both converge to the
-// same fixed point, Jacobi typically needs a few more iterations for
-// tightly-coupled constraint clusters. See ConstraintSolver::apply_shake /
-// apply_rattle (include/constraint_solver.h) for the scalar derivation this
-// mirrors exactly.
-// ============================================================================
 
 __global__ void shake_iteration_kernel(
     Real* x, Real* y, Real* z,
@@ -4072,7 +3493,6 @@ __global__ void shake_iteration_kernel(
     size_t i = constraint_atom1[idx];
     size_t j = constraint_atom2[idx];
 
-    // MPI ownership rule: same convention as bonds (a direct atom-pair term).
     bool i_is_local = (i < local_particles);
     bool j_is_local = (j < local_particles);
     if (!i_is_local && !j_is_local) return;
@@ -4093,9 +3513,6 @@ __global__ void shake_iteration_kernel(
     atomicMax_real(max_relative_error, fabs(diff) / d2);
     if (fabs(diff) / d2 < position_tolerance) return;
 
-    // Reference direction: the bond vector *before* this step's unconstrained
-    // position update -- makes this a linear correction per sweep instead of
-    // a nonlinear solve (classic SHAKE).
     Real ox = pre_x[i] - pre_x[j];
     Real oy = pre_y[i] - pre_y[j];
     Real oz = pre_z[i] - pre_z[j];
@@ -4117,7 +3534,6 @@ __global__ void shake_iteration_kernel(
     atomicAdd(&y[j],  corr_y * inv_mj);
     atomicAdd(&z[j],  corr_z * inv_mj);
 
-    // Keep v(t+dt/2) consistent with the corrected displacement.
     atomicAdd(&vx[i], -corr_x * inv_mi * inv_dt);
     atomicAdd(&vy[i], -corr_y * inv_mi * inv_dt);
     atomicAdd(&vz[i], -corr_z * inv_mi * inv_dt);
@@ -4163,7 +3579,6 @@ __global__ void rattle_iteration_kernel(
     Real dvy = vy[i] - vy[j];
     Real dvz = vz[i] - vz[j];
 
-    // d/dt |r_i - r_j|^2 = 2 (r_ij . v_ij); must be zero on the constraint manifold.
     Real k_dot = dx * dvx + dy * dvy + dz * dvz;
     atomicMax_real(max_error, fabs(k_dot));
     if (fabs(k_dot) < velocity_tolerance) return;
@@ -4193,10 +3608,6 @@ void ForceCalculatorCUDA::ensure_constraint_scratch_capacity(size_t n) {
 
 void ForceCalculatorCUDA::snapshot_constraint_positions(MDSystem& system) {
     if (num_constraints_cached == 0) return;
-    // Sized to the FULL local+ghost particle count: a constraint's
-    // non-owning atom can be a ghost slot, exactly like bonds, so this must
-    // cover every index apply_shake_on_device might read, not just the
-    // local prefix.
     const size_t n = system.get_num_particles();
     ensure_constraint_scratch_capacity(n);
     CUDA_CHECK(cudaMemcpyAsync(d_constraint_pre_x_, d_x, n * sizeof(Real),
@@ -4273,7 +3684,6 @@ bool ForceCalculatorCUDA::apply_rattle_on_device(MDSystem& system,
     return converged;
 }
 
-// CUDA kernel: Compute squared displacement for each particle and find maximum
 __global__ void compute_max_displacement_kernel(const Real* __restrict__ x, 
                                                 const Real* __restrict__ y, 
                                                 const Real* __restrict__ z,
@@ -4284,13 +3694,11 @@ __global__ void compute_max_displacement_kernel(const Real* __restrict__ x,
                                                 Real box_x, Real box_y, Real box_z,
                                                 bool periodic_x, bool periodic_y, bool periodic_z,
                                                 size_t n) {
-    // Shared memory for block-level reduction
     __shared__ Real s_max_disp[256];
     
     size_t tid = threadIdx.x;
     size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Each thread computes displacement for its particle
     Real local_max = 0.0;
     if (gid < n) {
         Real dx = x[gid] - x_ref[gid];
@@ -4316,7 +3724,6 @@ __global__ void compute_max_displacement_kernel(const Real* __restrict__ x,
     s_max_disp[tid] = local_max;
     __syncthreads();
     
-    // Block-level reduction to find maximum
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             s_max_disp[tid] = fmax(s_max_disp[tid], s_max_disp[tid + stride]);
@@ -4324,13 +3731,11 @@ __global__ void compute_max_displacement_kernel(const Real* __restrict__ x,
         __syncthreads();
     }
     
-    // First thread of each block writes block maximum to global memory
     if (tid == 0) {
         atomicMax_real(max_disp_sq, s_max_disp[0]);
     }
 }
 
-// Compute max displacement on GPU and return to host (single scalar transfer)
 Real ForceCalculatorCUDA::compute_max_displacement_on_device(size_t num_local_particles, const SimulationBox& box) {
     if (!device_data_initialized || !d_x || !d_x_ref) {
         return 0.0;  // No reference positions yet
@@ -4340,11 +3745,9 @@ Real ForceCalculatorCUDA::compute_max_displacement_on_device(size_t num_local_pa
         return 0.0;
     }
     
-    // Reset device max to zero
     Real zero = 0.0;
     CUDA_CHECK(cudaMemcpy(d_max_disp_sq, &zero, sizeof(Real), cudaMemcpyHostToDevice));
     
-    // Launch kernel to compute max displacement
     int threads = 256;
     int blocks = (num_local_particles + threads - 1) / threads;
     
@@ -4358,42 +3761,33 @@ Real ForceCalculatorCUDA::compute_max_displacement_on_device(size_t num_local_pa
     );
     CUDA_CHECK(cudaGetLastError());
     
-    // CRITICAL: Synchronize stream before downloading result
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     
-    // Download single scalar (only a few bytes)
     Real host_max_disp_sq = 0.0;
     CUDA_CHECK(cudaMemcpy(&host_max_disp_sq, d_max_disp_sq, sizeof(Real), cudaMemcpyDeviceToHost));
     
     return host_max_disp_sq;
 }
 
-// Append ghost particles to device arrays (after local particles)
 void ForceCalculatorCUDA::append_ghosts_to_device(MDSystem& system, size_t previous_local_count) {
     ParticleData& particles = system.get_particles();
     size_t total_particles = system.get_total_particles();
     
     if (total_particles <= previous_local_count) {
-        // No ghosts to append
         return;
     }
     
     size_t num_ghosts = total_particles - previous_local_count;
     
-    // Safety check: ensure device memory is large enough
     if (total_particles > allocated_particles) {
         if (is_rank_zero()) {
             std::cerr << "ERROR: append_ghosts_to_device: total_particles (" << total_particles 
                       << ") exceeds allocated_particles (" << allocated_particles << ")" << std::endl;
         }
-        // Reallocation invalidates every local device array.  Re-upload the
-        // complete local+ghost state; uploading only ghosts would leave the
-        // local prefix uninitialized.
         initial_upload_to_device(system);
         return;
     }
     
-    // Validate offset and size
     if (previous_local_count >= particles.x.size() || 
         previous_local_count + num_ghosts > particles.x.size()) {
         if (is_rank_zero()) {
@@ -4405,7 +3799,6 @@ void ForceCalculatorCUDA::append_ghosts_to_device(MDSystem& system, size_t previ
         return;
     }
     
-    // Upload ONLY ghost particles (append after local particles)
     size_t offset = previous_local_count;
     CUDA_CHECK(cudaMemcpyAsync(d_x + offset, particles.x.data() + offset, 
                                num_ghosts * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
@@ -4416,13 +3809,11 @@ void ForceCalculatorCUDA::append_ghosts_to_device(MDSystem& system, size_t previ
     CUDA_CHECK(cudaMemcpyAsync(d_type + offset, particles.type.data() + offset, 
                                num_ghosts * sizeof(int), cudaMemcpyHostToDevice, force_stream));
     
-    // Upload global_id for ghost particles (needed for force calculations)
     if (d_global_id && offset < particles.global_id.size()) {
         CUDA_CHECK(cudaMemcpyAsync(d_global_id + offset, particles.global_id.data() + offset,
                                    num_ghosts * sizeof(int), cudaMemcpyHostToDevice, force_stream));
     }
     
-    // Upload charge for ghost particles if electrostatics are enabled
     if (d_charge && offset < particles.charge.size()) {
         CUDA_CHECK(cudaMemcpyAsync(d_charge + offset, particles.charge.data() + offset, 
                                    num_ghosts * sizeof(Real), cudaMemcpyHostToDevice, force_stream));
@@ -4431,26 +3822,8 @@ void ForceCalculatorCUDA::append_ghosts_to_device(MDSystem& system, size_t previ
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
 }
 
-// ============================================================================
-// EWALD / PME ELECTROSTATICS
-//
-// Full Ewald summation = real-space (erfc-screened, neighbor list) +
-// reciprocal-space (B-spline charge spreading -> FFT -> Poisson solve ->
-// E-field -> inverse FFT -> force interpolation) + self-energy correction.
-// Parameters (alpha, grid size) are derived automatically from the physical
-// cutoff and box size; there is no direct-Coulomb-only fallback mode.
-//
-// TODO(ExaFMM): for multi-node runs the global 3D FFT below is the scaling
-// bottleneck (all-to-all communication). A future swap point is here: an
-// FMM-based reciprocal-space solve (e.g. ExaFMM) could replace the
-// spread/FFT/solve/interpolate sequence without touching the real-space or
-// self-energy terms.
-// ============================================================================
 
 namespace {
-// Bisection solve for the Ewald splitting parameter: find alpha such that
-// erfc(alpha * cutoff) == tolerance (standard real-space truncation error
-// criterion for Ewald/PME).
 Real ewald_solve_alpha(Real cutoff, Real tolerance) {
     Real lo = 1e-4, hi = 10.0 / cutoff;
     for (int iter = 0; iter < 100; ++iter) {
@@ -4460,8 +3833,6 @@ Real ewald_solve_alpha(Real cutoff, Real tolerance) {
     return 0.5 * (lo + hi);
 }
 
-// Smallest N >= minimum whose prime factors are only 2, 3, 5 (efficient for
-// both cuFFT and FFTW).
 int ewald_next_good_fft_size(int minimum) {
     if (minimum < 8) minimum = 8;
     for (int n = minimum; ; ++n) {
@@ -4473,9 +3844,6 @@ int ewald_next_good_fft_size(int minimum) {
     }
 }
 
-// B-spline structure-factor modulus |M(k)| for each of the `order` cardinal
-// B-spline knots, used to correct the Green's function for the charge
-// spreading interpolation (Essmann et al. 1995).
 std::vector<Real> ewald_compute_bspline_moduli(int grid_size_1d, int order) {
     std::vector<Real> b_mod(grid_size_1d);
     for (int k = 0; k < grid_size_1d; ++k) {
@@ -4509,8 +3877,6 @@ void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
     const Real k_coulomb = 332.0636;  // kcal/mol*Angstrom*e^-2, same unit system as LJ/CPU
 
     if (ewald_initialized_) {
-        // Box may change under NPT; grid size and alpha stay fixed, only the
-        // Green's-function prefactor (which depends on volume) is refreshed.
         ewald_prefactor_ = k_coulomb * 4.0 * M_PI / (box.lx * box.ly * box.lz);
         return;
     }
@@ -4519,10 +3885,6 @@ void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
     ewald_alpha_ = ewald_solve_alpha(cutoff, 1e-5);
     ewald_spline_order_ = 4;
 
-    // Grid spacing must resolve the reciprocal-space Gaussian width, which
-    // narrows as alpha grows: target alpha*h <= 0.25 (standard PME accuracy
-    // rule of thumb), capped at 1.0 Angstrom for small alpha/large boxes
-    // where that would be needlessly fine.
     const Real target_spacing = std::min(1.0, 0.25 / ewald_alpha_);
     ewald_grid_x_ = ewald_next_good_fft_size(static_cast<int>(ceil(box.lx / target_spacing)));
     ewald_grid_y_ = ewald_next_good_fft_size(static_cast<int>(ceil(box.ly / target_spacing)));
@@ -4581,10 +3943,6 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_ewald(MDSystem& system) {
     compute_electrostatic_forces_reciprocal(system);
 }
 
-// Real-space (near-field, erfc-screened) half of the Ewald sum, evaluated
-// over the existing neighbor list. Split out so compute_nonbonded_forces_
-// fused() can skip it (it does the equivalent work itself, combined with LJ
-// in one pass) while still sharing compute_electrostatic_forces_reciprocal().
 void ForceCalculatorCUDA::compute_electrostatic_forces_real_space(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
     size_t num_particles = system.get_num_particles();
@@ -4597,10 +3955,6 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_real_space(MDSystem& syst
     Real inv_box_x = 1.0/box_x, inv_box_y = 1.0/box_y, inv_box_z = 1.0/box_z;
 
     int num_blocks = (local_particles + block_size - 1) / block_size;
-    // Reuse the same fixed-point scratch buffers the LJ kernel used this
-    // step -- LJ and this kernel both run on force_stream, strictly
-    // sequentially, so LJ's flush has already completed by the time this
-    // clear runs.
     CUDA_CHECK(cudaMemsetAsync(d_force_fixed_x_, 0, local_particles * sizeof(long long), force_stream));
     CUDA_CHECK(cudaMemsetAsync(d_force_fixed_y_, 0, local_particles * sizeof(long long), force_stream));
     CUDA_CHECK(cudaMemsetAsync(d_force_fixed_z_, 0, local_particles * sizeof(long long), force_stream));
@@ -4627,11 +3981,6 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_real_space(MDSystem& syst
         d_fx, d_fy, d_fz, local_particles);
 }
 
-// Reciprocal-space (long-range, B-spline PME grid via cuFFT) part of the
-// Ewald sum, plus the self-energy correction. Split out of
-// compute_electrostatic_forces_ewald() so compute_nonbonded_forces_fused()
-// can call this on its own after the fused real-space pass, instead of going
-// through compute_electrostatic_forces_ewald()'s real-space call too.
 void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& system) {
     ensure_ewald_initialized(system);
 
@@ -4642,31 +3991,12 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
     Real inv_box_x = 1.0/system.get_box().lx, inv_box_y = 1.0/system.get_box().ly, inv_box_z = 1.0/system.get_box().lz;
     const Real k_coulomb = 332.0636;
 
-    // ---- Reciprocal-space (long-range) part on pme_stream_ ----
     const size_t grid_size =
         static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * ewald_grid_z_;
     const int grid_nzh = ewald_grid_z_ / 2 + 1;
     int blocks_grid = (grid_size + 255) / 256;
-    // Reciprocal-space grid operations (spread/interpolate/self-energy) must
-    // use LOCAL particles only: ghosts are periodic copies of atoms owned by
-    // other MPI ranks, and including them here would double-count charge
-    // density (each rank's real-space kernel already sees its neighbors'
-    // ghosts, but the reciprocal grid is a per-rank sum of owned charges).
     int blocks_particles = (local_particles + 255) / 256;
     const bool use_spatial_spread_order = d_tile_atoms && num_lj_tiles_ > 0;
-    // d_tile_atoms is allocated/populated with stride LJ_TILE_SIZE (see
-    // neighbor_list_kernels.cu), not a hardcoded 32 -- using the wrong
-    // stride here reads spread_work_items - num_lj_tiles_*LJ_CLUSTER_SIZE
-    // slots *past* the end of that array as bogus "particle indices" for
-    // pme_spread_charges_kernel, spreading garbage charge onto the PME grid
-    // and blowing up the reciprocal-space energy by many orders of
-    // magnitude while leaving forces comparatively unaffected (matches
-    // exactly what was observed: LJ tiled mode gave PE ~ +1.97e11 instead
-    // of the correct ~ -3.5e5, while CSR mode -- which never reads
-    // d_tile_atoms -- was correct). LJ_CLUSTER_SIZE (see
-    // compute_lj_forces_tiled_kernel above) must match LJ_TILE_SIZE in
-    // neighbor_list_kernels.cu; this is the same "no shared header for this
-    // constant" caveat noted there.
     const size_t spread_work_items = use_spatial_spread_order
         ? static_cast<size_t>(num_lj_tiles_) * LJ_CLUSTER_SIZE
         : local_particles;
@@ -4674,14 +4004,6 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
 
     pme_clear_grid_kernel<<<blocks_grid, 256, 0, pme_stream_>>>(d_pme_charge_grid_real_, grid_size);
 
-    // See pme_spread_charges_cluster_kernel above: unverified without
-    // Hopper-class hardware, so this path only fires when the user has
-    // explicitly opted in AND the running device actually reports compute
-    // capability >= 9.0 -- on any other GPU it silently falls back to the
-    // warp-aggregated kernel below, same as always.
-    // cudaLaunchKernelEx/cudaLaunchAttributeClusterDimension need CUDA 11.8+;
-    // guard on the toolkit version (this is ordinary host code, so
-    // __CUDA_ARCH__ is never defined here regardless of target GPU arch).
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11080
     if (pme_use_cluster_spread_ && device_supports_clusters_ && use_spatial_spread_order) {
         const int cluster_grid_blocks =
@@ -4689,13 +4011,6 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
 
         cudaLaunchConfig_t cluster_config = {};
         cluster_config.gridDim = dim3(cluster_grid_blocks, 1, 1);
-        // One block per tile, LJ_CLUSTER_SIZE (8) threads/block -- must match
-        // the tile stride in d_tile_atoms (see the spread_work_items fix
-        // above for the bug this exact mismatch caused when it was
-        // hardcoded to 32 after tiles shrank from 32 to LJ_CLUSTER_SIZE
-        // atoms). pme_spread_charges_cluster_kernel's internal shared-window
-        // clear/flush loops still cover the whole window correctly with a
-        // sub-warp block size, just with more loop iterations per thread.
         cluster_config.blockDim = dim3(LJ_CLUSTER_SIZE, 1, 1);
         cluster_config.stream = pme_stream_;
         cudaLaunchAttribute cluster_attr[1];
@@ -4705,11 +4020,6 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
         cluster_attr[0].val.clusterDim.z = 1;
         cluster_config.attrs = cluster_attr;
         cluster_config.numAttrs = 1;
-        // cudaLaunchKernelEx's variadic forwarding takes the address of each
-        // argument to build its void* arg array, which fails to compile for
-        // a const-qualified argument (const T* won't convert to void*).
-        // spread_work_items is declared const above, so pass an explicit
-        // non-const rvalue copy here instead of the const lvalue directly.
         CUDA_CHECK(cudaLaunchKernelEx(&cluster_config, pme_spread_charges_cluster_kernel,
             d_x, d_y, d_z, d_charge, d_pme_charge_grid_real_,
             d_tile_atoms, static_cast<size_t>(spread_work_items),
@@ -4728,42 +4038,108 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
         );
     }
 
-    // Out-of-place real-to-complex forward transform: the real spread grid
-    // is left untouched (unused for the rest of this step), output is the
-    // half-spectrum rho(k).
-    CUFFT_CHECK(cufftExecD2Z(pme_fft_plan_forward_, d_pme_charge_grid_real_, d_pme_charge_grid_freq_));
+    PmePpSplit& split = PmePpSplit::instance();
+    if (split.active()) {
+        // Dedicated PME group: send this step's box dims first (NPT-safe,
+        // matches PmeServerCuda::step()'s receiving broadcast), then hand the
+        // locally-spread charge grid off to the PME group instead of running
+        // the FFT/solve/inverse-FFT locally -- host-staged, see
+        // force_calculator_cuda.h's PmeServerCuda comment for why this isn't
+        // GPU-aware MPI in this pass.
+        int pp_rank = 0;
+        MPI_Comm_rank(split.pp_comm(), &pp_rank);
+        const int pp_leader_root = (pp_rank == 0) ? MPI_ROOT : MPI_PROC_NULL;
+        SimulationBox& box = system.get_box();
+        Real box_dims[3] = {box.lx, box.ly, box.lz};
+        MPI_Bcast(box_dims, 3, MPI_DOUBLE, pp_leader_root, split.inter_comm());
 
-    dim3 grid_blocks((ewald_grid_x_ + 7) / 8, (ewald_grid_y_ + 7) / 8, (grid_nzh + 7) / 8);
-    dim3 threads(8, 8, 8);
-    // Poisson solve turns the charge density rho(k) into the potential
-    // Phi(k) in place, and atomically accumulates reciprocal-space energy
-    // directly into d_potential_energy (k_coulomb folded into ewald_prefactor_).
-    pme_solve_poisson_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
-        d_pme_charge_grid_freq_,
-        d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
-        d_potential_energy, ewald_prefactor_, ewald_alpha_,
-        ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
-        inv_box_x, inv_box_y, inv_box_z
-    );
+        if (pme_split_host_grid_buffer_.size() != grid_size) {
+            pme_split_host_grid_buffer_.assign(grid_size, 0.0);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(pme_split_host_grid_buffer_.data(), d_pme_charge_grid_real_,
+                                   grid_size * sizeof(Real), cudaMemcpyDeviceToHost, pme_stream_));
+        CUDA_CHECK(cudaStreamSynchronize(pme_stream_));
 
-    if (d_virial) {
-        pme_reciprocal_virial_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
+        // Same intercomm protocol regardless of PME group size: a PME group
+        // of more than one rank (always the CPU FFTW-MPI fallback here, see
+        // MDSimulation::initialize_impl -- no cuFFTMp/NVSHMEM support)
+        // funnels through its own leader internally
+        // (PmeServer::step_distributed()'s intracommunicator Scatterv/
+        // Gatherv), so this PP rank doesn't need to know per-PME-rank slab
+        // layout. This replaced an earlier design using MPI_Reduce_scatter/
+        // MPI_Allgatherv directly on the intercomm here, which segfaulted
+        // inside OpenMPI's coll/basic reduce_scatter_inter in real testing.
+        Real energy_virial[2] = {0.0, 0.0};
+        {
+            MPI_Request req;
+            MPI_Ireduce(pme_split_host_grid_buffer_.data(), nullptr, static_cast<int>(grid_size),
+                        MPI_DOUBLE, MPI_SUM, /*root in remote (PME) group*/ 0,
+                        split.inter_comm(), &req);
+            MPI_Wait(&req, MPI_STATUS_IGNORE);
+
+            MPI_Bcast(pme_split_host_grid_buffer_.data(), static_cast<int>(grid_size), MPI_DOUBLE,
+                      0, split.inter_comm());
+            MPI_Bcast(energy_virial, 2, MPI_DOUBLE, 0, split.inter_comm());
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(d_pme_charge_grid_real_, pme_split_host_grid_buffer_.data(),
+                                   grid_size * sizeof(Real), cudaMemcpyHostToDevice, pme_stream_));
+
+        // d_potential_energy/d_virial already hold this step's LJ + real-space
+        // Coulomb contributions (accumulated earlier in compute_forces) --
+        // fold the PME group's reciprocal contribution in via a host round
+        // trip rather than a new kernel, since it's a single scalar add.
+        Real host_pe = 0.0, host_virial = 0.0;
+        CUDA_CHECK(cudaMemcpyAsync(&host_pe, d_potential_energy, sizeof(Real),
+                                   cudaMemcpyDeviceToHost, pme_stream_));
+        if (d_virial) {
+            CUDA_CHECK(cudaMemcpyAsync(&host_virial, d_virial, sizeof(Real),
+                                       cudaMemcpyDeviceToHost, pme_stream_));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(pme_stream_));
+        host_pe += energy_virial[0];
+        host_virial += energy_virial[1];
+        CUDA_CHECK(cudaMemcpyAsync(d_potential_energy, &host_pe, sizeof(Real),
+                                   cudaMemcpyHostToDevice, pme_stream_));
+        if (d_virial) {
+            CUDA_CHECK(cudaMemcpyAsync(d_virial, &host_virial, sizeof(Real),
+                                       cudaMemcpyHostToDevice, pme_stream_));
+        }
+    } else {
+        // Legacy path (no PP/PME split configured): every rank runs its own
+        // full FFT/solve/inverse-FFT against ONLY its own local atoms' charge
+        // grid, with no cross-rank charge-density reduction at all. This is
+        // a pre-existing limitation, unchanged here -- correct for
+        // single-rank runs, but NOT a physically correct multi-rank PME
+        // reciprocal-space solve (see force_calculator_cuda.h's
+        // PmeServerCuda comment). Set force_calculation.pme_ranks: 1 for a
+        // correct multi-rank CUDA PME run instead of relying on this path.
+        CUFFT_CHECK(cufftExecD2Z(pme_fft_plan_forward_, d_pme_charge_grid_real_, d_pme_charge_grid_freq_));
+
+        dim3 grid_blocks((ewald_grid_x_ + 7) / 8, (ewald_grid_y_ + 7) / 8, (grid_nzh + 7) / 8);
+        dim3 threads(8, 8, 8);
+        pme_solve_poisson_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
             d_pme_charge_grid_freq_,
             d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
-            d_virial, ewald_prefactor_, ewald_alpha_,
+            d_potential_energy, ewald_prefactor_, ewald_alpha_,
             ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
             inv_box_x, inv_box_y, inv_box_z
         );
+
+        if (d_virial) {
+            pme_reciprocal_virial_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
+                d_pme_charge_grid_freq_,
+                d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+                d_virial, ewald_prefactor_, ewald_alpha_,
+                ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
+                inv_box_x, inv_box_y, inv_box_z
+            );
+        }
+
+        CUFFT_CHECK(cufftExecZ2D(pme_fft_plan_inverse_, d_pme_charge_grid_freq_,
+                                 d_pme_charge_grid_real_));
     }
 
-    // Bring Phi(k) back once.  The real spread grid is dead after the forward
-    // transform, so reuse it for Phi(r) and avoid three field grids entirely.
-    CUFFT_CHECK(cufftExecZ2D(pme_fft_plan_inverse_, d_pme_charge_grid_freq_,
-                             d_pme_charge_grid_real_));
-
-    // Serialize only the final force gather with the force stream.  PME grid
-    // construction and the real-space pair kernels still overlap, while the
-    // ordered += below needs neither atomics nor a second force buffer.
     CUDA_CHECK(cudaEventRecord(pme_grid_ready_event_, pme_stream_));
     CUDA_CHECK(cudaStreamWaitEvent(force_stream, pme_grid_ready_event_, 0));
     pme_interpolate_forces_kernel<<<blocks_particles, 256, 0, force_stream>>>(
@@ -4775,7 +4151,6 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
         ewald_spline_order_, local_particles
     );
 
-    // ---- Self-energy correction (local particles only, see note above) ----
     pme_self_energy_kernel<<<blocks_particles, 256, 0, pme_stream_>>>(
         d_charge, d_potential_energy, k_coulomb, ewald_alpha_, local_particles
     );
@@ -4783,13 +4158,188 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
     CUDA_CHECK(cudaStreamSynchronize(pme_stream_));
 }
 
-// ============================================================================
-// C++ LibTorch MLIP support
-// ============================================================================
+// --- PmeServerCuda: dedicated PME-group side of a PP/PME rank split -------
+// Reuses the pme_*_kernel definitions above (same translation unit -- see
+// the class comment in force_calculator_cuda.h for why this can't live in
+// its own .cu file without CUDA_SEPARABLE_COMPILATION).
+
+PmeServerCuda::PmeServerCuda(PmePpSplit& split) : split_(split) {
+    box_.lx = box_.ly = box_.lz = 1.0;
+    box_.periodic_x = box_.periodic_y = box_.periodic_z = true;
+    box_.update_box_length();
+
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count <= 0) {
+        throw std::runtime_error("No CUDA device is visible (PmeServerCuda)");
+    }
+
+    MPI_Comm local_comm = MPI_COMM_NULL;
+    MPI_Comm_split_type(split_.pme_comm(), MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local_comm);
+    int local_rank = 0;
+    MPI_Comm_rank(local_comm, &local_rank);
+    device_id_ = local_rank % device_count;
+    MPI_Comm_free(&local_comm);
+    CUDA_CHECK(cudaSetDevice(device_id_));
+
+    CUDA_CHECK(cudaMalloc(&d_recip_energy_, sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_recip_virial_, sizeof(Real)));
+}
+
+PmeServerCuda::~PmeServerCuda() {
+    free_resources();
+    if (d_recip_energy_) { cudaFree(d_recip_energy_); d_recip_energy_ = nullptr; }
+    if (d_recip_virial_) { cudaFree(d_recip_virial_); d_recip_virial_ = nullptr; }
+}
+
+void PmeServerCuda::ensure_initialized() {
+    const Real k_coulomb = 332.0636;
+
+    if (ewald_initialized_) {
+        ewald_prefactor_ = k_coulomb * 4.0 * M_PI / (box_.lx * box_.ly * box_.lz);
+        return;
+    }
+
+    ewald_alpha_ = ewald_solve_alpha(cutoff_, 1e-5);
+    ewald_spline_order_ = 4;
+
+    const Real target_spacing = std::min(1.0, 0.25 / ewald_alpha_);
+    ewald_grid_x_ = ewald_next_good_fft_size(static_cast<int>(ceil(box_.lx / target_spacing)));
+    ewald_grid_y_ = ewald_next_good_fft_size(static_cast<int>(ceil(box_.ly / target_spacing)));
+    ewald_grid_z_ = ewald_next_good_fft_size(static_cast<int>(ceil(box_.lz / target_spacing)));
+
+    const size_t grid_size =
+        static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * ewald_grid_z_;
+    const int grid_nzh = ewald_grid_z_ / 2 + 1;
+    const size_t grid_size_freq =
+        static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * grid_nzh;
+
+    CUDA_CHECK(cudaMalloc(&d_pme_charge_grid_real_, grid_size * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_charge_grid_freq_, grid_size_freq * sizeof(cufftDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_x_, ewald_grid_x_ * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_y_, ewald_grid_y_ * sizeof(Real)));
+    CUDA_CHECK(cudaMalloc(&d_pme_b_spline_mod_z_, ewald_grid_z_ * sizeof(Real)));
+
+    CUFFT_CHECK(cufftPlan3d(&pme_fft_plan_forward_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, CUFFT_D2Z));
+    CUFFT_CHECK(cufftPlan3d(&pme_fft_plan_inverse_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, CUFFT_Z2D));
+    CUDA_CHECK(cudaStreamCreate(&pme_stream_));
+    CUFFT_CHECK(cufftSetStream(pme_fft_plan_forward_, pme_stream_));
+    CUFFT_CHECK(cufftSetStream(pme_fft_plan_inverse_, pme_stream_));
+
+    std::vector<Real> bmx = ewald_compute_bspline_moduli(ewald_grid_x_, ewald_spline_order_);
+    std::vector<Real> bmy = ewald_compute_bspline_moduli(ewald_grid_y_, ewald_spline_order_);
+    std::vector<Real> bmz = ewald_compute_bspline_moduli(ewald_grid_z_, ewald_spline_order_);
+    CUDA_CHECK(cudaMemcpy(d_pme_b_spline_mod_x_, bmx.data(), bmx.size()*sizeof(Real), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pme_b_spline_mod_y_, bmy.data(), bmy.size()*sizeof(Real), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pme_b_spline_mod_z_, bmz.data(), bmz.size()*sizeof(Real), cudaMemcpyHostToDevice));
+
+    host_grid_buffer_.assign(grid_size, 0.0);
+
+    ewald_prefactor_ = k_coulomb * 4.0 * M_PI / (box_.lx * box_.ly * box_.lz);
+    ewald_initialized_ = true;
+
+    std::cout << "[Ewald/PME][PmeServerCuda] grid " << ewald_grid_x_ << "x" << ewald_grid_y_
+              << "x" << ewald_grid_z_ << ", alpha=" << ewald_alpha_
+              << " 1/A, spline_order=" << ewald_spline_order_
+              << ", cutoff=" << cutoff_ << " A (device " << device_id_ << ")" << std::endl;
+}
+
+void PmeServerCuda::free_resources() {
+    if (d_pme_charge_grid_real_) { cudaFree(d_pme_charge_grid_real_); d_pme_charge_grid_real_ = nullptr; }
+    if (d_pme_charge_grid_freq_) { cudaFree(d_pme_charge_grid_freq_); d_pme_charge_grid_freq_ = nullptr; }
+    if (d_pme_b_spline_mod_x_) { cudaFree(d_pme_b_spline_mod_x_); d_pme_b_spline_mod_x_ = nullptr; }
+    if (d_pme_b_spline_mod_y_) { cudaFree(d_pme_b_spline_mod_y_); d_pme_b_spline_mod_y_ = nullptr; }
+    if (d_pme_b_spline_mod_z_) { cudaFree(d_pme_b_spline_mod_z_); d_pme_b_spline_mod_z_ = nullptr; }
+    if (pme_fft_plan_forward_) { cufftDestroy(pme_fft_plan_forward_); pme_fft_plan_forward_ = 0; }
+    if (pme_fft_plan_inverse_) { cufftDestroy(pme_fft_plan_inverse_); pme_fft_plan_inverse_ = 0; }
+    if (pme_stream_) { cudaStreamDestroy(pme_stream_); pme_stream_ = nullptr; }
+    ewald_initialized_ = false;
+}
+
+void PmeServerCuda::run(int total_steps, Real cutoff) {
+    cutoff_ = cutoff;
+    for (int step_i = 0; step_i < total_steps; ++step_i) {
+        step();
+    }
+}
+
+void PmeServerCuda::step() {
+    MPI_Comm inter = split_.inter_comm();
+    const bool leader = split_.is_pme_leader();
+    const int leader_root = leader ? MPI_ROOT : MPI_PROC_NULL;
+
+    // Box dims from the PP group's leader every step (NPT-safe) -- matching
+    // MPI_Bcast issued from ForceCalculatorCUDA::pme_reciprocal_begin's split
+    // branch on the sending side, root = rank of the PP leader within pp_comm().
+    Real box_dims[3] = {box_.lx, box_.ly, box_.lz};
+    MPI_Bcast(box_dims, 3, MPI_DOUBLE, /*root in remote (PP) group*/ 0, inter);
+    box_.lx = box_dims[0];
+    box_.ly = box_dims[1];
+    box_.lz = box_dims[2];
+    box_.update_box_length();
+
+    ensure_initialized();
+
+    const size_t grid_size =
+        static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ * ewald_grid_z_;
+    if (host_grid_buffer_.size() != grid_size) {
+        host_grid_buffer_.assign(grid_size, 0.0);
+    }
+
+    // Host-staged reduce: PP ranks pack their own device grid into a host
+    // buffer before sending (see ForceCalculatorCUDA::pme_reciprocal_begin);
+    // this rank receives directly into host_grid_buffer_.
+    MPI_Request req;
+    MPI_Ireduce(nullptr, host_grid_buffer_.data(), static_cast<int>(grid_size),
+                MPI_DOUBLE, MPI_SUM, leader_root, inter, &req);
+    MPI_Wait(&req, MPI_STATUS_IGNORE);
+
+    Real recip_energy = 0.0, recip_virial = 0.0;
+    if (leader) {
+        CUDA_CHECK(cudaMemcpyAsync(d_pme_charge_grid_real_, host_grid_buffer_.data(),
+                                   grid_size * sizeof(Real), cudaMemcpyHostToDevice, pme_stream_));
+        CUDA_CHECK(cudaMemsetAsync(d_recip_energy_, 0, sizeof(Real), pme_stream_));
+        CUDA_CHECK(cudaMemsetAsync(d_recip_virial_, 0, sizeof(Real), pme_stream_));
+
+        CUFFT_CHECK(cufftExecD2Z(pme_fft_plan_forward_, d_pme_charge_grid_real_, d_pme_charge_grid_freq_));
+
+        const int grid_nzh = ewald_grid_z_ / 2 + 1;
+        dim3 grid_blocks((ewald_grid_x_ + 7) / 8, (ewald_grid_y_ + 7) / 8, (grid_nzh + 7) / 8);
+        dim3 threads(8, 8, 8);
+        const Real inv_box_x = 1.0/box_.lx, inv_box_y = 1.0/box_.ly, inv_box_z = 1.0/box_.lz;
+        pme_solve_poisson_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
+            d_pme_charge_grid_freq_,
+            d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+            d_recip_energy_, ewald_prefactor_, ewald_alpha_,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
+            inv_box_x, inv_box_y, inv_box_z);
+        pme_reciprocal_virial_kernel<<<grid_blocks, threads, 0, pme_stream_>>>(
+            d_pme_charge_grid_freq_,
+            d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+            d_recip_virial_, ewald_prefactor_, ewald_alpha_,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
+            inv_box_x, inv_box_y, inv_box_z);
+
+        CUFFT_CHECK(cufftExecZ2D(pme_fft_plan_inverse_, d_pme_charge_grid_freq_, d_pme_charge_grid_real_));
+
+        CUDA_CHECK(cudaMemcpyAsync(host_grid_buffer_.data(), d_pme_charge_grid_real_,
+                                   grid_size * sizeof(Real), cudaMemcpyDeviceToHost, pme_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(&recip_energy, d_recip_energy_, sizeof(Real),
+                                   cudaMemcpyDeviceToHost, pme_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(&recip_virial, d_recip_virial_, sizeof(Real),
+                                   cudaMemcpyDeviceToHost, pme_stream_));
+        CUDA_CHECK(cudaStreamSynchronize(pme_stream_));
+    }
+
+    MPI_Bcast(host_grid_buffer_.data(), static_cast<int>(grid_size), MPI_DOUBLE, leader_root, inter);
+
+    Real energy_virial[2] = {recip_energy, recip_virial};
+    MPI_Bcast(energy_virial, 2, MPI_DOUBLE, leader_root, inter);
+}
+
 
 void ForceCalculatorCUDA::pre_register_mlip_sources()
 {
-    // Delegate to bridge function which has full MLIP headers
     mlip_bridge_register_md_sources(static_cast<void*>(this));
 }
 
@@ -4812,15 +4362,12 @@ void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
     const int* nlist_neighbors = nlist.get_neighbors();
 
     if (nonbonded_kernel_ == "graph") {
-        // ensure_graph_on_device() already produced CSR and row-major COO in
-        // device memory.  Nothing is downloaded, repacked, or uploaded here.
         if (!d_graph_offsets_ || (num_edges_ > 0 && (!d_edge_src_ || !d_edge_dst_))) {
             throw std::runtime_error("GPU MLIP graph requested before device graph construction");
         }
         return;
     }
 
-    // Count upper bound for half-list edges
     int64_t E_upper = 0;
     for (size_t i = 0; i < num_local; ++i)
         E_upper += (nlist_offsets[i + 1] - nlist_offsets[i]);
@@ -4836,7 +4383,6 @@ void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
         CUDA_CHECK(cudaMalloc(&d_edge_coo_packed_, sizeof(int32_t) * cap_edges_ * 2));
     }
 
-    // Build TRUE half-list COO on host (j > i for local-local; all local-ghost)
     std::vector<int32_t> h_src(E_upper), h_dst(E_upper);
     int64_t e = 0;
     for (size_t i = 0; i < num_local; ++i) {
@@ -4851,7 +4397,6 @@ void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
             ++e;
         }
     }
-    // Deduplicate
     using Pair = std::pair<int32_t,int32_t>;
     std::vector<Pair> pairs(e);
     for (int64_t k = 0; k < e; ++k) pairs[k] = {h_src[k], h_dst[k]};
@@ -4864,7 +4409,6 @@ void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
     int64_t E_full = E_half * 2;
     num_edges_ = E_full;
 
-    // Grow tmp buffers if needed
     int64_t need_half = std::max(E_half, (int64_t)1);
     if (!d_tmp_edge_src_ || need_half > cap_edges_ / 2) {
         if (d_tmp_edge_src_) { CUDA_CHECK(cudaFree(d_tmp_edge_src_)); d_tmp_edge_src_ = nullptr; }
@@ -4875,11 +4419,9 @@ void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
 
     CUDA_CHECK(cudaMemcpyAsync(d_tmp_edge_src_, h_src.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_tmp_edge_dst_, h_dst.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
-    // Packed half-list [src|dst] for full_directed_edge_list op
     CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_,         h_src.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_ + E_half, h_dst.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
 
-    // Expand to full directed list on GPU
     launch_half_to_full_edges(d_tmp_edge_src_, d_tmp_edge_dst_,
                                d_edge_src_, d_edge_dst_, E_half, force_stream);
 }
@@ -4904,7 +4446,6 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
     num_local_cached_ = num_local;
     num_ghost_cached_ = num_ghost;
 
-    // Grow MLIP force output buffer if needed
     if (num_total > cap_mlip_forces_) {
         if (d_mlip_forces_) { CUDA_CHECK(cudaFree(d_mlip_forces_)); d_mlip_forces_ = nullptr; }
         cap_mlip_forces_ = static_cast<int>(num_total * 1.25 + 64);
@@ -4912,11 +4453,9 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
     }
     CUDA_CHECK(cudaMemsetAsync(d_mlip_forces_, 0, sizeof(double) * num_total * 3, force_stream));
 
-    // Error flag
     if (!d_mlip_error_flag_) { CUDA_CHECK(cudaMalloc(&d_mlip_error_flag_, sizeof(int))); }
     CUDA_CHECK(cudaMemsetAsync(d_mlip_error_flag_, 0, sizeof(int), force_stream));
 
-    // The active graph was refreshed on-device before entering the MLIP path.
     if (nonbonded_kernel_ == "graph") {
         if (!graph_kernel_logged_) {
             std::cout << "[ForceCalculatorCUDA][rank " << get_mpi_rank()
@@ -4926,13 +4465,11 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
         }
     }
 
-    // PERF FIX: only rebuild COO edge list when neighbor list changed
     if (nlist_dirty_) {
         build_coo_edge_list_on_device(system);
         nlist_dirty_ = false;
     }
 
-    // Build minimum-image edge vectors [E_full, 3] float32
     {
         int64_t E_full = num_edges_;
         int64_t E_half = (nonbonded_kernel_ == "graph") ? E_full : E_full / 2;
@@ -4960,7 +4497,6 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
         }
     }
 
-    // Build batch [N]=0 and num_atoms [1]=N tensors
     {
         if (num_total > cap_batch_) {
             if (d_batch_) { CUDA_CHECK(cudaFree(d_batch_)); d_batch_ = nullptr; }
@@ -4973,10 +4509,8 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
         CUDA_CHECK(cudaMemcpyAsync(d_num_atoms_, &h_n, sizeof(int64_t), cudaMemcpyHostToDevice, force_stream));
     }
 
-    // Interleaved positions [num_total, 3]
     interleave_positions_on_device(num_total);
 
-    // Cell and PBC arrays on device
     SimulationBox& box = system.get_box();
     double h_cell[9]  = { box.lx, 0, 0,  0, box.ly, 0,  0, 0, box.lz };
     int    h_pbc[3]   = { box.periodic_x, box.periodic_y, box.periodic_z };
@@ -4985,7 +4519,6 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
     CUDA_CHECK(cudaMemcpyAsync(d_cell_,    h_cell, sizeof(double)*9, cudaMemcpyHostToDevice, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(d_pbc_buf_, h_pbc,  sizeof(int)*3,    cudaMemcpyHostToDevice, force_stream));
 
-    // ── Populate MlipInputView ────────────────────────────────────────────
     mlip::MlipInputView in_view;
     in_view.num_local = num_local;
     in_view.num_ghost = num_ghost;
@@ -5027,7 +4560,6 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
 
     in_view.stream = force_stream;
 
-    // ── Populate MlipOutputView ───────────────────────────────────────────
     mlip::MlipOutputView out_view;
     out_view.forces.data      = d_mlip_forces_;
     out_view.forces.dtype     = mlip::ScalarType::Float64;
@@ -5037,10 +4569,8 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
     out_view.forces.device_id = device_id;
     out_view.forces.is_device = true;
 
-    // ── Call MlipRuntime via bridge (avoids including mlip_runtime.h in .cu) ──
     mlip_bridge_compute(mlip_runtime_raw_, &in_view, &out_view);
 
-    // ── Scatter AoS forces back into SoA d_fx/d_fy/d_fz ─────────────────
     launch_accumulate_forces_scaled(
         d_mlip_forces_,
         d_fx, d_fy, d_fz,
@@ -5049,11 +4579,6 @@ void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
 }
 
-// ==================== FIRE energy minimizer (GPU-resident) ====================
-// See include/minimizer.h for the host-side (dt, alpha) state machine this
-// drives. Both kernels below touch LOCAL particles only; ghosts are excluded
-// from both the reduction and the update, and positions/velocities never
-// leave the device during minimization.
 
 __global__ void fire_reduction_kernel(
     const Real* __restrict__ fx, const Real* __restrict__ fy, const Real* __restrict__ fz,

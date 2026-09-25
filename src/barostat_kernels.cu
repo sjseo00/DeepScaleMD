@@ -2,9 +2,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-// Helper for atomicAdd with double precision
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
-// Native double atomicAdd available on compute capability 6.0+
 #else
 __device__ double atomicAdd(double* address, double val) {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
@@ -49,7 +47,6 @@ __global__ void scale_velocities_anisotropic_kernel(Real *vx, Real *vy, Real *vz
     vz[idx] *= scale_z;
 }
 
-// Reduction kernel for kinetic energy calculation (for barostat pressure computation)
 __global__ void compute_ke_virial_kernel(const Real *vx, const Real *vy, const Real *vz,
                                         const Real *mass, Real *output, size_t n) {
     __shared__ Real s_ke[256];
@@ -57,7 +54,6 @@ __global__ void compute_ke_virial_kernel(const Real *vx, const Real *vy, const R
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Each thread computes local kinetic energy
     Real local_ke = 0.0;
     if (idx < n) {
         Real vx_i = vx[idx];
@@ -69,7 +65,6 @@ __global__ void compute_ke_virial_kernel(const Real *vx, const Real *vy, const R
     s_ke[tid] = local_ke;
     __syncthreads();
     
-    // Block-level reduction
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             s_ke[tid] += s_ke[tid + s];
@@ -77,13 +72,11 @@ __global__ void compute_ke_virial_kernel(const Real *vx, const Real *vy, const R
         __syncthreads();
     }
     
-    // First thread writes block result
     if (tid == 0) {
         atomicAdd(output, s_ke[0]);
     }
 }
 
-// C++ wrapper functions for kernel launches
 extern "C" {
     void launch_scale_positions_kernel(Real *d_x, Real *d_y, Real *d_z, Real scale_factor, size_t num_particles, cudaStream_t stream) {
         if (num_particles == 0) return;
@@ -91,17 +84,14 @@ extern "C" {
         int block_size = 256;
         int grid_size = (num_particles + block_size - 1) / block_size;
         
-        // Launch kernel on specified stream (async if stream != 0)
         scale_positions_kernel<<<grid_size, block_size, 0, stream>>>(d_x, d_y, d_z, scale_factor, num_particles);
         
-        // Check for kernel launch errors
         cudaError_t launch_err = cudaGetLastError();
         if (launch_err != cudaSuccess) {
             printf("CUDA kernel launch error in scale_positions_kernel: %s\n", cudaGetErrorString(launch_err));
             return;
         }
         
-        // No device synchronize - let caller manage stream synchronization
     }
     
     void launch_scale_positions_anisotropic_kernel(Real *d_x, Real *d_y, Real *d_z,
@@ -145,7 +135,6 @@ extern "C" {
                                         size_t num_particles, cudaStream_t stream) {
         if (num_particles == 0) return;
         
-        // Initialize output to zero on device
         cudaMemsetAsync(d_ke_virial_out, 0, sizeof(Real), stream);
         
         int block_size = 256;

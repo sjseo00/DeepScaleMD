@@ -1,13 +1,3 @@
-/**
- * backend_interface.h
- *
- * Pure abstract interface for all execution backends (PyTorch, ONNX, T    virtual void execute(
-        const std::vector<BackendTensorView>& inputs,
-        std::vector<BackendTensorView>&       outputs,
-        cudaStream_t                          stream
-    ) = 0;lugin).
- * MD core must NOT include any framework-specific headers.
- */
 
 #pragma once
 #ifndef MLIP_BACKEND_INTERFACE_H
@@ -26,10 +16,6 @@
 
 namespace mlip {
 
-// ─────────────────── lightweight tensor view ─────────────────────────────────
-// Non-owning reference to a GPU or host buffer passed to/from backend::execute().
-// Uses char[] instead of std::string so the struct is ABI-neutral
-// (can be passed between TUs compiled with different _GLIBCXX_USE_CXX11_ABI).
 
 struct BackendTensorView {
     void*      data       = nullptr;
@@ -42,7 +28,6 @@ struct BackendTensorView {
     char       name[64]   = {};  // for dict-style forward; empty for positional
 };
 
-// ─────────────────── backend model metadata ──────────────────────────────────
 
 struct BackendInputMeta {
     char        name[64]  = {};
@@ -65,8 +50,6 @@ struct BackendModelMetadata {
     bool supports_tuple_output = true;
 };
 
-// ─────────────────── backend configuration ───────────────────────────────────
-// All strings are fixed char[] to remain ABI-neutral across the ABI=0/ABI=1 boundary.
 
 struct BackendConfiguration {
     char        model_path[512] = {};
@@ -78,34 +61,18 @@ struct BackendConfiguration {
     CallStyle   call_style   = CallStyle::Positional;
 };
 
-// ─────────────────── abstract backend ────────────────────────────────────────
 
 class IMlipBackend {
 public:
     virtual ~IMlipBackend() = default;
 
-    /**
-     * Load model and prepare runtime on the given device.
-     * Throws std::runtime_error on failure.
-     */
     virtual void initialize(
         const BackendConfiguration& config,
         const MlipExecutionContext& context
     ) = 0;
 
-    /**
-     * Introspect model input/output metadata (optional, may return empty).
-     * Called once at init time for validation.
-     */
     virtual BackendModelMetadata inspect_model() = 0;
 
-    /**
-     * Execute the model.
-     * inputs  — views already prepared by the preprocessing pipeline.
-     * outputs — writable views (allocated by MlipRuntime scratch/persistent buffers).
-     * stream  — MD CUDA stream; backend must enqueue on this stream.
-     * Does NOT call cudaDeviceSynchronize internally.
-     */
     virtual void execute(
         const std::vector<BackendTensorView>& inputs,
         std::vector<BackendTensorView>&       outputs,
@@ -117,7 +84,6 @@ public:
     virtual const char* name() const = 0;
 };
 
-// ─────────────────── backend registry ────────────────────────────────────────
 
 class BackendRegistry {
 public:

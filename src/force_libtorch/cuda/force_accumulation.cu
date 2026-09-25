@@ -1,18 +1,7 @@
-/**
- * force_accumulation.cu
- *
- * GPU kernel for accumulating MLIP output forces into the MD force buffer.
- * Supports unit conversion (eV/Å → kcal/mol/Å) and NaN validation.
- */
 
 #include "mlip_cuda_utils.cuh"
 #include <math.h>
 
-// ---------------------------------------------------------------------------
-// Kernel: accumulate MLIP forces (AoS) into SoA MD force buffers,
-//         applying a unit scale factor.
-//         Also performs optional NaN check via an error flag.
-// ---------------------------------------------------------------------------
 __global__
 void k_accumulate_forces_scaled(
     const double* __restrict__ mlip_forces,  // [N, 3] row-major (MLIP output)
@@ -41,9 +30,6 @@ void k_accumulate_forces_scaled(
     d_fz[i] += fz;
 }
 
-// ---------------------------------------------------------------------------
-// Kernel: zero the force buffer for local atoms only.
-// ---------------------------------------------------------------------------
 __global__
 void k_zero_forces(
     double* d_fx, double* d_fy, double* d_fz, int N)
@@ -55,9 +41,6 @@ void k_zero_forces(
     d_fz[i] = 0.0;
 }
 
-// ---------------------------------------------------------------------------
-// Host-callable launchers
-// ---------------------------------------------------------------------------
 extern "C" {
 
 void launch_accumulate_forces_scaled(

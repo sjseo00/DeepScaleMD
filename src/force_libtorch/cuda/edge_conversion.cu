@@ -1,22 +1,7 @@
-/**
- * edge_conversion.cu
- *
- * GPU kernels for neighbor/edge-list format conversions required by MLIP adapters.
- *
- * Canonical MD representation: COO half-list (src < dst for local-local pairs).
- * MACE/NequIP require: full directed edge list (both i→j and j→i).
- */
 
 #include "mlip_cuda_utils.cuh"
 #include <cstdint>
 
-// ---------------------------------------------------------------------------
-// Kernel: convert int32 src/dst arrays to int64 (in-place type promotion)
-//         and interleave into [2, E] layout required by PyTorch edge_index.
-//
-// Layout: out[0 * E + e] = src[e]   (row 0)
-//         out[1 * E + e] = dst[e]   (row 1)
-// ---------------------------------------------------------------------------
 __global__
 void k_pack_edge_index_i64(
     const int32_t* __restrict__ src,
@@ -30,13 +15,6 @@ void k_pack_edge_index_i64(
     out[num_edges + e]   = static_cast<int64_t>(dst[e]);
 }
 
-// ---------------------------------------------------------------------------
-// Kernel: expand half-list to full directed list.
-// Input  : half-list src[E_half], dst[E_half]
-// Output : full-list out_src[2*E_half], out_dst[2*E_half]
-//   out_src[e]            = src[e],  out_dst[e]            = dst[e]  (original)
-//   out_src[E_half + e]   = dst[e],  out_dst[E_half + e]   = src[e]  (reverse)
-// ---------------------------------------------------------------------------
 __global__
 void k_half_to_full_edges(
     const int32_t* __restrict__ src,
@@ -53,9 +31,6 @@ void k_half_to_full_edges(
     out_dst[E_half + e]   = src[e];
 }
 
-// ---------------------------------------------------------------------------
-// Kernel: interleave SoA positions (d_x, d_y, d_z) into AoS [N, 3] buffer.
-// ---------------------------------------------------------------------------
 __global__
 void k_interleave_positions(
     const double* __restrict__ d_x,
@@ -71,10 +46,6 @@ void k_interleave_positions(
     out[i * 3 + 2] = d_z[i];
 }
 
-// ---------------------------------------------------------------------------
-// Kernel: force scatter-back from AoS [N, 3] to SoA (d_fx, d_fy, d_fz).
-// Adds forces (accumulation, not overwrite).
-// ---------------------------------------------------------------------------
 __global__
 void k_scatter_forces(
     const double* __restrict__ forces_in,  // [N, 3] row-major
@@ -90,9 +61,6 @@ void k_scatter_forces(
     d_fz[i] += forces_in[i * 3 + 2];
 }
 
-// ---------------------------------------------------------------------------
-// Host-callable launchers
-// ---------------------------------------------------------------------------
 extern "C" {
 
 void launch_pack_edge_index_i64(

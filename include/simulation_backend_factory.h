@@ -19,7 +19,9 @@ std::unique_ptr<Thermostat> create_nose_hoover_thermostat_for_build(Real target_
 std::unique_ptr<Thermostat> create_langevin_thermostat_for_build(Real target_temperature, Real gamma);
 std::unique_ptr<Thermostat> create_andersen_thermostat_for_build(Real target_temperature, Real collision_freq);
 
-std::unique_ptr<Barostat> create_parrinello_rahman_barostat_for_build(Real target_pressure, Real w);
+std::unique_ptr<Barostat> create_parrinello_rahman_barostat_for_build(Real target_pressure, Real w,
+                                                                       Real gamma = 0.0, Real piston_temp = 0.0);
 std::unique_ptr<Barostat> create_andersen_barostat_for_build(Real target_pressure, Real compressibility);
+std::unique_ptr<Barostat> create_berendsen_barostat_for_build(Real target_pressure, Real tau_p);
 
 #endif
