@@ -14,10 +14,51 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
 #include <unistd.h>  // For getcwd
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
+
+namespace {
+
+// Fills `result` with what body(0, count, result, true) would produce, using several OpenMP
+// threads for a long range. Each thread handles one contiguous block of [0, count) into its own
+// vector and the blocks are appended in thread order, so the result is identical to the
+// sequential pass. body(begin, end, out, strict) returns false when it met a term it cannot
+// handle without throwing (strict == false); the pass is then repeated sequentially with
+// strict == true so that the original exception surfaces on the calling thread.
+template <typename T, typename Body>
+void collect_in_order(size_t count, std::vector<T>& result, Body&& body) {
+#ifdef _OPENMP
+    const size_t blocks = std::min<size_t>({static_cast<size_t>(std::max(1, omp_get_max_threads())),
+                                             size_t(16), count / 8192 + 1});
+    if (blocks > 1) {
+        std::vector<std::vector<T>> parts(blocks);
+        std::atomic<bool> failed{false};
+#pragma omp parallel num_threads(static_cast<int>(blocks))
+        {
+            const size_t team = static_cast<size_t>(omp_get_num_threads());
+            const size_t id = static_cast<size_t>(omp_get_thread_num());
+            if (!body(count * id / team, count * (id + 1) / team, parts[id], false)) failed.store(true);
+        }
+        if (!failed.load()) {
+            size_t total = 0;
+            for (const auto& part : parts) total += part.size();
+            result.reserve(result.size() + total);
+            for (auto& part : parts) result.insert(result.end(), part.begin(), part.end());
+            return;
+        }
+        result.clear();
+    }
+#endif
+    body(size_t(0), count, result, true);
+}
+
+}  // namespace
 
 void MDSystem::resize_particle_storage(size_t count) {
     // Bypass ParticleData::resize(), which assigns sequential global IDs and
@@ -813,6 +854,12 @@ void MDSystem::initialize_decomposition_runtime() {
     // GPU-resident mode is mandatory for a CUDA DeepScaleMD build. A backend
     // that cannot consume device buffers must fail instead of staging them.
     config.advanced.allow_host_staging = false;
+    // Decomp is created before ForceCalculatorCUDA::initialize() picks this
+    // rank's GPU (node-local rank modulo visible devices), and NCCL/NVSHMEM bind
+    // to the current device while initializing. Selecting the same device here
+    // keeps backend, buffers and force kernels on one GPU per rank even when
+    // every rank sees every GPU of the node.
+    config.advanced.cuda_device = dsdecompx::kCudaDeviceByLocalRank;
 #else
     config.execution = dsdecompx::ExecutionMode::Host;
 #endif
@@ -830,6 +877,39 @@ void MDSystem::initialize_decomposition_runtime() {
     if (rank==0) {
         std::cout << "[Halo] sizeof(ParticleRecord)=" << sizeof(dsdecompx::ParticleRecord)
                   << " bytes, halo_width=" << decomp_runtime_->halo_width() << std::endl;
+        const char* backend_name = "mpi";
+        switch (decomp_runtime_->backend_kind()) {
+            case dsdecompx::BackendKind::Nccl: backend_name = "nccl"; break;
+            case dsdecompx::BackendKind::Nvshmem: backend_name = "nvshmem"; break;
+            default: break;
+        }
+        std::cout << "[Halo] data-plane backend: " << backend_name << std::endl;
+    }
+}
+
+// With exactly two ranks along a periodic axis the left and right neighbor are
+// the same rank. When the domain is narrower than two halo widths, a particle
+// near the middle of the neighbor's domain lies inside both halo slabs and
+// arrives twice, as two periodic images of one atom. The pair kernels apply the
+// minimum image to every pair, so both copies interact with the same owned atom
+// and the short-range energy and forces near the domain faces are counted twice.
+void MDSystem::warn_if_domain_narrower_than_two_halos(Real halo_width) {
+    static bool warned = false;
+    if (warned || rank != 0 || !decomp_runtime_) return;
+    const auto& dimensions = decomp_runtime_->topology().dimensions();
+    const auto& local = decomp_runtime_->topology().local_domain();
+    const char axis_name[3] = {'x', 'y', 'z'};
+    for (int axis = 0; axis < 3; ++axis) {
+        const Real width = local.upper[axis] - local.lower[axis];
+        if (dimensions[axis] == 2 && width < 2.0 * halo_width) {
+            warned = true;
+            std::cerr << "[WARNING] Domain decomposition has 2 ranks along " << axis_name[axis]
+                      << " with a domain width of " << width << " A, less than twice the halo width ("
+                      << 2.0 * halo_width << " A). Atoms near the middle of a domain are received "
+                      << "as ghosts twice, so short-range energies and forces near the domain "
+                      << "faces are counted twice (PE and pressure are wrong). Use a larger box "
+                      << "or a different number of ranks." << std::endl;
+        }
     }
 }
 
@@ -862,6 +942,7 @@ void MDSystem::sync_decomposition_domain() {
 
     const auto& local = decomp_runtime_->topology().local_domain();
     decomp_runtime_->set_halo_width(halo_width);
+    warn_if_domain_narrower_than_two_halos(halo_width);
     // Update box subdomain bounds used by neighbor list builder and integrator
     box.xlo = local.lower[0]; box.xhi = local.upper[0];
     box.ylo = local.lower[1]; box.yhi = local.upper[1];
@@ -918,6 +999,45 @@ void MDSystem::invalidate_halo_cache() {
     if (decomp_runtime_) decomp_runtime_->invalidate_halo();
 }
 
+void MDSystem::ensure_bonded_parameter_cache() {
+    if (bonded_param_cache_ready_ || !topology) return;
+    auto fill = [](const auto& terms, const auto& lookup, auto&& store, std::vector<char>& ok) {
+        ok.assign(terms.size(), 0);
+        for (size_t t = 0; t < terms.size(); ++t) {
+            try {
+                store(t, lookup(terms[t].type));
+                ok[t] = 1;
+            } catch (const std::exception&) {
+                // Unknown type: only an error if this term ever becomes local, where the
+                // original lookup is repeated so the same exception is thrown.
+            }
+        }
+    };
+    const auto& bonds = topology->get_bonds();
+    bond_k_all_.assign(bonds.size(), 0.0); bond_r0_all_.assign(bonds.size(), 0.0);
+    fill(bonds, [&](const std::string& n) -> const BondType& { return topology->get_bond_type(n); },
+         [&](size_t t, const BondType& p) { bond_k_all_[t] = p.k; bond_r0_all_[t] = p.r0; }, bond_ok_all_);
+    const auto& angles = topology->get_angles();
+    angle_k_all_.assign(angles.size(), 0.0); angle_theta0_all_.assign(angles.size(), 0.0);
+    fill(angles, [&](const std::string& n) -> const AngleType& { return topology->get_angle_type(n); },
+         [&](size_t t, const AngleType& p) { angle_k_all_[t] = p.k; angle_theta0_all_[t] = p.theta0; }, angle_ok_all_);
+    const auto& dihedrals = topology->get_dihedrals();
+    dihedral_k_all_.assign(dihedrals.size(), 0.0); dihedral_phi0_all_.assign(dihedrals.size(), 0.0);
+    dihedral_n_all_.assign(dihedrals.size(), 0);
+    fill(dihedrals, [&](const std::string& n) -> const DihedralType& { return topology->get_dihedral_type(n); },
+         [&](size_t t, const DihedralType& p) {
+             dihedral_k_all_[t] = p.k; dihedral_phi0_all_[t] = p.phi0; dihedral_n_all_[t] = p.n; },
+         dihedral_ok_all_);
+    const auto& impropers = topology->get_impropers();
+    improper_k_all_.assign(impropers.size(), 0.0); improper_phi0_all_.assign(impropers.size(), 0.0);
+    improper_n_all_.assign(impropers.size(), 0);
+    fill(impropers, [&](const std::string& n) -> const DihedralType& { return topology->get_dihedral_type(n); },
+         [&](size_t t, const DihedralType& p) {
+             improper_k_all_[t] = p.k; improper_phi0_all_[t] = p.phi0; improper_n_all_[t] = p.n; },
+         improper_ok_all_);
+    bonded_param_cache_ready_ = true;
+}
+
 void MDSystem::refresh_local_bonded_topology() {
     const size_t local_count = get_local_particles();
     if (bonded_layout_local_count_ == local_count &&
@@ -932,79 +1052,142 @@ void MDSystem::refresh_local_bonded_topology() {
     local_special_pairs_.clear();
     local_constraints_.clear();
     if (!topology) return;
+    ensure_bonded_parameter_cache();
 
-    std::unordered_map<int, size_t> slot;
-    slot.reserve(particles.global_id.size() * 2);
-    // Owned slots take precedence over periodic duplicate ghost images.
+    // Global id -> local slot in a flat array (it used to be an unordered_map, with one
+    // hash lookup per topology term on every neighbor rebuild). Owned slots take
+    // precedence over periodic duplicate ghost images, and the first ghost wins.
+    int max_gid = -1;
+    for (const int gid : particles.global_id) max_gid = std::max(max_gid, gid);
+    std::vector<int>& slot = bonded_slot_scratch_;
+    slot.assign(static_cast<size_t>(max_gid + 1), -1);
     for (size_t i = 0; i < local_count && i < particles.global_id.size(); ++i) {
-        slot.emplace(particles.global_id[i], i);
+        const int gid = particles.global_id[i];
+        if (gid >= 0 && slot[gid] < 0) slot[gid] = static_cast<int>(i);
     }
     for (size_t i = local_count; i < particles.global_id.size(); ++i) {
-        slot.emplace(particles.global_id[i], i);
+        const int gid = particles.global_id[i];
+        if (gid >= 0 && slot[gid] < 0) slot[gid] = static_cast<int>(i);
     }
-
-    auto owned_slot = [&](int global_id) {
-        auto it = slot.find(global_id);
-        return it != slot.end() && it->second < local_count;
+    // Atoms that live on other ranks have ids above or between the local ones: absent.
+    auto slot_of = [&](int gid) -> int {
+        return (gid >= 0 && static_cast<size_t>(gid) < slot.size()) ? slot[gid] : -1;
     };
+    auto owned_slot = [&](int gid) {
+        const int s = slot_of(gid);
+        return s >= 0 && static_cast<size_t>(s) < local_count;
+    };
+    const bool redundant = bonded_redundant_;
 
-    local_bonds_.reserve(topology->get_bonds().size() / static_cast<size_t>(std::max(size, 1)) + 1);
-    for (const Bond& bond : topology->get_bonds()) {
-        const int owner = std::min(bond.atom1, bond.atom2);
-        if (!owned_slot(owner)) continue;
-        auto i = slot.find(bond.atom1), j = slot.find(bond.atom2);
-        if (i == slot.end() || j == slot.end()) continue;
-        local_bonds_.push_back({i->second, j->second, bond.type});
-    }
+    const size_t ranks = static_cast<size_t>(std::max(size, 1));
+    const auto& bonds = topology->get_bonds();
+    local_bonds_.reserve(bonds.size() / ranks + 1);
+    collect_in_order(bonds.size(), local_bonds_,
+                     [&](size_t begin, size_t end, std::vector<LocalBond>& out, bool strict) {
+        for (size_t t = begin; t < end; ++t) {
+            const Bond& bond = bonds[t];
+            const int owner = std::min(bond.atom1, bond.atom2);
+            if (!(redundant ? (owned_slot(bond.atom1) || owned_slot(bond.atom2)) : owned_slot(owner))) continue;
+            const int i = slot_of(bond.atom1), j = slot_of(bond.atom2);
+            if (i < 0 || j < 0) continue;
+            if (!bond_ok_all_[t]) {
+                if (!strict) return false;
+                topology->get_bond_type(bond.type);  // throws the original error
+            }
+            out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), &bond.type,
+                           bond_k_all_[t], bond_r0_all_[t]});
+        }
+        return true;
+    });
 
-    local_angles_.reserve(topology->get_angles().size() / static_cast<size_t>(std::max(size, 1)) + 1);
-    for (const Angle& angle : topology->get_angles()) {
-        if (!owned_slot(angle.atom2)) continue;
-        auto i = slot.find(angle.atom1), j = slot.find(angle.atom2), k = slot.find(angle.atom3);
-        if (i == slot.end() || j == slot.end() || k == slot.end()) continue;
-        local_angles_.push_back({i->second, j->second, k->second, angle.type});
-    }
+    const auto& angles = topology->get_angles();
+    local_angles_.reserve(angles.size() / ranks + 1);
+    collect_in_order(angles.size(), local_angles_,
+                     [&](size_t begin, size_t end, std::vector<LocalAngle>& out, bool strict) {
+        for (size_t t = begin; t < end; ++t) {
+            const Angle& angle = angles[t];
+            if (!(redundant ? (owned_slot(angle.atom1) || owned_slot(angle.atom2) || owned_slot(angle.atom3))
+                            : owned_slot(angle.atom2))) continue;
+            const int i = slot_of(angle.atom1), j = slot_of(angle.atom2), k = slot_of(angle.atom3);
+            if (i < 0 || j < 0 || k < 0) continue;
+            if (!angle_ok_all_[t]) {
+                if (!strict) return false;
+                topology->get_angle_type(angle.type);
+            }
+            out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), static_cast<size_t>(k),
+                           &angle.type, angle_k_all_[t], angle_theta0_all_[t]});
+        }
+        return true;
+    });
 
-    local_dihedrals_.reserve(topology->get_dihedrals().size() / static_cast<size_t>(std::max(size, 1)) + 1);
-    for (const Dihedral& dihedral : topology->get_dihedrals()) {
-        const int owner = std::min(dihedral.atom2, dihedral.atom3);
-        if (!owned_slot(owner)) continue;
-        auto i = slot.find(dihedral.atom1), j = slot.find(dihedral.atom2);
-        auto k = slot.find(dihedral.atom3), l = slot.find(dihedral.atom4);
-        if (i == slot.end() || j == slot.end() || k == slot.end() || l == slot.end()) continue;
-        local_dihedrals_.push_back(
-            {i->second, j->second, k->second, l->second, dihedral.type});
-    }
+    const auto& dihedrals = topology->get_dihedrals();
+    local_dihedrals_.reserve(dihedrals.size() / ranks + 1);
+    collect_in_order(dihedrals.size(), local_dihedrals_,
+                     [&](size_t begin, size_t end, std::vector<LocalDihedral>& out, bool strict) {
+        for (size_t t = begin; t < end; ++t) {
+            const Dihedral& dihedral = dihedrals[t];
+            const int owner = std::min(dihedral.atom2, dihedral.atom3);
+            if (!(redundant ? (owned_slot(dihedral.atom1) || owned_slot(dihedral.atom2) ||
+                               owned_slot(dihedral.atom3) || owned_slot(dihedral.atom4))
+                            : owned_slot(owner))) continue;
+            const int i = slot_of(dihedral.atom1), j = slot_of(dihedral.atom2);
+            const int k = slot_of(dihedral.atom3), l = slot_of(dihedral.atom4);
+            if (i < 0 || j < 0 || k < 0 || l < 0) continue;
+            if (!dihedral_ok_all_[t]) {
+                if (!strict) return false;
+                topology->get_dihedral_type(dihedral.type);
+            }
+            out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), static_cast<size_t>(k),
+                           static_cast<size_t>(l), &dihedral.type,
+                           dihedral_k_all_[t], dihedral_phi0_all_[t], dihedral_n_all_[t]});
+        }
+        return true;
+    });
 
-    local_impropers_.reserve(topology->get_impropers().size() / static_cast<size_t>(std::max(size, 1)) + 1);
-    for (const Dihedral& improper : topology->get_impropers()) {
-        const int owner = std::min(improper.atom2, improper.atom3);
-        if (!owned_slot(owner)) continue;
-        auto i = slot.find(improper.atom1), j = slot.find(improper.atom2);
-        auto k = slot.find(improper.atom3), l = slot.find(improper.atom4);
-        if (i == slot.end() || j == slot.end() || k == slot.end() || l == slot.end()) continue;
-        local_impropers_.push_back(
-            {i->second, j->second, k->second, l->second, improper.type});
-    }
+    const auto& impropers = topology->get_impropers();
+    local_impropers_.reserve(impropers.size() / ranks + 1);
+    collect_in_order(impropers.size(), local_impropers_,
+                     [&](size_t begin, size_t end, std::vector<LocalDihedral>& out, bool strict) {
+        for (size_t t = begin; t < end; ++t) {
+            const Dihedral& improper = impropers[t];
+            const int owner = std::min(improper.atom2, improper.atom3);
+            if (!(redundant ? (owned_slot(improper.atom1) || owned_slot(improper.atom2) ||
+                               owned_slot(improper.atom3) || owned_slot(improper.atom4))
+                            : owned_slot(owner))) continue;
+            const int i = slot_of(improper.atom1), j = slot_of(improper.atom2);
+            const int k = slot_of(improper.atom3), l = slot_of(improper.atom4);
+            if (i < 0 || j < 0 || k < 0 || l < 0) continue;
+            if (!improper_ok_all_[t]) {
+                if (!strict) return false;
+                topology->get_dihedral_type(improper.type);
+            }
+            out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), static_cast<size_t>(k),
+                           static_cast<size_t>(l), &improper.type,
+                           improper_k_all_[t], improper_phi0_all_[t], improper_n_all_[t]});
+        }
+        return true;
+    });
 
-    local_special_pairs_.reserve(topology->get_special_pairs().size() / static_cast<size_t>(std::max(size, 1)) + 1);
-    for (const SpecialPair& pair : topology->get_special_pairs()) {
+    const auto& special_pairs = topology->get_special_pairs();
+    local_special_pairs_.reserve(special_pairs.size() / ranks + 1);
+    for (const SpecialPair& pair : special_pairs) {
         const int owner = std::min(pair.atom1, pair.atom2);
-        if (!owned_slot(owner)) continue;
-        auto i = slot.find(pair.atom1), j = slot.find(pair.atom2);
-        if (i == slot.end() || j == slot.end()) continue;
+        if (!(redundant ? (owned_slot(pair.atom1) || owned_slot(pair.atom2)) : owned_slot(owner))) continue;
+        const int i = slot_of(pair.atom1), j = slot_of(pair.atom2);
+        if (i < 0 || j < 0) continue;
         local_special_pairs_.push_back(
-            {i->second, j->second, pair.lj_scale, pair.coulomb_scale,
+            {static_cast<size_t>(i), static_cast<size_t>(j), pair.lj_scale, pair.coulomb_scale,
              pair.sigma, pair.epsilon});
     }
 
-    local_constraints_.reserve(topology->get_constraints().size() / static_cast<size_t>(std::max(size, 1)) + 1);
-    for (const Constraint& c : topology->get_constraints()) {
+    const auto& constraints = topology->get_constraints();
+    local_constraints_.reserve(constraints.size() / ranks + 1);
+    for (const Constraint& c : constraints) {
         const int owner = std::min(c.atom1, c.atom2);
         if (!owned_slot(owner)) continue;
-        auto i = slot.find(c.atom1), j = slot.find(c.atom2);
-        if (i == slot.end() || j == slot.end()) continue;
-        local_constraints_.push_back({i->second, j->second, c.distance});
+        const int i = slot_of(c.atom1), j = slot_of(c.atom2);
+        if (i < 0 || j < 0) continue;
+        local_constraints_.push_back({static_cast<size_t>(i), static_cast<size_t>(j), c.distance});
     }
 
     bonded_layout_global_ids_ = particles.global_id;
@@ -1023,7 +1206,40 @@ bool MDSystem::exchange_halo_on_device(ForceCalculatorCUDA& calculator,
         storage, dsdecompx::HaloExchangeOptions{rebuild_halo, stream});
     resize_particle_storage(owned + result.ghost_count);
     particles.reset_counts(owned, result.ghost_count);
-    return result.storage_reallocated;
+    last_device_halo_plan_reused_ = result.plan_reused;
+    // A rebuilt plan (not a reused one) can reorder ghost slots even without a
+    // reallocation, which invalidates ghost-indexed neighbor lists.
+    return result.storage_reallocated || result.layout_changed;
+}
+
+bool MDSystem::can_overlap_halo_on_device(ForceCalculatorCUDA& calculator) {
+    if (size == 1 || !decomp_runtime_) return false;
+    const size_t owned = get_local_particles();
+    dsdecompx::ParticleInfo storage(
+        owned, particles.ghost_count(), calculator);
+    return decomp_runtime_->can_refresh_halo(storage);
+}
+
+void MDSystem::begin_halo_exchange_on_device(ForceCalculatorCUDA& calculator) {
+    if (size == 1) return;
+    if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
+    const size_t owned = get_local_particles();
+    dsdecompx::ParticleInfo storage(
+        owned, particles.ghost_count(), calculator);
+    decomp_runtime_->begin_halo_exchange(
+        storage, dsdecompx::HaloExchangeOptions{false, calculator.get_halo_stream()});
+}
+
+void MDSystem::end_halo_exchange_on_device(ForceCalculatorCUDA& calculator) {
+    if (size == 1) return;
+    const size_t owned = get_local_particles();
+    dsdecompx::ParticleInfo storage(
+        owned, particles.ghost_count(), calculator);
+    const auto result = decomp_runtime_->end_halo_exchange(storage);
+    resize_particle_storage(owned + result.ghost_count);
+    particles.reset_counts(owned, result.ghost_count);
+    last_device_halo_plan_reused_ = result.plan_reused;
+    calculator.make_force_stream_wait_for_halo();
 }
 
 bool MDSystem::migrate_particles_on_device(ForceCalculatorCUDA& calculator) {

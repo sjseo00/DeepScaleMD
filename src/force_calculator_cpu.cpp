@@ -454,7 +454,7 @@ void ForceCalculatorCPU::ensure_lj_coeff_table_built(const ForceFieldParams& par
 }
 
 void ForceCalculatorCPU::repack_tile_soa(const ParticleData& particles,
-                                         const CpuSpatialVerletList& nlist) {
+                                         const SpatialVerletList& nlist) {
     const int num_tiles = nlist.num_tiles();
     if (num_tiles <= 0 || particles.num_particles == 0) {
         tile_px_.clear(); tile_py_.clear(); tile_pz_.clear(); tile_q_.clear();
@@ -589,7 +589,7 @@ void ForceCalculatorCPU::ensure_mixed_precision_tables() {
     }
 }
 
-void ForceCalculatorCPU::ensure_tile_exclusion_masks(const CpuSpatialVerletList& nlist) {
+void ForceCalculatorCPU::ensure_tile_exclusion_masks(const SpatialVerletList& nlist) {
     const int num_pairs = nlist.num_tile_pairs();
     if (tile_excl_generation_ == nlist.build_generation() &&
         tile_pair_excl_.size() == static_cast<size_t>(num_pairs)) {
@@ -637,7 +637,7 @@ void ForceCalculatorCPU::ensure_tile_exclusion_masks(const CpuSpatialVerletList&
     tile_excl_generation_ = nlist.build_generation();
 }
 
-void ForceCalculatorCPU::ensure_lj_tile_masks(const CpuSpatialVerletList& nlist, size_t local_particles) {
+void ForceCalculatorCPU::ensure_lj_tile_masks(const SpatialVerletList& nlist, size_t local_particles) {
     const int num_tiles = nlist.num_tiles();
     if (lj_tile_mask_generation_ == nlist.build_generation() &&
         lj_tile_mask_local_particles_ == local_particles &&
@@ -682,7 +682,7 @@ void ForceCalculatorCPU::ensure_lj_tile_masks(const CpuSpatialVerletList& nlist,
     lj_tile_mask_local_particles_ = local_particles;
 }
 
-void ForceCalculatorCPU::ensure_lj_tile_excl_col(const CpuSpatialVerletList& nlist) {
+void ForceCalculatorCPU::ensure_lj_tile_excl_col(const SpatialVerletList& nlist) {
     (void)nlist;
     if (lj_tile_excl_col_generation_ == tile_excl_generation_ &&
         lj_tile_excl_col_.size() == tile_pair_excl_.size()) {
@@ -1768,7 +1768,7 @@ void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, b
     run_nonbonded_with_pme_overlap(system, do_coulomb, label, [&] {
     ParticleData& particles = system.get_particles();
     NeighborList& nlist_base = system.get_neighbor_list();
-    auto& nlist = static_cast<CpuSpatialVerletList&>(nlist_base);
+    auto& nlist = static_cast<SpatialVerletList&>(nlist_base);
     ForceFieldParams& params = system.get_ff_params();
     Topology& topology = system.get_topology();
     ensure_exclusion_cache_built(topology);
@@ -2285,7 +2285,7 @@ void ForceCalculatorCPU::compute_bond_forces(MDSystem& system) {
         Real r = std::sqrt(dx*dx + dy*dy + dz*dz);
         if (r < 1e-10) continue; // Avoid division by zero
 
-        const BondType& bond_type = topology.get_bond_type(bond.type);
+        const BondType& bond_type = topology.get_bond_type(*bond.type);
         Real k_bond = bond_type.k;    // Force constant
         Real r0 = bond_type.r0;       // Equilibrium distance
 
@@ -2358,7 +2358,7 @@ void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
         
         Real theta = std::acos(cos_theta);
         
-        const AngleType& angle_type = topology.get_angle_type(angle.type);
+        const AngleType& angle_type = topology.get_angle_type(*angle.type);
         Real k_angle = angle_type.k;         // Force constant
         Real theta0 = angle_type.theta0;     // Equilibrium angle
         Real dtheta = theta - theta0;
@@ -2480,7 +2480,7 @@ void ForceCalculatorCPU::compute_torsion_forces(MDSystem& system,
                             (n1_x*n2_y - n1_y*n2_x) * dz_jk;
         Real phi = std::atan2(sin_phi_num, cos_phi_num * jk_mag);
 
-        const DihedralType& dihedral_type = topology.get_dihedral_type(dihedral.type);
+        const DihedralType& dihedral_type = topology.get_dihedral_type(*dihedral.type);
         Real k_dihedral = dihedral_type.k;
         Real phi0 = dihedral_type.phi0;  // Phase shift
         int n = dihedral_type.n;         // Multiplicity

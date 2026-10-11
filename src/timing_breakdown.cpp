@@ -47,12 +47,16 @@ void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     for (const auto& component : cumulative_timing.force_component_time) {
         rows.push_back({component.first, 2, component.second});
     }
+    rows.push_back({"gpu_wait", 1, cumulative_timing.gpu_wait_time});
     rows.push_back({"comm", 1, cumulative_timing.comm_time});
     rows.push_back({"migrate", 1, cumulative_timing.migration_time});
     rows.push_back({"thermostat", 1, cumulative_timing.thermostat_time});
     rows.push_back({"barostat", 1, cumulative_timing.barostat_time});
     rows.push_back({"ke", 1, cumulative_timing.ke_time});
-    rows.push_back({"output", 1, cumulative_timing.output_time});
+    // Output is timed outside the MD loop (step 0 is written before the loop), so it is
+    // a top-level row and part of the total, not a share of md_loop.
+    const int idx_output    = static_cast<int>(rows.size());
+    rows.push_back({"output", 0, cumulative_timing.output_time});
 
     const int n = static_cast<int>(rows.size());
     std::vector<double> local(n), min_v(n), max_v(n), sum_v(n);
@@ -69,7 +73,8 @@ void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     std::vector<double> avg_v(n);
     for (int i = 0; i < n; ++i) avg_v[i] = sum_v[i] / mpi_size;
 
-    const double grand_total_avg = avg_v[idx_init] + avg_v[idx_minimize] + avg_v[idx_md_loop];
+    const double grand_total_avg = avg_v[idx_init] + avg_v[idx_minimize] + avg_v[idx_md_loop] +
+                                   avg_v[idx_output];
     const double md_loop_avg = avg_v[idx_md_loop];
     const double force_avg = avg_v[idx_force];
 
@@ -86,7 +91,7 @@ void MDSimulation::print_timing_report(double program_wallclock_ms) const {
     }
 
     std::cout << "------------------------------------------------------------\n";
-    std::cout << std::left << std::setw(26) << "total (init+minimize+loop)" << std::right
+    std::cout << std::left << std::setw(26) << "total (init+min+loop+out)" << std::right
                << std::fixed << std::setprecision(4) << std::setw(11) << grand_total_avg << " s\n";
 
     if (program_wallclock_ms >= 0.0) {

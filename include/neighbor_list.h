@@ -66,9 +66,9 @@ public:
 
 constexpr int kCpuTileSize = 8;
 
-class CpuSpatialVerletList : public NeighborList {
+class SpatialVerletList : public NeighborList {
 public:
-    CpuSpatialVerletList(Real cutoff, Real skin);
+    SpatialVerletList(Real cutoff, Real skin);
 
     void build(const ParticleData& particles, const SimulationBox& box, size_t num_local) override;
     void update(const ParticleData& particles, const SimulationBox& box, size_t num_local) override;

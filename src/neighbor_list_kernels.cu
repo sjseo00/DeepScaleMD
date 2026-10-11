@@ -1,5 +1,7 @@
 #include "../include/neighbor_list.h"
+#include "../include/tile_grid_info.h"
 #include <cuda_runtime.h>
+#include <map>
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
@@ -10,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <string>
 #include <climits>
 #include <algorithm>
 
@@ -173,6 +177,7 @@ __global__ void compute_tile_bboxes_kernel(
     Real lx, Real ly, Real lz,
     bool periodic_x, bool periodic_y, bool periodic_z,
     Real* __restrict__ tile_bbox_min, Real* __restrict__ tile_bbox_max,
+    unsigned char* __restrict__ tile_flags, int n_local,
     int num_tiles)
 {
     const int WARP_SIZE = 32;
@@ -199,6 +204,10 @@ __global__ void compute_tile_bboxes_kernel(
         rel_z = rel_z2 = pz - cz * cell_size_z;
     }
 
+    // Bit 0: the tile holds an owned atom; bit 1: it holds a ghost atom.
+    const unsigned owned_votes = __ballot_sync(0xffffffffu, atom >= 0 && atom < n_local);
+    const unsigned ghost_votes = __ballot_sync(0xffffffffu, atom >= n_local);
+
     for (int offset = 16; offset > 0; offset >>= 1) {
         rel_x = min(rel_x, __shfl_down_sync(0xffffffffu, rel_x, offset));
         rel_y = min(rel_y, __shfl_down_sync(0xffffffffu, rel_y, offset));
@@ -208,11 +217,22 @@ __global__ void compute_tile_bboxes_kernel(
         rel_z2 = max(rel_z2, __shfl_down_sync(0xffffffffu, rel_z2, offset));
     }
     if (lane == 0) {
+        tile_flags[tile] = static_cast<unsigned char>((owned_votes ? 1u : 0u) | (ghost_votes ? 2u : 0u));
         tile_bbox_min[tile*3+0] = rel_x;  tile_bbox_min[tile*3+1] = rel_y;  tile_bbox_min[tile*3+2] = rel_z;
         tile_bbox_max[tile*3+0] = rel_x2; tile_bbox_max[tile*3+1] = rel_y2; tile_bbox_max[tile*3+2] = rel_z2;
     }
 }
 
+
+// Marks the cells that hold a tile with a ghost atom (flag bit 1). Every writer stores the same value.
+__global__ void mark_ghost_cells_kernel(const unsigned char* __restrict__ tile_flags,
+                                        const int* __restrict__ tile_cell_id,
+                                        unsigned char* __restrict__ cell_has_ghost, int num_tiles)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= num_tiles) return;
+    if (tile_flags[t] & 2u) cell_has_ghost[tile_cell_id[t]] = 1;
+}
 
 constexpr int FINE_STENCIL_RADIUS = 2;
 constexpr int FINE_STENCIL_SIDE = 2 * FINE_STENCIL_RADIUS + 1;                    // 5
@@ -223,6 +243,7 @@ __global__ void build_lj_tile_pairs_fine_kernel(
     const int* __restrict__ tile_count,
     const Real* __restrict__ tile_bbox_min,
     const Real* __restrict__ tile_bbox_max,
+    const unsigned char* __restrict__ tile_flags,
     int* __restrict__ tile_pair_i,
     int* __restrict__ tile_pair_j,
     int* __restrict__ pair_counter,
@@ -285,37 +306,86 @@ __global__ void build_lj_tile_pairs_fine_kernel(
 
             Real off_x = dx * cell_size_x, off_y = dy * cell_size_y, off_z = dz * cell_size_z;
 
-            for (int combo = lane; combo < total_combos; combo += WARP_SIZE) {
-                int ti = combo / n_tiles_nb;
-                int tj = combo % n_tiles_nb;
-                int home_tile = home_tile_base + ti;
-                int nb_tile = nb_tile_base + tj;
+            // The slot counter is a single address: one atomicAdd per surviving tile pair
+            // (millions per build) serializes in the L2. The warp ranks its survivors with
+            // a ballot and its leader reserves the whole block of slots at once. The trip
+            // count is uniform over the warp, so every lane takes part in the ballot.
+            for (int combo_base = 0; combo_base < total_combos; combo_base += WARP_SIZE) {
+                const int combo = combo_base + lane;
+                bool keep = false;
+                int home_tile = 0, nb_tile = 0;
+                if (combo < total_combos) {
+                    const int ti = combo / n_tiles_nb;
+                    const int tj = combo % n_tiles_nb;
+                    home_tile = home_tile_base + ti;
+                    nb_tile = nb_tile_base + tj;
 
-                if (home_tile > nb_tile) continue;
+                    // The list is a half list (home <= neighbor): every owned-owned
+                    // pair appears once and Newton's third law supplies the other
+                    // force. An owned-ghost pair has no such partner (the ghost's
+                    // force belongs to another rank), so it must be listed with the
+                    // OWNED atom's tile as home. When the owned atom sits in the
+                    // higher-numbered tile that is the reverse orientation, emitted
+                    // only where it can contain such a pair; the mask kernel keeps
+                    // just the ghost neighbors of those entries.
+                    keep = !(home_tile > nb_tile &&
+                             !((tile_flags[home_tile] & 1u) && (tile_flags[nb_tile] & 2u)));
+                    if (keep) {
+                        Real hmin_x = tile_bbox_min[home_tile*3+0], hmax_x = tile_bbox_max[home_tile*3+0];
+                        Real hmin_y = tile_bbox_min[home_tile*3+1], hmax_y = tile_bbox_max[home_tile*3+1];
+                        Real hmin_z = tile_bbox_min[home_tile*3+2], hmax_z = tile_bbox_max[home_tile*3+2];
+                        Real nmin_x = tile_bbox_min[nb_tile*3+0] + off_x, nmax_x = tile_bbox_max[nb_tile*3+0] + off_x;
+                        Real nmin_y = tile_bbox_min[nb_tile*3+1] + off_y, nmax_y = tile_bbox_max[nb_tile*3+1] + off_y;
+                        Real nmin_z = tile_bbox_min[nb_tile*3+2] + off_z, nmax_z = tile_bbox_max[nb_tile*3+2] + off_z;
 
-                Real hmin_x = tile_bbox_min[home_tile*3+0], hmax_x = tile_bbox_max[home_tile*3+0];
-                Real hmin_y = tile_bbox_min[home_tile*3+1], hmax_y = tile_bbox_max[home_tile*3+1];
-                Real hmin_z = tile_bbox_min[home_tile*3+2], hmax_z = tile_bbox_max[home_tile*3+2];
-                Real nmin_x = tile_bbox_min[nb_tile*3+0] + off_x, nmax_x = tile_bbox_max[nb_tile*3+0] + off_x;
-                Real nmin_y = tile_bbox_min[nb_tile*3+1] + off_y, nmax_y = tile_bbox_max[nb_tile*3+1] + off_y;
-                Real nmin_z = tile_bbox_min[nb_tile*3+2] + off_z, nmax_z = tile_bbox_max[nb_tile*3+2] + off_z;
+                        Real gap_x = max((Real)0.0, max(hmin_x - nmax_x, nmin_x - hmax_x));
+                        Real gap_y = max((Real)0.0, max(hmin_y - nmax_y, nmin_y - hmax_y));
+                        Real gap_z = max((Real)0.0, max(hmin_z - nmax_z, nmin_z - hmax_z));
 
-                Real gap_x = max((Real)0.0, max(hmin_x - nmax_x, nmin_x - hmax_x));
-                Real gap_y = max((Real)0.0, max(hmin_y - nmax_y, nmin_y - hmax_y));
-                Real gap_z = max((Real)0.0, max(hmin_z - nmax_z, nmin_z - hmax_z));
+                        keep = gap_x*gap_x + gap_y*gap_y + gap_z*gap_z < cutoff_sq_extended;
+                    }
+                }
 
-                if (gap_x*gap_x + gap_y*gap_y + gap_z*gap_z >= cutoff_sq_extended) continue;
-
-                int slot = atomicAdd(pair_counter, 1);
-                if (slot < pair_capacity) {
-                    tile_pair_i[slot] = home_tile;
-                    tile_pair_j[slot] = nb_tile;
+                const unsigned keep_mask = __ballot_sync(0xffffffffu, keep);
+                if (keep_mask != 0u) {
+                    int base_slot = 0;
+                    if (lane == __ffs(keep_mask) - 1) base_slot = atomicAdd(pair_counter, __popc(keep_mask));
+                    base_slot = __shfl_sync(0xffffffffu, base_slot, __ffs(keep_mask) - 1);
+                    if (keep) {
+                        const int slot = base_slot + __popc(keep_mask & ((1u << lane) - 1u));
+                        if (slot < pair_capacity) {
+                            tile_pair_i[slot] = home_tile;
+                            tile_pair_j[slot] = nb_tile;
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+// Same search as is_excluded_pair() in force_calculator_cuda.cu: each atom's partner
+// list is sorted and holds global ids.
+__device__ __forceinline__ bool tile_list_is_excluded(const int* __restrict__ offsets,
+                                                      const int* __restrict__ partners,
+                                                      size_t atom_count,
+                                                      int atom1, int atom2) {
+    if (!offsets || !partners || atom1 < 0 ||
+        static_cast<size_t>(atom1) >= atom_count) return false;
+    const int begin = offsets[atom1];
+    const int end = offsets[atom1 + 1];
+    for (int index = begin; index < end; ++index) {
+        const int candidate = partners[index];
+        if (candidate == atom2) return true;
+        if (candidate > atom2) break;
+    }
+    return false;
+}
+
+// Besides the Verlet mask this writes an exclusion mask with the same bit layout, so
+// the force kernels test one bit instead of searching the partner list for every
+// pair on every step. The partner lists and global ids do not change between list
+// builds, so the mask stays valid for the life of the list.
 __global__ void build_tile_pair_verlet_masks_kernel(
     const Real* __restrict__ x,
     const Real* __restrict__ y,
@@ -324,6 +394,11 @@ __global__ void build_tile_pair_verlet_masks_kernel(
     const int* __restrict__ tile_pair_i,
     const int* __restrict__ tile_pair_j,
     unsigned long long* __restrict__ verlet_masks,
+    unsigned long long* __restrict__ excl_masks,
+    const int* __restrict__ global_id,
+    const int* __restrict__ exclusion_offsets,
+    const int* __restrict__ exclusion_partners,
+    size_t exclusion_atom_count,
     unsigned long long* __restrict__ pair_counts,
     int n_local, int num_tile_pairs,
     Real cutoff_sq, Real outer_cutoff_sq,
@@ -331,44 +406,150 @@ __global__ void build_tile_pair_verlet_masks_kernel(
     bool periodic_x, bool periodic_y, bool periodic_z)
 {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_tile_pairs) return;
+    const bool active = e < num_tile_pairs;  // no early return: the warp reduces the counters below
 
-    const int tile_i = tile_pair_i[e];
-    const int tile_j = tile_pair_j[e];
+    const int tile_i = active ? tile_pair_i[e] : 0;
+    const int tile_j = active ? tile_pair_j[e] : 0;
     const bool same_tile = tile_i == tile_j;
+    const bool reverse_entry = tile_i > tile_j;  // owned-in-home vs ghost-in-neighbor only
     unsigned long long mask = 0;
+    unsigned long long excl = 0;
     unsigned long long inside_rc = 0;
     unsigned long long inside_outer = 0;
 
-    for (int i_slot = 0; i_slot < LJ_TILE_SIZE; ++i_slot) {
+    // The distance test only has to separate pairs by the outer radius, which lies a whole
+    // skin beyond the force cutoff, so it runs in float (the pair kernels subtract float
+    // coordinates as well). The double version spent a division and a rounding in FP64 per
+    // slot pair, 64 slot pairs per entry, and reloaded the j coordinates from global memory
+    // for every i slot. The j side is loaded once per entry and kept in registers.
+    const float lx_f = static_cast<float>(lx), ly_f = static_cast<float>(ly), lz_f = static_cast<float>(lz);
+    const float inv_lx = 1.0f / lx_f, inv_ly = 1.0f / ly_f, inv_lz = 1.0f / lz_f;
+    const float outer_sq_f = static_cast<float>(outer_cutoff_sq);
+    const float rc_sq_f = static_cast<float>(cutoff_sq);
+
+    int j_atom[LJ_TILE_SIZE], j_gid[LJ_TILE_SIZE];
+    float jx[LJ_TILE_SIZE], jy[LJ_TILE_SIZE], jz[LJ_TILE_SIZE];
+#pragma unroll
+    for (int j_slot = 0; j_slot < LJ_TILE_SIZE; ++j_slot) {
+        const int j = active ? tile_atoms[tile_j * LJ_TILE_SIZE + j_slot] : -1;
+        j_atom[j_slot] = j;
+        j_gid[j_slot] = 0;
+        jx[j_slot] = jy[j_slot] = jz[j_slot] = 0.0f;
+        if (j >= 0) {
+            jx[j_slot] = static_cast<float>(x[j]);
+            jy[j_slot] = static_cast<float>(y[j]);
+            jz[j_slot] = static_cast<float>(z[j]);
+            j_gid[j_slot] = global_id[j];
+        }
+    }
+
+    for (int i_slot = 0; active && i_slot < LJ_TILE_SIZE; ++i_slot) {
         const int i = tile_atoms[tile_i * LJ_TILE_SIZE + i_slot];
         if (i < 0 || i >= n_local) continue;
-        const Real xi = x[i], yi = y[i], zi = z[i];
+        const float xi = static_cast<float>(x[i]);
+        const float yi = static_cast<float>(y[i]);
+        const float zi = static_cast<float>(z[i]);
+        const int gid_i = global_id[i];
 
+#pragma unroll
         for (int j_slot = 0; j_slot < LJ_TILE_SIZE; ++j_slot) {
-            const int j = tile_atoms[tile_j * LJ_TILE_SIZE + j_slot];
+            const int j = j_atom[j_slot];
             if (j < 0 || j == i) continue;
             if (same_tile && j < n_local && !(j > i)) continue;
+            if (reverse_entry && j < n_local) continue;  // owned-owned pairs live in the forward entry
 
-            Real dx = xi - x[j];
-            Real dy = yi - y[j];
-            Real dz = zi - z[j];
-            if (periodic_x) dx -= nearbyint(dx / lx) * lx;
-            if (periodic_y) dy -= nearbyint(dy / ly) * ly;
-            if (periodic_z) dz -= nearbyint(dz / lz) * lz;
-            const Real r2 = dx*dx + dy*dy + dz*dz;
-            if (r2 < outer_cutoff_sq) {
+            float dx = xi - jx[j_slot];
+            float dy = yi - jy[j_slot];
+            float dz = zi - jz[j_slot];
+            if (periodic_x) dx -= rintf(dx * inv_lx) * lx_f;
+            if (periodic_y) dy -= rintf(dy * inv_ly) * ly_f;
+            if (periodic_z) dz -= rintf(dz * inv_lz) * lz_f;
+            const float r2 = dx*dx + dy*dy + dz*dz;
+            if (r2 < outer_sq_f) {
                 mask |= 1ULL << (j_slot * LJ_TILE_SIZE + i_slot);
+                if (tile_list_is_excluded(exclusion_offsets, exclusion_partners,
+                                          exclusion_atom_count, gid_i, j_gid[j_slot])) {
+                    excl |= 1ULL << (j_slot * LJ_TILE_SIZE + i_slot);
+                }
                 ++inside_outer;
-                if (r2 < cutoff_sq) ++inside_rc;
+                if (r2 < rc_sq_f) ++inside_rc;
             }
         }
     }
 
-    verlet_masks[e] = mask;
-    if (inside_rc) atomicAdd(&pair_counts[0], inside_rc);
-    if (inside_outer) atomicAdd(&pair_counts[1], inside_outer);
+    if (active) {
+        verlet_masks[e] = mask;
+        excl_masks[e] = excl;
+    }
+    // Statistics only: one atomic per warp instead of two per thread (all on 2 addresses).
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        inside_rc += __shfl_down_sync(0xffffffffu, inside_rc, offset);
+        inside_outer += __shfl_down_sync(0xffffffffu, inside_outer, offset);
+    }
+    if ((threadIdx.x & 31) == 0) {
+        if (inside_rc) atomicAdd(&pair_counts[0], inside_rc);
+        if (inside_outer) atomicAdd(&pair_counts[1], inside_outer);
+    }
 }
+
+// Bit 2 of the tile flags: this home tile has at least one pair-list entry whose
+// neighbor tile holds a ghost atom. The ghost-only force pass skips every other
+// home tile without walking its entries.
+__global__ void mark_ghost_adjacent_tiles_kernel(
+    const int* __restrict__ tile_pair_offsets,
+    const int* __restrict__ tile_pair_j,
+    unsigned char* __restrict__ tile_flags,
+    int num_tiles)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= num_tiles) return;
+    unsigned char flags = tile_flags[t];
+    if (flags & 1u) {
+        for (int e = tile_pair_offsets[t]; e < tile_pair_offsets[t + 1]; ++e) {
+            if (tile_flags[tile_pair_j[e]] & 2u) { flags |= 4u; break; }
+        }
+    }
+    tile_flags[t] = flags;
+}
+
+namespace {
+// Thrust allocates temporary storage with cudaMalloc and frees it with cudaFree on every
+// sort/scan call; cudaFree synchronizes the device, and a tile-list build makes several
+// such calls. This keeps the blocks and hands them out again. Sizes change from build to
+// build, so a request takes any free block that is large enough but at most 4x too big
+// (or at most 4 MB for the tiny scan buffers: every new block is at least 1 MB, so with a
+// plain 4x rule a scan request never fits a block, allocates another one on every call
+// and leaks it; those cudaMalloc calls also stalled for 0.3 s now and then), and new
+// blocks are rounded up so later requests of similar size fit.
+struct CachedThrustAllocator {
+    typedef char value_type;
+    char* allocate(std::ptrdiff_t bytes) {
+        const size_t want = static_cast<size_t>(bytes);
+        auto it = free_blocks().lower_bound(want);
+        if (it != free_blocks().end() && it->first <= std::max<size_t>(4 * want, size_t(4) << 20)) {
+            char* ptr = it->second;
+            live_blocks()[ptr] = it->first;
+            free_blocks().erase(it);
+            return ptr;
+        }
+        size_t rounded = 1u << 20;
+        while (rounded < want) rounded *= 2;
+        char* ptr = nullptr;
+        cudaMalloc(&ptr, rounded);
+        live_blocks()[ptr] = rounded;
+        return ptr;
+    }
+    void deallocate(char* ptr, size_t) {
+        auto it = live_blocks().find(ptr);
+        if (it == live_blocks().end()) return;
+        free_blocks().emplace(it->second, ptr);
+        live_blocks().erase(it);
+    }
+private:
+    static std::multimap<size_t, char*>& free_blocks() { static std::multimap<size_t, char*> m; return m; }
+    static std::map<char*, size_t>& live_blocks() { static std::map<char*, size_t> m; return m; }
+};
+}  // namespace
 
 extern "C" void launch_cuda_tile_list_build(
     const Real* d_x, const Real* d_y, const Real* d_z,
@@ -377,18 +558,28 @@ extern "C" void launch_cuda_tile_list_build(
     Real lx, Real ly, Real lz,
     bool periodic_x, bool periodic_y, bool periodic_z,
     cudaStream_t stream,
+    const int* d_global_id,
+    const int* d_exclusion_offsets,
+    const int* d_exclusion_partners,
+    size_t exclusion_atom_count,
     int** out_d_tile_atoms,
     int** out_d_tile_pair_i,
     int** out_d_tile_pair_j,
     int** out_d_tile_pair_offsets,
     unsigned long long** out_d_tile_pair_verlet_mask,
+    unsigned long long** out_d_tile_pair_excl_mask,
+    unsigned char** out_d_tile_flags,
     int* out_num_tiles,
     int* out_num_tile_pairs,
     unsigned long long* out_pairs_inside_rc,
-    unsigned long long* out_pairs_inside_rc_plus_skin)
+    unsigned long long* out_pairs_inside_rc_plus_skin,
+    bool tiles_only,
+    TileGridInfo* grid_out)
 {
     Real extended_cutoff = cutoff + verlet_skin;
     Real cutoff_sq = extended_cutoff * extended_cutoff;
+    CachedThrustAllocator thrust_alloc;
+    const auto thrust_policy = thrust::cuda::par(thrust_alloc).on(stream);
     const int MAX_CELLS_PER_DIM = 512;
     const int block_size = 256;
     const int num_blocks = (n_total + block_size - 1) / block_size;
@@ -416,6 +607,8 @@ extern "C" void launch_cuda_tile_list_build(
             if (out_d_tile_pair_j)       *out_d_tile_pair_j       = nullptr;
             if (out_d_tile_pair_offsets) *out_d_tile_pair_offsets = nullptr;
             if (out_d_tile_pair_verlet_mask) *out_d_tile_pair_verlet_mask = nullptr;
+            if (out_d_tile_pair_excl_mask) *out_d_tile_pair_excl_mask = nullptr;
+            if (out_d_tile_flags)        *out_d_tile_flags        = nullptr;
             if (out_num_tiles)           *out_num_tiles           = 0;
             if (out_num_tile_pairs)      *out_num_tile_pairs      = 0;
             if (out_pairs_inside_rc)      *out_pairs_inside_rc      = 0;
@@ -430,6 +623,12 @@ extern "C" void launch_cuda_tile_list_build(
         Real fine_inv_cell_y = fine_ny / ly;
         Real fine_inv_cell_z = fine_nz / lz;
         long long fine_total_cells = (long long)fine_nx * fine_ny * fine_nz;
+
+        // Pinned landing zone for the scalar readbacks below: [0],[1] tile-count scalars /
+        // tile-pair count, [2..5] the two 64-bit pair statistics. A copy into a pageable
+        // stack variable is staged through a driver buffer and blocks inside the call.
+        static int* s_h_scalars = nullptr;
+        if (!s_h_scalars) cudaMallocHost(&s_h_scalars, 6 * sizeof(int));
 
         static int* s_d_fine_cell_start   = nullptr;
         static int* s_d_fine_cell_count   = nullptr;
@@ -478,7 +677,7 @@ extern "C" void launch_cuda_tile_list_build(
 
         thrust::device_ptr<int> fine_cnt_ptr(s_d_fine_cell_count);
         thrust::device_ptr<int> fine_start_ptr(s_d_fine_cell_start);
-        thrust::exclusive_scan(thrust::cuda::par.on(stream), fine_cnt_ptr, fine_cnt_ptr + fine_total_cells, fine_start_ptr);
+        thrust::exclusive_scan(thrust_policy, fine_cnt_ptr, fine_cnt_ptr + fine_total_cells, fine_start_ptr);
 
         populate_cells_kernel<<<num_blocks, block_size, 0, stream>>>(
             s_d_fine_particle_cell_id,
@@ -508,10 +707,10 @@ extern "C" void launch_cuda_tile_list_build(
             lx, ly, lz, periodic_x, periodic_y, periodic_z);
         NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
 
-        thrust::sequence(thrust::cuda::par.on(stream),
+        thrust::sequence(thrust_policy,
                           thrust::device_pointer_cast(s_d_tile_sorted_indices),
                           thrust::device_pointer_cast(s_d_tile_sorted_indices + n_total));
-        thrust::sort_by_key(thrust::cuda::par.on(stream),
+        thrust::sort_by_key(thrust_policy,
                              thrust::device_pointer_cast(s_d_sort_keys),
                              thrust::device_pointer_cast(s_d_sort_keys + n_total),
                              thrust::device_pointer_cast(s_d_tile_sorted_indices));
@@ -524,11 +723,15 @@ extern "C" void launch_cuda_tile_list_build(
         static int* s_d_tile_cell_id = nullptr;
         static Real* s_d_tile_bbox_min = nullptr;
         static Real* s_d_tile_bbox_max = nullptr;
+        static unsigned char* s_d_tile_flags = nullptr;
+        static unsigned char* s_d_cell_has_ghost = nullptr;
+        static long long s_cell_ghost_capacity = 0;
         static long long s_tile_atoms_capacity = 0;
 
         static int* s_d_tile_pair_i = nullptr;
         static int* s_d_tile_pair_j = nullptr;
         static unsigned long long* s_d_tile_pair_verlet_mask = nullptr;
+        static unsigned long long* s_d_tile_pair_excl_mask = nullptr;
         static long long s_tile_pairs_capacity = 0;
 
         static int* s_d_tile_pair_offsets = nullptr;
@@ -553,13 +756,12 @@ extern "C" void launch_cuda_tile_list_build(
 
         thrust::device_ptr<int> tcount_ptr(s_d_tile_count);
         thrust::device_ptr<int> toffset_ptr(s_d_tile_offset);
-        thrust::exclusive_scan(thrust::cuda::par.on(stream), tcount_ptr, tcount_ptr + fine_total_cells, toffset_ptr);
+        thrust::exclusive_scan(thrust_policy, tcount_ptr, tcount_ptr + fine_total_cells, toffset_ptr);
 
-        int last_offset = 0, last_count = 0;
-        cudaMemcpyAsync(&last_offset, s_d_tile_offset + (fine_total_cells - 1), sizeof(int), cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(&last_count,  s_d_tile_count  + (fine_total_cells - 1), sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(s_h_scalars,     s_d_tile_offset + (fine_total_cells - 1), sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(s_h_scalars + 1, s_d_tile_count  + (fine_total_cells - 1), sizeof(int), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
-        int total_tiles = std::max(0, last_offset + last_count);
+        int total_tiles = std::max(0, static_cast<int>(s_h_scalars[0]) + static_cast<int>(s_h_scalars[1]));
 
         long long atoms_needed = (long long)total_tiles * LJ_TILE_SIZE;
         if (atoms_needed > s_tile_atoms_capacity) {
@@ -567,12 +769,17 @@ extern "C" void launch_cuda_tile_list_build(
             if (s_d_tile_cell_id)  cudaFree(s_d_tile_cell_id);
             if (s_d_tile_bbox_min) cudaFree(s_d_tile_bbox_min);
             if (s_d_tile_bbox_max) cudaFree(s_d_tile_bbox_max);
-            long long new_cap = std::max(atoms_needed, s_tile_atoms_capacity + s_tile_atoms_capacity / 2);
+            if (s_d_tile_flags)    cudaFree(s_d_tile_flags);
+            // 25% headroom: the tile count drifts as atoms move between cells, and a
+            // reallocation (cudaFree synchronizes) in the middle of a run stalls the step.
+            long long new_cap = std::max(atoms_needed + atoms_needed / 4,
+                                         s_tile_atoms_capacity + s_tile_atoms_capacity / 2);
             long long new_tiles_cap = new_cap / LJ_TILE_SIZE;
             cudaMalloc(&s_d_tile_atoms, new_cap * sizeof(int));
             cudaMalloc(&s_d_tile_cell_id, new_tiles_cap * sizeof(int));
             cudaMalloc(&s_d_tile_bbox_min, new_tiles_cap * 3 * sizeof(Real));
             cudaMalloc(&s_d_tile_bbox_max, new_tiles_cap * 3 * sizeof(Real));
+            cudaMalloc(&s_d_tile_flags,    new_tiles_cap * sizeof(unsigned char));
             s_tile_atoms_capacity = new_cap;
         }
         if (atoms_needed > 0) {
@@ -596,8 +803,53 @@ extern "C" void launch_cuda_tile_list_build(
                 d_x, d_y, d_z, s_d_tile_atoms, s_d_tile_cell_id,
                 fine_nx, fine_ny, fine_cell_size_x, fine_cell_size_y, fine_cell_size_z,
                 lx, ly, lz, periodic_x, periodic_y, periodic_z,
-                s_d_tile_bbox_min, s_d_tile_bbox_max, total_tiles);
+                s_d_tile_bbox_min, s_d_tile_bbox_max, s_d_tile_flags, n_local, total_tiles);
             NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
+        }
+
+        // With ghost atoms the list builder also needs to know which cells hold a ghost tile.
+        const bool want_ghost_cells = tiles_only && n_total > n_local && total_tiles > 0;
+        if (want_ghost_cells) {
+            if (fine_total_cells > s_cell_ghost_capacity) {
+                if (s_d_cell_has_ghost) cudaFree(s_d_cell_has_ghost);
+                cudaMalloc(&s_d_cell_has_ghost, static_cast<size_t>(fine_total_cells));
+                s_cell_ghost_capacity = fine_total_cells;
+            }
+            cudaMemsetAsync(s_d_cell_has_ghost, 0, static_cast<size_t>(fine_total_cells), stream);
+            mark_ghost_cells_kernel<<<(total_tiles + 255) / 256, 256, 0, stream>>>(
+                s_d_tile_flags, s_d_tile_cell_id, s_d_cell_has_ghost, total_tiles);
+            NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
+        }
+
+        if (tiles_only) {
+            // The caller builds its own lists from the cell grid and the tiles.
+            if (out_d_tile_atoms)        *out_d_tile_atoms        = s_d_tile_atoms;
+            if (out_d_tile_pair_i)       *out_d_tile_pair_i       = nullptr;
+            if (out_d_tile_pair_j)       *out_d_tile_pair_j       = nullptr;
+            if (out_d_tile_pair_offsets) *out_d_tile_pair_offsets = nullptr;
+            if (out_d_tile_pair_verlet_mask) *out_d_tile_pair_verlet_mask = nullptr;
+            if (out_d_tile_pair_excl_mask) *out_d_tile_pair_excl_mask = nullptr;
+            if (out_d_tile_flags)        *out_d_tile_flags        = s_d_tile_flags;
+            if (out_num_tiles)           *out_num_tiles           = total_tiles;
+            if (out_num_tile_pairs)      *out_num_tile_pairs      = 0;
+            if (out_pairs_inside_rc)      *out_pairs_inside_rc      = 0;
+            if (out_pairs_inside_rc_plus_skin) *out_pairs_inside_rc_plus_skin = 0;
+            if (grid_out) {
+                grid_out->tile_offset = s_d_tile_offset;
+                grid_out->tile_count = s_d_tile_count;
+                grid_out->tile_cell_id = s_d_tile_cell_id;
+                grid_out->tile_bbox_min = s_d_tile_bbox_min;
+                grid_out->tile_bbox_max = s_d_tile_bbox_max;
+                grid_out->nx = fine_nx;
+                grid_out->ny = fine_ny;
+                grid_out->nz = fine_nz;
+                grid_out->cell_size_x = fine_cell_size_x;
+                grid_out->cell_size_y = fine_cell_size_y;
+                grid_out->cell_size_z = fine_cell_size_z;
+                grid_out->stencil_radius = FINE_STENCIL_RADIUS;
+                grid_out->cell_has_ghost = want_ghost_cells ? s_d_cell_has_ghost : nullptr;
+            }
+            return;
         }
 
         if (!s_d_pair_counter) cudaMalloc(&s_d_pair_counter, sizeof(int));
@@ -614,6 +866,7 @@ extern "C" void launch_cuda_tile_list_build(
             if (total_tiles > 0) {
                 build_lj_tile_pairs_fine_kernel<<<num_blocks_t, threads_per_block_t, 0, stream>>>(
                     s_d_tile_offset, s_d_tile_count, s_d_tile_bbox_min, s_d_tile_bbox_max,
+                    s_d_tile_flags,
                     s_d_tile_pair_i, s_d_tile_pair_j, s_d_pair_counter, capacity,
                     fine_nx, fine_ny, fine_nz,
                     fine_cell_size_x, fine_cell_size_y, fine_cell_size_z,
@@ -621,18 +874,22 @@ extern "C" void launch_cuda_tile_list_build(
                     cutoff_sq, fine_total_cells);
                 NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
             }
-            cudaMemcpyAsync(&host_pair_count, s_d_pair_counter, sizeof(int), cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(s_h_scalars, s_d_pair_counter, sizeof(int), cudaMemcpyDeviceToHost, stream);
             cudaStreamSynchronize(stream);
+            host_pair_count = static_cast<int>(s_h_scalars[0]);
 
             if (host_pair_count <= s_tile_pairs_capacity) break;
 
             if (s_d_tile_pair_i) cudaFree(s_d_tile_pair_i);
             if (s_d_tile_pair_j) cudaFree(s_d_tile_pair_j);
             if (s_d_tile_pair_verlet_mask) cudaFree(s_d_tile_pair_verlet_mask);
+            if (s_d_tile_pair_excl_mask) cudaFree(s_d_tile_pair_excl_mask);
             s_tile_pairs_capacity = (long long)(host_pair_count * 1.25) + 64;
             cudaMalloc(&s_d_tile_pair_i, s_tile_pairs_capacity * sizeof(int));
             cudaMalloc(&s_d_tile_pair_j, s_tile_pairs_capacity * sizeof(int));
             cudaMalloc(&s_d_tile_pair_verlet_mask,
+                       s_tile_pairs_capacity * sizeof(unsigned long long));
+            cudaMalloc(&s_d_tile_pair_excl_mask,
                        s_tile_pairs_capacity * sizeof(unsigned long long));
         }
 
@@ -644,14 +901,19 @@ extern "C" void launch_cuda_tile_list_build(
         if (total_tiles > 0 && host_pair_count > 0) {
             thrust::device_ptr<int> key_ptr(s_d_tile_pair_i);
             thrust::device_ptr<int> val_ptr(s_d_tile_pair_j);
-            thrust::sort_by_key(thrust::cuda::par.on(stream), key_ptr, key_ptr + host_pair_count, val_ptr);
+            thrust::sort_by_key(thrust_policy, key_ptr, key_ptr + host_pair_count, val_ptr);
 
             thrust::counting_iterator<int> search_begin(0);
             thrust::device_ptr<int> offsets_ptr(s_d_tile_pair_offsets);
-            thrust::lower_bound(thrust::cuda::par.on(stream), key_ptr, key_ptr + host_pair_count,
+            thrust::lower_bound(thrust_policy, key_ptr, key_ptr + host_pair_count,
                                  search_begin, search_begin + (total_tiles + 1), offsets_ptr);
         } else if (total_tiles > 0) {
             cudaMemsetAsync(s_d_tile_pair_offsets, 0, s_tile_pair_offsets_capacity * sizeof(int), stream);
+        }
+        if (total_tiles > 0 && host_pair_count > 0) {
+            mark_ghost_adjacent_tiles_kernel<<<(total_tiles + 255) / 256, 256, 0, stream>>>(
+                s_d_tile_pair_offsets, s_d_tile_pair_j, s_d_tile_flags, total_tiles);
+            NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
         }
 
         unsigned long long host_pair_counts[2] = {0, 0};
@@ -664,20 +926,34 @@ extern "C" void launch_cuda_tile_list_build(
             const int mask_grid = (host_pair_count + mask_block - 1) / mask_block;
             build_tile_pair_verlet_masks_kernel<<<mask_grid, mask_block, 0, stream>>>(
                 d_x, d_y, d_z, s_d_tile_atoms, s_d_tile_pair_i, s_d_tile_pair_j,
-                s_d_tile_pair_verlet_mask, s_d_verlet_pair_counts,
+                s_d_tile_pair_verlet_mask, s_d_tile_pair_excl_mask,
+                d_global_id, d_exclusion_offsets, d_exclusion_partners, exclusion_atom_count,
+                s_d_verlet_pair_counts,
                 n_local, host_pair_count, cutoff * cutoff, cutoff_sq,
                 lx, ly, lz, periodic_x, periodic_y, periodic_z);
             NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
         }
-        cudaMemcpyAsync(host_pair_counts, s_d_verlet_pair_counts,
-                        sizeof(host_pair_counts), cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
+        // The inside-cutoff counts are statistics only. Reading them back costs a full
+        // stream sync right after the (long) mask kernel, so it is opt-in
+        // (MD_NLIST_PAIR_COUNT_READBACK=1); otherwise the outputs stay 0 and the host moves on.
+        static const bool s_want_pair_stats = [] {
+            const char* v = std::getenv("MD_NLIST_PAIR_COUNT_READBACK");
+            return v && *v && std::string(v) != "0";
+        }();
+        if (s_want_pair_stats) {
+            cudaMemcpyAsync(s_h_scalars + 2, s_d_verlet_pair_counts,
+                            2 * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            std::memcpy(host_pair_counts, s_h_scalars + 2, sizeof(host_pair_counts));
+        }
 
         if (out_d_tile_atoms)        *out_d_tile_atoms        = s_d_tile_atoms;
         if (out_d_tile_pair_i)       *out_d_tile_pair_i       = s_d_tile_pair_i;
         if (out_d_tile_pair_j)       *out_d_tile_pair_j       = s_d_tile_pair_j;
         if (out_d_tile_pair_offsets) *out_d_tile_pair_offsets = (total_tiles > 0) ? s_d_tile_pair_offsets : nullptr;
         if (out_d_tile_pair_verlet_mask) *out_d_tile_pair_verlet_mask = s_d_tile_pair_verlet_mask;
+        if (out_d_tile_pair_excl_mask) *out_d_tile_pair_excl_mask = s_d_tile_pair_excl_mask;
+        if (out_d_tile_flags)        *out_d_tile_flags        = s_d_tile_flags;
         if (out_num_tiles)           *out_num_tiles           = total_tiles;
         if (out_num_tile_pairs)      *out_num_tile_pairs      = host_pair_count;
         if (out_pairs_inside_rc)      *out_pairs_inside_rc      = host_pair_counts[0];

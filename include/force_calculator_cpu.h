@@ -11,7 +11,7 @@
 #include <mpi.h>
 
 class Topology;
-class CpuSpatialVerletList;
+class SpatialVerletList;
 
 class ForceCalculatorCPU : public ForceCalculator {
 public:
@@ -111,7 +111,7 @@ private:
 
     std::vector<Real> tile_cx_, tile_cy_, tile_cz_, tile_rad_;
 
-    void repack_tile_soa(const ParticleData& particles, const CpuSpatialVerletList& nlist);
+    void repack_tile_soa(const ParticleData& particles, const SpatialVerletList& nlist);
     std::vector<Real> tile_px_, tile_py_, tile_pz_, tile_q_;
     std::vector<int>  tile_type_, tile_gid_;
 
@@ -122,20 +122,20 @@ private:
     std::vector<float> lj_c6c12_f_;
     std::vector<float> ewald_rs_table_f_;
 
-    void ensure_tile_exclusion_masks(const CpuSpatialVerletList& nlist);
+    void ensure_tile_exclusion_masks(const SpatialVerletList& nlist);
     std::vector<std::uint64_t> tile_pair_excl_;
     std::uint64_t tile_excl_generation_ = ~static_cast<std::uint64_t>(0);
 
     void ensure_lj_thread_buffers(int nthreads, size_t local_particles);
     std::vector<Real> lj_thread_fx_, lj_thread_fy_, lj_thread_fz_;  // size nthreads*local_particles
 
-    void ensure_lj_tile_masks(const CpuSpatialVerletList& nlist, size_t local_particles);
+    void ensure_lj_tile_masks(const SpatialVerletList& nlist, size_t local_particles);
     std::vector<uint8_t> lj_tile_valid_mask_, lj_tile_local_mask_;
     std::vector<std::uint64_t> lj_same_tile_mask_;
     std::uint64_t lj_tile_mask_generation_ = ~static_cast<std::uint64_t>(0);
     size_t lj_tile_mask_local_particles_ = ~static_cast<size_t>(0);
 
-    void ensure_lj_tile_excl_col(const CpuSpatialVerletList& nlist);
+    void ensure_lj_tile_excl_col(const SpatialVerletList& nlist);
     std::vector<std::uint64_t> lj_tile_excl_col_;
     std::uint64_t lj_tile_excl_col_generation_ = ~static_cast<std::uint64_t>(0);
 };

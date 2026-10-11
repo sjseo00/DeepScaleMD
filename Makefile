@@ -13,7 +13,9 @@ CPU_BUILD_DIR := build/deepscalemd-cpu
 CUDA_BUILD_DIR := build/deepscalemd-cuda
 SYCL_BUILD_DIR := build/deepscalemd-sycl
 
-.PHONY: all build cpu cuda sycl clean help
+.PHONY: all build cpu cuda sycl clean help systems memory-check parse pack plots mock progress
+
+PYTHON ?= python
 
 all: cpu
 
@@ -50,5 +52,9 @@ clean:
 
 help:
 	@echo "CMake wrapper targets: cpu | cuda | sycl | clean"
+	@echo "Benchmark targets: systems | memory-check | parse | pack | plots | mock"
 	@echo "Set LIBTORCH=ON with the cuda target to enable the LibTorch MLIP interface."
 	@echo "Override CPU_DSDECOMPX_DIR or CUDA_DSDECOMPX_DIR when needed."
+
+systems memory-check parse pack plots mock progress:
+	$(MAKE) -C bench $@ PYTHON=$(PYTHON)

@@ -540,6 +540,11 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
                       << " -> exact rc force check"
                       << " (legacy tile graph disabled)"
                       << std::endl;
+        } else if (nonbonded_kernel_ == "list") {
+            std::cout << "[Nonbonded kernel] per-atom neighbor-list dispatch requested"
+                      << " (CUDA, mixed precision, builtin LJ/PME, one or several ranks;"
+                      << " other cases use tiled)"
+                      << std::endl;
         } else {
             std::cout << "[Nonbonded kernel] tiled dispatch enabled (legacy path)"
                       << std::endl;
@@ -560,6 +565,7 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
                       << "virial still accumulate in double" << std::endl;
         }
         cuda_calc_cached_->set_pme_cluster_spread_enabled(pme_cluster_spread_);
+        cuda_calc_cached_->set_pme_grid_spacing(pme_grid_spacing_);
         if (pme_cluster_spread_ && system->get_rank() == 0) {
             std::cout << "[PME] thread-block-cluster spread kernel requested -- "
                       << "unverified on real Hopper hardware; only takes "
@@ -663,7 +669,9 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
     }
 
     neighbor_list_ = create_neighbor_list(NeighborListBackend::CPU_SPATIAL_VERLET, cutoff, verlet_skin);
-    neighbor_list_->set_nonbonded_kernel(nonbonded_kernel_);
+    // The host-side list only knows the tiled and graph layouts; "list" is a CUDA-only kernel
+    // that builds its per-atom lists from the device tile list.
+    neighbor_list_->set_nonbonded_kernel(nonbonded_kernel_ == "list" ? std::string("tiled") : nonbonded_kernel_);
     neighbor_list_->set_mlip_edge_list_needed(enable_libtorch_forces_);
     system->set_neighbor_list(neighbor_list_.get());
 
@@ -708,6 +716,7 @@ bool MDSimulation::is_using_cuda_backend() const {
 
 void MDSimulation::single_step() {
     auto step_start = std::chrono::high_resolution_clock::now();
+    pending_gpu_wait_ = 0.0;  // minimization and the first evaluation also pass through the neighbor phase
     
     ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
 
@@ -721,7 +730,7 @@ void MDSimulation::single_step() {
     handle_neighbor_phase(nlist_build_time, comm_time, migrate_time);
     
     double force_time = 0.0;
-    handle_force_phase(cuda_calc, force_time);
+    handle_force_phase(cuda_calc, force_time, energy_needed_for_step(current_step + 1));
 
     double integrate2_time = 0.0;
     handle_integrate2_phase(cuda_calc, integrate2_time);
@@ -829,6 +838,9 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         adaptive_rebuild_armed_ = true;
     }
 
+    // The ranks' decisions can differ only when a displacement check ran this step; the periodic
+    // and the forced rebuilds are the same on every rank.
+    bool decision_may_differ = false;
     if (!should_rebuild && neighbor_list_builds > 0) {
         // Ghost membership/order is now only refreshed at an actual neighbor
         // rebuild (dsDecompX's halo plan is reused between rebuilds; see
@@ -838,18 +850,30 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         // can drift into range of a neighbor that was never added as a
         // ghost, silently dropping that pair's force. This scan is a cheap
         // local O(local_N) pass, so run it every step when distributed.
+        // The MPI backend reports is_distributed() even for a single rank, which used to force
+        // a check (and a wait for the GPU) on every step. One GPU rank has no ghost atoms, so
+        // the check can be strided: an explicit neighbor_displacement_check_stride is honored,
+        // and the automatic update_freq/4 applies when the relaxed rebuild criterion is on
+        // (the default strict criterion keeps its per-step check).
+        const bool single_gpu_rank = comm_backend_->is_gpu_single_rank(cuda_calc_cached_ != nullptr);
         const int displacement_check_stride =
-            comm_backend_->is_distributed()
-                ? 1
+            (comm_backend_->is_distributed() && !single_gpu_rank)
+                // Several ranks: every step, unless the input asks for a stride and accepts the
+                // relaxed skin (the lagged check extrapolates over the interval).
+                ? ((neighbor_displacement_check_stride > 0 && neighbor_rebuild_relaxed_skin_)
+                       ? neighbor_displacement_check_stride : 1)
                 : (neighbor_displacement_check_stride > 0)
                     ? neighbor_displacement_check_stride
-                    : std::max(1, neighbor_list_update_freq / 4);
+                    : ((single_gpu_rank && !neighbor_rebuild_relaxed_skin_)
+                           ? 1
+                           : std::max(1, neighbor_list_update_freq / 4));
         const bool run_displacement_check =
             (current_step > 0) && (current_step % displacement_check_stride == 0);
 
         if (!run_displacement_check) {
             should_rebuild = false;
         } else {
+        decision_may_differ = true;
         const Real skin = (verlet_skin > 0.0) ? verlet_skin : 2.0;
         const Real hi_frac = neighbor_rebuild_hi_frac;
         const Real lo_frac = neighbor_rebuild_lo_frac;
@@ -859,15 +883,51 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
 #ifdef USE_CUDA
         const bool using_cuda_backend = (cuda_calc_cached_ != nullptr);
         if (using_cuda_backend) {
-            const Real max_disp_sq = cuda_calc_cached_->compute_max_displacement_on_device(
-                system->get_local_particles(), system->get_box());
-            if (max_disp_sq <= disp_lo_sq) {
-                adaptive_rebuild_armed_ = true;
+            // This call waits for the queued GPU work (force kernels of the previous
+            // steps included), so on a GPU-bound run most of the step shows up here.
+            //
+            // With several GPU ranks the check is lagged instead: it reads the measurement queued
+            // at the previous check (a step old, no wait for the current queue) and queues the new
+            // one, so the host can launch the next step while the GPU is still busy with this one.
+            // The reading is extrapolated by its own growth over the last interval, which covers
+            // the step of lag; DSMD_DISP_LAG=0 restores the waiting check.
+            static const bool lagged_check_enabled = [] {
+                const char* v = std::getenv("DSMD_DISP_LAG");
+                return !(v && std::string(v) == "0");
+            }();
+            const bool lagged_check = lagged_check_enabled && comm_backend_->is_distributed() && !single_gpu_rank;
+            const auto gpu_wait_start = std::chrono::high_resolution_clock::now();
+            Real max_disp_sq = 0.0;
+            bool have_reading = true;
+            if (lagged_check) {
+                const Real lagged_sq = cuda_calc_cached_->compute_max_displacement_lagged(
+                    system->get_local_particles(), system->get_box());
+                if (lagged_sq < 0.0) {
+                    have_reading = false;  // right after a rebuild: no reading against the new reference yet
+                    lagged_disp_have_previous_ = false;
+                } else {
+                    const Real reading = std::sqrt(lagged_sq);
+                    const Real growth = lagged_disp_have_previous_
+                        ? std::max<Real>(0.0, reading - lagged_disp_previous_) : 0.0;
+                    lagged_disp_previous_ = reading;
+                    lagged_disp_have_previous_ = true;
+                    max_disp_sq = (reading + growth) * (reading + growth);
+                }
+            } else {
+                max_disp_sq = cuda_calc_cached_->compute_max_displacement_on_device(
+                    system->get_local_particles(), system->get_box());
             }
-            should_rebuild = adaptive_rebuild_armed_ && (max_disp_sq > disp_hi_sq);
-            if (should_rebuild) {
-                adaptive_rebuild_armed_ = false;
-                reason_adaptive = true;
+            pending_gpu_wait_ += std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - gpu_wait_start).count();
+            if (have_reading) {
+                if (max_disp_sq <= disp_lo_sq) {
+                    adaptive_rebuild_armed_ = true;
+                }
+                should_rebuild = adaptive_rebuild_armed_ && (max_disp_sq > disp_hi_sq);
+                if (should_rebuild) {
+                    adaptive_rebuild_armed_ = false;
+                    reason_adaptive = true;
+                }
             }
         } else
 #endif
@@ -903,7 +963,7 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
     }
 
     const bool local_rebuild_decision = should_rebuild;
-    comm_backend_->unify_rebuild_decision(should_rebuild);
+    if (decision_may_differ) comm_backend_->unify_rebuild_decision(should_rebuild);
     if (!local_rebuild_decision && should_rebuild) {
         reason_mpi_sync = true;
     }
@@ -925,26 +985,53 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
                 migrate_end - migrate_start).count();
         }
 
+        // Non-rebuild step on a reusable halo plan: the ghost layout and count are
+        // already known, so the exchange is only begun here. The force phase
+        // evaluates the owned-owned pairs while it is in flight and finishes it
+        // before touching ghosts (see compute_forces_with_mode). Everything below
+        // that depends on the exchange's outcome (late rebuild, bonded refresh)
+        // cannot trigger on a reused plan, so it is skipped.
+        bool overlap_halo = false;
+#ifdef USE_CUDA
+        overlap_halo = cuda_calc && !should_rebuild && overlap_halo_enabled_ &&
+            !enable_python_forces_ && !enable_libtorch_forces_ &&
+            cuda_calc->supports_overlapped_forces(*system) &&
+            system->can_overlap_halo_on_device(*cuda_calc);
+        if (overlap_halo) {
+            system->begin_halo_exchange_on_device(*cuda_calc);
+            halo_overlap_pending_ = true;
+        }
+#endif
+
         bool gpu_direct_halo_done = false;
-        if (halo_backend_) {
+        if (!overlap_halo && halo_backend_) {
             gpu_direct_halo_done = halo_backend_->try_gpu_direct_halo(
                 *system, force_calc.get(), should_rebuild);
         }
 
-        if (cuda_calc && !gpu_direct_halo_done) {
+        if (!overlap_halo && cuda_calc && !gpu_direct_halo_done) {
             throw std::runtime_error(
                 "CUDA execution requires the dsDecompX GPU-resident halo backend; "
                 "host ParticleData fallback is disabled");
         }
 
-        if (!gpu_direct_halo_done) {
+        if (!overlap_halo && !gpu_direct_halo_done) {
             system->sync_halo_particles(should_rebuild);
         }
 
 #ifdef USE_CUDA
-        if (cuda_calc) {
-            bool late_rebuild = !global_rebuild_epoch && should_rebuild;
-            comm_backend_->unify_rebuild_decision(late_rebuild);
+        if (cuda_calc && !overlap_halo) {
+            // A late rebuild means the halo exchange itself forced one: on a
+            // non-rebuild step that only happens when it had to build a new
+            // plan (a reused plan keeps the ghost layout and storage). Both
+            // inputs below are identical on every rank, so ranks agree on
+            // whether to enter the collective and the common step skips it.
+            const bool late_rebuild_possible =
+                !global_rebuild_epoch && !system->last_device_halo_plan_reused();
+            bool late_rebuild = late_rebuild_possible && should_rebuild;
+            if (late_rebuild_possible) {
+                comm_backend_->unify_rebuild_decision(late_rebuild);
+            }
             if (late_rebuild) {
                 reason_mpi_sync = true;
 
@@ -962,19 +1049,18 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         }
 #endif
 
-        if (halo_backend_) {
+        if (!overlap_halo && halo_backend_) {
             halo_backend_->on_post_halo(
                 *system, force_calc.get(), should_rebuild, gpu_direct_halo_done);
         }
 
-#ifdef USE_CUDA
-        if (cuda_calc) {
-            const auto& cfg = system->get_force_manager().get_config();
-            if (cfg.enable_bonds || cfg.enable_angles || cfg.enable_dihedrals) {
-                cuda_calc->refresh_bonded_topology_on_device(*system);
-            }
+        // Owned order only changes at a migration and ghost slots only at a
+        // halo rebuild (dsDecompX keeps the CUDA halo plan between rebuilds),
+        // so the bonded topology can only go stale on a rebuild step. Checking
+        // it every step cost a device-to-host copy of all IDs plus a stream sync.
+        if (should_rebuild) {
+            refresh_cuda_bonded_topology_if_needed();
         }
-#endif
 
         auto comm_end = std::chrono::high_resolution_clock::now();
         const double distributed_phase_time =
@@ -1008,14 +1094,42 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
     });
 }
 
-void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml) {
+void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml, bool need_energy) {
     ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
 
-    if (force_calc && (enable_builtin_forces_ || enable_libtorch_forces_ || cuda_calc)) {
+    // Only the CUDA calculator can defer the readback; the others always
+    // produce host values.
+    const bool defer_energy = cuda_calc && !need_energy;
+#ifdef USE_CUDA
+    if (cuda_calc) {
+        cuda_calc->set_energy_readback_needed(!defer_energy);
+    }
+#endif
+
+    if (halo_overlap_pending_) {
+#ifdef USE_CUDA
+        // Overlapped step: owned-owned pairs run on the force stream while the
+        // exchange completes (MPI wait on the host, or stream-ordered NCCL /
+        // NVSHMEM); the force stream then waits for the unpack before the ghost
+        // pairs and everything else that needs ghost data.
+        cuda_calc->begin_forces_interior(*system);
+        system->end_halo_exchange_on_device(*cuda_calc);
+        halo_overlap_pending_ = false;
+        ++halo_overlap_steps_;
+        cuda_calc->finish_forces_boundary(*system);
+#endif
+    } else if (force_calc && (enable_builtin_forces_ || enable_libtorch_forces_ || cuda_calc)) {
         force_calc->compute_forces(*system);
     } else {
         zero_forces();
     }
+
+#ifdef USE_CUDA
+    if (cuda_calc) {
+        // Leave the calculator in its safe default for any other caller.
+        cuda_calc->set_energy_readback_needed(true);
+    }
+#endif
 
     Real python_potential_energy = 0.0;
 
@@ -1046,8 +1160,23 @@ void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml) {
         }
     }
 
-    cached_potential_energy =
-        (force_calc ? force_calc->get_potential_energy() : 0.0) + python_potential_energy;
+    if (!defer_energy) {
+        cached_potential_energy =
+            (force_calc ? force_calc->get_potential_energy() : 0.0) + python_potential_energy;
+    }
+}
+
+void MDSimulation::refresh_cuda_bonded_topology_if_needed() {
+#ifdef USE_CUDA
+    ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
+    if (!cuda_calc || !comm_backend_->is_distributed()) {
+        return;
+    }
+    const auto& cfg = system->get_force_manager().get_config();
+    if (cfg.enable_bonds || cfg.enable_angles || cfg.enable_dihedrals) {
+        cuda_calc->refresh_bonded_topology_on_device(*system);
+    }
+#endif
 }
 
 void MDSimulation::reverse_halo_for_bonded_if_needed() {
@@ -1066,9 +1195,10 @@ void MDSimulation::reverse_halo_for_bonded_if_needed() {
     }
 
 #ifdef USE_CUDA
-    ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
-    if (cuda_calc) {
-        system->reverse_halo_on_device(*cuda_calc);
+    // The CUDA bonded and special-pair kernels evaluate a term on every rank that owns one of its
+    // atoms and apply the force to owned atoms only (like the nonbonded pair kernels), so no
+    // force lands on a ghost atom and there is nothing to send back.
+    if (cuda_calc_cached_) {
         return;
     }
 #endif
@@ -1092,16 +1222,18 @@ void MDSimulation::handle_neighbor_rebuild_if_needed(bool should_rebuild) {
     }
 
     neighbor_list_builds++;
+    lagged_disp_have_previous_ = false;  // the displacement reference changed
 
 }
 
-void MDSimulation::handle_force_phase(ForceCalculatorCUDA* cuda_calc, double& force_time) {
+void MDSimulation::handle_force_phase(ForceCalculatorCUDA* cuda_calc, double& force_time,
+                                      bool need_energy) {
     force_time = measure_seconds([&]() {
         if (!cuda_calc) {
             zero_forces();
         }
 
-        compute_forces_with_mode(true);
+        compute_forces_with_mode(true, need_energy);
         reverse_halo_for_bonded_if_needed();
 
         if (!cuda_calc && comm_backend_->is_distributed() &&
@@ -1173,6 +1305,7 @@ void MDSimulation::accumulate_step_timing(double integrate1_time, double nlist_b
     last_timing.ke_ms = ke_time * 1000.0;
     last_timing.barostat_ms = barostat_time * 1000.0;
     last_timing.total_ms = total_time * 1000.0;
+    last_timing.gpu_wait_ms = pending_gpu_wait_ * 1000.0;
     last_timing.force_components_ms.clear();
 
     cumulative_timing.neighbor_time += nlist_build_time;
@@ -1184,6 +1317,8 @@ void MDSimulation::accumulate_step_timing(double integrate1_time, double nlist_b
     cumulative_timing.comm_time += comm_time;
     cumulative_timing.migration_time += migrate_time;
     cumulative_timing.total_time += total_time;
+    cumulative_timing.gpu_wait_time += pending_gpu_wait_;
+    pending_gpu_wait_ = 0.0;
     cumulative_timing.step_count++;
 
     if (timing_trace_force_ && force_calc) {
@@ -1331,6 +1466,9 @@ void MDSimulation::handle_box_change_rebuild() {
         {
             system->perform_halo_exchange(true);
         }
+        // The halo was rebuilt for the new box, so ghost slots may have moved;
+        // forces are computed right below, before the next neighbor phase.
+        refresh_cuda_bonded_topology_if_needed();
     }
 
     if (cuda_calc) {
@@ -1568,6 +1706,11 @@ void MDSimulation::run() {
 #endif
     timing_trace_mode_ = parse_timing_trace_mode();
     timing_trace_force_ = env_flag_enabled("MD_TIMING_TRACE_FORCE");
+    if (const char* overlap = std::getenv("DSMD_OVERLAP_HALO")) {
+        const std::string value(overlap);
+        overlap_halo_enabled_ = !(value == "0" || value == "false" || value == "FALSE" ||
+                                  value == "off" || value == "OFF");
+    }
     if (force_calc) {
         force_calc->set_timing_breakdown_enabled(timing_trace_force_);
     }
@@ -1614,6 +1757,12 @@ void MDSimulation::run() {
 
     if (system->get_rank() == 0) {
         std::cout << "Neighbor list builds = " << neighbor_list_builds << std::endl;
+        if (comm_backend_->is_distributed() && cuda_calc_cached_) {
+            std::cout << "Halo/force overlap: " << halo_overlap_steps_ << " of "
+                      << total_steps << " steps"
+                      << (overlap_halo_enabled_ ? "" : " (disabled by DSMD_OVERLAP_HALO)")
+                      << std::endl;
+        }
         if (nonbonded_kernel_ == "graph") {
             std::cout << "Active graph incremental prunes = " << active_graph_prunes_
                       << ", safe reuses = " << active_graph_reuses_ << std::endl;
@@ -1644,7 +1793,8 @@ void MDSimulation::print_step_timing(int step) {
               << " thermo_ms=" << last_timing.thermostat_ms
               << " ke_ms=" << last_timing.ke_ms
               << " baro_ms=" << last_timing.barostat_ms
-              << " io_ms=" << last_timing.io_ms;
+              << " io_ms=" << last_timing.io_ms
+              << " gpu_wait_ms=" << last_timing.gpu_wait_ms;
     for (const auto& [name, ms] : last_timing.force_components_ms) {
         std::cout << " force." << name << "_ms=" << ms;
     }
@@ -1658,6 +1808,10 @@ bool MDSimulation::should_output_step(int step) const {
 bool MDSimulation::needs_ke_update_for_step(int step) const {
     return should_output_step(step) || should_write_trajectory_step(step) ||
            (step == total_steps);
+}
+
+bool MDSimulation::energy_needed_for_step(int step) const {
+    return barostat != nullptr || needs_ke_update_for_step(step);
 }
 
 bool MDSimulation::should_write_trajectory_step(int step) const {
@@ -1830,15 +1984,34 @@ std::string MDSimulation::format_output_line(int step, const OutputMetrics& metr
     return output_line.str();
 }
 
+bool MDSimulation::output_needs_particle_stats() const {
+    for (OutputField field : output_fields_cache) {
+        if (field == OutputField::FMAX || field == OutputField::MAX_SPEED ||
+            field == OutputField::AVG_SPEED) {
+            return true;
+        }
+    }
+    return false;  // empty cache means the default STEP/T/KE line, all scalars
+}
+
 void MDSimulation::output_results(int step, bool emit_text) {
     double output_time = measure_seconds([&]() {
-        sync_output_state_to_host_if_needed();
+        // Console lines built from energy, temperature and pressure read scalars the
+        // force and KE phases already produced. Pulling every particle array down to the
+        // host (a pageable copy plus a stream sync, with the GPU idle) is only needed
+        // for a trajectory frame or for per-particle statistics in the printed line.
+        const bool want_particle_stats = emit_text && output_needs_particle_stats();
+        if (want_particle_stats || should_write_trajectory_step(step)) {
+            sync_output_state_to_host_if_needed();
+        }
 
         OutputMetrics metrics;
         ParticleData& particles = system->get_particles();
 
         compute_output_energies(particles, metrics);
-        compute_output_force_speed_stats(particles, metrics);
+        if (want_particle_stats) {
+            compute_output_force_speed_stats(particles, metrics);
+        }
         compute_output_thermodynamics(particles, metrics);
 
         if (emit_text) {
@@ -2003,6 +2176,8 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             } else if (key == "pme_cluster_spread") {
                 std::string v = trim_copy(value);
                 pme_cluster_spread_ = (v == "true" || v == "1" || v == "on");
+            } else if (key == "pme_grid_spacing") {
+                pme_grid_spacing_ = std::stod(trim_copy(value));
             } else if (key == "electrostatics_solver") {
                 electrostatics_solver_ = trim_copy(value);
             } else if (key == "pme_ranks") {
@@ -2084,6 +2259,9 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             neighbor_rebuild_hi_frac = std::stod(value);
         } else if (key == "neighbor_rebuild_lo_frac") {
             neighbor_rebuild_lo_frac = std::stod(value);
+        } else if (key == "neighbor_rebuild_relaxed_skin") {
+            const std::string v = trim_copy(value);
+            neighbor_rebuild_relaxed_skin_ = (v == "true" || v == "1" || v == "on");
         } else if (key == "neighbor_displacement_check_stride") {
             neighbor_displacement_check_stride = std::stoi(value);
         } else if (key == "integrator") {
@@ -2196,10 +2374,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                    nonbonded_kernel_.begin(), [](unsigned char c) {
                        return static_cast<char>(std::tolower(c));
                    });
-    if (nonbonded_kernel_ != "tiled" && nonbonded_kernel_ != "graph") {
+    if (nonbonded_kernel_ != "tiled" && nonbonded_kernel_ != "graph" && nonbonded_kernel_ != "list") {
         throw std::runtime_error(
             "Invalid force_calculation.nonbonded_kernel: '" + nonbonded_kernel_
-            + "'. Supported values are: tiled, graph");
+            + "'. Supported values are: tiled, graph, list");
     }
 
     electrostatics_solver_ = trim_copy(electrostatics_solver_);
@@ -2316,12 +2494,15 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     if (neighbor_rebuild_lo_frac >= neighbor_rebuild_hi_frac) {
         throw std::runtime_error("Invalid adaptive rebuild thresholds: neighbor_rebuild_lo_frac must be smaller than neighbor_rebuild_hi_frac");
     }
-    if (neighbor_rebuild_hi_frac > 0.5) {
+    if (neighbor_rebuild_hi_frac > 0.5 && !neighbor_rebuild_relaxed_skin_) {
         throw std::runtime_error(
             "Invalid neighbor_rebuild_hi_frac: must be <= 0.5 to preserve the Verlet-skin "
             "safety invariant (two particles closing head-on must not together cover more "
             "than the skin distance before a rebuild is forced); got " +
-            std::to_string(neighbor_rebuild_hi_frac));
+            std::to_string(neighbor_rebuild_hi_frac) +
+            ". Set neighbor_rebuild_relaxed_skin: true to accept the relaxed criterion "
+            "(like NAMD's margin 0): a pair can then be missed for a few steps while it is "
+            "still close to the cutoff, where its force is tiny.");
     }
     if (neighbor_displacement_check_stride < 0) {
         throw std::runtime_error("Invalid neighbor_displacement_check_stride: must be non-negative (0 means auto)");
@@ -2375,8 +2556,13 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
               << "*skin, check_stride="
               << (neighbor_displacement_check_stride > 0
                   ? std::to_string(neighbor_displacement_check_stride)
-                  : std::string("auto(update_freq/4)"))
+                  : std::string("auto(update_freq/4; every step on one GPU unless relaxed_skin)"))
               << std::endl;
+        if (neighbor_rebuild_hi_frac > 0.5) {
+            std::cout << "  WARNING: relaxed rebuild criterion (hi_frac > 0.5, neighbor_rebuild_relaxed_skin): "
+                      << "a pair can be missed for a few steps near the cutoff, where its force is tiny"
+                      << std::endl;
+        }
         std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
         if (enable_python_forces_) {
             std::cout << "  Python force path: " << python_force_path << std::endl;

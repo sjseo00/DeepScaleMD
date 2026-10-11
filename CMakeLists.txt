@@ -302,6 +302,18 @@ else()
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     target_link_libraries(deepscalemd PRIVATE
         ${_yaml_target} CUDA::cudart CUDA::cublas CUDA::curand CUDA::cufft)
+
+    # With an NCCL-enabled dsDecompX the multi-rank PME charge-grid sum runs on the device (NCCL
+    # allreduce on the PME stream) instead of through pinned host memory and MPI. Turn it off at
+    # configure time with -DDSMD_ENABLE_NCCL=OFF or at run time with DSMD_PME_NCCL=0.
+    option(DSMD_ENABLE_NCCL "Sum the multi-rank PME grid with NCCL when dsDecompX provides it" ON)
+    if(DSMD_ENABLE_NCCL AND dsDecompX_WITH_NCCL AND TARGET NCCL::NCCL)
+        target_compile_definitions(deepscalemd PRIVATE DSMD_WITH_NCCL=1)
+        target_link_libraries(deepscalemd PRIVATE NCCL::NCCL)
+        message(STATUS "DeepScaleMD: NCCL PME grid sum enabled")
+    else()
+        message(STATUS "DeepScaleMD: NCCL PME grid sum not built (MPI grid sum only)")
+    endif()
     set_target_properties(deepscalemd PROPERTIES
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON

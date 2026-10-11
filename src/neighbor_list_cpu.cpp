@@ -92,17 +92,17 @@ void kd_split_atoms(int* idx, int begin, int end,
 
 }  // namespace
 
-CpuSpatialVerletList::CpuSpatialVerletList(Real cutoff, Real skin)
+SpatialVerletList::SpatialVerletList(Real cutoff, Real skin)
     : cutoff_(cutoff), skin_(skin) {
     max_displacement_threshold_ = (0.5 * skin_) * (0.5 * skin_);
     active_skin_ = 0.5 * skin_;
 }
 
-void CpuSpatialVerletList::update(const ParticleData& particles, const SimulationBox& box, size_t num_local) {
+void SpatialVerletList::update(const ParticleData& particles, const SimulationBox& box, size_t num_local) {
     build(particles, box, num_local);
 }
 
-void CpuSpatialVerletList::prune_active(const ParticleData& particles,
+void SpatialVerletList::prune_active(const ParticleData& particles,
                                         const SimulationBox& box,
                                         size_t num_local) {
     const size_t local_n = (num_local > 0) ? num_local : particles.num_particles;
@@ -158,7 +158,7 @@ void CpuSpatialVerletList::prune_active(const ParticleData& particles,
     last_prune_z_.assign(particles.z.begin(), particles.z.end());
 }
 
-bool CpuSpatialVerletList::needs_active_prune(
+bool SpatialVerletList::needs_active_prune(
     const ParticleData& particles, const SimulationBox& box, size_t /*num_local*/) const {
     if (!build_active_graph_) return false;
     if (last_prune_x_.size() != particles.num_particles || last_prune_x_.empty()) return true;
@@ -186,7 +186,7 @@ namespace {
 constexpr Real kForceRebuildSentinel = -1.0;
 }
 
-Real CpuSpatialVerletList::compute_local_max_displacement_sq(
+Real SpatialVerletList::compute_local_max_displacement_sq(
     const ParticleData& particles, const SimulationBox& box, size_t num_local) const {
     if (last_build_x_.empty()) return kForceRebuildSentinel;
 
@@ -212,7 +212,7 @@ Real CpuSpatialVerletList::compute_local_max_displacement_sq(
     return local_max_disp_sq;
 }
 
-bool CpuSpatialVerletList::needs_rebuild(const ParticleData& particles, const SimulationBox& box, size_t num_local) const {
+bool SpatialVerletList::needs_rebuild(const ParticleData& particles, const SimulationBox& box, size_t num_local) const {
     Real local_max_disp_sq = compute_local_max_displacement_sq(particles, box, num_local);
     int local_rebuild = (local_max_disp_sq < 0.0 || local_max_disp_sq > max_displacement_threshold_) ? 1 : 0;
     int global_rebuild = local_rebuild;
@@ -224,7 +224,7 @@ bool CpuSpatialVerletList::needs_rebuild(const ParticleData& particles, const Si
     return global_rebuild > 0;
 }
 
-void CpuSpatialVerletList::build(const ParticleData& particles, const SimulationBox& box, size_t num_local) {
+void SpatialVerletList::build(const ParticleData& particles, const SimulationBox& box, size_t num_local) {
     ++build_generation_;
     const size_t local_N = (num_local > 0) ? num_local : particles.num_particles;
     const size_t total_N = particles.num_particles;
@@ -675,7 +675,7 @@ void CpuSpatialVerletList::build(const ParticleData& particles, const Simulation
                     (total_lanes > 0.0) ? static_cast<double>(inside_outer) / total_lanes : 0.0;
                 const double rc_vs_skin_ratio =
                     (inside_outer > 0) ? static_cast<double>(inside_rc) / static_cast<double>(inside_outer) : 0.0;
-                std::cout << "[CpuSpatialVerletList] tiles=" << num_tiles_
+                std::cout << "[SpatialVerletList] tiles=" << num_tiles_
                           << " tile_pairs=" << total_tile_pairs
                           << " lane_efficiency=" << lane_efficiency
                           << " (kept/total_lanes=" << inside_outer << "/"

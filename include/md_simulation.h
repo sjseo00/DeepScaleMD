@@ -85,6 +85,7 @@ private:
     Real verlet_skin;               // Verlet list skin distance
     Real neighbor_rebuild_hi_frac;  // rebuild trigger threshold as fraction of skin
     Real neighbor_rebuild_lo_frac;  // re-arm threshold as fraction of skin
+    bool neighbor_rebuild_relaxed_skin_ = false;  // allow neighbor_rebuild_hi_frac > 0.5 (NAMD-like, see docs)
     int neighbor_displacement_check_stride; // 0: auto (update_freq/4)
     int neighbor_list_builds;       // Count of neighbor list builds
     int active_graph_prunes_ = 0;   // incremental active-CSR rebuilds
@@ -105,6 +106,7 @@ private:
     std::string nonbonded_kernel_ = "tiled";
 
     bool pme_cluster_spread_ = false;
+    double pme_grid_spacing_ = 0.0;   // force_calculation.pme_grid_spacing (A); 0 = automatic
 
     std::string electrostatics_solver_ = "pme";
     int pme_ranks_ = 0;  // 0 = no PP/PME rank split (default, legacy rank-0-serial behavior)
@@ -197,6 +199,9 @@ private:
     
     bool neighbor_rebuild_forced;       // Force neighbor rebuild (e.g., after barostat)
     bool adaptive_rebuild_armed_ = true;
+    // Lagged displacement check (several GPU ranks): the previous reading, to extrapolate one check ahead.
+    Real lagged_disp_previous_ = 0.0;
+    bool lagged_disp_have_previous_ = false;
     
     enum class TimingTraceMode { Off, Step, Every };
     TimingTraceMode timing_trace_mode_ = TimingTraceMode::Off;
@@ -213,6 +218,7 @@ private:
         double ke_ms = 0.0;
         double barostat_ms = 0.0;
         double io_ms = 0.0;
+        double gpu_wait_ms = 0.0;  // host blocked on queued GPU work (displacement check)
         double total_ms = 0.0;
         std::vector<std::pair<std::string, double>> force_components_ms;
     } last_timing;
@@ -228,11 +234,13 @@ private:
         double ke_time = 0.0;           // Kinetic energy refresh for outputs
         double comm_time = 0.0;         // Halo communication/exchange
         double migration_time = 0.0;    // Escaped-particle migration
-        double output_time = 0.0;       // Output/IO operations
+        double output_time = 0.0;       // Output/IO operations (outside the MD loop wall time)
+        double gpu_wait_time = 0.0;     // Host blocked waiting for queued GPU work (displacement check)
         double total_time = 0.0;        // MD loop wall time (sum of step totals)
         int step_count = 0;             // Number of steps timed
         std::vector<std::pair<std::string, double>> force_component_time;
     } cumulative_timing;
+    double pending_gpu_wait_ = 0.0;  // gpu wait of the step in progress
 
     struct OutputMetrics {
         Real total_ke = 0.0;
@@ -271,6 +279,17 @@ private:
     void prepare_first_step();          // Initialize forces before first MD step
     bool should_output_step(int step) const;
     bool needs_ke_update_for_step(int step) const;
+    // True when the halo exchange of this step was only begun and is completed
+    // (and overlapped with the owned-owned force pairs) in compute_forces_with_mode().
+    bool halo_overlap_pending_ = false;
+    // Kill switch: DSMD_OVERLAP_HALO=0 restores the strictly sequential
+    // exchange-then-force order.
+    bool overlap_halo_enabled_ = true;
+    // Steps whose halo exchange was overlapped with the owned-owned force pairs.
+    long long halo_overlap_steps_ = 0;
+    // Potential energy and virial are read only by console/trajectory output
+    // (and the final step) and by the barostat.
+    bool energy_needed_for_step(int step) const;
     bool should_write_trajectory_step(int step) const;
     bool should_print_timing_for_step(int step) const;
     void handle_step_output(int step);
@@ -281,7 +300,10 @@ private:
     void handle_integrate1_phase(ForceCalculatorCUDA* cuda_calc, double& integrate1_time);
     void handle_neighbor_phase(double& nlist_build_time, double& comm_time, double& migrate_time);
     void handle_neighbor_rebuild_if_needed(bool should_rebuild);
-    void handle_force_phase(ForceCalculatorCUDA* cuda_calc, double& force_time);
+    // need_energy=false lets the CUDA force path skip the energy/virial readback
+    // (cached_potential_energy and get_virial() are then left unchanged).
+    void handle_force_phase(ForceCalculatorCUDA* cuda_calc, double& force_time,
+                            bool need_energy = true);
     void handle_integrate2_phase(ForceCalculatorCUDA* cuda_calc, double& integrate2_time);
     void handle_thermostat_phase(ForceCalculatorCUDA* cuda_calc, double& thermostat_time);
     void handle_ke_output_phase(double& ke_time);
@@ -299,13 +321,17 @@ private:
                                 double total_time);
     void handle_box_change_rebuild();
     void sync_output_state_to_host_if_needed();
+    bool output_needs_particle_stats() const;
     void compute_output_energies(const ParticleData& particles, OutputMetrics& metrics);
     void compute_output_force_speed_stats(const ParticleData& particles, OutputMetrics& metrics);
     void compute_output_thermodynamics(const ParticleData& particles, OutputMetrics& metrics);
     void emit_rank0_output(int step, const OutputMetrics& metrics);
     std::string format_output_line(int step, const OutputMetrics& metrics) const;
-    void compute_forces_with_mode(bool download_positions_for_ml);
+    void compute_forces_with_mode(bool download_positions_for_ml, bool need_energy = true);
     void reverse_halo_for_bonded_if_needed();
+    // CUDA multi-rank: re-derive the device bonded topology if the owned/ghost
+    // layout changed. Only needed after a migration or halo rebuild.
+    void refresh_cuda_bonded_topology_if_needed();
     void check_energy_stability();      // Check for energy drift and instabilities
     void zero_forces();                 // Zero all forces (local + ghost particles)
     void zero_velocities();             // Zero all velocities (local + ghost particles)
