@@ -271,8 +271,10 @@ protected:
     bool nlist_supported(MDSystem& system, std::string& reason);
     int ensure_ewald_real_table(MDSystem& system, Real cutoff_sq);
     void build_tile_lists_on_device(MDSystem& system, const TileGridInfo& grid);
+    void pack_nlist_slots(MDSystem& system, int phase);
     void compute_nonbonded_forces_list(MDSystem& system, bool with_coulomb,
-                                       Real* pair_energy_out, Real* pair_virial_out, int phase = 0);
+                                       Real* pair_energy_out, Real* pair_virial_out, int phase = 0,
+                                       bool slots_packed = false);
     void free_slot_lists();
     unsigned long long* d_exclusion_keys; // sorted global atom-pair keys
     size_t num_exclusions;
@@ -518,6 +520,23 @@ protected:
     bool pme_dmpi_ensure();
     void pme_dmpi_post(size_t grid_size);
     void pme_dmpi_complete(size_t grid_size);
+    // The charge grid of a rank is nonzero only inside the box its atoms' spline footprints cover
+    // (about the rank's domain plus the spline width), so the exchange sends that box, packed, behind
+    // a 6-int header (start and length of a periodic interval per axis: x0, nx, y0, ny, z0, nz)
+    // instead of the whole grid (only when the ranks are on different nodes).
+    bool pme_dmpi_box_enabled_ = true;
+    // All PP ranks share one node (decided collectively when the Ewald setup runs). Only then is the
+    // pair kernel queued ahead of the PME spread: across nodes the grid exchange is on the critical
+    // path and the spread has to start as early as possible.
+    bool pme_pp_single_node_ = false;
+    unsigned char* d_pme_occupancy_ = nullptr;  // [nx + ny + nz] grid planes covered by an owned charge
+    int* d_pme_box_ = nullptr;                  // [6] this rank's box (device)
+    int* h_pme_box_ = nullptr;                  // [6] pinned copy, valid once pme_stage_event_ has fired
+    void* d_pme_dmpi_pack_ = nullptr;           // the packed box that is sent
+    size_t d_pme_dmpi_pack_bytes_ = 0;
+    std::vector<int> pme_dmpi_boxes_;           // 6 ints per rank, filled by the headers that arrive
+    void pme_dmpi_queue_pack(size_t grid_size, size_t local_particles,
+                             Real inv_box_x, Real inv_box_y, Real inv_box_z);
 
     bool device_supports_clusters_ = false;
     bool pme_use_cluster_spread_ = false;

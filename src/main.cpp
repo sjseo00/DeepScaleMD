@@ -54,9 +54,12 @@ int main(int argc, char* argv[]) {
         }
 
     } catch (const std::exception& e) {
-        if (is_rank_zero()) {
-            std::cerr << "Error: " << e.what() << std::endl;
-        }
+        // Every rank reports: the exception may be thrown on a rank other than 0 only, and MPI_Abort
+        // kills the others before they get the chance.
+        std::cerr << "Error (rank " << get_mpi_rank() << "): " << e.what() << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    } catch (...) {
+        std::cerr << "Error (rank " << get_mpi_rank() << "): unknown exception" << std::endl;
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 

@@ -3277,6 +3277,10 @@ void ForceCalculatorCUDA::finalize() {
     if (h_scalars_) cudaFreeHost(h_scalars_);
     if (h_pme_grid_sum_) cudaFreeHost(h_pme_grid_sum_);
     if (d_pme_dmpi_recv_) { cudaFree(d_pme_dmpi_recv_); d_pme_dmpi_recv_ = nullptr; }
+    if (d_pme_dmpi_pack_) { cudaFree(d_pme_dmpi_pack_); d_pme_dmpi_pack_ = nullptr; }
+    if (d_pme_occupancy_) { cudaFree(d_pme_occupancy_); d_pme_occupancy_ = nullptr; }
+    if (d_pme_box_) { cudaFree(d_pme_box_); d_pme_box_ = nullptr; }
+    if (h_pme_box_) { cudaFreeHost(h_pme_box_); h_pme_box_ = nullptr; }
 #ifdef DSMD_WITH_NCCL
     if (pme_nccl_comm_) {
         ncclCommDestroy(static_cast<ncclComm_t>(pme_nccl_comm_));
@@ -4775,12 +4779,26 @@ void ForceCalculatorCUDA::build_tile_lists_on_device(MDSystem& system, const Til
     }
 }
 
+// Packs positions, charges, types and ids into tile-slot order for the pair kernel. phase 0 packs
+// every slot, 1 the owned slots, 2 the ghost slots (see nlist_pack_slots_kernel).
+void ForceCalculatorCUDA::pack_nlist_slots(MDSystem& system, int phase) {
+    const int num_slots = nlist_num_slots_;
+    if (num_slots <= 0) return;
+    const SimulationBox& box = system.get_box();
+    nlist_pack_slots_kernel<<<(num_slots + 1 + 255) / 256, 256, 0, force_stream>>>(
+        d_x, d_y, d_z, d_charge, d_type, d_global_id, d_tile_atoms, num_slots, nlist_local_atoms_,
+        d_slot_posq_, d_slot_type_, d_slot_gid_, d_slot_wrap_, false, phase,
+        box.lx, box.ly, box.lz, box.periodic_x, box.periodic_y, box.periodic_z);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // phase: 0 = the whole force evaluation; 1 = the part that needs no ghost atom (owned slots packed,
 // entries between tiles without a ghost), run while the halo exchange is in flight; 2 = the rest,
 // after the exchange, followed by the merge of the neighbor-side forces.
+// slots_packed: the caller has already run pack_nlist_slots for this phase.
 void ForceCalculatorCUDA::compute_nonbonded_forces_list(MDSystem& system, bool with_coulomb,
                                                         Real* pair_energy_out, Real* pair_virial_out,
-                                                        int phase) {
+                                                        int phase, bool slots_packed) {
     const int num_slots = nlist_num_slots_;
     if (num_slots <= 0) return;
     const SimulationBox& box = system.get_box();
@@ -4799,11 +4817,8 @@ void ForceCalculatorCUDA::compute_nonbonded_forces_list(MDSystem& system, bool w
     }
     const Real k_coulomb = 332.0636;
 
-    nlist_pack_slots_kernel<<<(num_slots + 1 + 255) / 256, 256, 0, force_stream>>>(
-        d_x, d_y, d_z, d_charge, d_type, d_global_id, d_tile_atoms, num_slots, nlist_local_atoms_,
-        d_slot_posq_, d_slot_type_, d_slot_gid_, d_slot_wrap_, false, phase,
-        box.lx, box.ly, box.lz, box.periodic_x, box.periodic_y, box.periodic_z);
-    CUDA_CHECK(cudaGetLastError());
+    // run_force_phase packs the slots ahead of the PME spread when it can (pack_slots_before_pme).
+    if (!slots_packed) pack_nlist_slots(system, phase);
 
     const int ewald_intervals = with_coulomb ? ensure_ewald_real_table(system, cutoff_sq) : 0;
     // Shared memory of a block: the image shifts, the Ewald table(s), and the type-pair table
@@ -5258,10 +5273,43 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         ensure_tile_pair_stats_enabled();
     }
 
+    // List mode: pack the slot arrays before the PME spread is queued. The spread runs on the
+    // highest-priority stream, so queued first it takes the SMs ahead of the pack kernel (about 55 us
+    // instead of 5 in the 2-GPU ApoA1 profile), and the pair kernel, which waits for the pack, starts
+    // that much later.
+    bool nlist_slots_packed = false;
+    auto pack_slots_before_pme = [&]() {
+        if (graph_mode || !nlist_mode_active_ || !(use_fused_nonbonded || ran_lj)) return;
+        pack_nlist_slots(system, interior ? 1 : (boundary ? 2 : 0));
+        nlist_slots_packed = true;
+    };
+
+    // List mode: queue the pair kernel before the PME spread. Queued first, the spread (atomic-heavy,
+    // highest-priority stream) fills the SMs, and the pair kernel (112 registers and 23 KB of shared
+    // memory per block) starts only about 35 us after it: in the 2-GPU ApoA1 profile the interior kernel
+    // began 89 us into the step although its launch was done at 54 us. Queued second, the spread takes
+    // the slots that retiring pair blocks free (it has the higher priority), and the PME chain, which
+    // has about 170 us of slack before the interpolation needs it, shifts only a little.
+    // Only when the ranks share a node: across nodes the grid exchange is on the critical path and the
+    // spread has to start early (with the pack ahead of it).
+    const bool defer_pme_spread = pme_pp_single_node_ && !graph_mode && nlist_mode_active_ &&
+                                  (use_fused_nonbonded || ran_lj);
+    bool pme_spread_pending = false;
+    auto start_pme_spread = [&]() {
+        if (defer_pme_spread) {
+            // The pair kernel takes ewald_alpha_, which the first spread would otherwise set up.
+            ensure_ewald_initialized(system);
+            pme_spread_pending = true;
+            return;
+        }
+        pack_slots_before_pme();
+        pme_reciprocal_spread(system);
+    };
+
     // Interior phase: spread the charges and stage the grid before the pair kernel is
     // launched, so the copy runs next to it and the grid sum can start right after.
     if (interior && ran_electrostatic_cfg && (graph_mode || use_fused_nonbonded)) {
-        pme_reciprocal_spread(system);
+        start_pme_spread();
     }
     // The per-tile list path runs the whole force phase after the halo exchange when the exchange
     // cannot be overlapped (rebuild steps, MD_NLIST_OVERLAP=0). With several ranks the PME grid
@@ -5271,7 +5319,7 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
     const bool early_pme_sum = !interior && !boundary && nlist_mode_active_ && ran_electrostatic_cfg &&
         use_fused_nonbonded && pme_stage_ == PmeStage::Idle && pme_grid_sum_needed();
     if (early_pme_sum) {
-        pme_reciprocal_spread(system);
+        start_pme_spread();
     }
     if (graph_mode && (ran_lj || ran_electrostatic_cfg)) {
         if (ran_electrostatic_cfg) ensure_ewald_initialized(system);
@@ -5292,7 +5340,8 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         CUDA_CHECK(cudaGetLastError());
     } else if (nlist_mode_active_ && (use_fused_nonbonded || ran_lj)) {
         compute_nonbonded_forces_list(system, use_fused_nonbonded, pair_energy_out, pair_virial_out,
-                                      interior ? 1 : (boundary ? 2 : 0));
+                                      interior ? 1 : (boundary ? 2 : 0), nlist_slots_packed);
+        if (pme_spread_pending) pme_reciprocal_spread(system);
         if (early_pme_sum) pme_reciprocal_post_sum();
         if (bonded_on_side_stream) {
             // The bonded forces (and their energy) are complete: add them to the force arrays.
@@ -6236,6 +6285,23 @@ void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
     ewald_prefactor_ = k_coulomb * 4.0 * M_PI / (box.lx * box.ly * box.lz);
     ewald_initialized_ = true;
 
+    // Every PP rank runs this at the same point (the first force evaluation), so the collective is safe.
+    {
+        MPI_Comm pp_comm = PmePpSplit::instance().pp_comm();
+        int pp_size = 1;
+        MPI_Comm_size(pp_comm, &pp_size);
+        int single_node = 1;
+        if (pp_size > 1) {
+            MPI_Comm node_comm = MPI_COMM_NULL;
+            MPI_Comm_split_type(pp_comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+            int node_size = 1;
+            MPI_Comm_size(node_comm, &node_size);
+            MPI_Comm_free(&node_comm);
+            single_node = (node_size == pp_size) ? 1 : 0;
+        }
+        pme_pp_single_node_ = single_node != 0;
+    }
+
     if (is_rank_zero()) {
         std::cout << "[Ewald/PME] grid " << ewald_grid_x_ << "x" << ewald_grid_y_ << "x" << ewald_grid_z_
                   << ", alpha=" << ewald_alpha_ << " 1/A, spline_order=" << ewald_spline_order_
@@ -6324,22 +6390,242 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
 // part[0][i] + part[1][i] + ... in rank order, one of the parts being the rank's own grid, which is
 // also the output (every thread reads all parts of its element before it writes). The fixed order
 // gives every rank bit-identical sums.
+//
+// A received part is not a whole grid but the box its sender's charges touch: x0/nx, y0/ny, z0/nz
+// give the start and length of a periodic interval per axis, and the box is packed row-major
+// (z fastest). Grid points outside it are zero in the sender's grid, so skipping them adds exactly
+// what the whole-grid sum would have added. The rank's own part is read from its grid directly.
 constexpr int PME_MAX_SUM_PARTS = 8;
 constexpr int PME_DMPI_TAG = 7311;
+constexpr int PME_DMPI_BOX_TAG = 7312;
 
 template <typename T>
-struct PmeGridParts {
+struct PmeGridBoxParts {
     const T* part[PME_MAX_SUM_PARTS];
+    int box[PME_MAX_SUM_PARTS][6];  // x0, nx, y0, ny, z0, nz of each received part
     int count;
+    int self;                       // index of the rank's own part (read from the output grid)
 };
 
+// One warp per row of the grid (fixed x and y, z running): the row's membership in each received box
+// is decided once, and the lanes then walk the row along z, so the accesses are contiguous and there
+// is no per-element division. The additions keep the rank order of the earlier version.
 template <typename T>
-__global__ void pme_sum_grid_parts_kernel(T* own, PmeGridParts<T> parts, size_t n) {
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    T sum = parts.part[0][i];
-    for (int k = 1; k < parts.count; ++k) sum += parts.part[k][i];
-    own[i] = sum;
+__global__ void pme_sum_grid_boxes_kernel(T* own, PmeGridBoxParts<T> parts,
+                                          int grid_nx, int grid_ny, int grid_nz) {
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const size_t rows = static_cast<size_t>(grid_nx) * grid_ny;
+    for (size_t row = static_cast<size_t>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+         row < rows; row += static_cast<size_t>(gridDim.x) * warps_per_block) {
+        const int gy = static_cast<int>(row % static_cast<size_t>(grid_ny));
+        const int gx = static_cast<int>(row / static_cast<size_t>(grid_ny));
+        bool in_row[PME_MAX_SUM_PARTS];
+        size_t row_base[PME_MAX_SUM_PARTS];
+#pragma unroll
+        for (int k = 0; k < PME_MAX_SUM_PARTS; ++k) {
+            in_row[k] = false;
+            row_base[k] = 0;
+            if (k < parts.count && k != parts.self) {
+                const int* box = parts.box[k];
+                int a = gx - box[0]; if (a < 0) a += grid_nx;
+                int bb = gy - box[2]; if (bb < 0) bb += grid_ny;
+                if (a < box[1] && bb < box[3]) {
+                    in_row[k] = true;
+                    row_base[k] = (static_cast<size_t>(a) * box[3] + bb) * box[5];
+                }
+            }
+        }
+        T* own_row = own + row * grid_nz;
+        for (int gz = lane; gz < grid_nz; gz += 32) {
+            T sum = T(0);
+#pragma unroll
+            for (int k = 0; k < PME_MAX_SUM_PARTS; ++k) {
+                if (k >= parts.count) break;
+                if (k == parts.self) {
+                    sum += own_row[gz];
+                } else if (in_row[k]) {
+                    int c = gz - parts.box[k][4]; if (c < 0) c += grid_nz;
+                    if (c < parts.box[k][5]) sum += parts.part[k][row_base[k] + c];
+                }
+            }
+            own_row[gz] = sum;
+        }
+    }
+}
+
+// Marks, per axis, the grid planes that the spline footprint (order points, the same indices the
+// spread uses) of any owned charged particle covers.
+// The marks of a block are collected in shared memory first (all the plane flags of the three axes
+// fit in a few hundred bytes), so the global flags are written once per block and plane instead of
+// once per particle and plane.
+__global__ void pme_mark_footprint_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const Real* __restrict__ charge, unsigned char* occupancy,
+    int grid_nx, int grid_ny, int grid_nz,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z, int spline_order, size_t num_particles)
+{
+    extern __shared__ unsigned char s_marks[];
+    const int planes = grid_nx + grid_ny + grid_nz;
+    for (int i = threadIdx.x; i < planes; i += blockDim.x) s_marks[i] = 0;
+    __syncthreads();
+    const size_t p = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (p < num_particles && fabs(charge[p]) >= 1e-12) {
+        Real u_x = (x[p] * inv_box_x + 0.5) * static_cast<Real>(grid_nx);
+        Real u_y = (y[p] * inv_box_y + 0.5) * static_cast<Real>(grid_ny);
+        Real u_z = (z[p] * inv_box_z + 0.5) * static_cast<Real>(grid_nz);
+        u_x = u_x - floor(u_x / grid_nx) * grid_nx;
+        u_y = u_y - floor(u_y / grid_ny) * grid_ny;
+        u_z = u_z - floor(u_z / grid_nz) * grid_nz;
+        float w[PME_MAX_SPLINE_ORDER];
+        int ix[PME_MAX_SPLINE_ORDER], iy[PME_MAX_SPLINE_ORDER], iz[PME_MAX_SPLINE_ORDER];
+        pme_compute_bspline_weights<float>(u_x, spline_order, w, ix);
+        pme_compute_bspline_weights<float>(u_y, spline_order, w, iy);
+        pme_compute_bspline_weights<float>(u_z, spline_order, w, iz);
+        for (int k = 0; k < spline_order; ++k) {
+            s_marks[pme_pbc_grid_index(ix[k], grid_nx)] = 1;
+            s_marks[grid_nx + pme_pbc_grid_index(iy[k], grid_ny)] = 1;
+            s_marks[grid_nx + grid_ny + pme_pbc_grid_index(iz[k], grid_nz)] = 1;
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < planes; i += blockDim.x) {
+        if (s_marks[i]) occupancy[i] = 1;
+    }
+}
+
+// The smallest periodic interval [start, start + length) of each axis that holds every marked
+// plane: the complement of the longest cyclic run of unmarked planes. One block per axis; every
+// marked plane measures the run of unmarked planes that follows it (its "gap"), the block takes
+// the largest gap (the smaller plane index on a tie) and the interval starts right after it. No
+// marked plane at all (no charged particle), or an axis longer than the shared array, gives the
+// whole axis.
+constexpr int PME_BOX_MAX_AXIS = 1024;
+constexpr int PME_BOX_THREADS = 128;
+
+__global__ void pme_footprint_box_kernel(const unsigned char* occupancy,
+                                         int grid_nx, int grid_ny, int grid_nz, int* box) {
+    __shared__ unsigned char s_marks[PME_BOX_MAX_AXIS];
+    __shared__ int s_gap[PME_BOX_THREADS];
+    __shared__ int s_pos[PME_BOX_THREADS];
+    const int axis = blockIdx.x;
+    const int n = axis == 0 ? grid_nx : (axis == 1 ? grid_ny : grid_nz);
+    if (n > PME_BOX_MAX_AXIS) {
+        if (threadIdx.x == 0) { box[axis * 2] = 0; box[axis * 2 + 1] = n; }
+        return;
+    }
+    const unsigned char* marks = occupancy + (axis == 0 ? 0 : (axis == 1 ? grid_nx : grid_nx + grid_ny));
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s_marks[i] = marks[i];
+    __syncthreads();
+
+    int best_gap = -1, best_pos = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (!s_marks[i]) continue;
+        int d = 1;
+        while (!s_marks[(i + d) % n]) ++d;  // ends at the latest at d = n, back at plane i itself
+        if (d - 1 > best_gap) { best_gap = d - 1; best_pos = i; }
+    }
+    s_gap[threadIdx.x] = best_gap;
+    s_pos[threadIdx.x] = best_pos;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const int other = threadIdx.x + stride;
+            if (s_gap[other] > s_gap[threadIdx.x] ||
+                (s_gap[other] == s_gap[threadIdx.x] && s_pos[other] < s_pos[threadIdx.x])) {
+                s_gap[threadIdx.x] = s_gap[other];
+                s_pos[threadIdx.x] = s_pos[other];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        int start = 0, length = n;
+        if (s_gap[0] > 0) {
+            start = (s_pos[0] + s_gap[0] + 1) % n;
+            length = n - s_gap[0];
+        }
+        box[axis * 2] = start;
+        box[axis * 2 + 1] = length;
+    }
+}
+
+// Copies the box out of the grid into a contiguous buffer, row-major with z fastest. One warp per row
+// of the box: the row's grid position is worked out once and the lanes copy along z.
+template <typename T>
+__global__ void pme_pack_box_kernel(const T* __restrict__ grid, T* __restrict__ packed,
+                                    const int* __restrict__ box,
+                                    int grid_nx, int grid_ny, int grid_nz) {
+    const int x0 = box[0], lx = box[1], y0 = box[2], ly = box[3], z0 = box[4], lz = box[5];
+    const size_t rows = static_cast<size_t>(lx) * ly;
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    for (size_t row = static_cast<size_t>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+         row < rows; row += static_cast<size_t>(gridDim.x) * warps_per_block) {
+        const int b = static_cast<int>(row % static_cast<size_t>(ly));
+        const int a = static_cast<int>(row / static_cast<size_t>(ly));
+        int gx = x0 + a; if (gx >= grid_nx) gx -= grid_nx;
+        int gy = y0 + b; if (gy >= grid_ny) gy -= grid_ny;
+        const T* source = grid + (static_cast<size_t>(gx) * grid_ny + gy) * grid_nz;
+        T* target = packed + row * lz;
+        for (int c = lane; c < lz; c += 32) {
+            int gz = z0 + c; if (gz >= grid_nz) gz -= grid_nz;
+            target[c] = source[gz];
+        }
+    }
+}
+
+// Queues, behind the spread on pme_stream_, everything the exchange needs from the device: the box
+// the spread charges cover, that box packed into a contiguous buffer, and the box itself on the host.
+void ForceCalculatorCUDA::pme_dmpi_queue_pack(size_t grid_size, size_t local_particles,
+                                              Real inv_box_x, Real inv_box_y, Real inv_box_z) {
+    // Only when the ranks are on different nodes. Within a node the whole-grid exchange is cheap
+    // (NVLink / shared memory) and the box costs GPU work next to the pair kernel; across nodes the
+    // exchange is what the step waits for.
+    pme_dmpi_box_enabled_ = !pme_pp_single_node_;
+    if (!h_pme_box_) CUDA_CHECK(cudaMallocHost(&h_pme_box_, 6 * sizeof(int)));
+    if (!pme_dmpi_box_enabled_) {
+        const int whole[6] = {0, ewald_grid_x_, 0, ewald_grid_y_, 0, ewald_grid_z_};
+        std::memcpy(h_pme_box_, whole, sizeof(whole));
+        return;
+    }
+    const int planes = ewald_grid_x_ + ewald_grid_y_ + ewald_grid_z_;
+    if (!d_pme_occupancy_) {
+        CUDA_CHECK(cudaMalloc(&d_pme_occupancy_, planes));
+        CUDA_CHECK(cudaMalloc(&d_pme_box_, 6 * sizeof(int)));
+    }
+    const size_t element_bytes = pme_float_ ? sizeof(float) : sizeof(Real);
+    const size_t grid_bytes = grid_size * element_bytes;
+    if (d_pme_dmpi_pack_bytes_ < grid_bytes) {
+        // The previous exchange has completed (complete() waited for its sends), so the old buffer is idle.
+        if (d_pme_dmpi_pack_) CUDA_CHECK(cudaFree(d_pme_dmpi_pack_));
+        CUDA_CHECK(cudaMalloc(&d_pme_dmpi_pack_, grid_bytes));
+        d_pme_dmpi_pack_bytes_ = grid_bytes;
+    }
+    CUDA_CHECK(cudaMemsetAsync(d_pme_occupancy_, 0, planes, pme_stream_));
+    if (local_particles > 0) {
+        pme_mark_footprint_kernel<<<static_cast<int>((local_particles + 255) / 256), 256,
+                                    static_cast<size_t>(planes), pme_stream_>>>(
+            d_x, d_y, d_z, d_charge, d_pme_occupancy_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_,
+            inv_box_x, inv_box_y, inv_box_z, ewald_spline_order_, local_particles);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    pme_footprint_box_kernel<<<3, PME_BOX_THREADS, 0, pme_stream_>>>(
+        d_pme_occupancy_, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, d_pme_box_);
+    CUDA_CHECK(cudaGetLastError());
+    // One warp per row of the box (at most nx * ny rows), eight warps per block.
+    const int pack_blocks = static_cast<int>((static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ + 7) / 8);
+    if (pme_float_) {
+        pme_pack_box_kernel<float><<<pack_blocks, 256, 0, pme_stream_>>>(
+            d_pme_charge_grid_f_, static_cast<float*>(d_pme_dmpi_pack_), d_pme_box_,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_);
+    } else {
+        pme_pack_box_kernel<Real><<<pack_blocks, 256, 0, pme_stream_>>>(
+            d_pme_charge_grid_real_, static_cast<Real*>(d_pme_dmpi_pack_), d_pme_box_,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(h_pme_box_, d_pme_box_, 6 * sizeof(int), cudaMemcpyDeviceToHost, pme_stream_));
 }
 
 // No PP/PME split and more than one rank: every rank sums the spread grids.
@@ -6436,8 +6722,10 @@ void ForceCalculatorCUDA::pme_reciprocal_spread(MDSystem& system) {
         pme_nccl_sum_grid(grid_size);
         pme_sum_via_nccl_ = true;
     } else if (pme_grid_sum_needed() && pme_dmpi_ensure()) {
-        // The grid stays on the device. Mark the end of the spread; post_sum() (called once the pair
-        // kernel is launched) waits for it and starts the exchange, complete() finishes the sum.
+        // The grid stays on the device. Mark the end of the spread (and of the packing of the box
+        // that is sent); post_sum() (called once the pair kernel is launched) waits for it and starts
+        // the exchange, complete() finishes the sum.
+        pme_dmpi_queue_pack(grid_size, local_particles, inv_box_x, inv_box_y, inv_box_z);
         CUDA_CHECK(cudaEventRecord(pme_stage_event_, pme_stream_));
         pme_sum_via_dmpi_ = true;
     } else if (pme_grid_sum_needed()) {
@@ -6571,22 +6859,36 @@ void ForceCalculatorCUDA::pme_dmpi_post(size_t grid_size) {
         CUDA_CHECK(cudaMalloc(&d_pme_dmpi_recv_, needed));
         d_pme_dmpi_recv_bytes_ = needed;
     }
-    // MPI reads the grid without any stream ordering: the clear and the spread must be done.
+    // MPI reads the grid without any stream ordering: the clear, the spread and the packing of the
+    // box must be done. The wait also makes the box on the host (h_pme_box_) valid.
     CUDA_CHECK(cudaEventSynchronize(pme_stage_event_));
 
     const MPI_Datatype type = pme_float_ ? MPI_FLOAT : MPI_DOUBLE;
-    const void* send_grid = pme_float_ ? static_cast<const void*>(d_pme_charge_grid_f_)
-                                       : static_cast<const void*>(d_pme_charge_grid_real_);
+    // What is sent: the packed box (its 6-int header goes ahead of it), or the whole grid when the box
+    // is switched off (the header then names the whole grid).
+    const size_t send_elements = static_cast<size_t>(h_pme_box_[1]) * h_pme_box_[3] * h_pme_box_[5];
+    const void* send_payload = !pme_dmpi_box_enabled_
+        ? (pme_float_ ? static_cast<const void*>(d_pme_charge_grid_f_)
+                      : static_cast<const void*>(d_pme_charge_grid_real_))
+        : d_pme_dmpi_pack_;
     unsigned char* receive_base = static_cast<unsigned char*>(d_pme_dmpi_recv_);
+    // The receive buffers have room for a whole grid per peer; a box is shorter than that, which MPI
+    // allows. The vector is sized once here and not touched until complete().
+    pme_dmpi_boxes_.assign(static_cast<size_t>(6) * pp_size, 0);
     pme_dmpi_requests_.clear();
     int slot = 0;
     for (int peer = 0; peer < pp_size; ++peer) {
         if (peer == pp_rank) continue;
         MPI_Request request = MPI_REQUEST_NULL;
+        MPI_Irecv(&pme_dmpi_boxes_[static_cast<size_t>(6) * peer], 6, MPI_INT, peer,
+                  PME_DMPI_BOX_TAG, pp_comm, &request);
+        pme_dmpi_requests_.push_back(request);
         MPI_Irecv(receive_base + static_cast<size_t>(slot) * grid_bytes, static_cast<int>(grid_size), type,
                   peer, PME_DMPI_TAG, pp_comm, &request);
         pme_dmpi_requests_.push_back(request);
-        MPI_Isend(send_grid, static_cast<int>(grid_size), type, peer, PME_DMPI_TAG, pp_comm, &request);
+        MPI_Isend(h_pme_box_, 6, MPI_INT, peer, PME_DMPI_BOX_TAG, pp_comm, &request);
+        pme_dmpi_requests_.push_back(request);
+        MPI_Isend(send_payload, static_cast<int>(send_elements), type, peer, PME_DMPI_TAG, pp_comm, &request);
         pme_dmpi_requests_.push_back(request);
         ++slot;
     }
@@ -6607,27 +6909,46 @@ void ForceCalculatorCUDA::pme_dmpi_complete(size_t grid_size) {
     const size_t element_bytes = pme_float_ ? sizeof(float) : sizeof(Real);
     const size_t grid_bytes = grid_size * element_bytes;
     const unsigned char* receive_base = static_cast<const unsigned char*>(d_pme_dmpi_recv_);
-    const int blocks = static_cast<int>((grid_size + 255) / 256);
-    if (pme_float_) {
-        PmeGridParts<float> parts;
+    // The sum kernel works on rows (one warp each, eight warps per block).
+    const int sum_blocks = static_cast<int>((static_cast<size_t>(ewald_grid_x_) * ewald_grid_y_ + 7) / 8);
+    // The boxes that arrived with the parts (the rank's own entry is never read).
+    const int axis_size[3] = {ewald_grid_x_, ewald_grid_y_, ewald_grid_z_};
+    auto fill_boxes = [&](auto& parts) {
         parts.count = pp_size;
+        parts.self = pp_rank;
+        for (int k = 0; k < pp_size; ++k) {
+            if (k == pp_rank) continue;
+            for (int j = 0; j < 6; ++j) parts.box[k][j] = pme_dmpi_boxes_[static_cast<size_t>(6) * k + j];
+            for (int axis = 0; axis < 3; ++axis) {
+                const int start = parts.box[k][2 * axis], length = parts.box[k][2 * axis + 1];
+                if (start < 0 || start >= axis_size[axis] || length < 0 || length > axis_size[axis]) {
+                    throw std::runtime_error("PME grid exchange: invalid box received from rank " + std::to_string(k));
+                }
+            }
+        }
+    };
+    if (pme_float_) {
+        PmeGridBoxParts<float> parts;
+        fill_boxes(parts);
         int slot = 0;
         for (int k = 0; k < pp_size; ++k) {
             parts.part[k] = (k == pp_rank)
                 ? d_pme_charge_grid_f_
                 : reinterpret_cast<const float*>(receive_base + static_cast<size_t>(slot++) * grid_bytes);
         }
-        pme_sum_grid_parts_kernel<float><<<blocks, 256, 0, pme_stream_>>>(d_pme_charge_grid_f_, parts, grid_size);
+        pme_sum_grid_boxes_kernel<float><<<sum_blocks, 256, 0, pme_stream_>>>(
+            d_pme_charge_grid_f_, parts, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_);
     } else {
-        PmeGridParts<Real> parts;
-        parts.count = pp_size;
+        PmeGridBoxParts<Real> parts;
+        fill_boxes(parts);
         int slot = 0;
         for (int k = 0; k < pp_size; ++k) {
             parts.part[k] = (k == pp_rank)
                 ? d_pme_charge_grid_real_
                 : reinterpret_cast<const Real*>(receive_base + static_cast<size_t>(slot++) * grid_bytes);
         }
-        pme_sum_grid_parts_kernel<Real><<<blocks, 256, 0, pme_stream_>>>(d_pme_charge_grid_real_, parts, grid_size);
+        pme_sum_grid_boxes_kernel<Real><<<sum_blocks, 256, 0, pme_stream_>>>(
+            d_pme_charge_grid_real_, parts, ewald_grid_x_, ewald_grid_y_, ewald_grid_z_);
     }
     CUDA_CHECK(cudaGetLastError());
 }

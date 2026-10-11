@@ -23,6 +23,9 @@
 #include <cuda_runtime.h>
 #endif
 
+// Reported by dsDecompX libraries that have it (see MDSystem::init, header/library check).
+namespace dsdecompx { std::size_t halo_exchange_options_size() noexcept __attribute__((weak)); }
+
 namespace {
 
 // Fills `result` with what body(0, count, result, true) would produce, using several OpenMP
@@ -864,6 +867,40 @@ void MDSystem::initialize_decomposition_runtime() {
     config.execution = dsdecompx::ExecutionMode::Host;
 #endif
 
+    // HaloExchangeOptions crosses the library boundary by value. If the headers this file was compiled
+    // with and the dsDecompX library come from different builds, the library reads garbage (for
+    // example a null communication stream), so compare the layouts before using it.
+    {
+        const bool library_reports_size = &dsdecompx::halo_exchange_options_size != nullptr;
+#ifdef DSDECOMPX_HALO_POSITIONS_ONLY
+        const bool consistent = library_reports_size &&
+            dsdecompx::halo_exchange_options_size() == sizeof(dsdecompx::HaloExchangeOptions);
+#else
+        const bool consistent = !library_reports_size ||
+            dsdecompx::halo_exchange_options_size() == sizeof(dsdecompx::HaloExchangeOptions);
+#endif
+        if (!consistent) {
+            std::string detail;
+#ifdef DSDECOMPX_HALO_POSITIONS_ONLY
+            detail = std::string("DeepScaleMD was compiled with ") + dsdecompx::header_path() +
+                     " (HaloExchangeOptions " + std::to_string(sizeof(dsdecompx::HaloExchangeOptions)) +
+                     " bytes)";
+#else
+            detail = "DeepScaleMD was compiled with an older dsdecompx.hpp (HaloExchangeOptions " +
+                     std::to_string(sizeof(dsdecompx::HaloExchangeOptions)) + " bytes, no positions_only)";
+#endif
+            if (library_reports_size) {
+                detail += "; the library reports " +
+                          std::to_string(dsdecompx::halo_exchange_options_size()) + " bytes";
+            } else {
+                detail += "; the library has no size report (an older build)";
+            }
+            throw std::runtime_error(
+                "dsDecompX headers and library do not match (different builds): " + detail +
+                ". Another dsdecompx.hpp earlier on the include path (CPATH, ~/.local/include) or an old "
+                "libdsdecompx.a is the usual cause; rebuild dsDecompX (bash build_cuda.sh) and DeepScaleMD.");
+        }
+    }
     decomp_runtime_ = std::make_unique<dsdecompx::Decomp>(pp_comm_, config);
 
     const auto& topology = decomp_runtime_->topology();
@@ -1195,6 +1232,24 @@ void MDSystem::refresh_local_bonded_topology() {
 }
 
 #ifdef USE_CUDA
+// A halo refresh on a reused plan only needs the new ghost positions: velocity, mass, charge, type
+// and id are fixed between rebuilds, and nothing on the CUDA path reads a ghost's velocity. Sending
+// the position triple instead of the full particle record cuts the halo traffic of a step to a
+// quarter (96 -> 24 bytes per ghost), which matters once the ranks sit on different nodes.
+// With a dsDecompX that predates the option (no DSDECOMPX_HALO_POSITIONS_ONLY) full records are sent.
+static dsdecompx::HaloExchangeOptions make_halo_options(bool rebuild, cudaStream_t stream,
+                                                        bool positions_only) {
+    dsdecompx::HaloExchangeOptions options;
+    options.rebuild = rebuild;
+    options.stream = stream;
+#ifdef DSDECOMPX_HALO_POSITIONS_ONLY
+    options.positions_only = positions_only;
+#else
+    (void)positions_only;
+#endif
+    return options;
+}
+
 bool MDSystem::exchange_halo_on_device(ForceCalculatorCUDA& calculator,
                                        bool rebuild_halo) {
     if (size == 1) return false;
@@ -1203,7 +1258,7 @@ bool MDSystem::exchange_halo_on_device(ForceCalculatorCUDA& calculator,
     dsdecompx::ParticleInfo storage(
         owned, particles.ghost_count(), calculator);
     const auto result = decomp_runtime_->exchange_halo(
-        storage, dsdecompx::HaloExchangeOptions{rebuild_halo, stream});
+        storage, make_halo_options(rebuild_halo, stream, !rebuild_halo));
     resize_particle_storage(owned + result.ghost_count);
     particles.reset_counts(owned, result.ghost_count);
     last_device_halo_plan_reused_ = result.plan_reused;
@@ -1227,7 +1282,7 @@ void MDSystem::begin_halo_exchange_on_device(ForceCalculatorCUDA& calculator) {
     dsdecompx::ParticleInfo storage(
         owned, particles.ghost_count(), calculator);
     decomp_runtime_->begin_halo_exchange(
-        storage, dsdecompx::HaloExchangeOptions{false, calculator.get_halo_stream()});
+        storage, make_halo_options(false, calculator.get_halo_stream(), true));
 }
 
 void MDSystem::end_halo_exchange_on_device(ForceCalculatorCUDA& calculator) {

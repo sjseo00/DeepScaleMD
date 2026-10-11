@@ -237,6 +237,14 @@ endif()
 if(DEEPSCALEMD_HAVE_FFTW_MPI)
     target_compile_definitions(deepscalemd PRIVATE DEEPSCALEMD_HAVE_FFTW_MPI)
 endif()
+# The dsdecompx.hpp that belongs to the library must win over any other copy on the include path
+# (CPATH, an old install under ~/.local). GCC searches CPATH before -isystem directories (and ignores
+# a -I for a directory that is also -isystem), so the include directories of imported targets are not
+# made -isystem here: they stay plain -I and are searched first. HaloExchangeOptions is passed by
+# value, so a stale header misreads it.
+set_property(TARGET deepscalemd PROPERTY NO_SYSTEM_FROM_IMPORTED ON)
+get_target_property(_dsdecompx_include_dirs dsdecompx::dsdecompx INTERFACE_INCLUDE_DIRECTORIES)
+message(STATUS "DeepScaleMD: dsdecompx include directory: ${_dsdecompx_include_dirs}")
 target_link_libraries(deepscalemd PRIVATE
     dsdecompx::dsdecompx
     MPI::MPI_CXX
