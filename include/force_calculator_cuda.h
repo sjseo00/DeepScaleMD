@@ -523,7 +523,8 @@ protected:
     // The charge grid of a rank is nonzero only inside the box its atoms' spline footprints cover
     // (about the rank's domain plus the spline width), so the exchange sends that box, packed, behind
     // a 6-int header (start and length of a periodic interval per axis: x0, nx, y0, ny, z0, nz)
-    // instead of the whole grid (only when the ranks are on different nodes).
+    // instead of the whole grid (always across nodes; within a node once (ranks - 1) grids are at
+    // least PME_DMPI_BOX_MIN_NODE_TRAFFIC bytes, decided per call in pme_dmpi_queue_pack).
     bool pme_dmpi_box_enabled_ = true;
     // All PP ranks share one node (decided collectively when the Ewald setup runs). Only then is the
     // pair kernel queued ahead of the PME spread: across nodes the grid exchange is on the critical

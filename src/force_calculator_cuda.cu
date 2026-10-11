@@ -6398,6 +6398,9 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_reciprocal(MDSystem& syst
 constexpr int PME_MAX_SUM_PARTS = 8;
 constexpr int PME_DMPI_TAG = 7311;
 constexpr int PME_DMPI_BOX_TAG = 7312;
+// Within one node the box is used once a whole-grid exchange would move this many bytes per rank and
+// step ((ranks - 1) grids): below it the box kernels cost more than the NVLink traffic they save.
+constexpr size_t PME_DMPI_BOX_MIN_NODE_TRAFFIC = size_t(32) << 20;
 
 template <typename T>
 struct PmeGridBoxParts {
@@ -6579,10 +6582,15 @@ __global__ void pme_pack_box_kernel(const T* __restrict__ grid, T* __restrict__ 
 // the spread charges cover, that box packed into a contiguous buffer, and the box itself on the host.
 void ForceCalculatorCUDA::pme_dmpi_queue_pack(size_t grid_size, size_t local_particles,
                                               Real inv_box_x, Real inv_box_y, Real inv_box_z) {
-    // Only when the ranks are on different nodes. Within a node the whole-grid exchange is cheap
-    // (NVLink / shared memory) and the box costs GPU work next to the pair kernel; across nodes the
-    // exchange is what the step waits for.
-    pme_dmpi_box_enabled_ = !pme_pp_single_node_;
+    // Across nodes always. Within a node a whole-grid exchange sends and receives (ranks - 1) grids per
+    // rank and step, which grows with the rank count (and with the grid: 3.5 GB at 8 ranks for a
+    // 720x720x243 float grid) while the pair work per rank shrinks, so the box is used once that
+    // traffic is large; for small grids the box kernels cost more than the NVLink traffic they save.
+    // A replicated solve needs every rank's charges on every rank, so the boxes (about a 1/ranks
+    // share of the grid each) are close to the least that has to be received.
+    const size_t whole_grid_traffic = grid_size * (pme_float_ ? sizeof(float) : sizeof(Real)) *
+                                      static_cast<size_t>(pme_pp_size_ > 1 ? pme_pp_size_ - 1 : 0);
+    pme_dmpi_box_enabled_ = !pme_pp_single_node_ || whole_grid_traffic >= PME_DMPI_BOX_MIN_NODE_TRAFFIC;
     if (!h_pme_box_) CUDA_CHECK(cudaMallocHost(&h_pme_box_, 6 * sizeof(int)));
     if (!pme_dmpi_box_enabled_) {
         const int whole[6] = {0, ewald_grid_x_, 0, ewald_grid_y_, 0, ewald_grid_z_};
