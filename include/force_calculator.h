@@ -27,6 +27,10 @@ public:
 
     virtual void set_mixed_precision(bool /*enabled*/) {}
 
+    // force_calculation.pme_grid_spacing (A); 0 = automatic. No-op on backends
+    // (e.g. python/libtorch) that don't run the builtin PME path.
+    virtual void set_pme_grid_spacing(Real /*spacing_angstrom*/) {}
+
     virtual Real get_potential_energy() const { return last_potential_energy; }
     virtual Real get_kinetic_energy() const { return last_kinetic_energy; }
     virtual Real get_virial() const { return last_virial; }

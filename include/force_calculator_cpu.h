@@ -34,6 +34,7 @@ public:
     }
 
     void set_mixed_precision(bool enabled) override;
+    void set_pme_grid_spacing(Real spacing_angstrom) override { pme_engine_.set_grid_spacing_override(spacing_angstrom); }
 
 private:
     void compute_bond_forces(MDSystem& system);

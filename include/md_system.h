@@ -57,6 +57,17 @@ private:
     Real physical_cutoff;
     Real verlet_skin_ = 2.0;
 
+    // decomposition: (advanced, optional YAML, nested as advanced.decomposition.*)
+    // overrides for the dsDecompX process-grid policy; empty/sentinel means "unset",
+    // leaving the library default (MPI_Dims_create) in charge. See
+    // set_decomposition_policy() and initialize_decomposition_runtime().
+    std::string decomposition_grid_policy_;
+    double decomposition_inter_node_weight_ = -1.0;
+    double decomposition_intra_node_weight_ = -1.0;
+    long decomposition_dynamic_interval_ = -1;
+    double decomposition_dynamic_imbalance_threshold_ = -1.0;
+    double decomposition_dynamic_relaxation_ = -1.0;
+
     int rank;
     int size;
     // The communicator this MDSystem's collectives run on. Defaults to
@@ -156,6 +167,20 @@ public:
     Real get_physical_cutoff() const { return physical_cutoff; }
     void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
     void set_verlet_skin(Real skin) { verlet_skin_ = skin; }
+
+    // decomposition.* (advanced, optional YAML section nested under advanced:); must be
+    // called before setup_domain_decomposition() to take effect. An empty policy string
+    // means "unset", leaving the library default (MPI_Dims_create) in charge.
+    void set_decomposition_policy(const std::string& policy, double inter_node_weight,
+                                  double intra_node_weight, long dynamic_interval,
+                                  double dynamic_imbalance_threshold, double dynamic_relaxation) {
+        decomposition_grid_policy_ = policy;
+        decomposition_inter_node_weight_ = inter_node_weight;
+        decomposition_intra_node_weight_ = intra_node_weight;
+        decomposition_dynamic_interval_ = dynamic_interval;
+        decomposition_dynamic_imbalance_threshold_ = dynamic_imbalance_threshold;
+        decomposition_dynamic_relaxation_ = dynamic_relaxation;
+    }
 
     void sync_decomposition_domain();
     void warn_if_domain_narrower_than_two_halos(Real halo_width);

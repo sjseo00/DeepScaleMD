@@ -578,6 +578,9 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
     if (!cuda_calc_cached_ && force_precision_ == "mixed") {
         force_calc->set_mixed_precision(true);
     }
+    if (!cuda_calc_cached_) {
+        force_calc->set_pme_grid_spacing(pme_grid_spacing_);
+    }
 
     if (enable_python_forces_) {
         python_interface = std::make_unique<PythonForceInterface>();
@@ -967,7 +970,7 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
     if (!local_rebuild_decision && should_rebuild) {
         reason_mpi_sync = true;
     }
-    const bool global_rebuild_epoch = should_rebuild;
+    [[maybe_unused]] const bool global_rebuild_epoch = should_rebuild;  // only read under USE_CUDA below
 
     ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
     bool gpu_single_rank = comm_backend_->is_gpu_single_rank(cuda_calc != nullptr);
@@ -1532,7 +1535,6 @@ void MDSimulation::compute_fire_reduction_cpu(Real& power, Real& f_norm_sq,
 
 void MDSimulation::apply_fire_update_cpu(const FireMinimizer::StepParams& params) {
     ParticleData& particles = system->get_particles();
-    const SimulationBox& box = system->get_box();
     const size_t n = system->get_local_particles();
     const Real f_norm_inv = (params.mix_velocity && params.f_norm > 0.0)
         ? (1.0 / params.f_norm) : 0.0;
@@ -2089,7 +2091,8 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     
     std::string line;
     std::string current_section = "";
-    
+    std::string current_subsection = "";  // advanced.<subsection>, e.g. advanced.decomposition
+    size_t subsection_indent = 0;
 
     while (std::getline(file, line)) {
         size_t comment_pos = line.find('#');
@@ -2099,10 +2102,12 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         
         if (line.empty()) continue;
         
-        const bool is_indented = !line.empty() && (line[0] == ' ' || line[0] == '\t');
+        size_t indent_width = line.find_first_not_of(" \t");
+        if (indent_width == std::string::npos) indent_width = line.size();
+        const bool is_indented = indent_width > 0;
 
         bool is_section_header = false;
-        if (!line.empty() && line[0] != ' ' && line[0] != '\t') {
+        if (!is_indented) {
             size_t colon_at = line.find(':');
             if (colon_at != std::string::npos) {
                 std::string after_colon = line.substr(colon_at + 1);
@@ -2112,6 +2117,23 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                     current_section = line.substr(0, colon_at);
                     current_section.erase(0, current_section.find_first_not_of(" \t"));
                     current_section.erase(current_section.find_last_not_of(" \t") + 1);
+                    current_subsection.clear();
+                    subsection_indent = 0;
+                }
+            }
+        } else if (current_section == "advanced") {
+            // advanced.decomposition is the only nested subsection today; a colon-only
+            // line one level under "advanced:" opens it like a top-level section header.
+            size_t colon_at = line.find(':');
+            if (colon_at != std::string::npos) {
+                std::string after_colon = line.substr(colon_at + 1);
+                after_colon.erase(0, after_colon.find_first_not_of(" \t\r\n"));
+                if (after_colon.empty()) {
+                    is_section_header = true;
+                    current_subsection = line.substr(0, colon_at);
+                    current_subsection.erase(0, current_subsection.find_first_not_of(" \t"));
+                    current_subsection.erase(current_subsection.find_last_not_of(" \t") + 1);
+                    subsection_indent = indent_width;
                 }
             }
         }
@@ -2125,6 +2147,8 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
 
         if (!is_indented) {
             current_section.clear();
+            current_subsection.clear();
+            subsection_indent = 0;
         }
         
         size_t colon_pos = line.find(':');
@@ -2182,6 +2206,21 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                 electrostatics_solver_ = trim_copy(value);
             } else if (key == "pme_ranks") {
                 pme_ranks_ = std::stoi(trim_copy(value));
+            }
+        } else if (current_section == "advanced" && current_subsection == "decomposition" &&
+                   indent_width > subsection_indent) {
+            if (key == "grid_policy") {
+                decomposition_grid_policy_ = trim_copy(value);
+            } else if (key == "inter_node_weight") {
+                decomposition_inter_node_weight_ = std::stod(value);
+            } else if (key == "intra_node_weight") {
+                decomposition_intra_node_weight_ = std::stod(value);
+            } else if (key == "dynamic_balance_interval") {
+                decomposition_dynamic_interval_ = std::stol(value);
+            } else if (key == "dynamic_imbalance_threshold") {
+                decomposition_dynamic_imbalance_threshold_ = std::stod(value);
+            } else if (key == "dynamic_relaxation") {
+                decomposition_dynamic_relaxation_ = std::stod(value);
             }
         } else if (current_section == "minimize") {
             if (key == "method") {
@@ -2514,6 +2553,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     
     system->set_physical_cutoff(cutoff_distance);
     system->set_verlet_skin(verlet_skin);
+    system->set_decomposition_policy(decomposition_grid_policy_, decomposition_inter_node_weight_,
+                                     decomposition_intra_node_weight_, decomposition_dynamic_interval_,
+                                     decomposition_dynamic_imbalance_threshold_,
+                                     decomposition_dynamic_relaxation_);
     system->get_ff_params().lj_switch_distance = lj_switch_distance;
     rebuild_output_info_items_cache();
     if (system->get_rank() == 0) {

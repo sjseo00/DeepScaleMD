@@ -111,6 +111,16 @@ private:
     std::string electrostatics_solver_ = "pme";
     int pme_ranks_ = 0;  // 0 = no PP/PME rank split (default, legacy rank-0-serial behavior)
 
+    // decomposition: (advanced, optional) dsDecompX process-grid policy, nested as
+    // advanced.decomposition.* in YAML. Empty/sentinel values mean "unset" -- falls
+    // back to the library default (MPI_Dims_create). See MDSystem::set_decomposition_policy().
+    std::string decomposition_grid_policy_;
+    double decomposition_inter_node_weight_ = -1.0;
+    double decomposition_intra_node_weight_ = -1.0;
+    long decomposition_dynamic_interval_ = -1;
+    double decomposition_dynamic_imbalance_threshold_ = -1.0;
+    double decomposition_dynamic_relaxation_ = -1.0;
+
     std::string mlip_model_path;
     std::string mlip_model_type;
     std::string mlip_model_size;

@@ -288,10 +288,7 @@ void PmeReciprocalEngine::ensure_initialized(Real cutoff, const SimulationBox& b
     ewald_spline_order_ = 4;
 
     Real target_spacing = std::min(static_cast<Real>(1.2), static_cast<Real>(0.4) / ewald_alpha_);
-    if (const char* spacing_env = std::getenv("MD_PME_GRID_SPACING")) {
-        const Real v = static_cast<Real>(std::atof(spacing_env));
-        if (v > 0.0) target_spacing = v;
-    }
+    if (grid_spacing_override_ > 0.0) target_spacing = grid_spacing_override_;
     ewald_grid_x_ = pme_next_good_fft_size(static_cast<int>(std::ceil(box.lx / target_spacing)));
     ewald_grid_y_ = pme_next_good_fft_size(static_cast<int>(std::ceil(box.ly / target_spacing)));
     ewald_grid_z_ = pme_next_good_fft_size(static_cast<int>(std::ceil(box.lz / target_spacing)), true);
@@ -361,10 +358,7 @@ void PmeReciprocalEngine::ensure_initialized_distributed(Real cutoff, const Simu
     ewald_spline_order_ = 4;
 
     Real target_spacing = std::min(static_cast<Real>(1.2), static_cast<Real>(0.4) / ewald_alpha_);
-    if (const char* spacing_env = std::getenv("MD_PME_GRID_SPACING")) {
-        const Real v = static_cast<Real>(std::atof(spacing_env));
-        if (v > 0.0) target_spacing = v;
-    }
+    if (grid_spacing_override_ > 0.0) target_spacing = grid_spacing_override_;
     ewald_grid_x_ = pme_next_good_fft_size(static_cast<int>(std::ceil(box.lx / target_spacing)));
     ewald_grid_y_ = pme_next_good_fft_size(static_cast<int>(std::ceil(box.ly / target_spacing)));
     ewald_grid_z_ = pme_next_good_fft_size(static_cast<int>(std::ceil(box.lz / target_spacing)), true);

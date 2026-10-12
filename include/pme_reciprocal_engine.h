@@ -50,6 +50,10 @@ public:
     // refreshes the cached prefactor. Must be called before any other method.
     void ensure_initialized(Real cutoff, const SimulationBox& box);
 
+    // force_calculation.pme_grid_spacing (A) from YAML. Must be set before the
+    // first ensure_initialized()/ensure_initialized_distributed() call to take effect.
+    void set_grid_spacing_override(Real spacing_angstrom) { grid_spacing_override_ = spacing_angstrom; }
+
 #ifdef DEEPSCALEMD_HAVE_FFTW_MPI
     // Distributed variant: this rank owns only an x-slab of the grid
     // (local_nx() planes starting at local_x_start()), determined by
@@ -108,6 +112,7 @@ public:
     int grid_z_pad() const { return pme_grid_z_pad_; }
 
 private:
+    Real grid_spacing_override_ = 0.0;  // 0 = automatic
     bool initialized_ = false;
     int ewald_grid_x_ = 0, ewald_grid_y_ = 0, ewald_grid_z_ = 0;
     Real ewald_alpha_ = 0.0;

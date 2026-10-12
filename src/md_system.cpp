@@ -820,33 +820,29 @@ void MDSystem::initialize_decomposition_runtime() {
     config.process_grid.allow_rank_reorder = false;
     // Keep the established MPI_Dims_create behavior by default. The planner is
     // opt-in so upgrading the library cannot silently change rank ownership.
-    if (const char* policy = std::getenv("GRID_POLICY")) {
-        const std::string selected(policy);
+    // Driven only by YAML's decomposition.grid_policy (set_decomposition_policy()).
+    if (!decomposition_grid_policy_.empty()) {
+        const std::string& selected = decomposition_grid_policy_;
         if (selected == "balanced") {
             config.grid_policy = dsdecompx::GridPolicy::Balanced;
-        } else if (selected == "topology" || selected == "topology-aware") {
+        } else if (selected == "topology" || selected == "topology-aware" || selected == "topology_aware") {
             config.grid_policy = dsdecompx::GridPolicy::TopologyAware;
-            if (const char* weight = std::getenv("INTER_NODE_WEIGHT")) {
-                const double parsed = std::atof(weight);
-                if (parsed > 0.0) config.topology_info.inter_node_weight = parsed;
+            if (decomposition_inter_node_weight_ > 0.0) {
+                config.topology_info.inter_node_weight = decomposition_inter_node_weight_;
             }
-            if (const char* weight = std::getenv("INTRA_NODE_WEIGHT")) {
-                const double parsed = std::atof(weight);
-                if (parsed > 0.0) config.topology_info.intra_node_weight = parsed;
+            if (decomposition_intra_node_weight_ > 0.0) {
+                config.topology_info.intra_node_weight = decomposition_intra_node_weight_;
             }
         } else if (selected == "dynamic") {
             config.grid_policy = dsdecompx::GridPolicy::Dynamic;
-            if (const char* value = std::getenv("DYNAMIC_BALANCE_INTERVAL")) {
-                const long parsed = std::atol(value);
-                if (parsed >= 0) config.dynamic.interval = static_cast<size_t>(parsed);
+            if (decomposition_dynamic_interval_ >= 0) {
+                config.dynamic.interval = static_cast<size_t>(decomposition_dynamic_interval_);
             }
-            if (const char* value = std::getenv("DYNAMIC_IMBALANCE_THRESHOLD")) {
-                const double parsed = std::atof(value);
-                if (parsed >= 1.0) config.dynamic.imbalance_threshold = parsed;
+            if (decomposition_dynamic_imbalance_threshold_ >= 1.0) {
+                config.dynamic.imbalance_threshold = decomposition_dynamic_imbalance_threshold_;
             }
-            if (const char* value = std::getenv("DYNAMIC_RELAXATION")) {
-                const double parsed = std::atof(value);
-                if (parsed > 0.0 && parsed <= 1.0) config.dynamic.relaxation = parsed;
+            if (decomposition_dynamic_relaxation_ > 0.0 && decomposition_dynamic_relaxation_ <= 1.0) {
+                config.dynamic.relaxation = decomposition_dynamic_relaxation_;
             }
         }
     }
