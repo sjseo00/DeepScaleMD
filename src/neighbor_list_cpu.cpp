@@ -24,17 +24,6 @@
 
 namespace {
 
-int get_log_rank() {
-    static int rank = -1;
-    if (rank < 0) {
-        int init = 0;
-        MPI_Initialized(&init);
-        rank = 0;
-        if (init) MPI_Comm_rank(PmePpSplit::instance().pp_comm(), &rank);
-    }
-    return rank;
-}
-
 struct TilePairRec {
     int home;
     int nb;
@@ -666,25 +655,6 @@ void SpatialVerletList::build(const ParticleData& particles, const SimulationBox
         }
         pairs_inside_rc_ = static_cast<std::uint64_t>(inside_rc);
         pairs_inside_rc_plus_skin_ = static_cast<std::uint64_t>(inside_outer);
-
-        if (const char* v = std::getenv("MD_LOG_TILE_PAIR_STATS")) {
-            if (*v && std::string(v) != "0" && get_log_rank() == 0) {
-                const double total_lanes =
-                    static_cast<double>(total_tile_pairs) * kCpuTileSize * kCpuTileSize;
-                const double lane_efficiency =
-                    (total_lanes > 0.0) ? static_cast<double>(inside_outer) / total_lanes : 0.0;
-                const double rc_vs_skin_ratio =
-                    (inside_outer > 0) ? static_cast<double>(inside_rc) / static_cast<double>(inside_outer) : 0.0;
-                std::cout << "[SpatialVerletList] tiles=" << num_tiles_
-                          << " tile_pairs=" << total_tile_pairs
-                          << " lane_efficiency=" << lane_efficiency
-                          << " (kept/total_lanes=" << inside_outer << "/"
-                          << static_cast<unsigned long long>(total_lanes) << ")"
-                          << " rc_vs_skin=" << rc_vs_skin_ratio
-                          << " (inside_rc/inside_rc_plus_skin=" << inside_rc << "/" << inside_outer << ")"
-                          << std::endl;
-            }
-        }
     } else {
         tile_atoms_.clear();
         tile_pair_offsets_.clear();
@@ -784,7 +754,7 @@ void SpatialVerletList::build(const ParticleData& particles, const SimulationBox
         }
     };
 
-    const bool need_atom_csr = build_active_graph_ || mlip_edge_list_needed_;
+    const bool need_atom_csr = build_active_graph_;
     if (need_atom_csr) {
     if (neighbor_capacity_per_atom_ <= 0) {
         const Real volume = Lx * Ly * Lz;

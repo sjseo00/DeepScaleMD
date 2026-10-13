@@ -4,7 +4,6 @@
 CMAKE ?= cmake
 JOBS ?=
 BUILD_TYPE ?= cpu
-LIBTORCH ?= OFF
 
 CPU_DSDECOMPX_DIR ?= $(CURDIR)/install/dsdecompx-cpu
 CUDA_DSDECOMPX_DIR ?= $(CURDIR)/install/dsdecompx-cuda
@@ -33,7 +32,6 @@ cuda:
 	$(CMAKE) -S . -B $(CUDA_BUILD_DIR) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DBACKEND=CUDA \
-		-DENABLE_LIBTORCH=$(LIBTORCH) \
 		-DDSDECOMPX_DIR="$(CUDA_DSDECOMPX_DIR)"
 	$(CMAKE) --build $(CUDA_BUILD_DIR) --parallel $(JOBS)
 
@@ -53,7 +51,6 @@ clean:
 help:
 	@echo "CMake wrapper targets: cpu | cuda | sycl | clean"
 	@echo "Benchmark targets: systems | memory-check | parse | pack | plots | mock"
-	@echo "Set LIBTORCH=ON with the cuda target to enable the LibTorch MLIP interface."
 	@echo "Override CPU_DSDECOMPX_DIR or CUDA_DSDECOMPX_DIR when needed."
 
 systems memory-check parse pack plots mock progress:

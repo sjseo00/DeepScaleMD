@@ -23,9 +23,6 @@ bool ConstraintSolver::apply_shake(MDSystem& system, Real dt,
     const size_t local_owned = system.get_local_particles();
     const Real inv_dt = 1.0 / dt;
 
-    const char* allow_unsafe = std::getenv("MD_ALLOW_UNSAFE_CROSSRANK_CONSTRAINTS");
-    const bool allow_unsafe_crossrank = (allow_unsafe != nullptr) && (std::string(allow_unsafe) == "1");
-    static bool warned_cross_rank_shake = false;
     size_t skipped_cross_rank = 0;
 
     for (int iter = 0; iter < max_iterations_; ++iter) {
@@ -82,20 +79,11 @@ bool ConstraintSolver::apply_shake(MDSystem& system, Real dt,
             particles.vz[j] += corr_z * inv_mj * inv_dt;
         }
 
-        if (skipped_cross_rank > 0 && !warned_cross_rank_shake) {
-            if (!allow_unsafe_crossrank) {
-                throw std::runtime_error(
-                    "[Constraints] MPI cross-rank constraints detected (ghost endpoint involved). "
-                    "Current CPU SHAKE/RATTLE path cannot safely enforce these in distributed mode. "
-                    "Use fewer MPI ranks so constrained partners stay local, disable constraints, "
-                    "or set MD_ALLOW_UNSAFE_CROSSRANK_CONSTRAINTS=1 to continue with skipped cross-rank constraints.");
-            } else {
-                std::cerr << "[Constraints][rank " << system.get_rank()
-                          << "] SHAKE skipped " << skipped_cross_rank
-                          << " cross-rank constraint(s) (ghost endpoint involved)."
-                          << std::endl;
-                warned_cross_rank_shake = true;
-            }
+        if (skipped_cross_rank > 0) {
+            throw std::runtime_error(
+                "[Constraints] MPI cross-rank constraints detected (ghost endpoint involved). "
+                "Current CPU SHAKE/RATTLE path cannot safely enforce these in distributed mode. "
+                "Use fewer MPI ranks so constrained partners stay local, or disable constraints.");
         }
 
         if (max_relative_error < position_tolerance_) return true;
@@ -112,9 +100,6 @@ bool ConstraintSolver::apply_rattle(MDSystem& system) {
     SimulationBox& box = system.get_box();
     const size_t local_owned = system.get_local_particles();
 
-    const char* allow_unsafe = std::getenv("MD_ALLOW_UNSAFE_CROSSRANK_CONSTRAINTS");
-    const bool allow_unsafe_crossrank = (allow_unsafe != nullptr) && (std::string(allow_unsafe) == "1");
-    static bool warned_cross_rank_rattle = false;
     size_t skipped_cross_rank = 0;
 
     for (int iter = 0; iter < max_iterations_; ++iter) {
@@ -156,20 +141,11 @@ bool ConstraintSolver::apply_rattle(MDSystem& system) {
             particles.vz[j] += k * inv_mj * dz;
         }
 
-        if (skipped_cross_rank > 0 && !warned_cross_rank_rattle) {
-            if (!allow_unsafe_crossrank) {
-                throw std::runtime_error(
-                    "[Constraints] MPI cross-rank constraints detected (ghost endpoint involved). "
-                    "Current CPU SHAKE/RATTLE path cannot safely enforce these in distributed mode. "
-                    "Use fewer MPI ranks so constrained partners stay local, disable constraints, "
-                    "or set MD_ALLOW_UNSAFE_CROSSRANK_CONSTRAINTS=1 to continue with skipped cross-rank constraints.");
-            } else {
-                std::cerr << "[Constraints][rank " << system.get_rank()
-                          << "] RATTLE skipped " << skipped_cross_rank
-                          << " cross-rank constraint(s) (ghost endpoint involved)."
-                          << std::endl;
-                warned_cross_rank_rattle = true;
-            }
+        if (skipped_cross_rank > 0) {
+            throw std::runtime_error(
+                "[Constraints] MPI cross-rank constraints detected (ghost endpoint involved). "
+                "Current CPU SHAKE/RATTLE path cannot safely enforce these in distributed mode. "
+                "Use fewer MPI ranks so constrained partners stay local, or disable constraints.");
         }
 
         if (max_error < velocity_tolerance_) return true;

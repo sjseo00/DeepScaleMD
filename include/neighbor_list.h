@@ -48,8 +48,6 @@ public:
                                     const SimulationBox& box,
                                     size_t num_local) const = 0;
 
-    virtual void set_mlip_edge_list_needed(bool /*needed*/) {}
-
     virtual bool needs_tile_reprune(const ParticleData& /*particles*/,
                                     const SimulationBox& /*box*/,
                                     size_t /*num_local*/) const {
@@ -88,7 +86,6 @@ public:
         build_tile_graph_ = (kernel == "tiled");
         build_active_graph_ = (kernel == "graph");
     }
-    void set_mlip_edge_list_needed(bool needed) override { mlip_edge_list_needed_ = needed; }
     bool needs_active_prune(const ParticleData& particles,
                             const SimulationBox& box,
                             size_t num_local) const override;
@@ -150,7 +147,6 @@ private:
     std::uint64_t pairs_inside_rc_plus_skin_ = 0;
     bool build_tile_graph_ = true;
     bool build_active_graph_ = false;
-    bool mlip_edge_list_needed_ = false;
 };
 
 std::unique_ptr<NeighborList> create_neighbor_list(NeighborListBackend kind, Real cutoff, Real skin);

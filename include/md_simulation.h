@@ -3,6 +3,7 @@
 
 #include "md_system.h"
 #include "force_calculator.h"
+#include "MLIPBackend.h"
 #include "integrator.h"
 #include "thermostat.h"
 #include "barostat.h"
@@ -25,7 +26,6 @@
 #include <hdf5.h>
 #endif
 
-namespace mlip { class MlipRuntime; }
 class HaloBackend;
 class CommBackend;
 class ForceCalculatorCUDA;
@@ -57,16 +57,13 @@ private:
     std::unique_ptr<Thermostat> thermostat;
     std::unique_ptr<Barostat> barostat;
     std::unique_ptr<NeighborList> neighbor_list_;
-    std::unique_ptr<PythonForceInterface> python_interface;
+    std::unique_ptr<MLIPBackend> mlip_backend_;
     std::unique_ptr<PmeServer> pme_server_;  // non-null only on dedicated PME-group ranks (CPU/SYCL builds)
 #ifdef USE_CUDA
     std::unique_ptr<PmeServerCuda> pme_server_cuda_;  // ditto, CUDA builds (see simulation_backend_factory.cpp)
 #endif
     ForceCalculatorCUDA* cuda_calc_cached_;
     bool using_cuda_backend_cached_;
-
-    std::unique_ptr<mlip::MlipRuntime> mlip_runtime_;
-    std::string mlip_spec_file_;    // path to per-model YAML spec (full schema)
 
     std::unique_ptr<ConstraintSolver> constraint_solver_;
     bool constraints_enabled_ = false;
@@ -99,7 +96,6 @@ private:
     std::string force_calculation_mode;
     bool enable_builtin_forces_ = true;
     bool enable_python_forces_ = false;
-    bool enable_libtorch_forces_ = false;
     std::string force_calculation_type;
     std::string force_precision_ = "double";
 
@@ -121,6 +117,9 @@ private:
     double decomposition_dynamic_imbalance_threshold_ = -1.0;
     double decomposition_dynamic_relaxation_ = -1.0;
 
+    std::string mlip_backend_name_ = "python";  // mlip_backend: python | libtorch
+    std::string mlip_model_folder_;             // mlip_model: converted model folder (libtorch)
+    std::vector<int> mlip_type_to_z_;           // mlip_type_to_z: MD type id -> atomic number
     std::string mlip_model_path;
     std::string mlip_model_type;
     std::string mlip_model_size;
@@ -130,11 +129,11 @@ private:
 
     std::string integrator_type;
     std::string thermostat_type;
-    Real tau_t;
+    Real tau_t;          // thermostat time constant, fs (same unit as timestep)
     std::string barostat_type;
     Real target_pressure;
-    Real tau_p;
-    // 0.0 = unset; initialize_barostat() then defaults to tau_p / 2, matching
+    Real tau_p;          // barostat time constant / piston period, fs (same unit as timestep)
+    // fs. 0.0 = unset; initialize_barostat() then defaults to tau_p / 2, matching
     // NAMD's own langevinPistonPeriod/langevinPistonDecay convention (Decay
     // is normally about half the Period). Only used by parrinello_rahman.
     Real tau_p_decay_ = 0.0;
@@ -203,12 +202,21 @@ private:
     int total_steps;
     Real dt;
     std::string python_force_path;
-    bool python_force_enabled;
     
     Real cached_potential_energy;       // Store PE from force calculation
     
     bool neighbor_rebuild_forced;       // Force neighbor rebuild (e.g., after barostat)
     bool adaptive_rebuild_armed_ = true;
+    // Box lengths the dsDecompX domain (periodic wrap of the migration, halo image shifts, subdomain
+    // bounds) was last synchronised with. NPT with several ranks: the barostat changes the box a
+    // little every step, and the decomposition only learns about it through sync_domain_to_box().
+    Real box_synced_lx_ = 0.0, box_synced_ly_ = 0.0, box_synced_lz_ = 0.0;
+    bool box_synced_valid_ = false;
+    // Largest box change (A, any axis) tolerated since the last domain synchronisation before the
+    // barostat forces a rebuild with a new halo plan: between rebuilds the ghost atoms of a periodic
+    // face are placed with the image shift of the last synchronisation, so this is also the error
+    // of those ghost positions.
+    static constexpr Real kBoxSyncBudget = 0.005;
     // Lagged displacement check (several GPU ranks): the previous reading, to extrapolate one check ahead.
     Real lagged_disp_previous_ = 0.0;
     bool lagged_disp_have_previous_ = false;
@@ -216,7 +224,6 @@ private:
     enum class TimingTraceMode { Off, Step, Every };
     TimingTraceMode timing_trace_mode_ = TimingTraceMode::Off;
     bool timing_trace_force_ = false;
-    static TimingTraceMode parse_timing_trace_mode();
 
     struct StepTiming {
         double nlist_build_ms = 0.0;
@@ -292,9 +299,6 @@ private:
     // True when the halo exchange of this step was only begun and is completed
     // (and overlapped with the owned-owned force pairs) in compute_forces_with_mode().
     bool halo_overlap_pending_ = false;
-    // Kill switch: DSMD_OVERLAP_HALO=0 restores the strictly sequential
-    // exchange-then-force order.
-    bool overlap_halo_enabled_ = true;
     // Steps whose halo exchange was overlapped with the owned-owned force pairs.
     long long halo_overlap_steps_ = 0;
     // Potential energy and virial are read only by console/trajectory output
@@ -330,6 +334,8 @@ private:
                                 double barostat_time, double modify_time,
                                 double total_time);
     void handle_box_change_rebuild();
+    void sync_domain_to_box();             // dsDecompX domain <- current box (invalidates the halo plan)
+    Real box_drift_since_sync() const;     // largest |L - L_synced| over the three axes (A)
     void sync_output_state_to_host_if_needed();
     bool output_needs_particle_stats() const;
     void compute_output_energies(const ParticleData& particles, OutputMetrics& metrics);
@@ -337,7 +343,7 @@ private:
     void compute_output_thermodynamics(const ParticleData& particles, OutputMetrics& metrics);
     void emit_rank0_output(int step, const OutputMetrics& metrics);
     std::string format_output_line(int step, const OutputMetrics& metrics) const;
-    void compute_forces_with_mode(bool download_positions_for_ml, bool need_energy = true);
+    void compute_forces_with_mode(bool need_energy = true);
     void reverse_halo_for_bonded_if_needed();
     // CUDA multi-rank: re-derive the device bonded topology if the owned/ghost
     // layout changed. Only needed after a migration or halo rebuild.

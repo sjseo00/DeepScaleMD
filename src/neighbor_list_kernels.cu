@@ -934,18 +934,8 @@ extern "C" void launch_cuda_tile_list_build(
             NEIGHBOR_LIST_CUDA_CHECK(cudaGetLastError());
         }
         // The inside-cutoff counts are statistics only. Reading them back costs a full
-        // stream sync right after the (long) mask kernel, so it is opt-in
-        // (MD_NLIST_PAIR_COUNT_READBACK=1); otherwise the outputs stay 0 and the host moves on.
-        static const bool s_want_pair_stats = [] {
-            const char* v = std::getenv("MD_NLIST_PAIR_COUNT_READBACK");
-            return v && *v && std::string(v) != "0";
-        }();
-        if (s_want_pair_stats) {
-            cudaMemcpyAsync(s_h_scalars + 2, s_d_verlet_pair_counts,
-                            2 * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);
-            std::memcpy(host_pair_counts, s_h_scalars + 2, sizeof(host_pair_counts));
-        }
+        // stream sync right after the (long) mask kernel, so the outputs stay 0 and the
+        // host moves on.
 
         if (out_d_tile_atoms)        *out_d_tile_atoms        = s_d_tile_atoms;
         if (out_d_tile_pair_i)       *out_d_tile_pair_i       = s_d_tile_pair_i;

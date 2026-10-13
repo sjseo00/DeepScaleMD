@@ -56,6 +56,9 @@ public:
     virtual void set_pressure(Real press) { target_pressure = press; }
     virtual void set_virial(Real virial) { last_virial = virial; }
     virtual void set_kinetic_energy(Real kinetic_energy) { last_kinetic_energy = kinetic_energy; }
+    // Seed of the piston noise. Every rank must run the same piston (same box), so the
+    // caller gives all ranks one seed; only barostats with a random term use it.
+    virtual void set_seed(unsigned int seed) { (void)seed; }
 
 #ifdef USE_CUDA
     virtual void apply_device(Real* d_x, Real* d_y, Real* d_z,
@@ -88,6 +91,7 @@ private:
 
 public:
     ParrinelloRahmanBarostat(Real press, Real mass, Real gamma_ = 0.0, Real piston_temp_ = 0.0);
+    void set_seed(unsigned int seed) override { rng.seed(seed); }
     void apply(ParticleData& particles, SimulationBox& box,
                Real dt, size_t local_particles = 0) override;
 };
@@ -131,6 +135,7 @@ private:
 
 public:
     ParrinelloRahmanBarostatCUDA(Real press, Real mass, Real gamma_ = 0.0, Real piston_temp_ = 0.0);
+    void set_seed(unsigned int seed) override { rng.seed(seed); }
     ~ParrinelloRahmanBarostatCUDA() override;
     // Self-contained host<->device round trip; used when this barostat is
     // driven from host-resident ParticleData (e.g. no active device force
@@ -214,6 +219,7 @@ private:
 
 public:
     ParrinelloRahmanBarostatSYCL(Real press, Real mass, Real gamma_ = 0.0, Real piston_temp_ = 0.0);
+    void set_seed(unsigned int seed) override { rng.seed(seed); }
     ~ParrinelloRahmanBarostatSYCL();
     void apply(ParticleData& particles, SimulationBox& box,
                Real dt, size_t local_particles = 0) override;

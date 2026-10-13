@@ -95,7 +95,7 @@ public:
     //     finish_forces_boundary()  ghost pairs, bonded, electrostatics, ...
     // The two calls together produce the same forces as compute_forces().
     // True when the configured force field can be split this way (builtin
-    // Lennard-Jones on the tiled or graph kernel, no MLIP, no force-component
+    // Lennard-Jones on the tiled or graph kernel, no force-component
     // timing, neighbor structure current).
     bool supports_overlapped_forces(MDSystem& system) const;
     void begin_forces_interior(MDSystem& system);
@@ -125,16 +125,16 @@ public:
     void register_ml_pinned_buffers(ParticleData& particles, size_t num_particles);
     void unregister_ml_pinned_buffers(ParticleData& particles);
 
-    void pre_register_mlip_sources();
-    void set_mlip_runtime(void* raw_runtime);
     void set_builtin_forces_enabled(bool enabled) { builtin_forces_enabled_ = enabled; }
     void set_mixed_precision(bool enabled) { mixed_precision_enabled_ = enabled; }
+    // The MPI library accepts device pointers (MDSystem::mpi_takes_device_pointers): the multi-rank
+    // PME grid exchange then goes GPU to GPU instead of through pinned host memory.
+    void set_cuda_aware_mpi(bool enabled) { cuda_aware_mpi_ = enabled; }
     bool is_mixed_precision() const { return mixed_precision_enabled_; }
     void set_pme_cluster_spread_enabled(bool enabled) { pme_use_cluster_spread_ = enabled; }
     bool is_pme_cluster_spread_enabled() const { return pme_use_cluster_spread_; }
     // Target PME grid spacing in A (0 = automatic: min(1, 0.25 / alpha)); ignored with a PME rank group.
     void set_pme_grid_spacing(Real spacing) { pme_grid_spacing_ = spacing; }
-    void compute_mlip_runtime_forces(MDSystem& system);
 
     void set_timing_breakdown_enabled(bool enabled) override { timing_breakdown_enabled_ = enabled; }
     // When false, compute_forces() leaves potential energy / virial on the device:
@@ -149,8 +149,6 @@ public:
     }
 
     bool nlist_dirty_ = true;
-
-    friend void mlip_bridge_register_md_sources(void* fc_cuda_ptr);
 
 protected:
     void compute_electrostatic_forces_real_space(MDSystem& system);
@@ -169,16 +167,12 @@ protected:
     void compute_improper_forces(MDSystem& system);
     void compute_special_pair_forces(MDSystem& system);
 
-    void build_coo_edge_list_on_device(MDSystem& system);
-    void interleave_positions_on_device(int num_total);
     void ensure_graph_on_device(MDSystem& system);
     void rebuild_graph_from_tiles_on_device(MDSystem& system);
     void ensure_graph_edge_capacity(int64_t edges);
 
     void allocate_device_memory(size_t num_particles);
 
-    void ensure_tile_pair_stats_enabled();
-    void log_tile_pair_stats_gpu();
     
     void upload_bonded_topology_to_device(MDSystem& system);
     void free_bonded_topology_device();
@@ -226,10 +220,6 @@ protected:
     unsigned long long pairs_inside_rc_ = 0;
     unsigned long long pairs_inside_rc_plus_skin_ = 0;
 
-    unsigned long long* d_tile_pair_stats_ = nullptr;
-    bool tile_pair_stats_probed_ = false;
-    bool tile_pair_stats_enabled_ = false;
-
 
     long long* d_force_fixed_x_ = nullptr;
     long long* d_force_fixed_y_ = nullptr;
@@ -245,7 +235,6 @@ protected:
     bool nlist_mode_active_ = false;          // the lists below belong to the current tile list
     bool nlist_fallback_reported_ = false;
     bool nlist_info_reported_ = false;
-    int nlist_verify_runs_ = 0;
     float* d_lj_c6c12_f_ = nullptr;           // {4 eps sigma^6, 4 eps sigma^12} per type pair
     float4* d_slot_posq_ = nullptr;           // [slots + 1] x, y, z, charge in tile-slot order (last = NaN padding)
     int* d_slot_type_ = nullptr;              // [slots + 1]
@@ -260,7 +249,7 @@ protected:
     int ewald_table_intervals_ = 0;
     Real ewald_table_alpha_ = 0.0;
     int tile_list_stride_ = 0;                // entries per tile row; only grows
-    int* d_nlist_counters_ = nullptr;         // [4] longest list found by the build; check counters
+    int* d_nlist_counters_ = nullptr;         // [1] longest list found by the build
     int* h_nlist_counters_ = nullptr;         // pinned copy
     size_t slot_capacity_ = 0;
     size_t tile_list_capacity_ = 0;
@@ -380,19 +369,11 @@ protected:
     
     int* d_debug_counters;
 
-    void*    mlip_runtime_raw_      = nullptr;  // non-owning ptr to MlipRuntime
-    bool     mlip_runtime_enabled_  = false;
     bool     builtin_forces_enabled_ = true;
     bool     mixed_precision_enabled_ = false;
 
-    int      num_local_cached_      = 0;
-    int      num_ghost_cached_      = 0;
-
     int32_t* d_edge_src_         = nullptr;
     int32_t* d_edge_dst_         = nullptr;
-    int32_t* d_edge_coo_packed_  = nullptr;
-    int32_t* d_tmp_edge_src_     = nullptr;
-    int32_t* d_tmp_edge_dst_     = nullptr;
     int64_t  num_edges_          = 0;
     int64_t  cap_edges_          = 0;
 
@@ -407,23 +388,6 @@ protected:
     bool     graph_dirty_         = true;
     Real     graph_active_skin_   = 0.0;
 
-    double* d_pos_interleaved_   = nullptr;
-    int     cap_pos_interleaved_ = 0;
-
-    double* d_mlip_forces_       = nullptr;
-    int     cap_mlip_forces_     = 0;
-
-    float*   d_edge_vectors_     = nullptr;
-    int64_t  cap_edge_vectors_   = 0;
-
-    int64_t* d_batch_            = nullptr;
-    int      cap_batch_          = 0;
-    int64_t* d_num_atoms_        = nullptr;
-
-    double*  d_cell_             = nullptr;
-    int*     d_pbc_buf_          = nullptr;
-
-    int*     d_mlip_error_flag_  = nullptr;
     
     size_t max_neighbors_allocated;
     
@@ -475,7 +439,6 @@ protected:
     // The energy and virial are read back only on some steps; kernels that add to them skip it otherwise.
     bool energy_wanted_now() const { return energy_readback_needed_ || timing_breakdown_enabled_; }
     int sm_count_ = 0;
-    int pair_entry_splits_override_ = -1;  // -1: env not read yet; 0: automatic
     cudaEvent_t pme_grid_ready_event_ = nullptr;
     cudaEvent_t pme_done_event_ = nullptr;  // all PME work on pme_stream_ (energy included) is done
     bool pme_in_flight_ = false;            // the FFT chain was queued, finish() has not run
@@ -511,6 +474,7 @@ protected:
     // Device-side grid sum over CUDA-aware MPI point-to-point (no host staging, no NCCL): every rank
     // sends its charge grid to every other rank (the transport the halo exchange uses) and sums the
     // parts in rank order on pme_stream_. See pme_dmpi_ensure().
+    bool cuda_aware_mpi_ = false;
     bool pme_dmpi_tried_ = false;
     bool pme_dmpi_active_ = false;
     bool pme_sum_via_dmpi_ = false;
@@ -549,7 +513,6 @@ protected:
     bool force_timing_events_ready_ = false;
     cudaEvent_t force_timing_event_start_ = nullptr;
     cudaEvent_t force_timing_event_bonded_ = nullptr;
-    cudaEvent_t force_timing_event_mlip_ = nullptr;
     cudaEvent_t force_timing_event_lj_ = nullptr;
     cudaEvent_t force_timing_event_electrostatic_ = nullptr;
     cudaEvent_t force_timing_event_special_ = nullptr;

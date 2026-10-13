@@ -10,11 +10,9 @@
 
 #include "../include/tile_grid_info.h"
 #include "../include/ewald_real_table.h"
-#include "../include/force_libtorch/mlip_types.h"
-using namespace mlip;
-#include <algorithm>   // std::sort, std::unique, std::distance
+#include <algorithm>
 #include <unordered_map>
-#include <utility>     // std::pair
+#include <utility>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -23,69 +21,6 @@ using namespace mlip;
 #include <nccl.h>
 #endif
 
-void mlip_bridge_register_md_sources(void* fc_cuda_ptr);
-void mlip_bridge_compute(void* runtime_ptr,
-                         const mlip::MlipInputView* in_view,
-                         mlip::MlipOutputView* out_view);
-
-extern "C" {
-    void launch_half_to_full_edges(
-        const int32_t* src, const int32_t* dst,
-        int32_t* out_src, int32_t* out_dst,
-        int64_t E_half, cudaStream_t stream);
-
-    void launch_interleave_positions(
-        const double* d_x, const double* d_y, const double* d_z,
-        double* out, int N, cudaStream_t stream);
-
-    void launch_accumulate_forces_scaled(
-        const double* mlip_forces,
-        double* d_fx, double* d_fy, double* d_fz,
-        double scale, int N,
-        int* d_error_flag, cudaStream_t stream);
-}
-
-__global__ void k_min_image_edge_vectors(
-    const double* __restrict__ x,
-    const double* __restrict__ y,
-    const double* __restrict__ z,
-    const int32_t* __restrict__ src,
-    const int32_t* __restrict__ dst,
-    float* __restrict__ ev,
-    int64_t E_half,
-    float lx, float ly, float lz,
-    bool px, bool py, bool pz)
-{
-    int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= E_half) return;
-    int s = src[e], d = dst[e];
-    float dx = (float)(x[d] - x[s]);
-    float dy = (float)(y[d] - y[s]);
-    float dz = (float)(z[d] - z[s]);
-    if (px) { if (dx >  lx*0.5f) dx -= lx; else if (dx < -lx*0.5f) dx += lx; }
-    if (py) { if (dy >  ly*0.5f) dy -= ly; else if (dy < -ly*0.5f) dy += ly; }
-    if (pz) { if (dz >  lz*0.5f) dz -= lz; else if (dz < -lz*0.5f) dz += lz; }
-    ev[e*3]           = dx;  ev[e*3+1]           = dy;  ev[e*3+2]           = dz;
-    ev[(E_half+e)*3]  = -dx; ev[(E_half+e)*3+1]  = -dy; ev[(E_half+e)*3+2]  = -dz;
-}
-
-__global__ void k_min_image_edge_vectors_directed(
-    const double* __restrict__ x, const double* __restrict__ y,
-    const double* __restrict__ z, const int32_t* __restrict__ src,
-    const int32_t* __restrict__ dst, float* __restrict__ ev, int64_t edges,
-    float lx, float ly, float lz, bool px, bool py, bool pz)
-{
-    const int64_t e = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (e >= edges) return;
-    const int s = src[e], d = dst[e];
-    float dx = static_cast<float>(x[d] - x[s]);
-    float dy = static_cast<float>(y[d] - y[s]);
-    float dz = static_cast<float>(z[d] - z[s]);
-    if (px) { if (dx > lx * 0.5f) dx -= lx; else if (dx < -lx * 0.5f) dx += lx; }
-    if (py) { if (dy > ly * 0.5f) dy -= ly; else if (dy < -ly * 0.5f) dy += ly; }
-    if (pz) { if (dz > lz * 0.5f) dz -= lz; else if (dz < -lz * 0.5f) dz += lz; }
-    ev[e * 3] = dx; ev[e * 3 + 1] = dy; ev[e * 3 + 2] = dz;
-}
 #include <limits>
 #include <iostream>
 #include <cuda_runtime.h>
@@ -400,7 +335,6 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_
     int mie_n, int mie_m, PairT mie_prefactor,
     PairT cutoff_sq, PairT switch_distance, PairT switch_sq, PairT inv_denom,
     int num_tiles,
-    unsigned long long* __restrict__ pair_stats,
     int j_filter,
     int entry_splits)
 {
@@ -536,7 +470,6 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_
 
             PairT my_fxj = PairT(0), my_fyj = PairT(0), my_fzj = PairT(0);
             if (accepted) {
-                if (pair_stats) atomicAdd(&pair_stats[0], 1ULL);
                 PairT dxp = xi - xj;
                 PairT dyp = yi - yj;
                 PairT dzp = zi - zj;
@@ -549,7 +482,6 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_
 
                 if (r2 < cutoff_sq_p && r2 >= PairT(1e-10) &&
                     ((excl_mask >> (src * LJ_CLUSTER_SIZE + sub)) & 1ULL) == 0) {
-                    if (pair_stats) atomicAdd(&pair_stats[1], 1ULL);
                     size_t type_idx = static_cast<size_t>(type_i) * max_types + type_j;
                     PairT eps, sig;
                     load_lj_pair_params(epsilon_mixed, sigma_mixed, lj_params_f, type_idx, eps, sig);
@@ -875,7 +807,6 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_non
     PairT cutoff_sq, PairT switch_distance, PairT switch_sq, PairT inv_denom,
     PairT k_coulomb, PairT alpha,
     int num_tiles,
-    unsigned long long* __restrict__ pair_stats,
     int j_filter,
     int entry_splits)
 {
@@ -1018,7 +949,6 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_non
 
             PairT my_fxj = PairT(0), my_fyj = PairT(0), my_fzj = PairT(0);
             if (accepted) {
-                if (pair_stats) atomicAdd(&pair_stats[0], 1ULL);
                 PairT dxp = xi - xj;
                 PairT dyp = yi - yj;
                 PairT dzp = zi - zj;
@@ -1029,7 +959,6 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_non
                 bool j_is_local = static_cast<unsigned>(j_atom) < local_n;
 
                 if (r2 < cutoff_sq_p && r2 >= PairT(1e-10)) {
-                    if (pair_stats) atomicAdd(&pair_stats[1], 1ULL);
                     const bool excluded =
                         ((excl_mask >> (src * LJ_CLUSTER_SIZE + sub)) & 1ULL) != 0;
                     PairT force_mag = PairT(0.0);
@@ -1596,8 +1525,7 @@ __device__ __forceinline__ float nlist_warp_sum(float v) {
 //
 // A pair takes the table path unless r^2 lies below the table (0.5 A^2); excluded pairs use it
 // too, with a short correction branch. The analytic formulas handle the rest, including the
-// pairs of an atom with itself (r^2 = 0). With ewald_intervals = 0 every pair is analytic
-// (MD_NLIST_TABLE=0).
+// pairs of an atom with itself (r^2 = 0). With ewald_intervals = 0 every pair is analytic.
 template <bool WANT_ENERGY, bool COULOMB, bool SMEM_TABLE, bool GHOSTS>
 __global__ void __launch_bounds__(128) compute_nonbonded_forces_list_kernel(
     const float4* __restrict__ posq, const int* __restrict__ slot_type,
@@ -1850,109 +1778,6 @@ __global__ void nlist_merge_slot_forces_kernel(
         fz[atom] += static_cast<Real>(f.z);
     }
     buffer[s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-}
-
-// MD_NLIST_VERIFY=1: for a sample of tiles, compares the number of list entries and the number
-// of excluded-pair bits with a brute-force count over all atoms (same float arithmetic as the
-// list builder, exact per-atom periodic images), and checks the geometry the pair kernel will
-// see (wrapped slot position minus the image shift of the entry's group) against the exact
-// minimum-image distance for every entry within the list radius.
-__global__ void nlist_verify_kernel(
-    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
-    const int* __restrict__ global_id, const int* __restrict__ tile_atoms,
-    const int* __restrict__ tile_list_degree, int list_stride, const unsigned* __restrict__ list,
-    const unsigned char* __restrict__ list_shift, const float4* __restrict__ posq,
-    const unsigned char* __restrict__ tile_flags,
-    int num_tiles, int num_atoms, unsigned dummy_slot,
-    float outer_sq, float lx, float ly, float lz,
-    bool periodic_x, bool periodic_y, bool periodic_z,
-    const int* __restrict__ exclusion_offsets, const int* __restrict__ exclusion_partners,
-    size_t exclusion_atom_count, int stride,
-    int* __restrict__ checked, int* __restrict__ length_mismatches,
-    int* __restrict__ exclusion_mismatches, int* __restrict__ geometry_mismatches)
-{
-    const int tile = (blockIdx.x * blockDim.x + threadIdx.x) * stride;
-    if (tile >= num_tiles) return;
-    const float inv_lx = 1.0f / lx, inv_ly = 1.0f / ly, inv_lz = 1.0f / lz;
-    int atoms[LJ_CLUSTER_SIZE], gids[LJ_CLUSTER_SIZE];
-    float ax[LJ_CLUSTER_SIZE], ay[LJ_CLUSTER_SIZE], az[LJ_CLUSTER_SIZE];
-    for (int k = 0; k < LJ_CLUSTER_SIZE; ++k) {
-        atoms[k] = tile_atoms[tile * LJ_CLUSTER_SIZE + k];
-        gids[k] = atoms[k] >= 0 ? global_id[atoms[k]] : -1;
-        ax[k] = atoms[k] >= 0 ? static_cast<float>(x[atoms[k]]) : 0.0f;
-        ay[k] = atoms[k] >= 0 ? static_cast<float>(y[atoms[k]]) : 0.0f;
-        az[k] = atoms[k] >= 0 ? static_cast<float>(z[atoms[k]]) : 0.0f;
-    }
-    int brute = 0, brute_excluded = 0;
-    const int num_slots = num_tiles * LJ_CLUSTER_SIZE;
-    for (int s = 0; s < num_slots; ++s) {
-        const int j = tile_atoms[s];
-        if (j < 0) continue;
-        {
-            const unsigned cand_tile = static_cast<unsigned>(s) >> 3;
-            const unsigned own_tile = static_cast<unsigned>(tile);
-            const bool keep = cand_tile == own_tile ||
-                              ((((cand_tile ^ own_tile) & 1u) != 0u) == (cand_tile > own_tile));
-            if (!keep) continue;
-            // Same rule as the builder: pairs of tiles without an owned atom are not listed.
-            if (tile_flags != nullptr && (tile_flags[own_tile] & 1u) == 0u &&
-                (tile_flags[cand_tile] & 1u) == 0u) continue;
-        }
-        const float xj = static_cast<float>(x[j]);
-        const float yj = static_cast<float>(y[j]);
-        const float zj = static_cast<float>(z[j]);
-        bool near_any = false;
-        for (int k = 0; k < LJ_CLUSTER_SIZE; ++k) {
-            if (atoms[k] < 0 || atoms[k] == j) continue;
-            float dx = ax[k] - xj, dy = ay[k] - yj, dz = az[k] - zj;
-            if (periodic_x) dx -= rintf(dx * inv_lx) * lx;
-            if (periodic_y) dy -= rintf(dy * inv_ly) * ly;
-            if (periodic_z) dz -= rintf(dz * inv_lz) * lz;
-            if (dx * dx + dy * dy + dz * dz < outer_sq) {
-                near_any = true;
-                if (is_excluded_pair(exclusion_offsets, exclusion_partners, exclusion_atom_count,
-                                     gids[k], global_id[j])) ++brute_excluded;
-            }
-        }
-        if (near_any) ++brute;
-    }
-    int listed = 0, listed_excluded = 0, bad_geometry = 0;
-    const unsigned* row = list + static_cast<long long>(tile) * list_stride;
-    const unsigned char* shift_row = list_shift + static_cast<long long>(tile) * (list_stride >> 2);
-    for (int e = 0; e < tile_list_degree[tile]; ++e) {
-        if (row[e] == dummy_slot) continue;
-        ++listed;
-        listed_excluded += __popc(row[e] >> NLIST_EXCL_SHIFT);
-        const int slot = static_cast<int>(row[e] & NLIST_SLOT_MASK);
-        const int atom_j = tile_atoms[slot];
-        if (atom_j < 0) { ++bad_geometry; continue; }
-        const unsigned code = shift_row[e >> 2];
-        const float shift_x = static_cast<float>(static_cast<int>(code & 3u) - 1) * lx;
-        const float shift_y = static_cast<float>(static_cast<int>((code >> 2) & 3u) - 1) * ly;
-        const float shift_z = static_cast<float>(static_cast<int>((code >> 4) & 3u) - 1) * lz;
-        const float4 pj = posq[slot];
-        for (int k = 0; k < LJ_CLUSTER_SIZE; ++k) {
-            if (atoms[k] < 0 || atoms[k] == atom_j) continue;
-            double tx = x[atoms[k]] - x[atom_j];
-            double ty = y[atoms[k]] - y[atom_j];
-            double tz = z[atoms[k]] - z[atom_j];
-            if (periodic_x) tx -= static_cast<double>(lx) * rint(tx / lx);
-            if (periodic_y) ty -= static_cast<double>(ly) * rint(ty / ly);
-            if (periodic_z) tz -= static_cast<double>(lz) * rint(tz / lz);
-            const double true_r2 = tx * tx + ty * ty + tz * tz;
-            if (true_r2 >= outer_sq) continue;
-            const float4 pk = posq[tile * LJ_CLUSTER_SIZE + k];
-            const float kx = (pk.x - shift_x) - pj.x;
-            const float ky = (pk.y - shift_y) - pj.y;
-            const float kz = (pk.z - shift_z) - pj.z;
-            const double kernel_r2 = static_cast<double>(kx * kx + ky * ky + kz * kz);
-            if (fabs(kernel_r2 - true_r2) > 0.05) ++bad_geometry;
-        }
-    }
-    atomicAdd(checked, 1);
-    if (brute != listed) atomicAdd(length_mismatches, 1);
-    if (brute_excluded != listed_excluded) atomicAdd(exclusion_mismatches, 1);
-    if (bad_geometry > 0) atomicAdd(geometry_mismatches, 1);
 }
 
 __global__ void count_directed_graph_degrees_kernel(
@@ -2469,6 +2294,9 @@ __device__ __forceinline__ Real pme_block_sum(Real v) {
             total += __shfl_down_sync(0xffffffffu, total, offset);
         }
     }
+    // A kernel may call this twice in a row (energy, then virial): the second call writes
+    // warp_sums again, so warp 0 must have finished reading it.
+    __syncthreads();
     return total;
 }
 
@@ -2596,11 +2424,13 @@ __global__ void pme_interpolate_forces_kernel(
         }
     }
 
-    const Real inv_grid_size = 1.0 /
-        (static_cast<Real>(grid_nx) * grid_ny * grid_nz);
-    fx[i] += -qi * static_cast<Real>(dphi_du_x) * (grid_nx * inv_box_x) * inv_grid_size;
-    fy[i] += -qi * static_cast<Real>(dphi_du_y) * (grid_ny * inv_box_y) * inv_grid_size;
-    fz[i] += -qi * static_cast<Real>(dphi_du_z) * (grid_nz * inv_box_z) * inv_grid_size;
+    // The inverse FFT (cuFFT C2R / FFTW c2r) is unnormalised, and that is exactly the potential whose
+    // gradient is the energy computed in the solve (E = 1/2 sum_k w G |rho(k)|^2, no 1/N). The grid
+    // potential is therefore used as it is: a 1/(nx ny nz) here made the reciprocal force a factor
+    // nx*ny*nz (933,120 for 108x108x80) too small, i.e. absent, while the energy kept counting it.
+    fx[i] += -qi * static_cast<Real>(dphi_du_x) * (grid_nx * inv_box_x);
+    fy[i] += -qi * static_cast<Real>(dphi_du_y) * (grid_ny * inv_box_y);
+    fz[i] += -qi * static_cast<Real>(dphi_du_z) * (grid_nz * inv_box_z);
 }
 
 __global__ void pme_self_energy_kernel(
@@ -2683,9 +2513,12 @@ __global__ void pme_reciprocal_virial_kernel(
         T rho_imag = fft_grid[idx].y;
         T rho_sq = rho_real * rho_real + rho_imag * rho_imag;
 
-        T virial_factor = T(1) + k_sq / (T(2) * alpha_sq);
+        // Trace of the virial, W = sum r.F = -dE/d(ln L) = sum_k E_k (1 - k^2 / (2 alpha^2)) with
+        // E_k = 1/2 w G |rho|^2 (matches the numerical box-scaling derivative of the energy). This
+        // kernel must run BEFORE pme_solve_poisson_kernel, which overwrites rho by G rho in place.
+        T virial_factor = T(1) - k_sq / (T(2) * alpha_sq);
         virial_contrib = static_cast<Real>(
-            static_cast<T>(pme_hermitian_weight(kz, grid_nz)) * virial_factor * green * rho_sq);
+            T(0.5) * static_cast<T>(pme_hermitian_weight(kz, grid_nz)) * virial_factor * green * rho_sq);
     }
 
     const Real block_total = pme_block_sum(virial_contrib);
@@ -2715,12 +2548,13 @@ __global__ void compute_bond_forces_kernel(
     Real* bond_k, Real* bond_r0,
     size_t num_bonds,
     Real* potential_energy,
+    Real* virial,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     size_t local_particles) {
 
     size_t bond_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    Real pe_block = 0.0;
+    Real pe_block = 0.0, virial_block = 0.0;
     do {
     if (bond_idx >= num_bonds) break;
 
@@ -2774,8 +2608,12 @@ __global__ void compute_bond_forces_kernel(
     }
 
     pe_block = owns_energy ? pe : 0.0;
+    // r.F of the bond (Urey-Bradley terms are bonds too). The trace of the virial of an angle,
+    // dihedral or improper term is zero under isotropic scaling, so only bonds contribute.
+    virial_block = owns_energy ? force_mag * r * r : 0.0;
     } while (false);
     block_atomic_add(potential_energy, pe_block);
+    block_atomic_add(virial, virial_block);
 }
 
 __global__ void compute_angle_forces_kernel(
@@ -3288,7 +3126,6 @@ void ForceCalculatorCUDA::finalize() {
     }
 #endif
     if (d_fire_reduce_) cudaFree(d_fire_reduce_);
-    if (d_tile_pair_stats_) cudaFree(d_tile_pair_stats_);
     if (d_graph_offsets_) cudaFree(d_graph_offsets_);
     if (d_graph_degrees_) cudaFree(d_graph_degrees_);
     if (d_graph_cursors_) cudaFree(d_graph_cursors_);
@@ -3297,17 +3134,6 @@ void ForceCalculatorCUDA::finalize() {
     if (d_graph_ref_z_) cudaFree(d_graph_ref_z_);
     if (d_edge_src_) cudaFree(d_edge_src_);
     if (d_edge_dst_) cudaFree(d_edge_dst_);
-    if (d_edge_coo_packed_) cudaFree(d_edge_coo_packed_);
-    if (d_tmp_edge_src_) cudaFree(d_tmp_edge_src_);
-    if (d_tmp_edge_dst_) cudaFree(d_tmp_edge_dst_);
-    if (d_pos_interleaved_) cudaFree(d_pos_interleaved_);
-    if (d_mlip_forces_) cudaFree(d_mlip_forces_);
-    if (d_edge_vectors_) cudaFree(d_edge_vectors_);
-    if (d_batch_) cudaFree(d_batch_);
-    if (d_num_atoms_) cudaFree(d_num_atoms_);
-    if (d_cell_) cudaFree(d_cell_);
-    if (d_pbc_buf_) cudaFree(d_pbc_buf_);
-    if (d_mlip_error_flag_) cudaFree(d_mlip_error_flag_);
     if (d_constraint_pre_x_) cudaFree(d_constraint_pre_x_);
     if (d_constraint_pre_y_) cudaFree(d_constraint_pre_y_);
     if (d_constraint_pre_z_) cudaFree(d_constraint_pre_z_);
@@ -3359,7 +3185,6 @@ void ForceCalculatorCUDA::finalize() {
     if (force_timing_events_ready_) {
         cudaEventDestroy(force_timing_event_start_);
         cudaEventDestroy(force_timing_event_bonded_);
-        cudaEventDestroy(force_timing_event_mlip_);
         cudaEventDestroy(force_timing_event_lj_);
         cudaEventDestroy(force_timing_event_electrostatic_);
         cudaEventDestroy(force_timing_event_special_);
@@ -3822,37 +3647,8 @@ void ForceCalculatorCUDA::build_bonded_topology_on_device(MDSystem& system) {
 void ForceCalculatorCUDA::refresh_bonded_topology_on_device(MDSystem& system) {
     if (!device_data_initialized) return;
 
-    // The lists are built on the GPU; DSMD_BONDED_HOST_BUILD=1 restores the host scan and upload.
-    static const bool host_build = [] {
-        const char* v = std::getenv("DSMD_BONDED_HOST_BUILD");
-        return v && *v && std::string(v) != "0";
-    }();
-    if (!host_build) {
-        build_bonded_topology_on_device(system);
-        return;
-    }
-
-    ParticleData& particles = system.get_particles();
-    const size_t total_count = system.get_total_particles();
-    const size_t local_count = system.get_local_particles();
-    if (particles.global_id.size() < total_count) particles.global_id.resize(total_count);
-
-    std::vector<int> current_ids(total_count);
-    if (total_count != 0) {
-        CUDA_CHECK(cudaMemcpyAsync(current_ids.data(), d_global_id,
-                                   total_count * sizeof(int),
-                                   cudaMemcpyDeviceToHost, force_stream));
-        CUDA_CHECK(cudaStreamSynchronize(force_stream));
-    }
-    if (local_count == bonded_layout_local_count_ && current_ids == bonded_layout_global_ids_) {
-        return;
-    }
-
-    std::copy(current_ids.begin(), current_ids.end(), particles.global_id.begin());
-    system.refresh_local_bonded_topology();
-    upload_bonded_topology_to_device(system);
-    bonded_layout_global_ids_ = std::move(current_ids);
-    bonded_layout_local_count_ = local_count;
+    // The lists are built on the GPU.
+    build_bonded_topology_on_device(system);
 }
 
 void ForceCalculatorCUDA::free_bonded_topology_device() {
@@ -4249,57 +4045,15 @@ extern "C" void launch_cuda_tile_list_build(
     bool tiles_only,
     TileGridInfo* grid_out);
 
-void ForceCalculatorCUDA::ensure_tile_pair_stats_enabled() {
-    if (tile_pair_stats_probed_) return;
-    tile_pair_stats_probed_ = true;
-    const char* v = std::getenv("MD_LOG_TILE_PAIR_STATS");
-    tile_pair_stats_enabled_ = (v && *v && std::string(v) != "0");
-    if (tile_pair_stats_enabled_) {
-        CUDA_CHECK(cudaMalloc(&d_tile_pair_stats_, 2 * sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMemset(d_tile_pair_stats_, 0, 2 * sizeof(unsigned long long)));
-    }
-}
-
-void ForceCalculatorCUDA::log_tile_pair_stats_gpu() {
-    if (!tile_pair_stats_enabled_) return;
-
-    CUDA_CHECK(cudaStreamSynchronize(force_stream));
-    unsigned long long stats[2] = {0, 0};
-    CUDA_CHECK(cudaMemcpy(stats, d_tile_pair_stats_, sizeof(stats), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemset(d_tile_pair_stats_, 0, sizeof(stats)));
-    const unsigned long long tested_pairs = stats[0];
-    const unsigned long long real_pairs = stats[1];
-
-    const double tile_pruning_efficiency =
-        (tested_pairs > 0) ? static_cast<double>(real_pairs) / static_cast<double>(tested_pairs) : 0.0;
-
-    const double atomic_ops =
-        3.0 * (static_cast<double>(num_lj_tile_pairs_) + static_cast<double>(num_lj_tiles_));
-    const double half_list_cost =
-        (real_pairs > 0) ? atomic_ops / static_cast<double>(real_pairs) : 0.0;
-
-    if (is_rank_zero()) {
-        std::cout << "\n[ForceCalculatorCUDA] real_pairs/tested_pairs(tile pruning efficiency)="
-                  << tile_pruning_efficiency
-                  << " (real=" << real_pairs << " tested=" << tested_pairs << ")\n"
-                  << "[ForceCalculatorCUDA] atomicAdd_triplets/real_pair(half-list cost)=" << half_list_cost
-                  << " (atomic_triplets~=" << atomic_ops << ")"
-                  << "\n" << std::endl;
-    }
-}
-
 void ForceCalculatorCUDA::ensure_graph_edge_capacity(int64_t edges) {
-    if (edges <= cap_edges_ && d_edge_src_ && d_edge_dst_ && d_edge_coo_packed_) return;
+    if (edges <= cap_edges_ && d_edge_src_ && d_edge_dst_) return;
     if (d_edge_src_) cudaFree(d_edge_src_);
     if (d_edge_dst_) cudaFree(d_edge_dst_);
-    if (d_edge_coo_packed_) cudaFree(d_edge_coo_packed_);
     d_edge_src_ = nullptr;
     d_edge_dst_ = nullptr;
-    d_edge_coo_packed_ = nullptr;
     cap_edges_ = std::max<int64_t>(256, edges + edges / 4 + 256);
     CUDA_CHECK(cudaMalloc(&d_edge_src_, sizeof(int32_t) * cap_edges_));
     CUDA_CHECK(cudaMalloc(&d_edge_dst_, sizeof(int32_t) * cap_edges_));
-    CUDA_CHECK(cudaMalloc(&d_edge_coo_packed_, sizeof(int32_t) * cap_edges_ * 2));
 }
 
 void ForceCalculatorCUDA::rebuild_graph_from_tiles_on_device(MDSystem& system) {
@@ -4385,12 +4139,6 @@ void ForceCalculatorCUDA::rebuild_graph_from_tiles_on_device(MDSystem& system) {
                 box.lx, box.ly, box.lz, inv_x, inv_y, inv_z);
         }
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_, d_edge_src_,
-                                   sizeof(int32_t) * edge_count,
-                                   cudaMemcpyDeviceToDevice, force_stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_ + edge_count, d_edge_dst_,
-                                   sizeof(int32_t) * edge_count,
-                                   cudaMemcpyDeviceToDevice, force_stream));
     }
     CUDA_CHECK(cudaMemcpyAsync(d_graph_ref_x_, d_x, sizeof(Real) * num_total,
                                cudaMemcpyDeviceToDevice, force_stream));
@@ -4559,7 +4307,7 @@ bool ForceCalculatorCUDA::nlist_supported(MDSystem& system, std::string& reason)
         reason = "it needs force_calculation.precision: mixed";
         return false;
     }
-    if (!builtin_forces_enabled_ || mlip_runtime_enabled_ || !force_config.enable_lennard_jones) {
+    if (!builtin_forces_enabled_ || !force_config.enable_lennard_jones) {
         reason = "it covers only the builtin Lennard-Jones force field";
         return false;
     }
@@ -4596,14 +4344,8 @@ void ForceCalculatorCUDA::free_slot_lists() {
 
 // Uploads the real-space Ewald tables (include/ewald_real_table.h: the force table followed by
 // the energy table, four floats per interval) for the current alpha and cutoff and returns the
-// number of intervals. Returns 0 when the table path is switched off (MD_NLIST_TABLE=0): the
-// list kernel then evaluates erfc analytically for every pair.
+// number of intervals.
 int ForceCalculatorCUDA::ensure_ewald_real_table(MDSystem& system, Real cutoff_sq) {
-    static const bool enabled = [] {
-        const char* v = std::getenv("MD_NLIST_TABLE");
-        return !(v && std::string(v) == "0");
-    }();
-    if (!enabled) return 0;
     ensure_ewald_initialized(system);  // alpha
     const int intervals = ewald_real_table_intervals(cutoff_sq);
     if (d_ewald_table_ && ewald_table_intervals_ == intervals && ewald_table_alpha_ == ewald_alpha_) {
@@ -4659,7 +4401,7 @@ void ForceCalculatorCUDA::build_tile_lists_on_device(MDSystem& system, const Til
         CUDA_CHECK(cudaMalloc(&d_tile_list_degree_, (slot_capacity_ / LJ_CLUSTER_SIZE + 1) * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_tile_list_interior_, (slot_capacity_ / LJ_CLUSTER_SIZE + 1) * sizeof(int)));
     }
-    if (!d_nlist_counters_) CUDA_CHECK(cudaMalloc(&d_nlist_counters_, 4 * sizeof(int)));
+    if (!d_nlist_counters_) CUDA_CHECK(cudaMalloc(&d_nlist_counters_, sizeof(int)));
     if (!h_nlist_counters_) CUDA_CHECK(cudaMallocHost(&h_nlist_counters_, 4 * sizeof(int)));
     // The pair kernel adds to this buffer and the merge kernel clears it after every step.
     CUDA_CHECK(cudaMemsetAsync(d_slot_force_, 0, (static_cast<size_t>(num_slots) + 1) * 4 * sizeof(float), force_stream));
@@ -4740,41 +4482,6 @@ void ForceCalculatorCUDA::build_tile_lists_on_device(MDSystem& system, const Til
                       << " MiB, periodic image per stencil cell, "
                       << (system.get_num_particles() - system.get_local_particles())
                       << " ghost atoms on this rank" << std::endl;
-        }
-    }
-
-    // MD_NLIST_VERIFY=1: sampled tiles of the first two builds are checked against a brute
-    // force count over all atoms (list length, number of excluded-pair bits) and the pair
-    // geometry of every entry (wrapped positions minus the entry's image shift against the
-    // minimum-image distance).
-    static const bool verify = [] {
-        const char* v = std::getenv("MD_NLIST_VERIFY");
-        return v && *v && std::string(v) != "0";
-    }();
-    if (verify && nlist_verify_runs_ < 2) {
-        ++nlist_verify_runs_;
-        CUDA_CHECK(cudaMemsetAsync(d_nlist_counters_, 0, 4 * sizeof(int), force_stream));
-        const int samples = 128;
-        const int stride = std::max(1, num_tiles / samples);
-        nlist_verify_kernel<<<(samples + 63) / 64, 64, 0, force_stream>>>(
-            d_x, d_y, d_z, d_global_id, d_tile_atoms, d_tile_list_degree_, tile_list_stride_,
-            d_tile_list_, d_tile_list_shift_, d_slot_posq_,
-            nlist_has_ghosts_ ? d_tile_flags_ : nullptr,
-            num_tiles, static_cast<int>(system.get_num_particles()), dummy_slot,
-            static_cast<float>(outer * outer), static_cast<float>(box.lx),
-            static_cast<float>(box.ly), static_cast<float>(box.lz),
-            box.periodic_x, box.periodic_y, box.periodic_z,
-            d_exclusion_offsets, d_exclusion_partners, exclusion_atom_count, stride,
-            d_nlist_counters_, d_nlist_counters_ + 1, d_nlist_counters_ + 2, d_nlist_counters_ + 3);
-        CUDA_CHECK(cudaGetLastError());
-        int counts[4] = {0, 0, 0, 0};
-        CUDA_CHECK(cudaMemcpy(counts, d_nlist_counters_, sizeof(counts), cudaMemcpyDeviceToHost));
-        if (is_rank_zero()) {
-            std::cout << "[nlist-check] build " << nlist_verify_runs_ << ": " << counts[0]
-                      << " sampled tiles, " << counts[1]
-                      << " with a list length different from the brute-force count, " << counts[2]
-                      << " with a different number of excluded pairs, " << counts[3]
-                      << " with a wrong pair geometry (image shift)" << std::endl;
         }
     }
 }
@@ -5061,10 +4768,10 @@ void ForceCalculatorCUDA::make_force_stream_wait_for_halo() {
 
 bool ForceCalculatorCUDA::supports_overlapped_forces(MDSystem& system) const {
     // Only the builtin Lennard-Jones pair kernels are split into owned-owned and
-    // ghost passes. Everything else (MLIP edges, Coulomb-only, force-component
+    // ghost passes. Everything else (Coulomb-only, force-component
     // timing) keeps the single post-halo evaluation.
     if (!device_data_initialized || !builtin_forces_enabled_ ||
-        mlip_runtime_enabled_ || timing_breakdown_enabled_) {
+        timing_breakdown_enabled_) {
         return false;
     }
     if (!system.get_force_manager().get_config().enable_lennard_jones) {
@@ -5072,12 +4779,7 @@ bool ForceCalculatorCUDA::supports_overlapped_forces(MDSystem& system) const {
     }
     if (nlist_mode_active_) {
         // The per-tile list kernel runs in two parts (compute_nonbonded_forces_list, phase 1 and 2).
-        // MD_NLIST_OVERLAP=0 keeps the single evaluation after the exchange (for A/B timing).
-        static const bool overlap_enabled = [] {
-            const char* v = std::getenv("MD_NLIST_OVERLAP");
-            return !(v && std::string(v) == "0");
-        }();
-        return overlap_enabled && num_lj_tiles_ > 0 && d_tile_atoms && d_tile_flags_ &&
+        return num_lj_tiles_ > 0 && d_tile_atoms && d_tile_flags_ &&
                d_tile_list_ && d_tile_list_shift_ && d_tile_list_degree_ && d_tile_list_interior_;
     }
     if (nonbonded_kernel_ == "graph") {
@@ -5092,16 +4794,7 @@ bool ForceCalculatorCUDA::supports_overlapped_forces(MDSystem& system) const {
 // GPU (and a second, mostly empty wave when it does not divide evenly); with two GPUs
 // it is less than one wave. More, shorter warps fill the machine and shrink the tail.
 // The result is identical for any value (fixed-point integer accumulation).
-// DSMD_PAIR_SPLITS=<n> overrides the choice (1 reproduces the unsplit launch).
 int ForceCalculatorCUDA::pair_entry_splits() {
-    if (pair_entry_splits_override_ < 0) {
-        pair_entry_splits_override_ = 0;
-        if (const char* v = std::getenv("DSMD_PAIR_SPLITS")) {
-            const int parsed = std::atoi(v);
-            if (parsed >= 1) pair_entry_splits_override_ = std::min(parsed, 32);
-        }
-    }
-    if (pair_entry_splits_override_ > 0) return pair_entry_splits_override_;
     if (sm_count_ <= 0) {
         int device = 0;
         CUDA_CHECK(cudaGetDevice(&device));
@@ -5177,7 +4870,6 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
     if (timing_breakdown_enabled_ && !force_timing_events_ready_) {
         CUDA_CHECK(cudaEventCreate(&force_timing_event_start_));
         CUDA_CHECK(cudaEventCreate(&force_timing_event_bonded_));
-        CUDA_CHECK(cudaEventCreate(&force_timing_event_mlip_));
         CUDA_CHECK(cudaEventCreate(&force_timing_event_lj_));
         CUDA_CHECK(cudaEventCreate(&force_timing_event_electrostatic_));
         CUDA_CHECK(cudaEventCreate(&force_timing_event_special_));
@@ -5192,12 +4884,8 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
     // Bonded terms reach across the subdomain boundary, so they wait for the halo.
     const bool run_bonded = builtin_forces_enabled_ && !interior;
     // List mode, boundary phase (halo exchange overlapped): the bonded kernels run on a side stream
-    // next to the boundary pair kernel. MD_BONDED_STREAM=0 keeps them on the force stream.
-    static const bool bonded_stream_enabled = [] {
-        const char* v = std::getenv("MD_BONDED_STREAM");
-        return !(v && std::string(v) == "0");
-    }();
-    bonded_side_ = bonded_stream_enabled && nlist_mode_active_ && boundary && run_bonded &&
+    // next to the boundary pair kernel.
+    bonded_side_ = nlist_mode_active_ && boundary && run_bonded &&
                    (force_config.enable_bonds || force_config.enable_angles || force_config.enable_dihedrals);
     if (bonded_side_) {
         ensure_bonded_side_buffers();
@@ -5230,14 +4918,6 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         ensure_graph_on_device(system);
     }
 
-    const bool ran_mlip = mlip_runtime_enabled_;
-    if (mlip_runtime_enabled_ && !interior) {
-        compute_mlip_runtime_forces(system);
-    }
-    if (time_components) {
-        CUDA_CHECK(cudaEventRecord(force_timing_event_mlip_, force_stream));
-    }
-
     const bool ran_lj = builtin_forces_enabled_ && force_config.enable_lennard_jones;
     const bool ran_electrostatic_cfg = builtin_forces_enabled_ && force_config.enable_coulomb;
     const bool graph_mode = nonbonded_kernel_ == "graph";
@@ -5268,10 +4948,6 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         ensure_ewald_initialized(system);
     }
     const Real k_coulomb = 332.0636;
-
-    if (!graph_mode && (ran_lj || use_fused_nonbonded)) {
-        ensure_tile_pair_stats_enabled();
-    }
 
     // List mode: pack the slot arrays before the PME spread is queued. The spread runs on the
     // highest-priority stream, so queued first it takes the SMs ahead of the pack kernel (about 55 us
@@ -5312,7 +4988,7 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         start_pme_spread();
     }
     // The per-tile list path runs the whole force phase after the halo exchange when the exchange
-    // cannot be overlapped (rebuild steps, MD_NLIST_OVERLAP=0). With several ranks the PME grid
+    // cannot be overlapped (rebuild steps). With several ranks the PME grid
     // sum is then started the same way as in the interior phase: spread now, post the sum right
     // after the pair kernel is launched, so the staged copy and the sum run next to that kernel
     // instead of after it.
@@ -5382,7 +5058,7 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
                 static_cast<P>(cutoff_sq), static_cast<P>(params.lj_switch_distance),
                 static_cast<P>(switch_sq), static_cast<P>(inv_denom),
                 static_cast<P>(k_coulomb), static_cast<P>(ewald_alpha_),
-                num_lj_tiles_, d_tile_pair_stats_, j_filter, entry_splits);
+                num_lj_tiles_, j_filter, entry_splits);
         };
         if (mixed_precision_enabled_) launch_fused(float{});
         else launch_fused(double{});
@@ -5419,7 +5095,7 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
                 static_cast<P>(params.mie_prefactor),
                 static_cast<P>(cutoff_sq), static_cast<P>(params.lj_switch_distance),
                 static_cast<P>(switch_sq), static_cast<P>(inv_denom),
-                num_lj_tiles_, d_tile_pair_stats_, j_filter, entry_splits);
+                num_lj_tiles_, j_filter, entry_splits);
         };
         if (mixed_precision_enabled_) launch_lj(float{});
         else launch_lj(double{});
@@ -5437,9 +5113,6 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         // The rest (ghost pairs, bonded, interpolation, energy) runs in
         // finish_forces_boundary() once the halo exchange has completed.
         return;
-    }
-    if (!graph_mode && (ran_lj || use_fused_nonbonded)) {
-        log_tile_pair_stats_gpu();
     }
     if (time_components) {
         CUDA_CHECK(cudaEventRecord(force_timing_event_lj_, force_stream));
@@ -5496,7 +5169,6 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
             prev = ev;
         };
         add_component("bonded", force_timing_event_bonded_, ran_bonded);
-        add_component("mlip", force_timing_event_mlip_, ran_mlip);
         add_component("lj", force_timing_event_lj_, ran_lj);
         add_component("electrostatic", force_timing_event_electrostatic_, ran_electrostatic);
         add_component("special_pairs", force_timing_event_special_, ran_special);
@@ -5537,6 +5209,7 @@ void ForceCalculatorCUDA::compute_bond_forces(MDSystem& system) {
         d_global_id,  // NEW: for ownership rule
         d_bond_atom1, d_bond_atom2, d_bond_k, d_bond_r0,
         num_bonds_cached, energy_wanted_now() ? d_potential_energy : nullptr,
+        energy_wanted_now() ? d_virial : nullptr,
         box.lx, box.ly, box.lz,
         1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
         local_particles
@@ -6240,13 +5913,9 @@ void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
     // interpolation) runs in float, on half the grid memory. With several ranks the float grid
     // is also what they exchange: it used to be a double grid converted to float for the sum
     // and back, and every rank then ran the double FFT chain on the critical path of each step.
-    // MD_PME_PRECISION=double keeps the double-precision grid; a PME group always uses it.
-    {
-        const char* requested = std::getenv("MD_PME_PRECISION");
-        const bool want_double = requested && std::string(requested) == "double";
-        pme_float_ = mixed_precision_enabled_ && !want_double && !pme_use_cluster_spread_ &&
-                     !PmePpSplit::instance().active();
-    }
+    // A PME group always uses the double-precision grid.
+    pme_float_ = mixed_precision_enabled_ && !pme_use_cluster_spread_ &&
+                 !PmePpSplit::instance().active();
     if (pme_float_) {
         CUDA_CHECK(cudaMalloc(&d_pme_charge_grid_f_, grid_size * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_pme_charge_freq_f_, grid_size_freq * sizeof(cufftComplex)));
@@ -6661,14 +6330,9 @@ void ForceCalculatorCUDA::pme_reciprocal_spread(MDSystem& system) {
     const int blocks_spread = static_cast<int>((spread_work_items + 255) / 256);
 
     // The common spline order 4 gets its own instantiation with the loops unrolled.
-    // MD_PME_SPREAD=aggregate keeps the warp-aggregated atomics in the float path too.
-    static const bool aggregate_float = [] {
-        const char* v = std::getenv("MD_PME_SPREAD");
-        return v && std::string(v) == "aggregate";
-    }();
     auto spread_charges = [&](auto* grid) {
         using T = std::remove_pointer_t<decltype(grid)>;
-        const int aggregate_atomics = (std::is_same<T, double>::value || aggregate_float) ? 1 : 0;
+        const int aggregate_atomics = std::is_same<T, double>::value ? 1 : 0;
         if (ewald_spline_order_ == 4) {
             pme_spread_charges_kernel<T, 4><<<blocks_spread, 256, 0, pme_stream_>>>(
                 d_x, d_y, d_z, d_charge, grid,
@@ -6781,9 +6445,8 @@ void ForceCalculatorCUDA::pme_reciprocal_spread(MDSystem& system) {
 // Creates (once, collectively) the NCCL communicator of the multi-rank PME grid sum. Every rank
 // of the PP communicator reaches the first call at the same point (the spread of the first force
 // evaluation, before any halo exchange is in flight). Returns false, identically on every rank,
-// when NCCL is not compiled in, is switched off (DSMD_PME_NCCL=0 on any rank) or cannot be
-// initialized (for example two ranks on one GPU); the grid is then summed through pinned host
-// memory and MPI as before.
+// when NCCL is not compiled in or cannot be initialized (for example two ranks on one GPU); the
+// grid is then summed through pinned host memory and MPI as before.
 bool ForceCalculatorCUDA::pme_nccl_ensure() {
     if (pme_nccl_tried_) return pme_nccl_active_;
     pme_nccl_tried_ = true;
@@ -6792,10 +6455,7 @@ bool ForceCalculatorCUDA::pme_nccl_ensure() {
     int pp_rank = 0, pp_size = 1;
     MPI_Comm_rank(pp_comm, &pp_rank);
     MPI_Comm_size(pp_comm, &pp_size);
-    const char* requested = std::getenv("DSMD_PME_NCCL");
-    int usable = (pp_size > 1 && !(requested && std::string(requested) == "0")) ? 1 : 0;
-    MPI_Allreduce(MPI_IN_PLACE, &usable, 1, MPI_INT, MPI_MIN, pp_comm);
-    if (!usable) return false;
+    if (pp_size <= 1) return false;
 
     ncclUniqueId id;
     std::memset(&id, 0, sizeof(id));
@@ -6828,8 +6488,8 @@ bool ForceCalculatorCUDA::pme_nccl_ensure() {
 
 // Whether the grid is exchanged between the GPUs over CUDA-aware MPI (device pointers, no staging
 // through host memory). Collective, decided once, identically on every rank. It needs the same
-// promise the halo exchange of this build relies on, CUDA_AWARE_MPI=1 in the environment, and at
-// most PME_MAX_SUM_PARTS ranks; DSMD_PME_DEVICE_MPI=0 on any rank switches it off.
+// property the halo exchange of this build relies on (the MPI backend of dsDecompX, which is in use
+// and found the MPI library CUDA-aware), and at most PME_MAX_SUM_PARTS ranks.
 bool ForceCalculatorCUDA::pme_dmpi_ensure() {
     if (pme_dmpi_tried_) return pme_dmpi_active_;
     pme_dmpi_tried_ = true;
@@ -6837,12 +6497,7 @@ bool ForceCalculatorCUDA::pme_dmpi_ensure() {
     int pp_rank = 0, pp_size = 1;
     MPI_Comm_rank(pp_comm, &pp_rank);
     MPI_Comm_size(pp_comm, &pp_size);
-    const char* aware = std::getenv("CUDA_AWARE_MPI");
-    const bool cuda_aware = aware && (std::string(aware) == "1" || std::string(aware) == "true" ||
-                                      std::string(aware) == "TRUE");
-    const char* disabled = std::getenv("DSMD_PME_DEVICE_MPI");
-    int usable = (pp_size > 1 && pp_size <= PME_MAX_SUM_PARTS && cuda_aware &&
-                  !(disabled && std::string(disabled) == "0")) ? 1 : 0;
+    int usable = (pp_size > 1 && pp_size <= PME_MAX_SUM_PARTS && cuda_aware_mpi_) ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &usable, 1, MPI_INT, MPI_MIN, pp_comm);
     pme_dmpi_active_ = usable != 0;
     if (pme_dmpi_active_ && pp_rank == 0) {
@@ -6982,19 +6637,6 @@ void ForceCalculatorCUDA::pme_nccl_sum_grid(size_t grid_size) {
 #endif
 }
 
-// DSMD_PME_MPI_BLOCKING=1: the MPI grid sum is one blocking MPI_Allreduce in complete() instead of
-// a MPI_Iallreduce started in post_sum() and finished by MPI_Wait. A non-blocking collective makes
-// progress only inside MPI calls, so the early start can end up costing the same as the late one;
-// the blocking call uses the MPI library's tuned algorithm. Job-wide setting: every rank must see
-// the same value (collectives of the two kinds do not match).
-static bool pme_mpi_blocking() {
-    static const bool blocking = [] {
-        const char* v = std::getenv("DSMD_PME_MPI_BLOCKING");
-        return v && *v && std::string(v) != "0";
-    }();
-    return blocking;
-}
-
 void ForceCalculatorCUDA::pme_reciprocal_post_sum() {
     if (pme_stage_ != PmeStage::Spread || !pme_grid_sum_needed()) return;
     if (pme_sum_via_dmpi_) {
@@ -7002,7 +6644,6 @@ void ForceCalculatorCUDA::pme_reciprocal_post_sum() {
         pme_stage_ = PmeStage::Posted;
         return;
     }
-    if (pme_mpi_blocking()) return;  // complete() does the whole sum
     MPI_Comm pp_comm = PmePpSplit::instance().pp_comm();
     // The staged copy waits behind the spread, which shares the GPU with the interior pair
     // kernel, so this is not a short wait. A blocking event wait would keep the host out of MPI
@@ -7125,21 +6766,8 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
                 if (pme_stage_ == PmeStage::Spread) pme_reciprocal_post_sum();
                 pme_dmpi_complete(grid_size);
             } else if (!pme_sum_via_nccl_) {
-                if (pme_mpi_blocking()) {
-                    // The staged copy first (the host buffer must be complete), then the whole sum.
-                    CUDA_CHECK(cudaEventSynchronize(pme_stage_event_));
-                    MPI_Comm pp_comm = PmePpSplit::instance().pp_comm();
-                    if (pme_sum_in_float_) {
-                        MPI_Allreduce(MPI_IN_PLACE, h_pme_grid_sum_, static_cast<int>(pme_grid_size_),
-                                      MPI_FLOAT, MPI_SUM, pp_comm);
-                    } else {
-                        MPI_Allreduce(MPI_IN_PLACE, h_pme_grid_sum_, static_cast<int>(pme_grid_size_),
-                                      MPI_DOUBLE, MPI_SUM, pp_comm);
-                    }
-                } else {
-                    if (pme_stage_ == PmeStage::Spread) pme_reciprocal_post_sum();
-                    MPI_Wait(&pme_request_, MPI_STATUS_IGNORE);
-                }
+                if (pme_stage_ == PmeStage::Spread) pme_reciprocal_post_sum();
+                MPI_Wait(&pme_request_, MPI_STATUS_IGNORE);
             }
             if (pme_sum_via_nccl_ || pme_sum_via_dmpi_) {
                 // Summed on the device (NCCL, or the device-MPI parts just added): nothing to upload.
@@ -7162,13 +6790,6 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
         dim3 threads(8, 8, 8);
         if (pme_float_) {
             CUFFT_CHECK(cufftExecR2C(pme_fft_plan_forward_, d_pme_charge_grid_f_, d_pme_charge_freq_f_));
-            pme_solve_poisson_kernel<float><<<grid_blocks, threads, 0, pme_stream_>>>(
-                d_pme_charge_freq_f_,
-                d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
-                want_energy ? d_potential_energy : nullptr, ewald_prefactor_, ewald_alpha_,
-                ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
-                inv_box_x, inv_box_y, inv_box_z, energy_scale
-            );
             if (want_energy && d_virial) {
                 pme_reciprocal_virial_kernel<float><<<grid_blocks, threads, 0, pme_stream_>>>(
                     d_pme_charge_freq_f_,
@@ -7178,16 +6799,16 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
                     inv_box_x, inv_box_y, inv_box_z, energy_scale
                 );
             }
-            CUFFT_CHECK(cufftExecC2R(pme_fft_plan_inverse_, d_pme_charge_freq_f_, d_pme_charge_grid_f_));
-        } else {
-            CUFFT_CHECK(cufftExecD2Z(pme_fft_plan_forward_, d_pme_charge_grid_real_, d_pme_charge_grid_freq_));
-            pme_solve_poisson_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
-                d_pme_charge_grid_freq_,
+            pme_solve_poisson_kernel<float><<<grid_blocks, threads, 0, pme_stream_>>>(
+                d_pme_charge_freq_f_,
                 d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
                 want_energy ? d_potential_energy : nullptr, ewald_prefactor_, ewald_alpha_,
                 ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
                 inv_box_x, inv_box_y, inv_box_z, energy_scale
             );
+            CUFFT_CHECK(cufftExecC2R(pme_fft_plan_inverse_, d_pme_charge_freq_f_, d_pme_charge_grid_f_));
+        } else {
+            CUFFT_CHECK(cufftExecD2Z(pme_fft_plan_forward_, d_pme_charge_grid_real_, d_pme_charge_grid_freq_));
             if (want_energy && d_virial) {
                 pme_reciprocal_virial_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
                     d_pme_charge_grid_freq_,
@@ -7197,6 +6818,13 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
                     inv_box_x, inv_box_y, inv_box_z, energy_scale
                 );
             }
+            pme_solve_poisson_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
+                d_pme_charge_grid_freq_,
+                d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+                want_energy ? d_potential_energy : nullptr, ewald_prefactor_, ewald_alpha_,
+                ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
+                inv_box_x, inv_box_y, inv_box_z, energy_scale
+            );
             CUFFT_CHECK(cufftExecZ2D(pme_fft_plan_inverse_, d_pme_charge_grid_freq_,
                                      d_pme_charge_grid_real_));
         }
@@ -7402,16 +7030,16 @@ void PmeServerCuda::step() {
         dim3 grid_blocks((ewald_grid_x_ + 7) / 8, (ewald_grid_y_ + 7) / 8, (grid_nzh + 7) / 8);
         dim3 threads(8, 8, 8);
         const Real inv_box_x = 1.0/box_.lx, inv_box_y = 1.0/box_.ly, inv_box_z = 1.0/box_.lz;
-        pme_solve_poisson_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
-            d_pme_charge_grid_freq_,
-            d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
-            d_recip_energy_, ewald_prefactor_, ewald_alpha_,
-            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
-            inv_box_x, inv_box_y, inv_box_z);
         pme_reciprocal_virial_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
             d_pme_charge_grid_freq_,
             d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
             d_recip_virial_, ewald_prefactor_, ewald_alpha_,
+            ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
+            inv_box_x, inv_box_y, inv_box_z);
+        pme_solve_poisson_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
+            d_pme_charge_grid_freq_,
+            d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+            d_recip_energy_, ewald_prefactor_, ewald_alpha_,
             ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
             inv_box_x, inv_box_y, inv_box_z);
 
@@ -7430,248 +7058,6 @@ void PmeServerCuda::step() {
 
     Real energy_virial[2] = {recip_energy, recip_virial};
     MPI_Bcast(energy_virial, 2, MPI_DOUBLE, leader_root, inter);
-}
-
-
-void ForceCalculatorCUDA::pre_register_mlip_sources()
-{
-    mlip_bridge_register_md_sources(static_cast<void*>(this));
-}
-
-void ForceCalculatorCUDA::set_mlip_runtime(void* raw_runtime)
-{
-    mlip_runtime_raw_     = raw_runtime;
-    mlip_runtime_enabled_ = (raw_runtime != nullptr);
-    if (mlip_runtime_enabled_) {
-        pre_register_mlip_sources();
-        std::cout << "[ForceCalculatorCUDA] MlipRuntime attached (C++ GPU-resident path).\n";
-    }
-}
-
-void ForceCalculatorCUDA::build_coo_edge_list_on_device(MDSystem& system)
-{
-    NeighborList& nlist = system.get_neighbor_list();
-    size_t num_local   = system.get_local_particles();
-    size_t num_total   = system.get_total_particles();
-    const int* nlist_offsets = nlist.get_offsets();
-    const int* nlist_neighbors = nlist.get_neighbors();
-
-    if (nonbonded_kernel_ == "graph") {
-        if (!d_graph_offsets_ || (num_edges_ > 0 && (!d_edge_src_ || !d_edge_dst_))) {
-            throw std::runtime_error("GPU MLIP graph requested before device graph construction");
-        }
-        return;
-    }
-
-    int64_t E_upper = 0;
-    for (size_t i = 0; i < num_local; ++i)
-        E_upper += (nlist_offsets[i + 1] - nlist_offsets[i]);
-
-    int64_t E_upper_full = E_upper * 2;
-    if (E_upper_full > cap_edges_) {
-        if (d_edge_src_)       { CUDA_CHECK(cudaFree(d_edge_src_));       d_edge_src_       = nullptr; }
-        if (d_edge_dst_)       { CUDA_CHECK(cudaFree(d_edge_dst_));       d_edge_dst_       = nullptr; }
-        if (d_edge_coo_packed_){ CUDA_CHECK(cudaFree(d_edge_coo_packed_));d_edge_coo_packed_= nullptr; }
-        cap_edges_ = static_cast<int64_t>(E_upper_full * 1.25 + 256);
-        CUDA_CHECK(cudaMalloc(&d_edge_src_,        sizeof(int32_t) * cap_edges_));
-        CUDA_CHECK(cudaMalloc(&d_edge_dst_,        sizeof(int32_t) * cap_edges_));
-        CUDA_CHECK(cudaMalloc(&d_edge_coo_packed_, sizeof(int32_t) * cap_edges_ * 2));
-    }
-
-    std::vector<int32_t> h_src(E_upper), h_dst(E_upper);
-    int64_t e = 0;
-    for (size_t i = 0; i < num_local; ++i) {
-        int offset = nlist_offsets[i];
-        int nn     = nlist_offsets[i + 1] - nlist_offsets[i];
-        for (int k = 0; k < nn; ++k) {
-            int32_t j = static_cast<int32_t>(nlist_neighbors[offset + k]);
-            if (j < 0 || j >= static_cast<int32_t>(num_total)) continue;
-            if (j < static_cast<int32_t>(num_local) && j <= static_cast<int32_t>(i)) continue;
-            h_src[e] = static_cast<int32_t>(i);
-            h_dst[e] = j;
-            ++e;
-        }
-    }
-    using Pair = std::pair<int32_t,int32_t>;
-    std::vector<Pair> pairs(e);
-    for (int64_t k = 0; k < e; ++k) pairs[k] = {h_src[k], h_dst[k]};
-    std::sort(pairs.begin(), pairs.end());
-    auto new_end = std::unique(pairs.begin(), pairs.end());
-    e = std::distance(pairs.begin(), new_end);
-    for (int64_t k = 0; k < e; ++k) { h_src[k] = pairs[k].first; h_dst[k] = pairs[k].second; }
-
-    int64_t E_half = e;
-    int64_t E_full = E_half * 2;
-    num_edges_ = E_full;
-
-    int64_t need_half = std::max(E_half, (int64_t)1);
-    if (!d_tmp_edge_src_ || need_half > cap_edges_ / 2) {
-        if (d_tmp_edge_src_) { CUDA_CHECK(cudaFree(d_tmp_edge_src_)); d_tmp_edge_src_ = nullptr; }
-        if (d_tmp_edge_dst_) { CUDA_CHECK(cudaFree(d_tmp_edge_dst_)); d_tmp_edge_dst_ = nullptr; }
-        CUDA_CHECK(cudaMalloc(&d_tmp_edge_src_, sizeof(int32_t) * need_half));
-        CUDA_CHECK(cudaMalloc(&d_tmp_edge_dst_, sizeof(int32_t) * need_half));
-    }
-
-    CUDA_CHECK(cudaMemcpyAsync(d_tmp_edge_src_, h_src.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_tmp_edge_dst_, h_dst.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_,         h_src.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_edge_coo_packed_ + E_half, h_dst.data(), sizeof(int32_t)*E_half, cudaMemcpyHostToDevice, force_stream));
-
-    launch_half_to_full_edges(d_tmp_edge_src_, d_tmp_edge_dst_,
-                               d_edge_src_, d_edge_dst_, E_half, force_stream);
-}
-
-void ForceCalculatorCUDA::interleave_positions_on_device(int num_total)
-{
-    if (num_total > cap_pos_interleaved_) {
-        if (d_pos_interleaved_) { CUDA_CHECK(cudaFree(d_pos_interleaved_)); d_pos_interleaved_ = nullptr; }
-        cap_pos_interleaved_ = static_cast<int>(num_total * 1.25 + 64);
-        CUDA_CHECK(cudaMalloc(&d_pos_interleaved_, sizeof(double) * cap_pos_interleaved_ * 3));
-    }
-    launch_interleave_positions(d_x, d_y, d_z, d_pos_interleaved_, num_total, force_stream);
-}
-
-void ForceCalculatorCUDA::compute_mlip_runtime_forces(MDSystem& system)
-{
-    if (!mlip_runtime_raw_) return;
-
-    const int num_local = static_cast<int>(system.get_local_particles());
-    const int num_ghost = static_cast<int>(system.get_ghost_count());
-    const int num_total = num_local + num_ghost;
-    num_local_cached_ = num_local;
-    num_ghost_cached_ = num_ghost;
-
-    if (num_total > cap_mlip_forces_) {
-        if (d_mlip_forces_) { CUDA_CHECK(cudaFree(d_mlip_forces_)); d_mlip_forces_ = nullptr; }
-        cap_mlip_forces_ = static_cast<int>(num_total * 1.25 + 64);
-        CUDA_CHECK(cudaMalloc(&d_mlip_forces_, sizeof(double) * cap_mlip_forces_ * 3));
-    }
-    CUDA_CHECK(cudaMemsetAsync(d_mlip_forces_, 0, sizeof(double) * num_total * 3, force_stream));
-
-    if (!d_mlip_error_flag_) { CUDA_CHECK(cudaMalloc(&d_mlip_error_flag_, sizeof(int))); }
-    CUDA_CHECK(cudaMemsetAsync(d_mlip_error_flag_, 0, sizeof(int), force_stream));
-
-    if (nonbonded_kernel_ == "graph") {
-        if (!graph_kernel_logged_) {
-            std::cout << "[ForceCalculatorCUDA][rank " << get_mpi_rank()
-                      << "] executing nonbonded_kernel=graph for GPU MLIP"
-                      << " (compact directed active CSR)" << std::endl;
-            graph_kernel_logged_ = true;
-        }
-    }
-
-    if (nlist_dirty_) {
-        build_coo_edge_list_on_device(system);
-        nlist_dirty_ = false;
-    }
-
-    {
-        int64_t E_full = num_edges_;
-        int64_t E_half = (nonbonded_kernel_ == "graph") ? E_full : E_full / 2;
-        if (E_full > cap_edge_vectors_) {
-            if (d_edge_vectors_) { CUDA_CHECK(cudaFree(d_edge_vectors_)); d_edge_vectors_ = nullptr; }
-            cap_edge_vectors_ = static_cast<int64_t>(E_full * 1.25 + 256);
-            CUDA_CHECK(cudaMalloc(&d_edge_vectors_, sizeof(float) * cap_edge_vectors_ * 3));
-        }
-        if (E_half > 0) {
-            const int32_t* h_src_dev = d_edge_coo_packed_;
-            const int32_t* h_dst_dev = d_edge_coo_packed_ + E_half;
-            SimulationBox& box = system.get_box();
-            int blk = 256, grid = (int)((E_half + blk - 1) / blk);
-            if (nonbonded_kernel_ == "graph") {
-                k_min_image_edge_vectors_directed<<<grid, blk, 0, force_stream>>>(
-                    d_x, d_y, d_z, h_src_dev, h_dst_dev, d_edge_vectors_, E_half,
-                    (float)box.lx, (float)box.ly, (float)box.lz,
-                    box.periodic_x, box.periodic_y, box.periodic_z);
-            } else {
-                k_min_image_edge_vectors<<<grid, blk, 0, force_stream>>>(
-                    d_x, d_y, d_z, h_src_dev, h_dst_dev, d_edge_vectors_, E_half,
-                    (float)box.lx, (float)box.ly, (float)box.lz,
-                    box.periodic_x, box.periodic_y, box.periodic_z);
-            }
-        }
-    }
-
-    {
-        if (num_total > cap_batch_) {
-            if (d_batch_) { CUDA_CHECK(cudaFree(d_batch_)); d_batch_ = nullptr; }
-            cap_batch_ = static_cast<int>(num_total * 1.25 + 64);
-            CUDA_CHECK(cudaMalloc(&d_batch_, sizeof(int64_t) * cap_batch_));
-        }
-        CUDA_CHECK(cudaMemsetAsync(d_batch_, 0, sizeof(int64_t) * num_total, force_stream));
-        if (!d_num_atoms_) { CUDA_CHECK(cudaMalloc(&d_num_atoms_, sizeof(int64_t))); }
-        int64_t h_n = num_total;
-        CUDA_CHECK(cudaMemcpyAsync(d_num_atoms_, &h_n, sizeof(int64_t), cudaMemcpyHostToDevice, force_stream));
-    }
-
-    interleave_positions_on_device(num_total);
-
-    SimulationBox& box = system.get_box();
-    double h_cell[9]  = { box.lx, 0, 0,  0, box.ly, 0,  0, 0, box.lz };
-    int    h_pbc[3]   = { box.periodic_x, box.periodic_y, box.periodic_z };
-    if (!d_cell_) { CUDA_CHECK(cudaMalloc(&d_cell_, sizeof(double) * 9)); }
-    if (!d_pbc_buf_) { CUDA_CHECK(cudaMalloc(&d_pbc_buf_, sizeof(int) * 3)); }
-    CUDA_CHECK(cudaMemcpyAsync(d_cell_,    h_cell, sizeof(double)*9, cudaMemcpyHostToDevice, force_stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_pbc_buf_, h_pbc,  sizeof(int)*3,    cudaMemcpyHostToDevice, force_stream));
-
-    mlip::MlipInputView in_view;
-    in_view.num_local = num_local;
-    in_view.num_ghost = num_ghost;
-    in_view.num_total = num_total;
-
-    in_view.positions.data      = d_pos_interleaved_;
-    in_view.positions.dtype     = mlip::ScalarType::Float64;
-    in_view.positions.ndim      = 2;
-    in_view.positions.shape[0]  = num_total;
-    in_view.positions.shape[1]  = 3;
-    in_view.positions.device_id = device_id;
-    in_view.positions.is_device = true;
-
-    in_view.species.data      = d_type;
-    in_view.species.dtype     = mlip::ScalarType::Int32;
-    in_view.species.ndim      = 1;
-    in_view.species.shape[0]  = num_total;
-    in_view.species.device_id = device_id;
-    in_view.species.is_device = true;
-
-    in_view.neighbors.num_edges = num_edges_;
-    in_view.neighbors.src       = d_edge_src_;
-    in_view.neighbors.dst       = d_edge_dst_;
-
-    in_view.cell.data      = d_cell_;
-    in_view.cell.dtype     = mlip::ScalarType::Float64;
-    in_view.cell.ndim      = 2;
-    in_view.cell.shape[0]  = 3;
-    in_view.cell.shape[1]  = 3;
-    in_view.cell.device_id = device_id;
-    in_view.cell.is_device = true;
-
-    in_view.pbc.data      = d_pbc_buf_;
-    in_view.pbc.dtype     = mlip::ScalarType::Int32;
-    in_view.pbc.ndim      = 1;
-    in_view.pbc.shape[0]  = 3;
-    in_view.pbc.device_id = device_id;
-    in_view.pbc.is_device = true;
-
-    in_view.stream = force_stream;
-
-    mlip::MlipOutputView out_view;
-    out_view.forces.data      = d_mlip_forces_;
-    out_view.forces.dtype     = mlip::ScalarType::Float64;
-    out_view.forces.ndim      = 2;
-    out_view.forces.shape[0]  = num_total;
-    out_view.forces.shape[1]  = 3;
-    out_view.forces.device_id = device_id;
-    out_view.forces.is_device = true;
-
-    mlip_bridge_compute(mlip_runtime_raw_, &in_view, &out_view);
-
-    launch_accumulate_forces_scaled(
-        d_mlip_forces_,
-        d_fx, d_fy, d_fz,
-        1.0, num_local, d_mlip_error_flag_, force_stream);
-
-    CUDA_CHECK(cudaStreamSynchronize(force_stream));
 }
 
 

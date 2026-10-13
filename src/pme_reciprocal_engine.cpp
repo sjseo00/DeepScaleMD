@@ -220,8 +220,10 @@ void pme_interpolate_forces_from_potential(
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     int spline_order, size_t num_particles)
 {
-    const Real inv_grid_size =
-        1.0 / (static_cast<Real>(grid_nx) * grid_ny * grid_nz);
+    // The inverse FFT (cuFFT C2R / FFTW c2r) is unnormalised, and that is exactly the potential whose
+    // gradient is the energy computed in the solve (E = 1/2 sum_k w G |rho(k)|^2, no 1/N). The grid
+    // potential is therefore used as it is: a 1/(nx ny nz) here made the reciprocal force a factor
+    // nx*ny*nz (933,120 for 108x108x80) too small, i.e. absent, while the energy kept counting it.
     #pragma omp parallel for schedule(static)
     for (long ii = 0; ii < static_cast<long>(num_particles); ++ii) {
         size_t i = static_cast<size_t>(ii);
@@ -264,9 +266,9 @@ void pme_interpolate_forces_from_potential(
                 }
             }
         }
-        fx[i] += -qi * dphi_du_x * (grid_nx * inv_box_x) * inv_grid_size;
-        fy[i] += -qi * dphi_du_y * (grid_ny * inv_box_y) * inv_grid_size;
-        fz[i] += -qi * dphi_du_z * (grid_nz * inv_box_z) * inv_grid_size;
+        fx[i] += -qi * dphi_du_x * (grid_nx * inv_box_x);
+        fy[i] += -qi * dphi_du_y * (grid_ny * inv_box_y);
+        fz[i] += -qi * dphi_du_z * (grid_nz * inv_box_z);
     }
 }
 
@@ -493,7 +495,8 @@ void PmeReciprocalEngine::ensure_green_cached(const SimulationBox& box) {
 
                 pme_green_[idx] = green;
                 pme_green_energy_[idx] = 0.5 * w * green;
-                pme_green_virial_[idx] = w * green * (1.0 + k_sq * inv_2alpha_sq);
+                // trace of the virial = sum E_k (1 - k^2/(2 alpha^2)), E_k = 1/2 w G |rho|^2
+                pme_green_virial_[idx] = 0.5 * w * green * (1.0 - k_sq * inv_2alpha_sq);
             }
         }
     }

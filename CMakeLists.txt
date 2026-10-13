@@ -21,7 +21,9 @@ string(TOUPPER "${BACKEND}" BACKEND)
 
 option(ENABLE_PYTHON "Enable the embedded Python force interface" ON)
 option(ENABLE_LIBTORCH
-       "Enable the native LibTorch/TorchScript MLIP runtime (CUDA only)" OFF)
+       "Build the LibTorch MLIP backend (mlip_backend: libtorch); BACKEND=CUDA only" OFF)
+set(LIBTORCH_PYTHON "" CACHE FILEPATH
+    "Python interpreter whose torch package provides LibTorch (default: python3 on PATH); ignored when Torch_DIR is set")
 option(ENABLE_ADIOS2
        "Enable the ADIOS2 BP parallel trajectory writer (trajectory_format: bp)" OFF)
 option(ENABLE_HDF5
@@ -40,7 +42,8 @@ endif()
 
 if(ENABLE_LIBTORCH AND NOT BACKEND STREQUAL "CUDA")
     message(FATAL_ERROR
-        "ENABLE_LIBTORCH requires BACKEND=CUDA.")
+        "ENABLE_LIBTORCH requires -DBACKEND=CUDA: the LibTorch MLIP backend is not available in "
+        "${BACKEND} builds. Use mlip_backend: python there.")
 endif()
 
 set(_deepscalemd_uses_cuda OFF)
@@ -188,7 +191,10 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/halo_backend.cpp
     src/comm_backend.cpp
     src/md_simulation.cpp
-    src/force_python/python_interface.cpp
+    src/PythonBackend.cpp
+    src/MLIPBackendFactory.cpp
+    src/MLIPMetadata.cpp
+    src/MiniJson.cpp
     src/force_calculator_cpu.cpp
     src/force_manager.cpp
     src/mpi_utils.cpp
@@ -198,20 +204,7 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/main.cpp)
 
 set(DEEPSCALEMD_HOST_SOURCES
-    src/timing_breakdown.cpp
-    src/force_libtorch/mlip_runtime_stub.cpp)
-
-set(DEEPSCALEMD_MLIP_CUDA_SOURCES
-    src/force_libtorch/config/yaml_parser.cpp
-    src/force_libtorch/runtime/execution_plan.cpp
-    src/force_libtorch/runtime/mlip_runtime.cpp
-    src/force_libtorch/binding/md_data_sources.cpp
-    src/force_libtorch/mlip_force_bridge.cpp
-    src/force_libtorch/operations/operation_registry_singletons.cpp
-    src/force_libtorch/operations/cuda/preprocess_ops.cu
-    src/force_libtorch/operations/cuda/postprocess_ops.cu
-    src/force_libtorch/cuda/edge_conversion.cu
-    src/force_libtorch/cuda/force_accumulation.cu)
+    src/timing_breakdown.cpp)
 
 set(DEEPSCALEMD_CUDA_SOURCES
     src/integrator_kernels.cu
@@ -220,16 +213,14 @@ set(DEEPSCALEMD_CUDA_SOURCES
     src/force_calculator_cuda.cu
     src/neighbor_list_kernels.cu
     src/neighbor_list_kernels_optimized.cu
-    src/timing_breakdown.cpp
-    ${DEEPSCALEMD_MLIP_CUDA_SOURCES})
+    src/timing_breakdown.cpp)
 
 add_executable(deepscalemd ${DEEPSCALEMD_COMMON_SOURCES})
 add_executable(DeepScaleMD::deepscalemd ALIAS deepscalemd)
 
 target_compile_features(deepscalemd PRIVATE cxx_std_17)
 target_include_directories(deepscalemd PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/force_libtorch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_definitions(deepscalemd PRIVATE USE_MPI)
 if(DEEPSCALEMD_HAVE_FFTW_OMP)
     target_compile_definitions(deepscalemd PRIVATE DEEPSCALEMD_HAVE_FFTW_OMP)
@@ -296,24 +287,74 @@ elseif(BACKEND STREQUAL "SYCL")
     target_link_options(deepscalemd PRIVATE -fsycl)
     set_target_properties(deepscalemd PROPERTIES OUTPUT_NAME dsMD)
 else()
-    find_package(yaml-cpp REQUIRED CONFIG)
-    if(TARGET yaml-cpp::yaml-cpp)
-        set(_yaml_target yaml-cpp::yaml-cpp)
-    else()
-        set(_yaml_target yaml-cpp)
-    endif()
-
     target_sources(deepscalemd PRIVATE ${DEEPSCALEMD_CUDA_SOURCES})
     target_compile_definitions(deepscalemd PRIVATE USE_CUDA)
     target_compile_options(deepscalemd PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     target_link_libraries(deepscalemd PRIVATE
-        ${_yaml_target} CUDA::cudart CUDA::cublas CUDA::curand CUDA::cufft)
+        CUDA::cudart CUDA::cublas CUDA::curand CUDA::cufft)
+
+    # LibTorch for the MLIP backend: the one shipped in the Python torch package (the same torch the model
+    # converter exports with). Pass -DTorch_DIR=<...>/share/cmake/Torch to use another LibTorch instead.
+    if(ENABLE_LIBTORCH)
+        if(NOT Torch_DIR)
+            if(NOT LIBTORCH_PYTHON)
+                find_program(LIBTORCH_PYTHON NAMES python3 python)
+            endif()
+            if(NOT LIBTORCH_PYTHON)
+                message(FATAL_ERROR
+                    "ENABLE_LIBTORCH: no Python interpreter found. Set -DLIBTORCH_PYTHON=<python with torch> "
+                    "or -DTorch_DIR=<LibTorch>/share/cmake/Torch.")
+            endif()
+            execute_process(
+                COMMAND "${LIBTORCH_PYTHON}" -c "import torch; print(torch.utils.cmake_prefix_path)"
+                OUTPUT_VARIABLE _libtorch_prefix
+                RESULT_VARIABLE _libtorch_python_status
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(NOT _libtorch_python_status EQUAL 0 OR NOT _libtorch_prefix)
+                message(FATAL_ERROR
+                    "ENABLE_LIBTORCH: '${LIBTORCH_PYTHON}' cannot import torch. Set -DLIBTORCH_PYTHON=<python "
+                    "with torch> or -DTorch_DIR=<LibTorch>/share/cmake/Torch.")
+            endif()
+            list(APPEND CMAKE_PREFIX_PATH "${_libtorch_prefix}")
+        endif()
+        # Torch's CMake config appends -gencode flags for the GPU it autodetects to CMAKE_CUDA_FLAGS. The MD
+        # architectures come from CMAKE_CUDA_ARCHITECTURES (and the MD kernels do not build for sm_61), so put
+        # the flags back.
+        set(_dsmd_cuda_flags_before "${CMAKE_CUDA_FLAGS}")
+        find_package(Torch REQUIRED)
+        set(CMAKE_CUDA_FLAGS "${_dsmd_cuda_flags_before}")
+        if(TORCH_CXX_FLAGS MATCHES "_GLIBCXX_USE_CXX11_ABI=0")
+            message(FATAL_ERROR
+                "ENABLE_LIBTORCH: this LibTorch uses the pre-cxx11 libstdc++ ABI, but dsDecompX and the MD code "
+                "are built with the cxx11 ABI. Use a LibTorch built with the cxx11 ABI "
+                "(torch.compiled_with_cxx11_abi() is True).")
+        endif()
+        target_compile_definitions(deepscalemd PRIVATE DSMD_WITH_LIBTORCH)
+        # Torch's include directories and compile definitions (USE_DISTRIBUTED, USE_C10D_NCCL, ...) must not reach the
+        # MD sources, so the LibTorch backend sources are a separate static library that links Torch privately; the
+        # MD target links only that library. (Linking the Torch targets to the MD target directly, even through
+        # $<LINK_ONLY:>, leaked them in a test project; going through a static library did not.) The library uses
+        # load_mlip_metadata() from the MD sources, which the executable provides.
+        add_library(dsmd_libtorch STATIC
+            src/LibTorchBackend.cpp
+            src/TorchScriptRunner.cpp
+            src/OpLibLoader.cpp)
+        target_compile_features(dsmd_libtorch PRIVATE cxx_std_17)
+        target_include_directories(dsmd_libtorch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_definitions(dsmd_libtorch PRIVATE USE_CUDA)
+        separate_arguments(_torch_cxx_flags UNIX_COMMAND "${TORCH_CXX_FLAGS}")
+        target_compile_options(dsmd_libtorch PRIVATE ${_torch_cxx_flags})
+        target_link_libraries(dsmd_libtorch PRIVATE ${TORCH_LIBRARIES} CUDA::cudart ${CMAKE_DL_LIBS})
+        target_link_libraries(deepscalemd PRIVATE dsmd_libtorch)
+        message(STATUS "DeepScaleMD: LibTorch MLIP backend enabled (Torch ${Torch_VERSION}, ${Torch_DIR})")
+    endif()
 
     # With an NCCL-enabled dsDecompX the multi-rank PME charge-grid sum runs on the device (NCCL
     # allreduce on the PME stream) instead of through pinned host memory and MPI. Turn it off at
-    # configure time with -DDSMD_ENABLE_NCCL=OFF or at run time with DSMD_PME_NCCL=0.
+    # configure time with -DDSMD_ENABLE_NCCL=OFF.
     option(DSMD_ENABLE_NCCL "Sum the multi-rank PME grid with NCCL when dsDecompX provides it" ON)
     if(DSMD_ENABLE_NCCL AND dsDecompX_WITH_NCCL AND TARGET NCCL::NCCL)
         target_compile_definitions(deepscalemd PRIVATE DSMD_WITH_NCCL=1)
@@ -326,15 +367,6 @@ else()
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
         OUTPUT_NAME dsMD)
-
-    if(ENABLE_LIBTORCH)
-        find_package(Torch REQUIRED CONFIG)
-        target_sources(deepscalemd PRIVATE
-            src/force_libtorch/backend/pytorch_backend.cpp
-            src/force_libtorch/backend/pytorch_backend_register.cpp)
-        target_compile_definitions(deepscalemd PRIVATE USE_LIBTORCH)
-        target_link_libraries(deepscalemd PRIVATE ${TORCH_LIBRARIES})
-    endif()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
@@ -446,7 +478,6 @@ if(BUILD_TESTING)
 endif()
 
 message(STATUS "DeepScaleMD backend: ${BACKEND}")
-message(STATUS "DeepScaleMD LibTorch runtime: ${ENABLE_LIBTORCH}")
 message(STATUS "dsDecompX CUDA support: ${dsDecompX_WITH_CUDA}")
 message(STATUS "dsDecompX NCCL support: ${dsDecompX_WITH_NCCL}")
 message(STATUS "dsDecompX NVSHMEM support: ${dsDecompX_WITH_NVSHMEM}")

@@ -526,7 +526,6 @@ void ForceCalculatorCPU::repack_tile_soa(const ParticleData& particles,
 }
 
 void ForceCalculatorCPU::set_mixed_precision(bool enabled) {
-    mixed_precision_probed_ = true;
     if (!enabled) {
         mixed_precision_nonbonded_ = false;
         return;
@@ -551,30 +550,6 @@ void ForceCalculatorCPU::set_mixed_precision(bool enabled) {
 }
 
 void ForceCalculatorCPU::ensure_mixed_precision_tables() {
-    if (!mixed_precision_probed_) {
-        mixed_precision_probed_ = true;
-        const char* v = std::getenv("MD_NONBONDED_PRECISION");
-        if (v && *v) {
-            std::string mode(v);
-            std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-            });
-            mixed_precision_nonbonded_ = (mode == "mixed" || mode == "single" || mode == "float");
-            if (mixed_precision_nonbonded_ && is_rank_zero()) {
-                std::cout << "[ForceCalculatorCPU] nonbonded kernel: MIXED precision "
-                             "(float pair arithmetic, double accumulation)" << std::endl;
-            }
-        }
-#if !defined(__AVX2__)
-        if (mixed_precision_nonbonded_) {
-            if (is_rank_zero()) {
-                std::cerr << "[ForceCalculatorCPU] WARNING: MD_NONBONDED_PRECISION=mixed needs an "
-                             "AVX2 build; falling back to the double kernel." << std::endl;
-            }
-            mixed_precision_nonbonded_ = false;
-        }
-#endif
-    }
     if (!mixed_precision_nonbonded_) return;
 
     if (lj_c6c12_f_.size() != lj_c6c12_.size()) {
@@ -2036,11 +2011,7 @@ void ForceCalculatorCPU::ensure_ewald_initialized(MDSystem& system) {
     ewald_spline_order_ = pme_engine_.spline_order();
 
     ewald_rs_table_r2_min_ = 1e-4;
-    Real ewald_rs_table_spacing = 0.04;
-    if (const char* rs_spacing_env = std::getenv("MD_PME_RS_TABLE_SPACING")) {
-        const Real v = static_cast<Real>(std::atof(rs_spacing_env));
-        if (v > 0.0) ewald_rs_table_spacing = v;
-    }
+    const Real ewald_rs_table_spacing = 0.04;
     ewald_rs_table_inv_spacing_ = 1.0 / ewald_rs_table_spacing;
     ewald_rs_table_size_ = build_real_space_ewald_table(
         cutoff, ewald_alpha_, ewald_rs_table_r2_min_,
@@ -2055,7 +2026,7 @@ void ForceCalculatorCPU::ensure_ewald_initialized(MDSystem& system) {
         std::cout << "[Ewald/PME][CPU] real-space table: " << ewald_rs_table_size_
                   << " nodes, spacing=" << ewald_rs_table_spacing << " A^2, "
                   << (ewald_rs_table_size_ * 2 * sizeof(float)) / 1024
-                  << "KB float mirror (MD_PME_RS_TABLE_SPACING overrides)" << std::endl;
+                  << "KB float mirror" << std::endl;
     }
 }
 

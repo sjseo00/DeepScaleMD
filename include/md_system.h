@@ -182,6 +182,13 @@ public:
         decomposition_dynamic_relaxation_ = dynamic_relaxation;
     }
 
+    // The halo exchange runs on dsDecompX's MPI backend and the MPI library takes device pointers
+    // (dsDecompX decides: the backend is what its build provides, CUDA-aware support is asked of the
+    // MPI library). False for NCCL/NVSHMEM and for a single rank.
+    bool mpi_takes_device_pointers() const {
+        return decomp_runtime_ && decomp_runtime_->mpi_takes_device_pointers();
+    }
+
     void sync_decomposition_domain();
     void warn_if_domain_narrower_than_two_halos(Real halo_width);
     void invalidate_halo_cache();

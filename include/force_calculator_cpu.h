@@ -118,7 +118,6 @@ private:
 
     void ensure_mixed_precision_tables();
     bool mixed_precision_nonbonded_ = false;
-    bool mixed_precision_probed_ = false;
     std::vector<float> tile_fx_, tile_fy_, tile_fz_, tile_fq_;
     std::vector<float> lj_c6c12_f_;
     std::vector<float> ewald_rs_table_f_;

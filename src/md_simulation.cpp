@@ -28,10 +28,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "force_libtorch/runtime/mlip_runtime.h"
-#include "force_libtorch/mlip_types.h"
-using namespace mlip;
-
 namespace {
 template <typename F>
 double measure_seconds(F&& fn) {
@@ -41,9 +37,18 @@ double measure_seconds(F&& fn) {
     return std::chrono::duration<double>(end - start).count();
 }
 
-bool env_flag_enabled(const char* name) {
-    const char* value = std::getenv(name);
-    return (value != nullptr) && (std::string(value) == "1");
+std::string lowercase_copy(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+bool parse_bool_option(const std::string& key, const std::string& value) {
+    const std::string v = lowercase_copy(value);
+    if (v == "true" || v == "1" || v == "on" || v == "yes") return true;
+    if (v == "false" || v == "0" || v == "off" || v == "no") return false;
+    throw std::runtime_error("Invalid " + key + ": '" + value + "' (expected true or false)");
 }
 
 class ScopedCoutSilencer {
@@ -129,6 +134,36 @@ std::string trim_copy(const std::string& input) {
     return input.substr(start, end - start + 1);
 }
 
+// "[8, 1]" or "8, 1" -> {8, 1}; used by mlip_type_to_z.
+std::vector<int> parse_int_list(const std::string& value, const std::string& key) {
+    std::string body = trim_copy(value);
+    if (!body.empty() && body.front() == '[') {
+        if (body.back() != ']') {
+            throw std::runtime_error("Invalid " + key + ": '" + value + "' (missing closing ']')");
+        }
+        body = body.substr(1, body.size() - 2);
+    }
+    std::vector<int> result;
+    std::stringstream stream(body);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        item = trim_copy(item);
+        if (item.empty()) continue;
+        size_t used = 0;
+        int number = 0;
+        try {
+            number = std::stoi(item, &used);
+        } catch (const std::exception&) {
+            used = 0;
+        }
+        if (used != item.size()) {
+            throw std::runtime_error("Invalid " + key + ": '" + item + "' is not an integer");
+        }
+        result.push_back(number);
+    }
+    return result;
+}
+
 std::set<std::string> parse_force_components(const std::string& value) {
     std::set<std::string> result;
     std::stringstream stream(value);
@@ -177,7 +212,6 @@ std::map<std::string, std::string> read_dsmd_input_manifest(const std::string& f
 MDSimulation::MDSimulation() : 
     cuda_calc_cached_(nullptr),
     using_cuda_backend_cached_(false),
-    mlip_spec_file_(""),
     coordinate_file(""),
     topology_file(""),
     parameter_file(""),
@@ -202,10 +236,10 @@ MDSimulation::MDSimulation() :
     mlip_dtype("float32"),
     integrator_type("verlet"),
     thermostat_type("none"),
-    tau_t(0.1),
+    tau_t(100.0),                        // fs
     barostat_type("none"),
     target_pressure(1.0),
-    tau_p(1.0),
+    tau_p(1000.0),                       // fs
     output_freq(10),                     // Default: every 10 steps
     output_info("STEP, T, KE"),          // Default output info
     trajectory_format("xyz"),            // Default: XYZ format
@@ -215,7 +249,6 @@ MDSimulation::MDSimulation() :
     total_steps(0), 
     dt(0.001), 
     python_force_path("python_force"), 
-    python_force_enabled(false),
     cached_potential_energy(0.0),
     neighbor_rebuild_forced(false),
     adaptive_rebuild_armed_(true) {
@@ -306,7 +339,6 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
     std::string force_mode;
     if (enable_builtin_forces_) force_mode = "Built-in";
     if (enable_python_forces_) force_mode += (force_mode.empty() ? "Python" : " + Python");
-    if (enable_libtorch_forces_) force_mode += (force_mode.empty() ? "LibTorch" : " + LibTorch");
     if (force_mode.empty()) force_mode = display_name(force_calculation_mode);
 
     const SimulationBox& box = system->get_box();
@@ -559,6 +591,7 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
     if (cuda_calc_cached_) {
         cuda_calc_cached_->set_builtin_forces_enabled(enable_builtin_forces_);
         cuda_calc_cached_->set_mixed_precision(force_precision_ == "mixed");
+        cuda_calc_cached_->set_cuda_aware_mpi(system->mpi_takes_device_pointers());
         if (force_precision_ == "mixed" && system->get_rank() == 0) {
             std::cout << "[Force precision] mixed precision enabled: LJ/Ewald "
                       << "real-space pair math runs in float, forces/energy/"
@@ -583,88 +616,26 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
     }
 
     if (enable_python_forces_) {
-        python_interface = std::make_unique<PythonForceInterface>();
-        python_interface->initialize_python(python_force_path);
-        if (system->get_rank() == 0) {
-            std::cout << "Python force calculation interface initialized" << std::endl;
+        if (is_using_cuda_backend() && mlip_device != "cpu") {
+            mlip_device = "cuda";
         }
+        if (mlip_dtype.empty()) mlip_dtype = "float32";
 
-        {
-            if (is_using_cuda_backend() && mlip_device != "cpu") {
-                mlip_device = "cuda";
-            }
-            if (mlip_dtype.empty()) mlip_dtype = "float32";
-            const std::string effective_model_type =
-                !mlip_model_type.empty() ? mlip_model_type : force_calculation_type;
-            if (system->get_rank() == 0) {
-                if (effective_model_type.empty()) {
-                    std::cout << "Using Python force provider without MLIP model initialization" << std::endl;
-                } else {
-                    std::cout << "Initializing Python MLIP (type=" << effective_model_type << ")..." << std::endl;
-                    std::cout << "  model_path: " << mlip_model_path << std::endl;
-                    std::cout << "  model_type: " << effective_model_type << std::endl;
-                    std::cout << "  model_size: " << mlip_model_size << std::endl;
-                    std::cout << "  device:     " << mlip_device << std::endl;
-                    std::cout << "  dtype:      " << mlip_dtype << std::endl;
-                }
-            }
-            if (!effective_model_type.empty()) {
-                python_interface->initialize_ml_model(
-                    mlip_model_path, effective_model_type, mlip_model_size,
-                    mlip_device, mlip_dtype, mlip_extra_kwargs);
-            }
-        }
+        MLIPConfig mlip_cfg;
+        mlip_cfg.backend = mlip_backend_name_;
+        mlip_cfg.model_path = mlip_model_folder_;
+        mlip_cfg.type_to_z = mlip_type_to_z_;
+        mlip_cfg.verbose = (system->get_rank() == 0);
+        mlip_cfg.python.force_path = python_force_path;
+        mlip_cfg.python.model_path = mlip_model_path;
+        mlip_cfg.python.model_type = !mlip_model_type.empty() ? mlip_model_type : force_calculation_type;
+        mlip_cfg.python.model_size = mlip_model_size;
+        mlip_cfg.python.device = mlip_device;
+        mlip_cfg.python.dtype = mlip_dtype;
+        mlip_cfg.python.extra_kwargs = mlip_extra_kwargs;
+        mlip_backend_ = create_mlip_backend(mlip_cfg);
     }
 
-    if (enable_libtorch_forces_) {
-#ifndef USE_CUDA
-        throw std::runtime_error(
-            "[LibTorch] libtorch force mode requires a CUDA build (USE_CUDA). "
-            "Current build does not enable CUDA.");
-#else
-        if (!is_using_cuda_backend()) {
-            throw std::runtime_error(
-                "[LibTorch] libtorch force mode requires an active CUDA backend. "
-                "Current run is not using ForceCalculatorCUDA.");
-        }
-
-        if (mlip_spec_file_.empty()) {
-            throw std::runtime_error(
-                "[LibTorch] force_calculation.mode = libtorch requires "
-                "'mlip_spec_file' key in the MD YAML pointing to a model spec file.");
-        }
-
-        if (system->get_rank() == 0) {
-            std::cout << "[MlipRuntime] Initializing C++ MLIP runtime...\n"
-                      << "  spec: " << mlip_spec_file_ << "\n";
-        }
-
-        MlipExecutionContext ctx;
-        ctx.mpi_rank  = system->get_rank();
-        ctx.mpi_size  = system->get_size();
-        ctx.device_id = 0;   // TODO: multi-GPU rank mapping
-
-        mlip_runtime_ = std::make_unique<mlip::MlipRuntime>();
-
-        {
-            auto* fc_cuda = cuda_calc_cached_;
-            if (fc_cuda) fc_cuda->pre_register_mlip_sources();
-        }
-
-        mlip_runtime_->initialize(mlip_spec_file_, ctx);
-
-        if (system->get_rank() == 0) {
-            std::cout << "[MlipRuntime] ✅ Runtime ready. cutoff="
-                      << mlip_runtime_->cutoff() << " Å\n";
-        }
-
-        auto* fc_cuda = cuda_calc_cached_;
-        if (fc_cuda) {
-            fc_cuda->set_mlip_runtime(static_cast<void*>(mlip_runtime_.get()));
-        }
-#endif
-    }
-    
     Real cutoff = cutoff_distance;
     if (system->get_rank() == 0) {
         std::cout << "Using cpu_spatial_verlet neighbor list with skin distance: "
@@ -675,7 +646,6 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
     // The host-side list only knows the tiled and graph layouts; "list" is a CUDA-only kernel
     // that builds its per-atom lists from the device tile list.
     neighbor_list_->set_nonbonded_kernel(nonbonded_kernel_ == "list" ? std::string("tiled") : nonbonded_kernel_);
-    neighbor_list_->set_mlip_edge_list_needed(enable_libtorch_forces_);
     system->set_neighbor_list(neighbor_list_.get());
 
     initialize_integrator();
@@ -763,6 +733,13 @@ void MDSimulation::single_step() {
 
 void MDSimulation::prepare_first_step() {
     ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
+
+    {
+        // The decomposition was created for this box (MDSystem::initialize_decomposition).
+        const SimulationBox& box = system->get_box();
+        box_synced_lx_ = box.lx; box_synced_ly_ = box.ly; box_synced_lz_ = box.lz;
+        box_synced_valid_ = true;
+    }
 
     if (integrator_type == "leap_frog" || integrator_type == "leapfrog") {
         integrator->initialize_velocities(system->get_particles(), dt, system->get_local_particles());
@@ -893,12 +870,8 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
             // at the previous check (a step old, no wait for the current queue) and queues the new
             // one, so the host can launch the next step while the GPU is still busy with this one.
             // The reading is extrapolated by its own growth over the last interval, which covers
-            // the step of lag; DSMD_DISP_LAG=0 restores the waiting check.
-            static const bool lagged_check_enabled = [] {
-                const char* v = std::getenv("DSMD_DISP_LAG");
-                return !(v && std::string(v) == "0");
-            }();
-            const bool lagged_check = lagged_check_enabled && comm_backend_->is_distributed() && !single_gpu_rank;
+            // the step of lag.
+            const bool lagged_check = comm_backend_->is_distributed() && !single_gpu_rank;
             const auto gpu_wait_start = std::chrono::high_resolution_clock::now();
             Real max_disp_sq = 0.0;
             bool have_reading = true;
@@ -980,6 +953,11 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         auto comm_start = std::chrono::high_resolution_clock::now();
 
         if (should_rebuild) {
+            // NPT: the migration wraps atoms into the box dsDecompX holds, and the new halo plan takes
+            // its image shifts from it, so it has to be the box of this step.
+            if (box_synced_valid_ && box_drift_since_sync() > 0.0) {
+                sync_domain_to_box();
+            }
             auto migrate_start = std::chrono::high_resolution_clock::now();
             comm_backend_->migrate_particles_if_needed(
                 *system, true, force_calc.get());
@@ -996,8 +974,8 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         // cannot trigger on a reused plan, so it is skipped.
         bool overlap_halo = false;
 #ifdef USE_CUDA
-        overlap_halo = cuda_calc && !should_rebuild && overlap_halo_enabled_ &&
-            !enable_python_forces_ && !enable_libtorch_forces_ &&
+        overlap_halo = cuda_calc && !should_rebuild &&
+            !enable_python_forces_ &&
             cuda_calc->supports_overlapped_forces(*system) &&
             system->can_overlap_halo_on_device(*cuda_calc);
         if (overlap_halo) {
@@ -1038,6 +1016,9 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
             if (late_rebuild) {
                 reason_mpi_sync = true;
 
+                if (box_synced_valid_ && box_drift_since_sync() > 0.0) {
+                    sync_domain_to_box();
+                }
                 auto migrate_start = std::chrono::high_resolution_clock::now();
                 comm_backend_->migrate_particles_if_needed(
                     *system, true, force_calc.get());
@@ -1097,7 +1078,7 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
     });
 }
 
-void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml, bool need_energy) {
+void MDSimulation::compute_forces_with_mode(bool need_energy) {
     ForceCalculatorCUDA* cuda_calc = cuda_calc_cached_;
 
     // Only the CUDA calculator can defer the readback; the others always
@@ -1121,7 +1102,7 @@ void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml, bool
         ++halo_overlap_steps_;
         cuda_calc->finish_forces_boundary(*system);
 #endif
-    } else if (force_calc && (enable_builtin_forces_ || enable_libtorch_forces_ || cuda_calc)) {
+    } else if (force_calc && (enable_builtin_forces_ || cuda_calc)) {
         force_calc->compute_forces(*system);
     } else {
         zero_forces();
@@ -1136,31 +1117,46 @@ void MDSimulation::compute_forces_with_mode(bool download_positions_for_ml, bool
 
     Real python_potential_energy = 0.0;
 
-    if (enable_python_forces_ && python_interface) {
-        SimulationBox& box = system->get_box();
+    if (mlip_backend_) {
+        const SimulationBox& box = system->get_box();
+        ParticleData& particles = system->get_particles();
 
-        if (download_positions_for_ml && cuda_calc) {
+        MLIPInputs mlip_in;
+        MLIPOutputs mlip_out;
+        mlip_in.n_owned = static_cast<int64_t>(system->get_local_particles());
+        mlip_in.n_all = static_cast<int64_t>(system->get_num_particles());
+        mlip_in.cell[0] = box.lx;
+        mlip_in.cell[1] = box.ly;
+        mlip_in.cell[2] = box.lz;
+        mlip_in.pbc[0] = box.periodic_x;
+        mlip_in.pbc[1] = box.periodic_y;
+        mlip_in.pbc[2] = box.periodic_z;
+        mlip_out.need_energy = true;
 #ifdef USE_CUDA
-            cuda_calc->download_positions_for_ml(
-                system->get_particles(), system->get_num_particles());
-            cuda_calc->download_forces_for_ml(
-                system->get_particles(), system->get_num_particles());
-#endif
-        }
-
-        python_interface->compute_force(
-            system->get_particles(), system->get_ff_params(),
-            system->get_neighbor_list(),
-            box.lx, box.ly, box.lz,
-            box.periodic_x, box.periodic_y, box.periodic_z);
-        python_potential_energy = static_cast<Real>(python_interface->get_last_energy());
-
         if (cuda_calc) {
-#ifdef USE_CUDA
-            cuda_calc->upload_forces_from_ml(
-                system->get_particles(), system->get_num_particles());
+            mlip_in.d_x = cuda_calc->get_device_x();
+            mlip_in.d_y = cuda_calc->get_device_y();
+            mlip_in.d_z = cuda_calc->get_device_z();
+            mlip_in.d_type = cuda_calc->get_device_type();
+            mlip_in.stream = cuda_calc->get_force_stream();
+            mlip_out.d_fx = cuda_calc->get_device_fx();
+            mlip_out.d_fy = cuda_calc->get_device_fy();
+            mlip_out.d_fz = cuda_calc->get_device_fz();
+        } else
 #endif
+        {
+            mlip_in.host_memory = true;
+            mlip_in.d_x = particles.x.data();
+            mlip_in.d_y = particles.y.data();
+            mlip_in.d_z = particles.z.data();
+            mlip_in.d_type = particles.type.data();
+            mlip_out.d_fx = particles.fx.data();
+            mlip_out.d_fy = particles.fy.data();
+            mlip_out.d_fz = particles.fz.data();
         }
+
+        mlip_backend_->compute(mlip_in, mlip_out);
+        python_potential_energy = static_cast<Real>(mlip_out.energy);
     }
 
     if (!defer_energy) {
@@ -1236,35 +1232,8 @@ void MDSimulation::handle_force_phase(ForceCalculatorCUDA* cuda_calc, double& fo
             zero_forces();
         }
 
-        compute_forces_with_mode(true, need_energy);
+        compute_forces_with_mode(need_energy);
         reverse_halo_for_bonded_if_needed();
-
-        if (!cuda_calc && comm_backend_->is_distributed() &&
-            env_flag_enabled("MD_CHECK_FORCE_BALANCE")) {
-            const ParticleData& p = system->get_particles();
-            const size_t n_local = system->get_local_particles();
-            Real local_sum[3] = {0.0, 0.0, 0.0};
-            for (size_t i = 0; i < n_local; ++i) {
-                local_sum[0] += p.fx[i];
-                local_sum[1] += p.fy[i];
-                local_sum[2] += p.fz[i];
-            }
-            Real global_sum[3] = {0.0, 0.0, 0.0};
-            MPI_Reduce(local_sum, global_sum, 3, MPI_DOUBLE, MPI_SUM, 0, PmePpSplit::instance().pp_comm());
-            int mpi_rank = 0;
-            MPI_Comm_rank(PmePpSplit::instance().pp_comm(), &mpi_rank);
-            if (mpi_rank == 0) {
-                const Real net = std::sqrt(global_sum[0] * global_sum[0] +
-                                           global_sum[1] * global_sum[1] +
-                                           global_sum[2] * global_sum[2]);
-                if (net > 1e-3) {
-                    std::cerr << "[MD_CHECK_FORCE_BALANCE] step " << current_step
-                              << ": |sum(F)| = " << net
-                              << " (expected ~0) -- asymmetric cross-rank force"
-                              << std::endl;
-                }
-            }
-        }
     });
 }
 
@@ -1410,9 +1379,19 @@ void MDSimulation::handle_barostat_phase(ForceCalculatorCUDA* cuda_calc,
             Real new_lx = system->get_box().lx;
             Real new_ly = system->get_box().ly;
             Real new_lz = system->get_box().lz;
-            bool box_changed = has_significant_box_change(
-                old_lx, old_ly, old_lz,
-                new_lx, new_ly, new_lz);
+            // Several ranks: the box change of one step is tiny, the drift since the last domain
+            // synchronisation is what matters (see kBoxSyncBudget). Every rank must take the same
+            // branch, the rebuild is collective.
+            const bool several_ranks = comm_backend_->is_distributed() &&
+                                       !comm_backend_->is_gpu_single_rank(cuda_calc != nullptr);
+            bool box_changed;
+            if (several_ranks && box_synced_valid_) {
+                box_changed = !comm_backend_->all_true(box_drift_since_sync() <= kBoxSyncBudget);
+            } else {
+                box_changed = has_significant_box_change(
+                    old_lx, old_ly, old_lz,
+                    new_lx, new_ly, new_lz);
+            }
 
             if (box_changed) {
                 handle_box_change_rebuild();
@@ -1456,7 +1435,7 @@ void MDSimulation::handle_box_change_rebuild() {
 
     neighbor_rebuild_forced = true;
     if (comm_backend_->is_distributed()) {
-        system->sync_decomposition_domain();
+        sync_domain_to_box();
         system->invalidate_halo_cache();
     }
 
@@ -1491,7 +1470,21 @@ void MDSimulation::handle_box_change_rebuild() {
     if (!cuda_calc) {
         zero_forces();
     }
-    compute_forces_with_mode(true);
+    compute_forces_with_mode();
+}
+
+void MDSimulation::sync_domain_to_box() {
+    system->sync_decomposition_domain();
+    const SimulationBox& box = system->get_box();
+    box_synced_lx_ = box.lx; box_synced_ly_ = box.ly; box_synced_lz_ = box.lz;
+    box_synced_valid_ = true;
+}
+
+Real MDSimulation::box_drift_since_sync() const {
+    const SimulationBox& box = system->get_box();
+    return std::max({std::abs(box.lx - box_synced_lx_),
+                     std::abs(box.ly - box_synced_ly_),
+                     std::abs(box.lz - box_synced_lz_)});
 }
 
 void MDSimulation::zero_forces() {
@@ -1683,15 +1676,6 @@ void MDSimulation::run_energy_minimization() {
 }
 
 
-MDSimulation::TimingTraceMode MDSimulation::parse_timing_trace_mode() {
-    const char* value = std::getenv("MD_TIMING_TRACE");
-    if (!value) return TimingTraceMode::Off;
-    const std::string v(value);
-    if (v == "every") return TimingTraceMode::Every;
-    if (v == "step") return TimingTraceMode::Step;
-    return TimingTraceMode::Off;
-}
-
 void MDSimulation::run() {
     // Dedicated PME-group ranks (force_calculation.pme_ranks > 0) already ran
     // their entire simulation inside PmeServer::run(), driven from
@@ -1706,24 +1690,17 @@ void MDSimulation::run() {
         return;
     }
 #endif
-    timing_trace_mode_ = parse_timing_trace_mode();
-    timing_trace_force_ = env_flag_enabled("MD_TIMING_TRACE_FORCE");
-    if (const char* overlap = std::getenv("DSMD_OVERLAP_HALO")) {
-        const std::string value(overlap);
-        overlap_halo_enabled_ = !(value == "0" || value == "false" || value == "FALSE" ||
-                                  value == "off" || value == "OFF");
-    }
     if (force_calc) {
         force_calc->set_timing_breakdown_enabled(timing_trace_force_);
     }
     if (system->get_rank() == 0) {
         std::cout << "Starting MD simulation for " << total_steps << " steps" << std::endl;
         if (timing_trace_mode_ != TimingTraceMode::Off) {
-            std::cout << "Per-step timing trace enabled (MD_TIMING_TRACE="
+            std::cout << "Per-step timing trace enabled (advanced.timing_trace="
                       << (timing_trace_mode_ == TimingTraceMode::Every ? "every" : "step") << ")"
                       << (timing_trace_force_ ? ", with force-component breakdown" : "") << std::endl;
         } else if (timing_trace_force_) {
-            std::cout << "Force-component timing enabled (MD_TIMING_TRACE_FORCE=1); "
+            std::cout << "Force-component timing enabled (advanced.timing_trace_force); "
                       << "will appear in the end-of-run report" << std::endl;
         }
     }
@@ -1761,9 +1738,7 @@ void MDSimulation::run() {
         std::cout << "Neighbor list builds = " << neighbor_list_builds << std::endl;
         if (comm_backend_->is_distributed() && cuda_calc_cached_) {
             std::cout << "Halo/force overlap: " << halo_overlap_steps_ << " of "
-                      << total_steps << " steps"
-                      << (overlap_halo_enabled_ ? "" : " (disabled by DSMD_OVERLAP_HALO)")
-                      << std::endl;
+                      << total_steps << " steps" << std::endl;
         }
         if (nonbonded_kernel_ == "graph") {
             std::cout << "Active graph incremental prunes = " << active_graph_prunes_
@@ -1843,17 +1818,18 @@ void MDSimulation::handle_step_output(int step) {
 
     output_results(step, emit_text);
 
-    if (emit_text && system->get_rank() == 0) {
-        std::cout << "Neighbor rebuild reasons through step " << step
-                  << " (overlapping counts):"
-                  << " periodic=" << rebuild_reason_periodic_
-                  << " adaptive=" << rebuild_reason_adaptive_
-                  << " forced=" << rebuild_reason_forced_
-                  << " mpi_sync=" << rebuild_reason_mpi_sync_
-                  << " box_change=" << rebuild_reason_box_change_
-                  << " other=" << rebuild_reason_other_
-                  << std::endl;
-    }
+    // Per-output-step rebuild-reason line disabled for now (the end-of-run summary is kept).
+    // if (emit_text && system->get_rank() == 0) {
+    //     std::cout << "Neighbor rebuild reasons through step " << step
+    //               << " (overlapping counts):"
+    //               << " periodic=" << rebuild_reason_periodic_
+    //               << " adaptive=" << rebuild_reason_adaptive_
+    //               << " forced=" << rebuild_reason_forced_
+    //               << " mpi_sync=" << rebuild_reason_mpi_sync_
+    //               << " box_change=" << rebuild_reason_box_change_
+    //               << " other=" << rebuild_reason_other_
+    //               << std::endl;
+    // }
 }
 
 void MDSimulation::compute_output_energies(const ParticleData& particles, OutputMetrics& metrics) {
@@ -2065,9 +2041,7 @@ void MDSimulation::finalize(double program_wallclock_ms) {
         force_calc->finalize();
     }
     
-    if (python_interface) {
-        python_interface->finalize_python();
-    }
+    mlip_backend_.reset();
     
     finalize_trajectory_writers();
 
@@ -2191,8 +2165,6 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                 force_calculation_mode = trim_copy(value);
             } else if (key == "type" || key == "force_calculation_type") {
                 force_calculation_type = value;
-            } else if (key == "spec_file" || key == "mlip_spec_file") {
-                mlip_spec_file_ = value;
             } else if (key == "precision") {
                 force_precision_ = trim_copy(value);
             } else if (key == "nonbonded_kernel") {
@@ -2207,20 +2179,38 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             } else if (key == "pme_ranks") {
                 pme_ranks_ = std::stoi(trim_copy(value));
             }
-        } else if (current_section == "advanced" && current_subsection == "decomposition" &&
-                   indent_width > subsection_indent) {
-            if (key == "grid_policy") {
-                decomposition_grid_policy_ = trim_copy(value);
-            } else if (key == "inter_node_weight") {
-                decomposition_inter_node_weight_ = std::stod(value);
-            } else if (key == "intra_node_weight") {
-                decomposition_intra_node_weight_ = std::stod(value);
-            } else if (key == "dynamic_balance_interval") {
-                decomposition_dynamic_interval_ = std::stol(value);
-            } else if (key == "dynamic_imbalance_threshold") {
-                decomposition_dynamic_imbalance_threshold_ = std::stod(value);
-            } else if (key == "dynamic_relaxation") {
-                decomposition_dynamic_relaxation_ = std::stod(value);
+        } else if (current_section == "advanced") {
+            const bool in_subsection = !current_subsection.empty() && indent_width > subsection_indent;
+            if (in_subsection) {
+                if (current_subsection == "decomposition") {
+                    if (key == "grid_policy") {
+                        decomposition_grid_policy_ = trim_copy(value);
+                    } else if (key == "inter_node_weight") {
+                        decomposition_inter_node_weight_ = std::stod(value);
+                    } else if (key == "intra_node_weight") {
+                        decomposition_intra_node_weight_ = std::stod(value);
+                    } else if (key == "dynamic_balance_interval") {
+                        decomposition_dynamic_interval_ = std::stol(value);
+                    } else if (key == "dynamic_imbalance_threshold") {
+                        decomposition_dynamic_imbalance_threshold_ = std::stod(value);
+                    } else if (key == "dynamic_relaxation") {
+                        decomposition_dynamic_relaxation_ = std::stod(value);
+                    }
+                }
+            } else if (key == "timing_trace") {
+                const std::string v = lowercase_copy(trim_copy(value));
+                if (v == "every") {
+                    timing_trace_mode_ = TimingTraceMode::Every;
+                } else if (v == "step") {
+                    timing_trace_mode_ = TimingTraceMode::Step;
+                } else if (v == "off" || v == "false" || v == "none") {
+                    timing_trace_mode_ = TimingTraceMode::Off;
+                } else {
+                    throw std::runtime_error(
+                        "Invalid advanced.timing_trace: '" + value + "' (supported: off, step, every)");
+                }
+            } else if (key == "timing_trace_force") {
+                timing_trace_force_ = parse_bool_option("advanced.timing_trace_force", value);
             }
         } else if (current_section == "minimize") {
             if (key == "method") {
@@ -2325,10 +2315,12 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             langevin_piston_temp_ = std::stod(value);
         } else if (key == "python_force_path") {
             python_force_path = value;
-        } else if (key == "python_force_enabled") {
-            python_force_enabled = (value == "true");
-        } else if (key == "mlip_spec_file") {
-            mlip_spec_file_ = value;
+        } else if (key == "mlip_backend") {
+            mlip_backend_name_ = trim_copy(value);
+        } else if (key == "mlip_model") {
+            mlip_model_folder_ = trim_copy(value);
+        } else if (key == "mlip_type_to_z") {
+            mlip_type_to_z_ = parse_int_list(value, key);
         } else if (key == "box_x") {
             system->get_box().lx = std::stod(value);
         } else if (key == "box_y") {
@@ -2380,20 +2372,38 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     force_calculation_mode = trim_copy(force_calculation_mode);
     const auto force_components = parse_force_components(force_calculation_mode);
     for (const auto& component : force_components) {
-        if (component != "builtin" && component != "python" && component != "libtorch") {
+        if (component == "libtorch") {
+#ifdef USE_CUDA
+            throw std::runtime_error(
+                "force_calculation.mode 'libtorch' is not available yet: the LibTorch MLIP backend is "
+                "being rebuilt (docs/mlip_integration_design.md). Use 'python'.");
+#else
+            throw std::runtime_error(
+                "force_calculation.mode 'libtorch' is only supported in CUDA builds, not in CPU/SYCL "
+                "builds. Use 'python'.");
+#endif
+        }
+        if (component != "builtin" && component != "python") {
             throw std::runtime_error(
                 "Invalid force_calculation.mode component: '" + component
-                + "'. Supported components are: builtin, python, libtorch");
+                + "'. Supported components are: builtin, python");
         }
     }
     if (force_components.empty()) {
         throw std::runtime_error(
             "Invalid force_calculation.mode: '" + force_calculation_mode
-            + "'. Specify one or more of: builtin, python, libtorch");
+            + "'. Specify one or more of: builtin, python");
     }
     enable_builtin_forces_  = force_components.count("builtin") != 0;
     enable_python_forces_   = force_components.count("python") != 0;
-    enable_libtorch_forces_ = force_components.count("libtorch") != 0;
+
+    {
+        MLIPConfig mlip_check;
+        mlip_check.backend = mlip_backend_name_;
+        mlip_check.model_path = mlip_model_folder_;
+        mlip_check.type_to_z = mlip_type_to_z_;
+        validate_mlip_config(mlip_check);
+    }
 
     force_precision_ = trim_copy(force_precision_);
     if (force_precision_.empty()) {
@@ -2608,11 +2618,12 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         }
         std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
         if (enable_python_forces_) {
-            std::cout << "  Python force path: " << python_force_path << std::endl;
-        }
-        std::cout << "  Python force interface: " << (python_force_enabled ? "enabled" : "disabled") << std::endl;
-        if (python_force_enabled) {
-            std::cout << "  Python force path: " << python_force_path << std::endl;
+            std::cout << "  MLIP backend: " << (mlip_backend_name_.empty() ? "python" : mlip_backend_name_) << std::endl;
+            if (mlip_backend_name_.empty() || mlip_backend_name_ == "python") {
+                std::cout << "  Python force path: " << python_force_path << std::endl;
+            } else {
+                std::cout << "  MLIP model: " << mlip_model_folder_ << std::endl;
+            }
         }
     }
 }
@@ -2665,20 +2676,25 @@ void MDSimulation::initialize_thermostat() {
                       << " Nose-Hoover thermostat (T=" << target_temperature << " K)" << std::endl;
         }
     } else if (thermostat_type == "langevin") {
-        Real gamma = 1.0 / tau_t; // friction coefficient from time constant
+        Real gamma = 1.0 / tau_t; // friction coefficient (1/fs) from the time constant (fs)
         thermostat = create_langevin_thermostat_for_build(target_temperature, gamma);
         if (system->get_rank() == 0) {
             std::cout << "Initialized " << label
                       << " Langevin thermostat (T=" << target_temperature 
-                      << " K, tau=" << tau_t << " ps)" << std::endl;
+                      << " K, tau=" << tau_t << " fs)" << std::endl;
+            if (tau_t < 10.0 * dt) {
+                std::cout << "  WARNING: tau_t=" << tau_t << " fs is shorter than 10 timesteps ("
+                          << 10.0 * dt << " fs). tau_t is in femtoseconds, the unit of the timestep "
+                          << "(NAMD langevinDamping 1/ps -> tau_t: 1000)." << std::endl;
+            }
         }
     } else if (thermostat_type == "andersen") {
-        Real collision_freq = 1.0 / tau_t; // collision frequency from time constant
+        Real collision_freq = 1.0 / tau_t; // collision frequency (1/fs) from the time constant (fs)
         thermostat = create_andersen_thermostat_for_build(target_temperature, collision_freq);
         if (system->get_rank() == 0) {
             std::cout << "Initialized " << label
                       << " Andersen thermostat (T=" << target_temperature 
-                      << " K, freq=" << collision_freq << " ps^-1)" << std::endl;
+                      << " K, freq=" << collision_freq << " fs^-1)" << std::endl;
         }
     } else {
         if (system->get_rank() == 0) {
@@ -2726,6 +2742,18 @@ void MDSimulation::initialize_barostat() {
         // decay to tau_p/2 when unset, matching NAMD's own 200fs/100fs ratio.
         const Real tau_p_decay = (tau_p_decay_ > 0.0) ? tau_p_decay_ : (0.5 * tau_p);
         const Real piston_gamma = 1.0 / tau_p_decay;
+
+        // tau_p and tau_p_decay are in femtoseconds, the unit of the timestep: W above carries
+        // tau_p^2 and the piston friction update h_dot += dt (drift - gamma h_dot) is an explicit
+        // Euler step, which diverges for gamma * dt > 2 (a value given in ps, 0.2 for 200 fs, reads
+        // as 0.2 fs and ends in a NaN box).
+        if (tau_p < 10.0 * dt || tau_p_decay < 10.0 * dt) {
+            throw std::runtime_error(
+                "Parrinello-Rahman barostat: tau_p=" + std::to_string(tau_p) + " fs and tau_p_decay=" +
+                std::to_string(tau_p_decay) + " fs must each be at least 10 timesteps (" +
+                std::to_string(10.0 * dt) + " fs). Both are in femtoseconds, the unit of the timestep "
+                "(NAMD langevinPistonPeriod 200 / langevinPistonDecay 100 -> tau_p: 200, tau_p_decay: 100).");
+        }
         const Real piston_temp = (langevin_piston_temp_ > 0.0)
             ? langevin_piston_temp_ : target_temperature;
 
@@ -2736,6 +2764,16 @@ void MDSimulation::initialize_barostat() {
         }
         barostat = create_parrinello_rahman_barostat_for_build(target_pressure, W,
                                                                  piston_gamma, piston_temp);
+        {
+            // The piston noise must be the same on every rank, otherwise the ranks' boxes drift
+            // apart and the domain decomposition no longer describes one system.
+            int seed = 0;
+            if (system->get_rank() == 0) {
+                seed = static_cast<int>(std::random_device{}() & 0x7fffffffu);
+            }
+            seed = comm_backend_->sum_int(seed);
+            barostat->set_seed(static_cast<unsigned int>(seed));
+        }
         if (system->get_rank() == 0) {
             std::cout << "Initialized " << label
                   << " Parrinello-Rahman barostat (P=" << target_pressure
@@ -2747,7 +2785,7 @@ void MDSimulation::initialize_barostat() {
         if (system->get_rank() == 0) {
             std::cout << "Initialized " << label
                   << " Andersen barostat (P=" << target_pressure 
-                      << " bar, tau=" << tau_p << " ps)" << std::endl;
+                      << " bar, tau=" << tau_p << " fs)" << std::endl;
         }
     } else if (barostat_type == "berendsen") {
         barostat = create_berendsen_barostat_for_build(target_pressure, tau_p);

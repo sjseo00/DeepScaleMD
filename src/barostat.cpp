@@ -38,6 +38,9 @@ inline Real compute_instant_pressure_bar(Real kinetic_energy, Real virial, Real 
 }
 
 inline Real clamp_scale_factor(Real mu) {
+    // NaN passes through std::min/std::max unchanged, and a NaN box makes the neighbor-list
+    // build fail far from its cause: treat a non-finite factor as "no scaling".
+    if (!std::isfinite(mu)) return 1.0;
     return std::min(std::max(mu, 1.0 - kMaxIsotropicScalePerStep), 1.0 + kMaxIsotropicScalePerStep);
 }
 
@@ -79,6 +82,9 @@ inline Real langevin_piston_hdot_update(Real h_dot, Real drift, Real gamma,
         const Real noise_std = std::sqrt(2.0 * gamma * kB * piston_temp * dt / W);
         new_h_dot += noise_std * dist(rng);
     }
+    // gamma * dt >= 1 or a garbage pressure would make this explicit update diverge
+    // (initialize_barostat rejects the former); never carry a non-finite velocity forward.
+    if (!std::isfinite(new_h_dot)) return 0.0;
     return new_h_dot;
 }
 
