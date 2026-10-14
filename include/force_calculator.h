@@ -34,6 +34,9 @@ public:
     virtual Real get_potential_energy() const { return last_potential_energy; }
     virtual Real get_kinetic_energy() const { return last_kinetic_energy; }
     virtual Real get_virial() const { return last_virial; }
+    // The MLIP's contribution to the virial of this rank, added to the value the last force phase read back. Call it
+    // only on a step whose force phase read the energy and virial back (it adds to that value).
+    void add_external_virial(Real virial) { last_virial += virial; }
 
     virtual void calculate_kinetic_energy(MDSystem& system) = 0;
 

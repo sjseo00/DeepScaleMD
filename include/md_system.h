@@ -56,6 +56,7 @@ private:
 
     Real physical_cutoff;
     Real verlet_skin_ = 2.0;
+    Real mlip_ghost_depth_ = 0.0;   // set when an MLIP that needs real ghost atoms (libtorch) is selected
 
     // decomposition: (advanced, optional YAML, nested as advanced.decomposition.*)
     // overrides for the dsDecompX process-grid policy; empty/sentinel means "unset",
@@ -78,6 +79,8 @@ private:
     // any code that touches this.
     MPI_Comm pp_comm_ = MPI_COMM_WORLD;
     std::vector<std::string> coordinate_elements_;
+    // By MD type id: the element symbol the coordinate file gives the atoms of that type ("" if they disagree). Same on every PP rank.
+    std::vector<std::string> type_coordinate_elements_;
 
     std::unique_ptr<dsdecompx::Decomp> decomp_runtime_;
     bool last_device_halo_plan_reused_ = false;
@@ -106,6 +109,7 @@ private:
     bool bonded_redundant_ = false;
     void resize_particle_storage(size_t count);
     void initialize_decomposition_runtime();
+    void check_mlip_halo_fits(Real halo_width) const;
 
 public:
     MDSystem();
@@ -139,6 +143,7 @@ public:
     void set_neighbor_list(NeighborList* nlist) { neighbor_list_ptr_ = nlist; }
     Topology& get_topology() { return *topology; }
     bool has_topology() const { return static_cast<bool>(topology); }
+    const std::vector<std::string>& get_type_coordinate_elements() const { return type_coordinate_elements_; }
     const std::vector<LocalBond>& get_local_bonds() const { return local_bonds_; }
     const std::vector<LocalAngle>& get_local_angles() const { return local_angles_; }
     const std::vector<LocalDihedral>& get_local_dihedrals() const { return local_dihedrals_; }
@@ -167,6 +172,15 @@ public:
     Real get_physical_cutoff() const { return physical_cutoff; }
     void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
     void set_verlet_skin(Real skin) { verlet_skin_ = skin; }
+
+    // An MLIP with LibTorch needs ghost atoms as deep as its receptive field (num_layers * cutoff, design 5.1), not just
+    // the force cutoff. Re-applies the halo width right away. 0 (the default) leaves the halo to the force cutoff, so
+    // runs without such an MLIP are unchanged.
+    void set_mlip_ghost_depth(Real depth);
+    // Halo width in A: the larger of the force cutoff and the MLIP depth, plus the Verlet skin and a margin.
+    Real get_halo_width() const { return (physical_cutoff > mlip_ghost_depth_ ? physical_cutoff : mlip_ghost_depth_) + verlet_skin_ + 1.0; }
+    // True when the box is split into more than one subdomain along the axis (0, 1, 2); the halo then provides ghosts there.
+    bool axis_is_decomposed(int axis) const;
 
     // decomposition.* (advanced, optional YAML section nested under advanced:); must be
     // called before setup_domain_decomposition() to take effect. An empty policy string

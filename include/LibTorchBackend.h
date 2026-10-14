@@ -27,6 +27,7 @@ public:
 
     double cutoff() const override;
     double ghost_cutoff() const override;
+    bool uses_edge_shifts() const override;
     const MLIPMetadata& metadata() const;
 
 private:

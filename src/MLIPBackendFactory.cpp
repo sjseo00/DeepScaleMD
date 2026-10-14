@@ -18,6 +18,13 @@ std::string effective_backend(const MLIPConfig& cfg) {
 void validate_mlip_config(const MLIPConfig& cfg) {
     const std::string backend = effective_backend(cfg);
     if (backend == "python") {
+        // optional here (Python guesses the elements of the types without it), but an entry that is given has to be an element
+        for (int z : cfg.type_to_z) {
+            if (z < 1 || z > 118) {
+                throw std::runtime_error(
+                    "Invalid mlip_type_to_z entry " + std::to_string(z) + ": atomic numbers are 1..118");
+            }
+        }
         return;
     }
     if (backend != "libtorch") {
@@ -38,10 +45,7 @@ void validate_mlip_config(const MLIPConfig& cfg) {
         throw std::runtime_error(
             "mlip_backend 'libtorch' requires mlip_model: <converted model folder>");
     }
-    if (cfg.type_to_z.empty()) {
-        throw std::runtime_error(
-            "mlip_backend 'libtorch' requires mlip_type_to_z: [<atomic number of MD type 0>, <of type 1>, ...]");
-    }
+    // mlip_type_to_z may be empty here: the MD reads it from the atom type names of the topology before it creates the backend
     for (int z : cfg.type_to_z) {
         if (z < 1 || z > 118) {
             throw std::runtime_error(

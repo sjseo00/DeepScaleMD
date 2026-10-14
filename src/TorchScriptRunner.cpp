@@ -33,9 +33,11 @@ TorchScriptRunner::TorchScriptRunner(const std::string& model_file, const torch:
 }
 
 std::vector<torch::Tensor> TorchScriptRunner::run(const std::vector<torch::Tensor>& inputs) {
-    if (inputs.size() != 4) {
-        throw std::invalid_argument("TorchScriptRunner::run expects {pos, atomic_numbers, edge_index, n_owned}");
+    if (inputs.size() != 4 && inputs.size() != 5) {
+        throw std::invalid_argument("TorchScriptRunner::run expects {pos, atomic_numbers, edge_index, n_owned} "
+                                    "or {pos, atomic_numbers, edge_index, edge_shift, n_owned}");
     }
+    const size_t expected_outputs = inputs.size() == 5 ? 4 : 3;
     std::vector<c10::IValue> arguments(inputs.begin(), inputs.end());
 
     c10::IValue result;
@@ -45,9 +47,9 @@ std::vector<torch::Tensor> TorchScriptRunner::run(const std::vector<torch::Tenso
         throw std::runtime_error("TorchScriptRunner: forward of '" + model_file_ + "' failed: " + error.msg());
     }
 
-    if (!result.isTuple() || result.toTuple()->elements().size() != 3) {
-        throw std::runtime_error("TorchScriptRunner: '" + model_file_ +
-                                 "' must return (energy, atom_energy, forces)");
+    if (!result.isTuple() || result.toTuple()->elements().size() != expected_outputs) {
+        throw std::runtime_error("TorchScriptRunner: '" + model_file_ + "' must return " +
+                                 (expected_outputs == 4 ? "(energy, atom_energy, forces, virial)" : "(energy, atom_energy, forces)"));
     }
     std::vector<torch::Tensor> outputs;
     for (const c10::IValue& element : result.toTuple()->elements()) {

@@ -12,9 +12,10 @@ class TorchModelRunner {
 public:
     virtual ~TorchModelRunner() = default;
 
-    // inputs:  {pos [N, 3], atomic_numbers [N] int64, edge_index [2, E] int64, n_owned [] int64} (design 3.1)
+    // inputs:  {pos [N, 3], atomic_numbers [N] int64, edge_index [2, E] int64, n_owned [] int64} (design 3.1), or with
+    //          edge shifts (metadata edge_shifts) {pos, atomic_numbers, edge_index, edge_shift [E, 3], n_owned}
     // returns: {energy [1], atom_energy [N], forces [N, 3]} (design 3.2), in the model's dtype and units, on the
-    //          device the inputs are on.
+    //          device the inputs are on; with edge shifts also {..., virial [1]}.
     virtual std::vector<torch::Tensor> run(const std::vector<torch::Tensor>& inputs) = 0;
 };
 

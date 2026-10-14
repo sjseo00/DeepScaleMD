@@ -23,6 +23,9 @@ struct MLIPInputs {
     const double*  d_z = nullptr;             // [n_all], device
     const int*     d_type = nullptr;          // [n_all], device, MD type id (0-based)
     const int64_t* d_edge_index = nullptr;    // [2 * n_edges], device
+    const double*  d_edge_shift = nullptr;    // [3 * n_edges], device, [E, 3] row-major: the vector added to the position difference
+                                              // of edge e (A), a lattice vector for a neighbor across a periodic boundary;
+                                              // nullptr = all zero. Read only by a backend whose uses_edge_shifts() is true
     int64_t n_owned = 0;
     int64_t n_all = 0;
     int64_t n_edges = 0;
@@ -40,11 +43,13 @@ struct MLIPOutputs {
     double* d_atom_energy = nullptr;          // [n_all], device, nullptr if not needed. Overwritten (not added to)
     bool    need_energy = false;              // energy is copied to the host only when true
     double  energy = 0.0;                     // owned-atom energy sum, valid if need_energy
+    double  virial = 0.0;                     // sum of r.F over the atoms the model saw plus the edge-shift term (kcal/mol); only
+    bool    has_virial = false;               // set (with need_energy) by a backend that returns it, i.e. one with edge shifts
 };
 
 // The former mlip_config section keys (docs/04): everything the Python MLIP path takes.
 struct PythonMLIPConfig {
-    std::string force_path = "python_force";  // python_force_path
+    std::string module_path = "mlip_python";  // python_mlip_path: the directory with ml_forces.py (relative to the working directory, or absolute)
     std::string model_path;                   // mlip_config.model_path
     std::string model_type;                   // mlip_config.model_type, or force_calculation.type if empty
     std::string model_size = "small";
@@ -67,6 +72,9 @@ public:
     virtual void compute(const MLIPInputs& in, MLIPOutputs& out) = 0;
     virtual double cutoff() const = 0;        // neighbor-list cutoff (A); 0 = not applicable (PythonBackend)
     virtual double ghost_cutoff() const = 0;  // ghost depth without skin (A); 0 = keep MD's own halo width
+    // True: the model takes periodic images as edge shifts (MLIPInputs::d_edge_shift) and gives the virial, so the MD side
+    // does not copy atoms across the periodic boundary for it.
+    virtual bool uses_edge_shifts() const { return false; }
 };
 
 // Defined in MLIPBackendFactory.cpp. An empty cfg.backend means "python".

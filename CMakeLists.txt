@@ -19,7 +19,7 @@ set(BACKEND "CPU" CACHE STRING
 set_property(CACHE BACKEND PROPERTY STRINGS CPU CUDA SYCL)
 string(TOUPPER "${BACKEND}" BACKEND)
 
-option(ENABLE_PYTHON "Enable the embedded Python force interface" ON)
+option(ENABLE_PYTHON "Enable the embedded Python MLIP interface (mlip_backend: python)" ON)
 option(ENABLE_LIBTORCH
        "Build the LibTorch MLIP backend (mlip_backend: libtorch); BACKEND=CUDA only" OFF)
 set(LIBTORCH_PYTHON "" CACHE FILEPATH
@@ -192,7 +192,9 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/comm_backend.cpp
     src/md_simulation.cpp
     src/PythonBackend.cpp
+    src/PythonModules.cpp
     src/MLIPBackendFactory.cpp
+    src/Elements.cpp
     src/MLIPMetadata.cpp
     src/MiniJson.cpp
     src/force_calculator_cpu.cpp
@@ -341,6 +343,7 @@ else()
         add_library(dsmd_libtorch STATIC
             src/LibTorchBackend.cpp
             src/TorchScriptRunner.cpp
+            src/AOTIRunner.cpp
             src/OpLibLoader.cpp)
         target_compile_features(dsmd_libtorch PRIVATE cxx_std_17)
         target_include_directories(dsmd_libtorch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -349,6 +352,11 @@ else()
         target_compile_options(dsmd_libtorch PRIVATE ${_torch_cxx_flags})
         target_link_libraries(dsmd_libtorch PRIVATE ${TORCH_LIBRARIES} CUDA::cudart ${CMAKE_DL_LIBS})
         target_link_libraries(deepscalemd PRIVATE dsmd_libtorch)
+        # dsMD finds the LibTorch (and its bundled libraries) it was linked with without LD_LIBRARY_PATH
+        set_property(TARGET deepscalemd APPEND PROPERTY BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib")
+        set_property(TARGET deepscalemd APPEND PROPERTY INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib")
+        # MD-side GPU work around the model (periodic images, edge list, force folding); only built with LibTorch.
+        target_sources(deepscalemd PRIVATE src/EdgeBuilder.cu src/MLIPStep.cu)
         message(STATUS "DeepScaleMD: LibTorch MLIP backend enabled (Torch ${Torch_VERSION}, ${Torch_DIR})")
     endif()
 

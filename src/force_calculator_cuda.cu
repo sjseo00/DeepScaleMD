@@ -4204,6 +4204,21 @@ void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
     const Real physical_cutoff = system.get_physical_cutoff();
     const Real verlet_skin = std::max<Real>(0.0, search_radius - physical_cutoff);
 
+    // Only the machine-learned potential computes forces (force_calculation.mode: python): there is no builtin pair
+    // kernel to feed, so the classical tile list is not built. (It also cannot be built for a box narrower than
+    // 5 x (cutoff + skin) / 2, which a small MLIP test system easily is.) Only the displacement reference is kept.
+    if (!builtin_forces_enabled_) {
+        nlist_mode_active_ = false;
+        ++disp_ref_epoch_;
+        CUDA_CHECK(cudaMemcpyAsync(d_x_ref, d_x, local_particles * sizeof(Real),
+                                   cudaMemcpyDeviceToDevice, force_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_y_ref, d_y, local_particles * sizeof(Real),
+                                   cudaMemcpyDeviceToDevice, force_stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_z_ref, d_z, local_particles * sizeof(Real),
+                                   cudaMemcpyDeviceToDevice, force_stream));
+        return;
+    }
+
     // The per-atom list path needs the tile list in its full form (both orders of every tile
     // pair); the tiled kernels need the half list. Which one is built is decided here.
     nlist_mode_active_ = false;

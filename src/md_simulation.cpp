@@ -1,4 +1,6 @@
 #include "md_simulation.h"
+#include "Elements.h"
+#include <cctype>
 #include "neighbor_list.h"
 #include "force_calculator_cuda.h"
 #include "constraint_solver.h"
@@ -7,6 +9,9 @@
 #include "halo_backend.h"
 #include "comm_backend.h"
 #include "simulation_backend_factory.h"
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+#include "MLIPStep.cuh"
+#endif
 #include "pme_rank_split.h"
 #include "pme_server.h"
 #include <mpi.h>
@@ -134,34 +139,123 @@ std::string trim_copy(const std::string& input) {
     return input.substr(start, end - start + 1);
 }
 
-// "[8, 1]" or "8, 1" -> {8, 1}; used by mlip_type_to_z.
-std::vector<int> parse_int_list(const std::string& value, const std::string& key) {
-    std::string body = trim_copy(value);
-    if (!body.empty() && body.front() == '[') {
-        if (body.back() != ']') {
-            throw std::runtime_error("Invalid " + key + ": '" + value + "' (missing closing ']')");
-        }
-        body = body.substr(1, body.size() - 2);
+// An element written in the input file: a symbol (any capitalization: "o", "NA" and "Na" all work) or an atomic number.
+// 0 if it is neither.
+int element_from_text(const std::string& text) {
+    const std::string item = trim_copy(text);
+    if (item.empty()) return 0;
+    size_t used = 0;
+    int number = 0;
+    try {
+        number = std::stoi(item, &used);
+    } catch (const std::exception&) {
+        used = 0;
     }
-    std::vector<int> result;
-    std::stringstream stream(body);
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        item = trim_copy(item);
-        if (item.empty()) continue;
-        size_t used = 0;
-        int number = 0;
-        try {
-            number = std::stoi(item, &used);
-        } catch (const std::exception&) {
-            used = 0;
-        }
-        if (used != item.size()) {
-            throw std::runtime_error("Invalid " + key + ": '" + item + "' is not an integer");
-        }
-        result.push_back(number);
+    if (used == item.size()) return (number >= 1 && number <= 118) ? number : 0;
+    std::string symbol = item;
+    for (size_t i = 0; i < symbol.size(); ++i) {
+        symbol[i] = static_cast<char>(i == 0 ? std::toupper(static_cast<unsigned char>(symbol[i]))
+                                             : std::tolower(static_cast<unsigned char>(symbol[i])));
     }
-    return result;
+    return atomic_number_from_symbol(symbol);
+}
+
+// The element of every MD atom type (MD type id -> atomic number) for the MLIP. The MLIP needs the atomic number of every atom; the
+// MD has only type numbers and force-field names (OW, HW, CA, ...), so the element of a type is looked up in this order:
+//   1. the input file's  mlip_elements:  section ("OW: O", atom type name -> element): the user says it;
+//   otherwise from what the files say, and all of it has to agree:
+//   2. the element column of the topology (canonical topologies have one),
+//   3. the element symbol the coordinate file gives the atoms of the type (the first column of the xyz file),
+//   4. the mass of the type (the standard atomic mass it is closest to: 15.999 is oxygen, 1.008 hydrogen).
+// Returns a line for the start-up summary. Stops with a message that says what to write in the input file when it cannot tell or
+// when the files contradict each other.
+std::string resolve_mlip_type_to_z(const Topology& topology, const std::vector<std::string>& coordinate_elements_by_type,
+                                   const std::map<std::string, std::string>& given, std::vector<int>& type_to_z) {
+    std::vector<std::string> names;                          // by MD type id
+    std::vector<int> first_atom;                             // an atom of that type (for its mass)
+    std::vector<std::string> topology_elements;              // by MD type id: the topology's element column ("" none or not consistent)
+    for (int atom = 0; atom < topology.get_num_atoms(); ++atom) {
+        const size_t id = static_cast<size_t>(topology.get_atom_type_id(atom));
+        if (id >= names.size()) {
+            names.resize(id + 1);
+            first_atom.resize(id + 1, -1);
+            topology_elements.resize(id + 1, "\x01");
+        }
+        if (first_atom[id] < 0) {
+            first_atom[id] = atom;
+            names[id] = topology.get_atom_type_name(atom);
+        }
+        const std::string& element = topology.get_atom_element(atom);
+        if (topology_elements[id] == "\x01") topology_elements[id] = element;
+        else if (topology_elements[id] != element) topology_elements[id].clear();
+    }
+    std::string name_list;
+    for (const std::string& name : names) name_list += (name_list.empty() ? "" : ", ") + name;
+    for (const auto& entry : given) {
+        if (std::find(names.begin(), names.end(), entry.first) == names.end()) {
+            throw std::runtime_error("mlip_elements: the topology has no atom type named '" + entry.first + "' (its atom types: " + name_list + ")");
+        }
+    }
+
+    type_to_z.assign(names.size(), 0);
+    std::string description;
+    std::string block;                                       // what to add to the input file for the types dsMD cannot tell
+    std::string problems;
+    for (size_t id = 0; id < names.size(); ++id) {
+        const std::string& name = names[id];
+        const double mass = topology.get_atom_mass(first_atom[id]);
+        const std::string file_symbol = id < coordinate_elements_by_type.size() ? coordinate_elements_by_type[id] : "";
+
+        int z = 0;
+        std::string source;
+        const auto it = given.find(name);
+        if (it != given.end()) {
+            z = element_from_text(it->second);
+            if (z == 0) {
+                throw std::runtime_error("mlip_elements: '" + it->second + "' (for the atom type '" + name + "') is not an element symbol (O, H, Na, ...)");
+            }
+            source = "mlip_elements";
+        } else {
+            // what each file says (0 = nothing usable)
+            const int candidates[3] = {atomic_number_from_symbol(topology_elements[id] == "\x01" ? "" : topology_elements[id]),
+                                       atomic_number_from_symbol(file_symbol), atomic_number_from_mass(mass)};
+            const char* labels[3] = {"topology", "coordinate file", "mass"};
+            std::string disagreement;
+            for (int k = 0; k < 3; ++k) {
+                if (candidates[k] == 0) continue;
+                if (z == 0) {
+                    z = candidates[k];
+                    source = labels[k];
+                } else if (candidates[k] == z) {
+                    source += std::string(", ") + labels[k];
+                } else {
+                    z = -1;
+                }
+            }
+            if (z == -1) {
+                disagreement = "the files disagree about the atom type '" + name + "': ";
+                for (int k = 0; k < 3; ++k) {
+                    if (candidates[k] != 0) disagreement += std::string(labels[k]) + " says " + element_symbol(candidates[k]) + ", ";
+                }
+                problems += disagreement.substr(0, disagreement.size() - 2) + "\n";
+                block += "  " + name + ": <element>\n";
+                continue;
+            }
+        }
+        if (z == 0) {
+            problems += "cannot tell the element of the atom type '" + name + "' (mass " + std::to_string(mass) + ", coordinate file symbol '" +
+                        file_symbol + "')\n";
+            block += "  " + name + ": <element>\n";
+            continue;
+        }
+        type_to_z[id] = z;
+        description += (id ? ", " : "") + name + " = " + element_symbol(z) + " (" + source + ")";
+    }
+    if (!problems.empty()) {
+        throw std::runtime_error("the MLIP needs the element of every atom type, and\n" + problems +
+                                 "Say it in the input file:\n\nmlip_elements:\n" + block);
+    }
+    return description;
 }
 
 std::set<std::string> parse_force_components(const std::string& value) {
@@ -248,7 +342,7 @@ MDSimulation::MDSimulation() :
     current_step(0), 
     total_steps(0), 
     dt(0.001), 
-    python_force_path("python_force"), 
+    python_mlip_path("mlip_python"), 
     cached_potential_energy(0.0),
     neighbor_rebuild_forced(false),
     adaptive_rebuild_armed_(true) {
@@ -338,7 +432,7 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
 
     std::string force_mode;
     if (enable_builtin_forces_) force_mode = "Built-in";
-    if (enable_python_forces_) force_mode += (force_mode.empty() ? "Python" : " + Python");
+    if (enable_python_mlip_) force_mode += (force_mode.empty() ? "MLIP" : " + MLIP");
     if (force_mode.empty()) force_mode = display_name(force_calculation_mode);
 
     const SimulationBox& box = system->get_box();
@@ -419,7 +513,10 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
     item("Compute backend", backend);
     item("Configuration", config_file);
     item("Force calculation", force_mode);
-    item("Nonbonded kernel", display_name(nonbonded_kernel_) + ", " + display_name(force_precision_) + " precision");
+    const bool mlip_only = enable_python_mlip_ && !enable_builtin_forces_;   // no builtin force field is evaluated
+    if (!mlip_only) {
+        item("Nonbonded kernel", display_name(nonbonded_kernel_) + ", " + display_name(force_precision_) + " precision");
+    }
     item("Skin distance", format_real(verlet_skin) + " A");
 
     section("Simulation");
@@ -457,14 +554,27 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
         item("Exclusions", format_count(topology.get_exclusion_keys().size()), 4);
     }
 
-    section("Force Field");
-    item("Nonbonded potential", "Mie (" + std::to_string(ff.mie_repulsive_exponent) +
-                                ", " + std::to_string(ff.mie_attractive_exponent) + ")");
-    item("Cutoff distance", format_real(cutoff_distance) + " A");
-    if (lj_switch_distance > 0.0) {
-        item("LJ switch distance", format_real(lj_switch_distance) + " A");
+    section(mlip_only ? "Machine-Learned Potential" : "Force Field");
+    if (mlip_only) {
+        item("MLIP backend", mlip_backend_name_);
+        if (mlip_backend_name_ == "libtorch") {
+            item("MLIP model", mlip_model_folder_);
+        } else {
+            item("MLIP model", (!mlip_model_type.empty() ? mlip_model_type : force_calculation_type) +
+                                   (mlip_model_path.empty() ? std::string() : " (" + mlip_model_path + ")"));
+        }
+    } else {
+        item("Nonbonded potential", "Mie (" + std::to_string(ff.mie_repulsive_exponent) +
+                                    ", " + std::to_string(ff.mie_attractive_exponent) + ")");
+        item("Cutoff distance", format_real(cutoff_distance) + " A");
+        if (lj_switch_distance > 0.0) {
+            item("LJ switch distance", format_real(lj_switch_distance) + " A");
+        }
     }
     item("Neighbor-list update", interval(neighbor_list_update_freq));
+    if (!mlip_elements_description_.empty()) {
+        item("MLIP elements", mlip_elements_description_);
+    }
 
     section("Output");
     item("Output prefix", output_prefix);
@@ -615,18 +725,23 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         force_calc->set_pme_grid_spacing(pme_grid_spacing_);
     }
 
-    if (enable_python_forces_) {
+    if (enable_python_mlip_) {
         if (is_using_cuda_backend() && mlip_device != "cpu") {
             mlip_device = "cuda";
         }
         if (mlip_dtype.empty()) mlip_dtype = "float32";
+
+        if (system->has_topology()) {
+            mlip_elements_description_ = resolve_mlip_type_to_z(system->get_topology(), system->get_type_coordinate_elements(),
+                                                                mlip_elements_by_type_name_, mlip_type_to_z_);
+        }
 
         MLIPConfig mlip_cfg;
         mlip_cfg.backend = mlip_backend_name_;
         mlip_cfg.model_path = mlip_model_folder_;
         mlip_cfg.type_to_z = mlip_type_to_z_;
         mlip_cfg.verbose = (system->get_rank() == 0);
-        mlip_cfg.python.force_path = python_force_path;
+        mlip_cfg.python.module_path = python_mlip_path;
         mlip_cfg.python.model_path = mlip_model_path;
         mlip_cfg.python.model_type = !mlip_model_type.empty() ? mlip_model_type : force_calculation_type;
         mlip_cfg.python.model_size = mlip_model_size;
@@ -634,6 +749,29 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         mlip_cfg.python.dtype = mlip_dtype;
         mlip_cfg.python.extra_kwargs = mlip_extra_kwargs;
         mlip_backend_ = create_mlip_backend(mlip_cfg);
+
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+        // A backend with a cutoff wants an edge list (libtorch). Nothing below runs for the python backend or for runs
+        // without an MLIP.
+        if (mlip_backend_->cutoff() > 0.0) {
+            if (!cuda_calc_cached_) {
+                throw std::runtime_error(
+                    "mlip_backend 'libtorch' needs the CUDA force calculator, but this run fell back to the CPU one");
+            }
+            const int md_types = system->get_ff_params().num_atom_types;
+            if (md_types > static_cast<int>(mlip_type_to_z_.size())) {
+                throw std::runtime_error(
+                    "the MLIP elements have " + std::to_string(mlip_type_to_z_.size()) + " entries but the system has " +
+                    std::to_string(md_types) + " atom types: give the atomic number of every type");
+            }
+            mlip_step_ = std::make_unique<MLIPStep>();
+            system->set_mlip_ghost_depth(mlip_backend_->ghost_cutoff());   // ghosts as deep as the model reaches
+            if (system->get_rank() == 0) {
+                std::cout << "[MLIP] ghost depth " << mlip_backend_->ghost_cutoff() << " A, halo width "
+                          << system->get_halo_width() << " A, edge cutoff " << mlip_backend_->cutoff() << " A" << std::endl;
+            }
+        }
+#endif
     }
 
     Real cutoff = cutoff_distance;
@@ -975,7 +1113,7 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         bool overlap_halo = false;
 #ifdef USE_CUDA
         overlap_halo = cuda_calc && !should_rebuild &&
-            !enable_python_forces_ &&
+            !enable_python_mlip_ &&
             cuda_calc->supports_overlapped_forces(*system) &&
             system->can_overlap_halo_on_device(*cuda_calc);
         if (overlap_halo) {
@@ -1118,6 +1256,12 @@ void MDSimulation::compute_forces_with_mode(bool need_energy) {
     Real python_potential_energy = 0.0;
 
     if (mlip_backend_) {
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+      if (mlip_step_) {
+        compute_mlip_step_forces(need_energy, python_potential_energy);
+      } else
+#endif
+      {
         const SimulationBox& box = system->get_box();
         ParticleData& particles = system->get_particles();
 
@@ -1157,6 +1301,7 @@ void MDSimulation::compute_forces_with_mode(bool need_energy) {
 
         mlip_backend_->compute(mlip_in, mlip_out);
         python_potential_energy = static_cast<Real>(mlip_out.energy);
+      }
     }
 
     if (!defer_energy) {
@@ -1164,6 +1309,68 @@ void MDSimulation::compute_forces_with_mode(bool need_energy) {
             (force_calc ? force_calc->get_potential_energy() : 0.0) + python_potential_energy;
     }
 }
+
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+void MDSimulation::compute_mlip_step_forces(bool need_energy, Real& energy) {
+    ForceCalculatorCUDA& calc = *cuda_calc_cached_;
+    const SimulationBox& box = system->get_box();
+    cudaStream_t stream = calc.get_force_stream();
+
+    // Axes with no ghosts from the halo (a single rank, or one rank along the axis) get periodic images instead.
+    const bool periodic[3] = {box.periodic_x, box.periodic_y, box.periodic_z};
+    const Real length[3] = {box.lx, box.ly, box.lz};
+    const Real lo[3] = {box.xlo, box.ylo, box.zlo};
+    const Real hi[3] = {box.xhi, box.yhi, box.zhi};
+    MLIPStepGeometry geometry;
+    for (int axis = 0; axis < 3; ++axis) {
+        geometry.box[axis] = length[axis];
+        geometry.lo[axis] = lo[axis];
+        geometry.hi[axis] = hi[axis];
+        geometry.image_axis[axis] = periodic[axis] && !system->axis_is_decomposed(axis);
+    }
+    geometry.depth = mlip_backend_->ghost_cutoff();
+    geometry.slack = verlet_skin + 1.0;   // atoms drift this far outside the subdomain between neighbor rebuilds
+    geometry.edge_shifts = mlip_backend_->uses_edge_shifts();   // images as shifts of edges instead of as atoms
+
+    const int64_t n_owned = static_cast<int64_t>(system->get_local_particles());
+    const int64_t n_md = static_cast<int64_t>(system->get_num_particles());
+    mlip_step_->prepare(calc.get_device_x(), calc.get_device_y(), calc.get_device_z(), calc.get_device_type(),
+                        n_owned, n_md, mlip_backend_->cutoff(), geometry, stream);
+
+    // Once, at the first step: what the model is given (how the periodic images are handled and how big the problem is).
+    static bool first_step_reported = false;
+    if (!first_step_reported && system->get_rank() == 0) {
+        first_step_reported = true;
+        std::cout << "[MLIP] first step: the model sees " << mlip_step_->n_atoms() << " atoms and " << mlip_step_->n_edges()
+                  << " edges; periodic images as "
+                  << (mlip_step_->edge_shifts_active() ? std::string("edge shifts (no image atoms)")
+                                                       : std::to_string(mlip_step_->n_images()) + " image atoms")
+                  << std::endl;
+    }
+
+    MLIPInputs in = mlip_step_->inputs();
+    MLIPOutputs out = mlip_step_->outputs(need_energy);
+    mlip_backend_->compute(in, out);
+    mlip_step_->set_model_virial(out.has_virial, out.virial);
+    mlip_step_->add_forces(calc.get_device_fx(), calc.get_device_fy(), calc.get_device_fz(), stream);
+
+    if (need_energy) {
+        // sum over atoms of r.F, with the model's forces on owned, ghost and image atoms (design 5.3); the MD adds the
+        // per-rank values up (comm_backend_->sum_reduce) where it uses the virial.
+        calc.add_external_virial(static_cast<Real>(mlip_step_->virial(stream)));
+        // The model's energy is the sum over this rank's owned atoms; the builtin energy is already global.
+        energy = comm_backend_->sum_reduce(static_cast<Real>(out.energy));
+    }
+
+    // Ghost atoms carry forces too: send them back to the atoms they are copies of (no-op on a single rank).
+    system->reverse_halo_on_device(calc);
+
+    // The model runs asynchronously on the MD stream. Wait here, so that its GPU time is counted as force time; without
+    // this the next synchronizing step (the thermostat's kinetic energy read) absorbs it and the timing report is wrong.
+    // Nothing else changes: that step waits for the same stream right after.
+    cudaStreamSynchronize(stream);
+}
+#endif
 
 void MDSimulation::refresh_cuda_bonded_topology_if_needed() {
 #ifdef USE_CUDA
@@ -2042,6 +2249,9 @@ void MDSimulation::finalize(double program_wallclock_ms) {
     }
     
     mlip_backend_.reset();
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+    mlip_step_.reset();
+#endif
     
     finalize_trajectory_writers();
 
@@ -2226,6 +2436,9 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             } else if (key == "output_freq") {
                 minimizer_output_freq_ = std::stoi(value);
             }
+        } else if (current_section == "mlip_elements") {
+            // atom type name -> element ("OW: O"); only needed when dsMD cannot tell the element itself
+            mlip_elements_by_type_name_[trim_copy(key)] = trim_copy(value);
         } else if (current_section == "mlip_config" || current_section == "mace_config") {
             if (key == "model_path") {
                 mlip_model_path = value;
@@ -2313,14 +2526,16 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             tau_p_decay_ = std::stod(value);
         } else if (key == "langevin_piston_temp") {
             langevin_piston_temp_ = std::stod(value);
-        } else if (key == "python_force_path") {
-            python_force_path = value;
+        } else if (key == "python_mlip_path") {
+            python_mlip_path = value;
         } else if (key == "mlip_backend") {
             mlip_backend_name_ = trim_copy(value);
         } else if (key == "mlip_model") {
             mlip_model_folder_ = trim_copy(value);
         } else if (key == "mlip_type_to_z") {
-            mlip_type_to_z_ = parse_int_list(value, key);
+            throw std::runtime_error(
+                "mlip_type_to_z is no longer used. Leave it out (dsMD finds the element of every atom type from the coordinate file and the "
+                "masses of the topology), or name the elements of the atom types in a section:\n\nmlip_elements:\n  OW: O\n  HW: H\n");
         } else if (key == "box_x") {
             system->get_box().lx = std::stod(value);
         } else if (key == "box_y") {
@@ -2395,7 +2610,7 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             + "'. Specify one or more of: builtin, python");
     }
     enable_builtin_forces_  = force_components.count("builtin") != 0;
-    enable_python_forces_   = force_components.count("python") != 0;
+    enable_python_mlip_   = force_components.count("python") != 0;
 
     {
         MLIPConfig mlip_check;
@@ -2617,10 +2832,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                       << std::endl;
         }
         std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
-        if (enable_python_forces_) {
+        if (enable_python_mlip_) {
             std::cout << "  MLIP backend: " << (mlip_backend_name_.empty() ? "python" : mlip_backend_name_) << std::endl;
             if (mlip_backend_name_.empty() || mlip_backend_name_ == "python") {
-                std::cout << "  Python force path: " << python_force_path << std::endl;
+                std::cout << "  Python MLIP module path: " << python_mlip_path << std::endl;
             } else {
                 std::cout << "  MLIP model: " << mlip_model_folder_ << std::endl;
             }

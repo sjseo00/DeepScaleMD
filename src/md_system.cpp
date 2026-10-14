@@ -131,7 +131,7 @@ void MDSystem::load_config(const std::string& config_file) {
         }
         
         // Handle section headers (keys without values or with empty values)
-        if (value.empty() || key == "builtin_forcefield" || key == "python_force_interface" || key == "force_calculation") {
+        if (value.empty() || key == "builtin_forcefield" || key == "force_calculation") {
             current_section = key;
             continue;
         }
@@ -140,8 +140,6 @@ void MDSystem::load_config(const std::string& config_file) {
         std::string full_key = key;
         if (current_section == "builtin_forcefield") {
             full_key = "builtin_" + key;
-        } else if (current_section == "python_force_interface") {
-            full_key = "python_" + key;
         } else if (current_section == "force_calculation") {
             // Keep backward compatibility with existing inputs that already
             // include the force_calculation_ prefix inside the section.
@@ -422,6 +420,40 @@ void MDSystem::load_topology(const std::string& topo_file,
     if (element_mismatch >= 0) {
         throw std::runtime_error("Coordinate/topology element-order mismatch at atom " +
                                  std::to_string(element_mismatch));
+    }
+
+    // The element symbol the coordinate file gives the atoms of every MD type (the MLIP reads the element of a type from it when
+    // the type's name is a force-field name such as OW). Found on root, sent to all ranks as one tab-separated string.
+    {
+        std::string joined;
+        if (rank == 0) {
+            const std::string unseen = "\x01";
+            std::vector<std::string> per_type;
+            const size_t n = std::min(coordinate_elements_.size(), static_cast<size_t>(topology->get_num_atoms()));
+            for (size_t i = 0; i < n; ++i) {
+                const size_t id = static_cast<size_t>(topology->get_atom_type_id(static_cast<int>(i)));
+                if (id >= per_type.size()) per_type.resize(id + 1, unseen);
+                if (per_type[id] == unseen) per_type[id] = coordinate_elements_[i];
+                else if (per_type[id] != coordinate_elements_[i]) per_type[id].clear();   // the atoms of this type have different symbols
+            }
+            for (size_t id = 0; id < per_type.size(); ++id) {
+                joined += (id ? "\t" : "") + (per_type[id] == unseen ? std::string() : per_type[id]);
+            }
+        }
+        int length = static_cast<int>(joined.size());
+        MPI_Bcast(&length, 1, MPI_INT, 0, pp_comm_);
+        joined.resize(static_cast<size_t>(length));
+        if (length > 0) MPI_Bcast(&joined[0], length, MPI_CHAR, 0, pp_comm_);
+        type_coordinate_elements_.clear();
+        if (length > 0) {
+            size_t start = 0;
+            while (true) {
+                const size_t tab = joined.find('\t', start);
+                type_coordinate_elements_.push_back(joined.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+                if (tab == std::string::npos) break;
+                start = tab + 1;
+            }
+        }
     }
 
     // Only root performs the O(Nglobal) atom-property lookup.  The resulting
@@ -846,7 +878,7 @@ void MDSystem::initialize_decomposition_runtime() {
             }
         }
     }
-    config.halo.width = physical_cutoff + verlet_skin_ + 1.0;
+    config.halo.width = get_halo_width();
     config.halo.include_edges_and_corners = true;
 #ifdef USE_CUDA
     config.execution = dsdecompx::ExecutionMode::Cuda;
@@ -946,8 +978,40 @@ void MDSystem::warn_if_domain_narrower_than_two_halos(Real halo_width) {
     }
 }
 
+void MDSystem::set_mlip_ghost_depth(Real depth) {
+    mlip_ghost_depth_ = depth;
+    if (decomp_runtime_) {
+        sync_decomposition_domain();   // pushes the new halo width and runs the subdomain check
+    }
+}
+
+bool MDSystem::axis_is_decomposed(int axis) const {
+    if (size <= 1 || !decomp_runtime_) return false;
+    return decomp_runtime_->topology().dimensions()[axis] > 1;
+}
+
+// One halo exchange reaches only the neighboring ranks. A model that needs ghosts deeper than a neighbor's whole
+// subdomain would need atoms from ranks further away; the forces would be wrong without any error, so refuse to run.
+void MDSystem::check_mlip_halo_fits(Real halo_width) const {
+    if (mlip_ghost_depth_ <= 0.0 || !decomp_runtime_) return;
+    const auto& dimensions = decomp_runtime_->topology().dimensions();
+    const auto& local = decomp_runtime_->topology().local_domain();
+    const char axis_name[3] = {'x', 'y', 'z'};
+    for (int axis = 0; axis < 3; ++axis) {
+        const Real width = local.upper[axis] - local.lower[axis];
+        if (dimensions[axis] > 1 && width < halo_width) {
+            throw std::runtime_error(
+                std::string("MLIP ghost layer does not fit: ghost depth ") + std::to_string(mlip_ghost_depth_) +
+                " A + skin + margin = " + std::to_string(halo_width) + " A is deeper than this rank's subdomain along " +
+                axis_name[axis] + " (" + std::to_string(width) + " A). One halo exchange reaches only the neighboring "
+                "ranks, so the forces would be wrong. Use fewer ranks along that axis, a larger box, or a model with a "
+                "smaller cutoff or fewer layers.");
+        }
+    }
+}
+
 void MDSystem::sync_decomposition_domain() {
-    const Real halo_width = physical_cutoff + verlet_skin_ + 1.0;
+    const Real halo_width = get_halo_width();
     // For single-rank MPI the full box is the domain, but the bounds still
     // need refreshing after an NPT box change.
     if (size == 1) {
@@ -975,6 +1039,7 @@ void MDSystem::sync_decomposition_domain() {
 
     const auto& local = decomp_runtime_->topology().local_domain();
     decomp_runtime_->set_halo_width(halo_width);
+    check_mlip_halo_fits(halo_width);
     warn_if_domain_narrower_than_two_halos(halo_width);
     // Update box subdomain bounds used by neighbor list builder and integrator
     box.xlo = local.lower[0]; box.xhi = local.upper[0];

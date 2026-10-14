@@ -21,9 +21,7 @@ static bool is_rank_zero() {
     return rank == 0;
 }
 
-ForceManager::ForceManager() : backend_type("cpu") {
-    config.mode = ForceMode::BUILTIN;
-}
+ForceManager::ForceManager() : backend_type("cpu") {}
 
 void ForceManager::initialize(const ForceConfig& force_config, const std::string& backend) {
     config = force_config;
@@ -31,15 +29,10 @@ void ForceManager::initialize(const ForceConfig& force_config, const std::string
     
     if (is_rank_zero()) {
         std::cout << "Initializing Force Manager:" << std::endl;
-        std::cout << "  Mode: " << (config.mode == ForceMode::BUILTIN ? "Built-in" : "Python") << std::endl;
         std::cout << "  Backend: " << backend_type << std::endl;
     }
     
-    if (config.mode == ForceMode::BUILTIN) {
-        active_calculator = create_builtin_calculator();
-    } else {
-        active_calculator = create_python_calculator();
-    }
+    active_calculator = create_builtin_calculator();
     
     if (active_calculator) {
         active_calculator->initialize();
@@ -93,43 +86,8 @@ std::unique_ptr<ForceCalculator> ForceManager::create_builtin_calculator() {
     }
 }
 
-std::unique_ptr<ForceCalculator> ForceManager::create_python_calculator() {
-    if (is_rank_zero()) {
-        std::cout << "Creating Python force calculator interface" << std::endl;
-    }
-    
-    if (backend_type == "cpu") {
-        return std::make_unique<ForceCalculatorCPU>();
-    }
-#ifdef USE_CUDA
-    else if (backend_type == "cuda") {
-        return std::make_unique<ForceCalculatorCUDA>();
-    }
-#endif
-#ifdef USE_SYCL
-    else if (backend_type == "sycl") {
-        return std::make_unique<ForceCalculatorSYCL>();
-    }
-#endif
-    else {
-        if (is_rank_zero()) {
-            std::cout << "Warning: Unknown backend for Python interface, using CPU" << std::endl;
-        }
-        return std::make_unique<ForceCalculatorCPU>();
-    }
-}
-
 ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std::string, std::string>& config_map) {
     ForceConfig config;
-    
-    auto mode_it = config_map.find("force_calculation_mode");
-    if (mode_it != config_map.end()) {
-        if (mode_it->second == "builtin") {
-            config.mode = ForceMode::BUILTIN;
-        } else if (mode_it->second == "python") {
-            config.mode = ForceMode::PYTHON;
-        }
-    }
     
     auto type_it = config_map.find("force_calculation_type");
     if (type_it != config_map.end()) {
@@ -195,25 +153,6 @@ ForceManager::ForceConfig ForceManager::parse_config_from_map(const std::map<std
         auto coulomb_it = config_map.find("force_calculation_enable_coulomb");
         if (coulomb_it != config_map.end()) {
             config.enable_coulomb = (coulomb_it->second == "true");
-        }
-    }
-    
-    auto path_it = config_map.find("force_calculation_path");
-    if (path_it != config_map.end()) {
-        config.python_path = path_it->second;
-        config.python_force_path = path_it->second;  // Also set old field
-    }
-    
-    auto python_enabled_it = config_map.find("python_enabled");
-    if (python_enabled_it != config_map.end()) {
-        config.python_enabled = (python_enabled_it->second == "true");
-    }
-    
-    auto python_path_it = config_map.find("python_force_path");
-    if (python_path_it != config_map.end()) {
-        config.python_force_path = python_path_it->second;
-        if (config.python_path.empty()) {
-            config.python_path = python_path_it->second;
         }
     }
     

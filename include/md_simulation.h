@@ -31,6 +31,9 @@ class CommBackend;
 class ForceCalculatorCUDA;
 class ConstraintSolver;
 class PmeServer;
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+class MLIPStep;
+#endif
 #ifdef USE_CUDA
 class PmeServerCuda;
 #endif
@@ -58,6 +61,9 @@ private:
     std::unique_ptr<Barostat> barostat;
     std::unique_ptr<NeighborList> neighbor_list_;
     std::unique_ptr<MLIPBackend> mlip_backend_;
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+    std::unique_ptr<MLIPStep> mlip_step_;   // only when an MLIP that wants an edge list (libtorch) is selected
+#endif
     std::unique_ptr<PmeServer> pme_server_;  // non-null only on dedicated PME-group ranks (CPU/SYCL builds)
 #ifdef USE_CUDA
     std::unique_ptr<PmeServerCuda> pme_server_cuda_;  // ditto, CUDA builds (see simulation_backend_factory.cpp)
@@ -95,7 +101,7 @@ private:
     int rebuild_reason_other_ = 0;
     std::string force_calculation_mode;
     bool enable_builtin_forces_ = true;
-    bool enable_python_forces_ = false;
+    bool enable_python_mlip_ = false;     // force_calculation.mode contains 'python': the MLIP path is on
     std::string force_calculation_type;
     std::string force_precision_ = "double";
 
@@ -119,7 +125,9 @@ private:
 
     std::string mlip_backend_name_ = "python";  // mlip_backend: python | libtorch
     std::string mlip_model_folder_;             // mlip_model: converted model folder (libtorch)
-    std::vector<int> mlip_type_to_z_;           // mlip_type_to_z: MD type id -> atomic number
+    std::vector<int> mlip_type_to_z_;           // MD type id -> atomic number: found by dsMD (resolve_mlip_type_to_z), what the backends get
+    std::map<std::string, std::string> mlip_elements_by_type_name_;   // mlip_elements: section, atom type name -> element
+    std::string mlip_elements_description_;     // the same for the start-up summary
     std::string mlip_model_path;
     std::string mlip_model_type;
     std::string mlip_model_size;
@@ -201,7 +209,7 @@ private:
     int current_step;
     int total_steps;
     Real dt;
-    std::string python_force_path;
+    std::string python_mlip_path;         // python_mlip_path: directory with ml_forces.py (mlip_backend: python)
     
     Real cached_potential_energy;       // Store PE from force calculation
     
@@ -344,6 +352,10 @@ private:
     void emit_rank0_output(int step, const OutputMetrics& metrics);
     std::string format_output_line(int step, const OutputMetrics& metrics) const;
     void compute_forces_with_mode(bool need_energy = true);
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+    // The libtorch MLIP on this rank's GPU arrays: images, edges, model, forces, virial, reverse halo (design 4, 5, 8).
+    void compute_mlip_step_forces(bool need_energy, Real& energy);
+#endif
     void reverse_halo_for_bonded_if_needed();
     // CUDA multi-rank: re-derive the device bonded topology if the owned/ghost
     // layout changed. Only needed after a migration or halo rebuild.

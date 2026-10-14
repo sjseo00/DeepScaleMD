@@ -1,10 +1,13 @@
 #include "LibTorchBackend.h"
 
+#include "AOTIRunner.h"
 #include "OpLibLoader.h"
+#include "PythonModules.h"
 #include "TorchModelRunner.h"
 #include "TorchScriptRunner.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <torch/version.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -18,7 +21,7 @@
 
 namespace {
 
-// 1 eV in kcal/mol; the same value as EV_TO_KCAL_PER_MOL in python_force/mlip_interface.py, so results of the
+// 1 eV in kcal/mol; the same value as EV_TO_KCAL_PER_MOL in mlip_python/mlip_interface.py, so results of the
 // python and libtorch backends compare directly (design A.6).
 constexpr double kEvToKcalPerMol = 23.0609;
 
@@ -28,6 +31,29 @@ std::string join_ints(const std::vector<int>& values) {
     std::string text;
     for (int v : values) text += (text.empty() ? "" : ", ") + std::to_string(v);
     return text;
+}
+
+std::string join_strings(const std::vector<std::string>& values) {
+    std::string text;
+    for (const std::string& v : values) text += (text.empty() ? "" : ", ") + v;
+    return text;
+}
+
+// An AOTI package holds kernels compiled for one GPU architecture (metadata target_gpu): refuse one built for the CPU or for
+// another architecture before loading it, with the reason, instead of failing inside the compiled code.
+void check_aoti_target(const MLIPMetadata& meta, const torch::Device& device) {
+    if (meta.target_gpu == "cpu") {
+        throw std::runtime_error("LibTorchBackend: model '" + meta.model_name + "' is an AOTI package compiled for the CPU "
+                                 "(a test package); the MLIP backend runs on the GPU: convert it again with --device cuda");
+    }
+    const cudaDeviceProp& props = *at::cuda::getDeviceProperties(device.index());
+    const std::string here = "sm_" + std::to_string(props.major) + std::to_string(props.minor);
+    if (meta.target_gpu != here) {
+        throw std::runtime_error("LibTorchBackend: model '" + meta.model_name + "' is an AOTI package compiled for " +
+                                 meta.target_gpu + ", but this GPU (" + props.name + ") is " + here +
+                                 "; AOTI packages are specific to a GPU architecture: convert the model again on a node "
+                                 "with this GPU");
+    }
 }
 
 }  // namespace
@@ -41,8 +67,12 @@ struct LibTorchBackend::Impl {
     torch::Tensor type_to_z;                 // int64 [number of MD types] on the device
 
     // Runs the model on tensors already on the device (shared by compute() and the warm-up).
+    // edge_shift is used only by a model with edge shifts (metadata edge_shifts).
     std::vector<torch::Tensor> run(const torch::Tensor& pos, const torch::Tensor& atomic_numbers,
-                                   const torch::Tensor& edge_index, int64_t n_owned) {
+                                   const torch::Tensor& edge_index, const torch::Tensor& edge_shift, int64_t n_owned) {
+        if (metadata.edge_shifts) {
+            return runner->run({pos, atomic_numbers, edge_index, edge_shift, torch::tensor(n_owned, torch::kInt64)});
+        }
         return runner->run({pos, atomic_numbers, edge_index, torch::tensor(n_owned, torch::kInt64)});
     }
 
@@ -53,10 +83,11 @@ struct LibTorchBackend::Impl {
         pos[1][0] = 0.5 * metadata.cutoff;
         torch::Tensor z = torch::full({2}, static_cast<int64_t>(metadata.elements.front()), integer);
         torch::Tensor edges = torch::tensor(std::vector<int64_t>{0, 1, 1, 0}, torch::kInt64).reshape({2, 2}).to(device);
+        torch::Tensor shift = torch::zeros({2, 3}, real);
         torch::NoGradGuard no_grad;
         for (int call = 0; call < kWarmupCalls; ++call) {
-            std::vector<torch::Tensor> out = run(pos, z, edges, 1);
-            if (out.size() != 3 || out[2].sizes() != torch::IntArrayRef({2, 3})) {
+            std::vector<torch::Tensor> out = run(pos, z, edges, shift, 1);
+            if (out.size() != (metadata.edge_shifts ? 4u : 3u) || out[2].sizes() != torch::IntArrayRef({2, 3})) {
                 throw std::runtime_error("LibTorchBackend: the model returned unexpected shapes on the warm-up input");
             }
         }
@@ -79,7 +110,8 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
     // 6. Every MD type must map to an element the model knows. Checked before loading anything heavy.
     if (cfg.type_to_z.empty()) {
         throw std::runtime_error(
-            "LibTorchBackend: mlip_type_to_z is required (atomic number of each MD atom type, e.g. [8, 1]); the "
+            "LibTorchBackend: the element of every MD atom type is required (mlip_type_to_z; dsMD fills it in from the "
+            "coordinate file, the masses or the input file's mlip_elements: section); the "
             "model supports atomic numbers " + join_ints(meta.elements));
     }
     std::vector<int64_t> table;
@@ -99,15 +131,50 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
     s.device = torch::Device(torch::kCUDA, c10::cuda::current_device());
     s.type_to_z = torch::tensor(table, torch::kInt64).to(s.device);
 
-    // 3. custom operator libraries, before the model is loaded
+    // 2b. versions: what the model was converted with against what runs here (design 7.4)
+    {
+        int cuda_version = 0;
+        cudaRuntimeGetVersion(&cuda_version);   // e.g. 11080 for CUDA 11.8
+        const std::string cuda_text = std::to_string(cuda_version / 1000) + "." + std::to_string((cuda_version % 1000) / 10);
+        const VersionReport versions = check_runtime_versions(meta, TORCH_VERSION, cuda_text);
+        for (const std::string& warning : versions.warnings) std::cerr << "LibTorchBackend: warning: " << warning << std::endl;
+        if (!versions.errors.empty()) {
+            std::string message = "LibTorchBackend:";
+            for (const std::string& error : versions.errors) message += " " + error + ".";
+            throw std::runtime_error(message);
+        }
+    }
+
+    // 3. operators the model calls, before it is loaded. cuEquivariance registers its operators from Python (design 11.3,
+    // A.11-9): importing its module in the embedded interpreter is all the Python this backend runs; the model itself is
+    // executed by LibTorch. The libraries (OpenEquivariance: a plain operator library) are dlopened after that.
+    if (!meta.required_python_modules.empty()) {
+        std::string python_torch;
+        try {
+            python_torch = import_python_modules(meta.required_python_modules);
+        } catch (const std::exception& e) {
+            throw std::runtime_error("LibTorchBackend: model '" + meta.model_name + "' needs the Python modules " +
+                                     join_strings(meta.required_python_modules) + " imported before it can be loaded: " + e.what());
+        }
+        // "2.7.1+cu118" against TORCH_VERSION "2.7.1": two torch builds in one process would crash later, so stop here.
+        if (python_torch.substr(0, python_torch.find('+')) != TORCH_VERSION) {
+            throw std::runtime_error("LibTorchBackend: the embedded Python imports torch " + python_torch + ", but this program is "
+                                     "linked with LibTorch " + TORCH_VERSION + "; activate the environment with the same torch "
+                                     "(the one the model was converted in), or put its site-packages on PYTHONPATH");
+        }
+    }
     load_op_libs(meta.required_op_libs);
 
     // 4. the runner for this file format
     if (meta.backend == "torchscript") {
         s.runner = std::make_unique<TorchScriptRunner>(
             (std::filesystem::path(cfg.model_path) / "model.pt").string(), s.device);
+    } else if (meta.backend == "aoti") {
+        check_aoti_target(meta, s.device);
+        s.runner = std::make_unique<AOTIRunner>(
+            (std::filesystem::path(cfg.model_path) / "model.pt2").string(), s.device);
     } else {
-        throw std::runtime_error("LibTorchBackend: backend '" + meta.backend + "' is not implemented yet");
+        throw std::runtime_error("LibTorchBackend: backend '" + meta.backend + "' is not implemented");
     }
 
     // 7. warm-up
@@ -124,6 +191,7 @@ LibTorchBackend::~LibTorchBackend() = default;
 
 double LibTorchBackend::cutoff() const { return impl_->metadata.cutoff; }
 double LibTorchBackend::ghost_cutoff() const { return impl_->metadata.ghost_cutoff; }
+bool LibTorchBackend::uses_edge_shifts() const { return impl_->metadata.edge_shifts; }
 const MLIPMetadata& LibTorchBackend::metadata() const { return impl_->metadata; }
 
 void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
@@ -165,7 +233,16 @@ void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
         ? torch::from_blob(const_cast<int64_t*>(in.d_edge_index), {2, n_edges}, int64)
         : torch::empty({2, 0}, int64);
 
-    std::vector<torch::Tensor> result = s.run(pos, atomic_numbers, edge_index, in.n_owned);
+    torch::Tensor edge_shift;
+    if (s.metadata.edge_shifts) {
+        // [E, 3] in the model's dtype; no shifts given = every edge is between atoms that are really there
+        const auto real_model = torch::TensorOptions().device(s.device).dtype(s.dtype);
+        edge_shift = (in.d_edge_shift && n_edges > 0)
+            ? torch::from_blob(const_cast<double*>(in.d_edge_shift), {n_edges, 3}, real64).to(s.dtype)
+            : torch::zeros({n_edges, 3}, real_model);
+    }
+
+    std::vector<torch::Tensor> result = s.run(pos, atomic_numbers, edge_index, edge_shift, in.n_owned);
     const torch::Tensor& energy = result[0];
     const torch::Tensor& atom_energy = result[1];
     const torch::Tensor& forces = result[2];
@@ -187,5 +264,9 @@ void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
     // The only host synchronization, and only when the caller wants the energy this step.
     if (out.need_energy) {
         out.energy = energy.item<double>() * s.energy_to_md;
+        if (s.metadata.edge_shifts) {
+            out.virial = result[3].item<double>() * s.energy_to_md;
+            out.has_virial = true;
+        }
     }
 }

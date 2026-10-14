@@ -1,10 +1,12 @@
 #ifndef MLIP_PYTHON_BACKEND_H
 #define MLIP_PYTHON_BACKEND_H
 
-// The embedded-CPython MLIP path (python_force/ml_forces.py) behind MLIPBackend. Positions go to Python
+// The embedded-CPython MLIP path (mlip_python/ml_forces.py) behind MLIPBackend. Positions go to Python
 // as host arrays and the returned forces are added to the MD force arrays. In a CUDA build the device
 // arrays are staged through host memory every call.
-// Python.h and NumPy are used only in PythonBackend.cpp (ENABLE_PYTHON_INTERFACE).
+// Python.h and NumPy are used only in PythonBackend.cpp (ENABLE_PYTHON_INTERFACE). A build without it refuses this
+// backend when it is created; a failure in Python (import, model, force call) stops the run with the Python traceback,
+// it never turns into zero forces.
 
 #include "MLIPBackend.h"
 
@@ -25,15 +27,15 @@ public:
     double ghost_cutoff() const override { return 0.0; }  // MD keeps its own halo width
 
 private:
-    void initialize_python(const std::string& force_module_path);
-    void initialize_ml_model(const PythonMLIPConfig& py);
+    void initialize_python(const std::string& module_path);
+    void initialize_ml_model(const PythonMLIPConfig& py, const std::vector<int>& type_to_z);
     void finalize_python();
     // Calls ml_forces.compute_force on host arrays and adds the result to fx/fy/fz[0, n).
     // `type` is read only when n differs from the previous call (the Python side caches the atom types).
     void call_python(const double* x, const double* y, const double* z, const int* type, size_t n,
                      double* fx, double* fy, double* fz, const double* cell, const bool* pbc);
 
-    std::string python_force_path_ = "python_force";
+    std::string python_mlip_path_ = "mlip_python";
     void* py_ml_module_ = nullptr;             // PyObject* (ml_forces module)
     void* py_ml_compute_func_ = nullptr;       // PyObject* (ml_forces.compute_force)
     void* py_ml_get_energy_func_ = nullptr;    // PyObject* (ml_forces.get_last_energy)

@@ -135,10 +135,15 @@ __device__ __forceinline__ void for_each_neighbor(int64_t p, const double* sx, c
     }
 }
 
-__global__ void count_kernel(int64_t n, const double* sx, const double* sy, const double* sz, const int32_t* starts,
-                             Grid grid, double cutoff2, int64_t* counts) {
+// Atoms from n_centers on (periodic images) are not centers of an edge; n_centers = n means every atom is.
+__global__ void count_kernel(int64_t n, int64_t n_centers, const int32_t* sorted_atom, const double* sx, const double* sy,
+                             const double* sz, const int32_t* starts, Grid grid, double cutoff2, int64_t* counts) {
     const int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (p >= n) return;
+    if (sorted_atom[p] >= n_centers) {
+        counts[p] = 0;
+        return;
+    }
     int64_t count = 0;
     for_each_neighbor(p, sx, sy, sz, starts, grid, cutoff2, [&](int) { ++count; });
     counts[p] = count;
@@ -149,16 +154,26 @@ __global__ void total_kernel(int64_t n, const int64_t* offsets, const int64_t* c
 }
 
 // Same traversal as count_kernel, so each center writes exactly the slots its count reserved.
-__global__ void fill_kernel(int64_t n, int64_t n_edges, const double* sx, const double* sy, const double* sz,
-                            const int32_t* sorted_atom, const int32_t* starts, Grid grid, double cutoff2,
-                            const int64_t* offsets, int64_t* edges) {
+// With `owner` (periodic images as shifts): row 1 is the real atom the neighbor copies, and shift [E, 3] gets the
+// neighbor's offset from it.
+__global__ void fill_kernel(int64_t n, int64_t n_edges, int64_t n_centers, const double* sx, const double* sy,
+                            const double* sz, const int32_t* sorted_atom, const int32_t* starts, Grid grid, double cutoff2,
+                            const int64_t* offsets, int64_t* edges, const int32_t* owner, const double* shift_x,
+                            const double* shift_y, const double* shift_z, double* shift) {
     const int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (p >= n) return;
-    int64_t slot = offsets[p];
     const int64_t center = sorted_atom[p];
+    if (center >= n_centers) return;
+    int64_t slot = offsets[p];
     for_each_neighbor(p, sx, sy, sz, starts, grid, cutoff2, [&](int q) {
-        edges[slot] = center;                      // row 0: i
-        edges[n_edges + slot] = sorted_atom[q];    // row 1: j
+        const int32_t atom = sorted_atom[q];
+        edges[slot] = center;                                    // row 0: i
+        edges[n_edges + slot] = owner ? owner[atom] : atom;      // row 1: j
+        if (owner) {
+            shift[3 * slot] = shift_x[atom];
+            shift[3 * slot + 1] = shift_y[atom];
+            shift[3 * slot + 2] = shift_z[atom];
+        }
         ++slot;
     });
 }
@@ -185,6 +200,7 @@ EdgeBuilder::~EdgeBuilder() {
     cudaFree(d_offsets_);
     cudaFree(d_temp_);
     cudaFree(d_edges_);
+    cudaFree(d_shift_);
     cudaFree(d_status_);
     cudaFreeHost(h_status_);
 }
@@ -202,8 +218,13 @@ void EdgeBuilder::ensure(T*& ptr, size_t& capacity, size_t needed) {
 }
 
 int64_t EdgeBuilder::build(const double* d_x, const double* d_y, const double* d_z, int64_t n, double cutoff,
-                           cudaStream_t stream, const double* lo, const double* hi) {
+                           cudaStream_t stream, const double* lo, const double* hi, const Images* images) {
     if (!(cutoff > 0.0)) throw std::invalid_argument("EdgeBuilder::build: cutoff must be positive");
+    if (images && (images->n_centers < 0 || images->n_centers > n || !images->d_owner || !images->d_shift_x ||
+                   !images->d_shift_y || !images->d_shift_z)) {
+        throw std::invalid_argument("EdgeBuilder::build: invalid periodic image description");
+    }
+    const int64_t n_centers = images ? images->n_centers : n;
     if (n < 0 || n >= std::numeric_limits<int32_t>::max()) {
         throw std::invalid_argument("EdgeBuilder::build: atom count out of range");
     }
@@ -266,7 +287,8 @@ int64_t EdgeBuilder::build(const double* d_x, const double* d_y, const double* d
     cell_starts_kernel<<<blocks_for(grid.cells + 1), kThreads, 0, stream>>>(grid.cells, n, d_cell_sorted_, d_starts_);
 
     // 5. count the neighbors of every atom, prefix sum, total
-    count_kernel<<<blocks_for(n), kThreads, 0, stream>>>(n, d_sx_, d_sy_, d_sz_, d_starts_, grid, cutoff2, d_counts_);
+    count_kernel<<<blocks_for(n), kThreads, 0, stream>>>(n, n_centers, d_atom_sorted_, d_sx_, d_sy_, d_sz_, d_starts_, grid,
+                                                          cutoff2, d_counts_);
     cub::DeviceScan::ExclusiveSum(d_temp_, scan_bytes, d_counts_, d_offsets_, static_cast<int>(n), stream);
     total_kernel<<<1, 1, 0, stream>>>(n, d_offsets_, d_counts_, &d_status_->edges);
 
@@ -282,8 +304,11 @@ int64_t EdgeBuilder::build(const double* d_x, const double* d_y, const double* d
 
     // 6. fill [2, E]
     ensure(d_edges_, cap_edges_, 2 * static_cast<size_t>(n_edges_));
-    fill_kernel<<<blocks_for(n), kThreads, 0, stream>>>(n, n_edges_, d_sx_, d_sy_, d_sz_, d_atom_sorted_, d_starts_,
-                                                         grid, cutoff2, d_offsets_, d_edges_);
+    if (images) ensure(d_shift_, cap_shift_, 3 * static_cast<size_t>(n_edges_));
+    fill_kernel<<<blocks_for(n), kThreads, 0, stream>>>(
+        n, n_edges_, n_centers, d_sx_, d_sy_, d_sz_, d_atom_sorted_, d_starts_, grid, cutoff2, d_offsets_, d_edges_,
+        images ? images->d_owner : nullptr, images ? images->d_shift_x : nullptr, images ? images->d_shift_y : nullptr,
+        images ? images->d_shift_z : nullptr, images ? d_shift_ : nullptr);
     EDGE_CUDA_CHECK(cudaGetLastError());
     return n_edges_;
 }
