@@ -119,6 +119,18 @@ def _build_tensornet(elements, cutoff, seed, model_path, head, dtype, accel, dev
     return TensorNetAdapter(load_tensornet_model(model_path), model_name=Path(model_path).name)
 
 
+def _build_bam(elements, cutoff, seed, model_path, head, dtype, accel, device) -> MLIPAdapter:
+    if accel != "e3nn":
+        raise ValueError("arch 'bam' supports --accel e3nn only so far")
+    if not model_path:
+        raise ValueError("arch 'bam' needs --model <BAM checkpoint .pkl file>")
+    if elements or cutoff is not None or head:
+        raise ValueError("arch 'bam' takes its elements and cutoff from the model; do not pass --elements, --cutoff or --head")
+    from .bam import BAMAdapter, load_bam_model   # imported here: bam_torch is optional
+    model, checkpoint = load_bam_model(model_path, accel=accel)
+    return BAMAdapter(model, checkpoint, model_name=Path(model_path).stem)
+
+
 ADAPTERS: Dict[str, Callable[..., MLIPAdapter]] = {
     "toy_pair": _build_toy_pair,
     "toy_mp": _build_toy_mp,
@@ -131,6 +143,7 @@ ADAPTERS: Dict[str, Callable[..., MLIPAdapter]] = {
     "mattersim": _build_mattersim,
     "deepmd": _build_deepmd,
     "tensornet": _build_tensornet,
+    "bam": _build_bam,
 }
 
 

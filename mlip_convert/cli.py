@@ -1,11 +1,12 @@
 """Command line converter:  python -m mlip_convert <arch> --backend torchscript -o <folder>
 
 Writes model.pt (--backend aoti: model.pt2), metadata.json and reference.json into <folder> (design 3.5). <arch> is toy_pair, toy_mp, mace,
-nequip (allegro is the same path), sevennet, painn, chgnet, mattersim, deepmd or tensornet:
+nequip (allegro is the same path), sevennet, painn, chgnet, mattersim, deepmd, tensornet or bam:
   mace: --model <saved MACE model>, needs mace-torch;   nequip, allegro: --model <.ckpt or .nequip.zip>, needs nequip;
   sevennet: --model <checkpoint .pth>, needs sevenn;    painn: --model <schnetpack best_model> --elements 1,6,7,8,9, needs schnetpack;
   chgnet: --model optional (the weights inside the package), needs chgnet;   mattersim: --model <checkpoint .pth>, needs mattersim;
-  deepmd: --model <training checkpoint .pt> (strictly local descriptors), needs deepmd-kit;   tensornet: --model <matgl model folder>, needs matgl.
+  deepmd: --model <training checkpoint .pt> (strictly local descriptors), needs deepmd-kit;   tensornet: --model <matgl model folder>, needs matgl;
+  bam: --model <BAM checkpoint .pkl>, needs bam_torch.
 What each model needs and what is not supported: docs/mlip_converter_models.md.
 """
 import argparse

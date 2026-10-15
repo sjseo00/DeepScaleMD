@@ -17,7 +17,9 @@ What the installed mace does, which this adapter relies on:
 mace's own LAMMPS export (mace/cli/create_lammps_model.py) does the same thing: node energy times a local mask, then
 autograd.grad with respect to positions.
 """
+import copy
 import os
+import types
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -86,6 +88,29 @@ def _to_openeq(model: torch.nn.Module, device: str) -> torch.nn.Module:
         torch.set_default_dtype(previous_default)
 
 
+def _make_patched_forwards_scriptable(model: torch.nn.Module) -> int:
+    """mace's cueq / openeq conversions (mace/modules/wrapper_ops.py) replace a convolution's forward by a function of their own
+    that calls `self.original_forward`, a bound method stored on the instance; TorchScript cannot convert such an attribute
+    ("Module ... has no attribute 'original_forward'"). Here the convolution before the patch becomes a submodule of its own
+    (same parameters, its own TorchScript class), so `self.original_forward(...)` is an ordinary submodule call. Returns how many
+    modules were changed."""
+    changed = 0
+    for module in list(model.modules()):
+        if not isinstance(module.__dict__.get("original_forward"), types.MethodType):
+            continue
+        original = copy.copy(module)
+        original._parameters = dict(module._parameters)
+        original._buffers = dict(module._buffers)
+        original._modules = dict(module._modules)
+        original.__class__ = type(type(module).__name__ + "Original", (type(module),), {})
+        original.__dict__.pop("forward", None)
+        original.__dict__.pop("original_forward", None)
+        del module.__dict__["original_forward"]
+        module.original_forward = original
+        changed += 1
+    return changed
+
+
 def load_mace_model(path, dtype: torch.dtype = torch.float64, accel: str = "e3nn", device: str = "cpu") -> torch.nn.Module:
     """A saved MACE model (torch.save of the whole model, as mace's tools write it) in eval mode, without gradients.
     accel "cueq" / "openeq" converts it to cuEquivariance / OpenEquivariance tensor products (on `device`). While e3nn's
@@ -104,6 +129,8 @@ def load_mace_model(path, dtype: torch.dtype = torch.float64, accel: str = "e3nn
     model = model.to(dtype).eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+    if accel != "e3nn":
+        _make_patched_forwards_scriptable(model)
     return model
 
 

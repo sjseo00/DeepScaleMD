@@ -86,7 +86,10 @@ def _resolve_openeq() -> AccelInfo:
     path = Path(library)
     if not path.is_file():
         raise AccelError(f"openequivariance reports its extension at {library}, which does not exist")
-    return AccelInfo([str(path.resolve())], [], {"openequivariance": package_version("openequivariance")})
+    # The library holds the kernels, but the backward pass of its operators is registered by Python code when the package is
+    # imported (torch.library.register_autograd). Without that import a C++ program gets correct energies and wrong forces
+    # ("an autograd kernel was not registered ... silently incorrect behavior"), so the package is imported first like cueq's.
+    return AccelInfo([str(path.resolve())], ["openequivariance"], {"openequivariance": package_version("openequivariance")})
 
 
 def _resolve_flash() -> AccelInfo:
