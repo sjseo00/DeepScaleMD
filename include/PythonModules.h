@@ -25,6 +25,9 @@ void add_active_python_environment();
 // thread runs it: the calling thread, or an autograd engine thread that computes the backward pass of a TorchScript model.
 // (A GIL held by the main thread while it waits for the engine would deadlock that.)
 //
+// "openequivariance" gets one more check after its import: its backward pass is registered only if its torch extension was
+// built, and a failed build is silent (energies right, forces wrong), so a missing registration throws with the build error.
+//
 // Throws std::runtime_error with the Python error text when an import fails, and when this build has no embedded Python
 // (configure with -DENABLE_PYTHON=ON).
 std::string import_python_modules(const std::vector<std::string>& modules);

@@ -61,6 +61,39 @@ struct GilScope {
     }
 };
 
+// A module can import cleanly and still not have registered what the model needs. OpenEquivariance registers the backward
+// pass of its operators (torch.library.register_autograd) only when its torch extension was built and loaded, and it keeps
+// the build error to itself: the import succeeds, the energies are right and every force is silently wrong ("an autograd
+// kernel was not registered ... silently incorrect behavior"). Returns what is missing, or "" when all is in place.
+std::string openequivariance_problem() {
+    static const char* const code =
+        "import torch\n"
+        "problem = ''\n"
+        "try:\n"
+        "    from openequivariance._torch import extlib as _extlib\n"
+        "    _built = getattr(_extlib, 'BUILT_EXTENSION', True)\n"
+        "    _error = getattr(_extlib, 'BUILT_EXTENSION_ERROR', None)\n"
+        "except Exception:\n"
+        "    _built, _error = True, None\n"
+        "if not _built:\n"
+        "    problem = 'its torch extension was not built or loaded (%s)' % (_error,)\n"
+        "else:\n"
+        "    try:\n"
+        "        _ok = torch._C._dispatch_has_kernel_for_dispatch_key('libtorch_tp_jit::jit_conv_forward', 'Autograd')\n"
+        "    except Exception as _e:\n"
+        "        problem = 'its operator libtorch_tp_jit::jit_conv_forward does not exist (%s)' % (_e,)\n"
+        "    else:\n"
+        "        if not _ok:\n"
+        "            problem = 'the backward pass of its operator libtorch_tp_jit::jit_conv_forward is not registered'\n";
+    PyRef globals(PyDict_New());
+    if (!globals.object) throw std::runtime_error("cannot create a Python dictionary: " + take_python_error());
+    PyDict_SetItemString(globals.object, "__builtins__", PyEval_GetBuiltins());
+    PyRef ran(PyRun_String(code, Py_file_input, globals.object, globals.object));
+    if (!ran.object) throw std::runtime_error("the OpenEquivariance check failed to run: " + take_python_error());
+    PyObject* problem = PyDict_GetItemString(globals.object, "problem");   // borrowed
+    return (problem && PyUnicode_Check(problem)) ? PyUnicode_AsUTF8(problem) : "";
+}
+
 #endif
 
 }  // namespace
@@ -84,7 +117,7 @@ std::string import_python_modules(const std::vector<std::string>& modules) {
     throw std::runtime_error(
         "this model needs the Python modules " + names + " imported before it can be loaded (they register "
         "operators of the model from Python), and this build has no embedded Python: configure dsMD with -DENABLE_PYTHON=ON "
-        "(Python 3 development files and NumPy), or use the e3nn or OpenEquivariance version of the model");
+        "(Python 3 development files and NumPy), or use the e3nn version of the model");
 #else
     std::string torch_version;
     GilScope gil;
@@ -106,6 +139,18 @@ std::string import_python_modules(const std::vector<std::string>& modules) {
             PyRef version(PyObject_GetAttrString(module.object, "__version__"));
             if (version.object && PyUnicode_Check(version.object)) torch_version = PyUnicode_AsUTF8(version.object);
             PyErr_Clear();
+        }
+        if (name == "openequivariance") {
+            const std::string problem = openequivariance_problem();
+            if (!problem.empty()) {
+                throw std::runtime_error(
+                    "openequivariance was imported, but " + problem + ". Run with it and the energies are right while every "
+                    "force is wrong. Check on the compute node, in the activated environment: python -c 'import "
+                    "openequivariance; from openequivariance._torch import extlib; print(extlib.BUILT_EXTENSION, "
+                    "extlib.BUILT_EXTENSION_ERROR)' (the extension is compiled when it is not cached for this node: a C++ compiler "
+                    "(gcc 9 or newer), ninja and nvcc must be on PATH in the job; a stale lock file in ~/.cache/torch_extensions/ "
+                    "also stops the build)");
+            }
         }
     }
     return torch_version;
