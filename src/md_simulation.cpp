@@ -11,6 +11,7 @@
 #include "simulation_backend_factory.h"
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
 #include "MLIPStep.cuh"
+#include "MLIPReplica.h"
 #endif
 #include "pme_rank_split.h"
 #include "pme_server.h"
@@ -342,7 +343,7 @@ MDSimulation::MDSimulation() :
     current_step(0), 
     total_steps(0), 
     dt(0.001), 
-    python_mlip_path("mlip_python"), 
+    python_mlip_path("MLIP_tools/mlip_python"), 
     cached_potential_energy(0.0),
     neighbor_rebuild_forced(false),
     adaptive_rebuild_armed_(true) {
@@ -736,11 +737,17 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
                                                                 mlip_elements_by_type_name_, mlip_type_to_z_);
         }
 
+        mlip_comm_ = make_mlip_rank_comm();
         MLIPConfig mlip_cfg;
+        mlip_cfg.comm = mlip_comm_.get();
         mlip_cfg.backend = mlip_backend_name_;
         mlip_cfg.model_path = mlip_model_folder_;
         mlip_cfg.type_to_z = mlip_type_to_z_;
         mlip_cfg.verbose = (system->get_rank() == 0);
+        mlip_cfg.allow_tf32 = tf32_;
+        if (tf32_ && mlip_backend_name_ != "libtorch" && system->get_rank() == 0) {
+            std::cerr << "[MLIP] advanced.tf32 only applies to mlip_backend: libtorch; ignored" << std::endl;
+        }
         mlip_cfg.python.module_path = python_mlip_path;
         mlip_cfg.python.model_path = mlip_model_path;
         mlip_cfg.python.model_type = !mlip_model_type.empty() ? mlip_model_type : force_calculation_type;
@@ -748,6 +755,11 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         mlip_cfg.python.device = mlip_device;
         mlip_cfg.python.dtype = mlip_dtype;
         mlip_cfg.python.extra_kwargs = mlip_extra_kwargs;
+        if (system->get_rank() == 0) {
+            // On stderr: the start-up std::cout is silenced. Tells which dsMD a log came from (this line exists only in a build that
+            // reads metadata.json "layer_exchange").
+            std::cerr << "[dsMD] built " << __DATE__ << " " << __TIME__ << "; reads layer_exchange models" << std::endl;
+        }
         mlip_backend_ = create_mlip_backend(mlip_cfg);
 
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
@@ -1311,7 +1323,74 @@ void MDSimulation::compute_forces_with_mode(bool need_energy) {
 }
 
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+namespace {
+
+// Once, at the first step: what the model of each rank has to do, so that the cost of the ghost atoms can be seen. Collective
+// over the ranks (every rank calls it at the same step). Rank 0 prints. `owned` = the atoms the rank owns. `layered`: a layer-exchange
+// model, whose edges all go onto owned atoms, so no edge is computed twice and the ghost atoms add no work to the layers.
+void report_mlip_load(MLIPRankComm& comm, const MLIPStep& step, int64_t owned, const char* how, bool layered = false) {
+    const double mine[3] = {static_cast<double>(owned), static_cast<double>(step.n_atoms()), static_cast<double>(step.n_edges())};
+    std::vector<double> all;
+    std::vector<int64_t> counts;
+    comm.allgatherv(mine, 3, all, counts);
+    if (comm.rank() != 0) return;
+    const int ranks = comm.size();
+    double lo[3], hi[3], sum[3] = {0, 0, 0};
+    for (int k = 0; k < 3; ++k) lo[k] = hi[k] = all[k];
+    for (int r = 0; r < ranks; ++r) {
+        for (int k = 0; k < 3; ++k) {
+            const double v = all[3 * static_cast<size_t>(r) + k];
+            lo[k] = std::min(lo[k], v);
+            hi[k] = std::max(hi[k], v);
+            sum[k] += v;
+        }
+    }
+    auto range = [](double a, double b) {
+        return a == b ? std::to_string(static_cast<long long>(a))
+                      : std::to_string(static_cast<long long>(a)) + ".." + std::to_string(static_cast<long long>(b));
+    };
+    std::cout << "[MLIP] first step" << how << ": the model sees " << step.n_atoms() << " atoms and " << step.n_edges()
+              << " edges on rank 0" << (step.edges_pruned() ? " (edges that cannot change the owned energies left out)" : "")
+              << "; periodic images as "
+              << (step.edge_shifts_active() ? std::string("edge shifts (no image atoms)")
+                                            : std::to_string(step.n_images()) + " image atoms")
+              << std::endl;
+    if (ranks > 1 && layered) {
+        std::cout << "[MLIP]   per rank: owned " << range(lo[0], hi[0]) << ", model atoms " << range(lo[1], hi[1]) << ", edges "
+                  << range(lo[2], hi[2]) << "; every edge is computed by one rank only (" << static_cast<long long>(sum[2])
+                  << " edges in total), the ghost atoms only carry the features they receive" << std::endl;
+    } else if (ranks > 1) {
+        std::cout << "[MLIP]   per rank: owned " << range(lo[0], hi[0]) << ", model atoms " << range(lo[1], hi[1])
+                  << ", edges " << range(lo[2], hi[2]) << "; the models of all " << ranks << " ranks together see "
+                  << static_cast<long long>(sum[1]) << " atoms for " << static_cast<long long>(sum[0]) << " real ones (x"
+                  << std::fixed << std::setprecision(2) << (sum[0] > 0 ? sum[1] / sum[0] : 0.0) << std::defaultfloat
+                  << "): that is the work the ghost atoms add" << std::endl;
+    }
+}
+
+// The transport of a layer-exchange model (MLIPHaloTransport): the node features go through dsDecompX along the halo plan of this step.
+class MDHaloTransport : public MLIPHaloTransport {
+public:
+    MDHaloTransport(MDSystem& system, ForceCalculatorCUDA& calculator) : system_(system), calculator_(calculator) {}
+    void forward(const MLIPHaloBuffer& b) override { run(b, false); }
+    void reverse(const MLIPHaloBuffer& b) override { run(b, true); }
+
+private:
+    void run(const MLIPHaloBuffer& b, bool reverse) {
+        if (!b.on_device) throw std::runtime_error("MDHaloTransport: the node features must be in device memory");
+        system_.exchange_field_on_device(calculator_, b.data, b.n_owned + b.n_ghost, b.width, b.element_bytes, reverse, b.stream);
+    }
+    MDSystem& system_;
+    ForceCalculatorCUDA& calculator_;
+};
+
+}  // namespace
+
 void MDSimulation::compute_mlip_step_forces(bool need_energy, Real& energy) {
+    if (system->mlip_replicated()) {
+        compute_mlip_replicated_forces(need_energy, energy);
+        return;
+    }
     ForceCalculatorCUDA& calc = *cuda_calc_cached_;
     const SimulationBox& box = system->get_box();
     cudaStream_t stream = calc.get_force_stream();
@@ -1331,6 +1410,9 @@ void MDSimulation::compute_mlip_step_forces(bool need_energy, Real& energy) {
     geometry.depth = mlip_backend_->ghost_cutoff();
     geometry.slack = verlet_skin + 1.0;   // atoms drift this far outside the subdomain between neighbor rebuilds
     geometry.edge_shifts = mlip_backend_->uses_edge_shifts();   // images as shifts of edges instead of as atoms
+    geometry.prune_row = mlip_backend_->edge_receiver_row();    // leave out the edges that cannot change owned energies
+    const bool layered = mlip_backend_->exchanges_layers();     // ghost atoms one cutoff deep, features exchanged between the layers
+    geometry.owned_receivers_only = layered;
 
     const int64_t n_owned = static_cast<int64_t>(system->get_local_particles());
     const int64_t n_md = static_cast<int64_t>(system->get_num_particles());
@@ -1339,16 +1421,15 @@ void MDSimulation::compute_mlip_step_forces(bool need_energy, Real& energy) {
 
     // Once, at the first step: what the model is given (how the periodic images are handled and how big the problem is).
     static bool first_step_reported = false;
-    if (!first_step_reported && system->get_rank() == 0) {
+    if (!first_step_reported) {
         first_step_reported = true;
-        std::cout << "[MLIP] first step: the model sees " << mlip_step_->n_atoms() << " atoms and " << mlip_step_->n_edges()
-                  << " edges; periodic images as "
-                  << (mlip_step_->edge_shifts_active() ? std::string("edge shifts (no image atoms)")
-                                                       : std::to_string(mlip_step_->n_images()) + " image atoms")
-                  << std::endl;
+        report_mlip_load(*mlip_comm_, *mlip_step_, n_owned,
+                         layered ? " (layer exchange: ghost atoms one cutoff deep, node features sent between the layers)" : "", layered);
     }
 
     MLIPInputs in = mlip_step_->inputs();
+    MDHaloTransport halo(*system, calc);
+    if (layered) in.halo = &halo;
     MLIPOutputs out = mlip_step_->outputs(need_energy);
     mlip_backend_->compute(in, out);
     mlip_step_->set_model_virial(out.has_virial, out.virial);
@@ -1368,6 +1449,60 @@ void MDSimulation::compute_mlip_step_forces(bool need_energy, Real& energy) {
     // The model runs asynchronously on the MD stream. Wait here, so that its GPU time is counted as force time; without
     // this the next synchronizing step (the thermostat's kinetic energy read) absorbs it and the timing report is wrong.
     // Nothing else changes: that step waits for the same stream right after.
+    cudaStreamSynchronize(stream);
+}
+
+// A subdomain is narrower than the ghost layer of the model, so a halo exchange cannot supply it (MDSystem::mlip_replicated):
+// every rank gets the atoms of all ranks, computes the whole system like a single rank (periodic images on every periodic axis,
+// the model's energy over all atoms) and keeps the forces of its own atoms, which are the first n_owned of the gathered ones.
+// No halo ghosts are used and none of their forces have to be sent back. The energy and the virial are those of the whole system
+// on every rank: the MD adds the rank values up where it uses the virial, hence the 1 / ranks.
+void MDSimulation::compute_mlip_replicated_forces(bool need_energy, Real& energy) {
+    ForceCalculatorCUDA& calc = *cuda_calc_cached_;
+    const SimulationBox& box = system->get_box();
+    cudaStream_t stream = calc.get_force_stream();
+    if (!mlip_replica_) mlip_replica_ = std::make_unique<MLIPReplica>();
+
+    const int64_t n_owned = static_cast<int64_t>(system->get_local_particles());
+    mlip_replica_->gather(*mlip_comm_, calc.get_device_x(), calc.get_device_y(), calc.get_device_z(), calc.get_device_type(),
+                          n_owned, stream);
+    const int64_t n_all = mlip_replica_->n_total();
+
+    // The whole periodic box: every periodic axis gets images, as in a single-rank run.
+    const bool periodic[3] = {box.periodic_x, box.periodic_y, box.periodic_z};
+    const Real length[3] = {box.lx, box.ly, box.lz};
+    MLIPStepGeometry geometry;
+    for (int axis = 0; axis < 3; ++axis) {
+        geometry.box[axis] = length[axis];
+        geometry.lo[axis] = 0.0;
+        geometry.hi[axis] = length[axis];
+        geometry.image_axis[axis] = periodic[axis];
+    }
+    geometry.depth = mlip_backend_->ghost_cutoff();
+    geometry.slack = verlet_skin + 1.0;
+    geometry.edge_shifts = mlip_backend_->uses_edge_shifts();
+    geometry.prune_row = mlip_backend_->edge_receiver_row();
+    geometry.owned_receivers_only = mlip_backend_->exchanges_layers();   // every atom is "owned" here: no ghosts, nothing to exchange
+
+    mlip_step_->prepare(mlip_replica_->x(), mlip_replica_->y(), mlip_replica_->z(), mlip_replica_->type(), n_all, n_all,
+                        mlip_backend_->cutoff(), geometry, stream);
+
+    static bool first_step_reported = false;
+    if (!first_step_reported) {
+        first_step_reported = true;
+        report_mlip_load(*mlip_comm_, *mlip_step_, n_owned, " (replicated: every rank computes all atoms)");
+    }
+
+    MLIPInputs in = mlip_step_->inputs();
+    MLIPOutputs out = mlip_step_->outputs(need_energy);
+    mlip_backend_->compute(in, out);
+    mlip_step_->set_model_virial(out.has_virial, out.virial);
+    mlip_step_->add_forces(calc.get_device_fx(), calc.get_device_fy(), calc.get_device_fz(), stream, n_owned);
+
+    if (need_energy) {
+        calc.add_external_virial(static_cast<Real>(mlip_step_->virial(stream)) / mlip_comm_->size());
+        energy = static_cast<Real>(out.energy);   // already the whole system's
+    }
     cudaStreamSynchronize(stream);
 }
 #endif
@@ -2251,7 +2386,9 @@ void MDSimulation::finalize(double program_wallclock_ms) {
     mlip_backend_.reset();
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
     mlip_step_.reset();
+    mlip_replica_.reset();
 #endif
+    mlip_comm_.reset();
     
     finalize_trajectory_writers();
 
@@ -2421,6 +2558,8 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                 }
             } else if (key == "timing_trace_force") {
                 timing_trace_force_ = parse_bool_option("advanced.timing_trace_force", value);
+            } else if (key == "tf32") {
+                tf32_ = parse_bool_option("advanced.tf32", value);
             }
         } else if (current_section == "minimize") {
             if (key == "method") {
@@ -2778,6 +2917,7 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     
     system->set_physical_cutoff(cutoff_distance);
     system->set_verlet_skin(verlet_skin);
+    system->set_builtin_forces_enabled(enable_builtin_forces_);
     system->set_decomposition_policy(decomposition_grid_policy_, decomposition_inter_node_weight_,
                                      decomposition_intra_node_weight_, decomposition_dynamic_interval_,
                                      decomposition_dynamic_imbalance_threshold_,

@@ -29,6 +29,12 @@ struct MLIPStepGeometry {
     double depth = 0.0;                 // how far the model reaches: the backend's ghost_cutoff
     double slack = 0.0;                 // how far atoms may sit outside [lo, hi] (the Verlet skin) plus a margin
     bool edge_shifts = false;           // the backend takes periodic images as edge shifts (MLIPBackend::uses_edge_shifts)
+    // MLIPBackend::edge_receiver_row(), or -1. With a row, only the edges are built whose receiver lies within
+    // (depth - cutoff) + slack of the subdomain box [lo, hi]: the others cannot change the energy of an owned atom.
+    int prune_row = -1;
+    // A layer-exchange model (MLIPBackend::exchanges_layers): the edges go onto the owned atoms only (the features of the ghost
+    // atoms come from their owners), whatever the distance. Needs prune_row.
+    bool owned_receivers_only = false;
 };
 
 class MLIPStep {
@@ -54,9 +60,11 @@ public:
     int64_t n_images() const { return n_all_ - n_md_; }
     bool edge_shifts_active() const { return shift_active_; }   // this step's images are edge shifts
     int64_t n_edges() const { return edges_.edge_count(); }
+    bool edges_pruned() const { return pruned_; }    // this step's edge list leaves out the edges that cannot matter
 
-    // d_fx += the model's forces on the MD atoms, images folded onto the atoms they copy.
-    void add_forces(double* d_fx, double* d_fy, double* d_fz, cudaStream_t stream);
+    // d_fx += the model's forces on the MD atoms, images folded onto the atoms they copy. With n_target >= 0 only the first
+    // n_target MD atoms (the replicated step: this rank's own atoms come first, MLIPReplica).
+    void add_forces(double* d_fx, double* d_fy, double* d_fz, cudaStream_t stream, int64_t n_target = -1);
 
     // sum_i r_i . F_i over every atom the model saw, with the model's forces (before folding), in kcal/mol. Synchronizes.
     // With edge shifts it is the virial the model returned (set_model_virial), which includes the shift term.
@@ -73,6 +81,7 @@ private:
     cudaStream_t stream_ = nullptr;
     int64_t n_owned_ = 0, n_md_ = 0, n_all_ = 0;
     bool have_images_ = false;
+    bool pruned_ = false;
     bool shift_active_ = false;         // images are edge shifts this step
     bool model_virial_valid_ = false;
     double model_virial_ = 0.0;
@@ -99,6 +108,7 @@ private:
     double* d_fz_ = nullptr;  size_t cap_fz_ = 0;
     double* d_terms_ = nullptr;  size_t cap_terms_ = 0;
     unsigned char* d_temp_ = nullptr;  size_t cap_temp_ = 0;
+    unsigned char* d_ok_ = nullptr;    size_t cap_ok_ = 0;      // per node: may be the receiver of an edge that matters
     long long* d_total_ = nullptr;      // image count (device)
     long long* h_total_ = nullptr;      // pinned
     double* d_sum_ = nullptr;           // virial (device)

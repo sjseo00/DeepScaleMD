@@ -136,16 +136,26 @@ __device__ __forceinline__ void for_each_neighbor(int64_t p, const double* sx, c
 }
 
 // Atoms from n_centers on (periodic images) are not centers of an edge; n_centers = n means every atom is.
+// With `ok` (EdgeBuilder::Prune): an edge is counted only when its receiver node has ok != 0 (`row` 0: the center, 1: the neighbor,
+// which is a node through owner[] when periodic images are shifts).
 __global__ void count_kernel(int64_t n, int64_t n_centers, const int32_t* sorted_atom, const double* sx, const double* sy,
-                             const double* sz, const int32_t* starts, Grid grid, double cutoff2, int64_t* counts) {
+                             const double* sz, const int32_t* starts, Grid grid, double cutoff2, int64_t* counts,
+                             const int32_t* owner, const unsigned char* ok, int row) {
     const int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (p >= n) return;
-    if (sorted_atom[p] >= n_centers) {
+    if (sorted_atom[p] >= n_centers || (ok && row == 0 && !ok[sorted_atom[p]])) {
         counts[p] = 0;
         return;
     }
+    const bool check_neighbor = ok && row == 1;
     int64_t count = 0;
-    for_each_neighbor(p, sx, sy, sz, starts, grid, cutoff2, [&](int) { ++count; });
+    for_each_neighbor(p, sx, sy, sz, starts, grid, cutoff2, [&](int q) {
+        if (check_neighbor) {
+            const int32_t atom = sorted_atom[q];
+            if (!ok[owner ? owner[atom] : atom]) return;
+        }
+        ++count;
+    });
     counts[p] = count;
 }
 
@@ -159,14 +169,17 @@ __global__ void total_kernel(int64_t n, const int64_t* offsets, const int64_t* c
 __global__ void fill_kernel(int64_t n, int64_t n_edges, int64_t n_centers, const double* sx, const double* sy,
                             const double* sz, const int32_t* sorted_atom, const int32_t* starts, Grid grid, double cutoff2,
                             const int64_t* offsets, int64_t* edges, const int32_t* owner, const double* shift_x,
-                            const double* shift_y, const double* shift_z, double* shift) {
+                            const double* shift_y, const double* shift_z, double* shift, const unsigned char* ok, int row) {
     const int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (p >= n) return;
     const int64_t center = sorted_atom[p];
     if (center >= n_centers) return;
+    if (ok && row == 0 && !ok[center]) return;                   // counted as no edges
+    const bool check_neighbor = ok && row == 1;
     int64_t slot = offsets[p];
     for_each_neighbor(p, sx, sy, sz, starts, grid, cutoff2, [&](int q) {
         const int32_t atom = sorted_atom[q];
+        if (check_neighbor && !ok[owner ? owner[atom] : atom]) return;   // the same test as count_kernel
         edges[slot] = center;                                    // row 0: i
         edges[n_edges + slot] = owner ? owner[atom] : atom;      // row 1: j
         if (owner) {
@@ -218,12 +231,19 @@ void EdgeBuilder::ensure(T*& ptr, size_t& capacity, size_t needed) {
 }
 
 int64_t EdgeBuilder::build(const double* d_x, const double* d_y, const double* d_z, int64_t n, double cutoff,
-                           cudaStream_t stream, const double* lo, const double* hi, const Images* images) {
+                           cudaStream_t stream, const double* lo, const double* hi, const Images* images,
+                           const Prune* prune) {
     if (!(cutoff > 0.0)) throw std::invalid_argument("EdgeBuilder::build: cutoff must be positive");
     if (images && (images->n_centers < 0 || images->n_centers > n || !images->d_owner || !images->d_shift_x ||
                    !images->d_shift_y || !images->d_shift_z)) {
         throw std::invalid_argument("EdgeBuilder::build: invalid periodic image description");
     }
+    if (prune && (!prune->d_receiver_ok || (prune->row != 0 && prune->row != 1))) {
+        throw std::invalid_argument("EdgeBuilder::build: invalid prune description");
+    }
+    const unsigned char* ok = prune ? prune->d_receiver_ok : nullptr;
+    const int ok_row = prune ? prune->row : 1;
+    const int32_t* owner_of = images ? images->d_owner : nullptr;
     const int64_t n_centers = images ? images->n_centers : n;
     if (n < 0 || n >= std::numeric_limits<int32_t>::max()) {
         throw std::invalid_argument("EdgeBuilder::build: atom count out of range");
@@ -288,7 +308,7 @@ int64_t EdgeBuilder::build(const double* d_x, const double* d_y, const double* d
 
     // 5. count the neighbors of every atom, prefix sum, total
     count_kernel<<<blocks_for(n), kThreads, 0, stream>>>(n, n_centers, d_atom_sorted_, d_sx_, d_sy_, d_sz_, d_starts_, grid,
-                                                          cutoff2, d_counts_);
+                                                          cutoff2, d_counts_, owner_of, ok, ok_row);
     cub::DeviceScan::ExclusiveSum(d_temp_, scan_bytes, d_counts_, d_offsets_, static_cast<int>(n), stream);
     total_kernel<<<1, 1, 0, stream>>>(n, d_offsets_, d_counts_, &d_status_->edges);
 
@@ -308,7 +328,7 @@ int64_t EdgeBuilder::build(const double* d_x, const double* d_y, const double* d
     fill_kernel<<<blocks_for(n), kThreads, 0, stream>>>(
         n, n_edges_, n_centers, d_sx_, d_sy_, d_sz_, d_atom_sorted_, d_starts_, grid, cutoff2, d_offsets_, d_edges_,
         images ? images->d_owner : nullptr, images ? images->d_shift_x : nullptr, images ? images->d_shift_y : nullptr,
-        images ? images->d_shift_z : nullptr, images ? d_shift_ : nullptr);
+        images ? images->d_shift_z : nullptr, images ? d_shift_ : nullptr, ok, ok_row);
     EDGE_CUDA_CHECK(cudaGetLastError());
     return n_edges_;
 }

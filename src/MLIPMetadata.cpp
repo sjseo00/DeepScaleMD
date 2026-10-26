@@ -106,12 +106,18 @@ MLIPMetadata parse_mlip_metadata(const std::string& json_text, const std::string
     m.cutoff = r.positive_number(root, "cutoff", "cutoff");
     m.num_layers = r.integer_in_range(
         r.require(root, "num_layers", JsonValue::Type::Number, "num_layers"), "num_layers", 1, 1000);
+    if (const JsonValue* exchange = r.optional(root, "layer_exchange", JsonValue::Type::Bool, "layer_exchange")) {
+        m.layer_exchange = exchange->boolean;
+    }
     m.ghost_cutoff = r.positive_number(root, "ghost_cutoff", "ghost_cutoff");
-    // Message passing over num_layers layers needs ghosts that deep; less gives silently wrong forces.
-    const double required_depth = m.num_layers * m.cutoff;
+    // Message passing over num_layers layers needs ghosts that deep; less gives silently wrong forces. A model that exchanges
+    // its node features between the layers gets the features of the ghost atoms from their owners: one cutoff is enough.
+    const double required_depth = (m.layer_exchange ? 1 : m.num_layers) * m.cutoff;
     if (m.ghost_cutoff < required_depth * (1.0 - 1e-12)) {
-        r.fail("field 'ghost_cutoff' (" + std::to_string(m.ghost_cutoff) + ") must be at least num_layers * cutoff (" +
-               std::to_string(required_depth) + ")");
+        r.fail("field 'ghost_cutoff' (" + std::to_string(m.ghost_cutoff) + ") must be at least " +
+               std::string(m.layer_exchange ? "cutoff (layer_exchange)" : "num_layers * cutoff") + " (" +
+               std::to_string(required_depth) + ")" +
+               std::string(m.layer_exchange ? "" : "; this file does not say 'layer_exchange': true (a model converted with --layer-exchange does)"));
     }
 
     const JsonValue& elements = r.require(root, "elements", JsonValue::Type::Array, "elements");
@@ -174,8 +180,16 @@ MLIPMetadata parse_mlip_metadata(const std::string& json_text, const std::string
     if (const JsonValue* shifts = r.optional(root, "edge_shifts", JsonValue::Type::Bool, "edge_shifts")) {
         m.edge_shifts = shifts->boolean;
     }
+    if (const JsonValue* row = r.optional(root, "edge_receiver_row", JsonValue::Type::Number, "edge_receiver_row")) {
+        m.edge_receiver_row = r.integer_in_range(*row, "edge_receiver_row", 0, 1);
+    }
     if (m.edge_shifts && m.backend != "torchscript") {
         r.fail("field 'edge_shifts' is only available with backend 'torchscript'");
+    }
+    if (m.layer_exchange) {
+        if (m.backend != "torchscript") r.fail("field 'layer_exchange' is only available with backend 'torchscript'");
+        if (!m.edge_shifts) r.fail("field 'layer_exchange' needs 'edge_shifts': the ghost atoms are only the halo's, periodic images must be edge shifts");
+        if (m.edge_receiver_row < 0) r.fail("field 'layer_exchange' needs 'edge_receiver_row': the edges must go onto the owned atoms only");
     }
     if (m.backend == "aoti" && m.target_gpu.empty()) {
         r.fail("backend 'aoti' needs field 'target_gpu' (the compiled GPU architecture, e.g. 'sm_90')");

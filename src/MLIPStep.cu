@@ -104,11 +104,11 @@ __global__ void extend_kernel(int64_t n, const double* x, const double* y, const
     });
 }
 
-// md_f[i] += f[i] + sum of the forces on the images of i, summed in slot order.
-__global__ void add_forces_kernel(int64_t n, const double* fx, const double* fy, const double* fz,
+// md_f[i] += f[i] + sum of the forces on the images of i, summed in slot order, for the first n_out of the n MD atoms.
+__global__ void add_forces_kernel(int64_t n_out, int64_t n, const double* fx, const double* fy, const double* fz,
                                   const int64_t* counts, const int64_t* offsets, double* mx, double* my, double* mz) {
     const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
-    if (i >= n) return;
+    if (i >= n_out) return;
     double ax = fx[i], ay = fy[i], az = fz[i];
     if (counts) {
         const int64_t first = n + offsets[i];
@@ -128,6 +128,33 @@ __global__ void virial_terms_kernel(int64_t n, const double* x, const double* y,
     const int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
     if (p >= n) return;
     terms[p] = x[p] * fx[p] + y[p] * fy[p] + z[p] * fz[p];
+}
+
+// ok[i] = the node is within `reach` of the box [lo, hi] (Euclidean distance to the box); a NaN position gives 0 (EdgeBuilder
+// reports it).
+struct Region {
+    double lo[3];
+    double hi[3];
+};
+
+__global__ void mark_receivers_kernel(int64_t n, const double* x, const double* y, const double* z, Region box, double reach2,
+                                      unsigned char* ok) {
+    const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    const double p[3] = {x[i], y[i], z[i]};
+    double d2 = 0.0;
+    for (int a = 0; a < 3; ++a) {
+        const double d = fmax(fmax(box.lo[a] - p[a], p[a] - box.hi[a]), 0.0);
+        d2 += d * d;
+    }
+    ok[i] = d2 <= reach2 ? 1 : 0;
+}
+
+// ok[i] = i is an owned atom: the receivers of a layer-exchange model.
+__global__ void mark_owned_kernel(int64_t n, int64_t n_owned, unsigned char* ok) {
+    const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    if (i >= n) return;
+    ok[i] = i < n_owned ? 1 : 0;
 }
 
 inline unsigned blocks_for(int64_t n) { return static_cast<unsigned>((n + kThreads - 1) / kThreads); }
@@ -157,6 +184,7 @@ MLIPStep::~MLIPStep() {
     cudaFree(d_fz_);
     cudaFree(d_terms_);
     cudaFree(d_temp_);
+    cudaFree(d_ok_);
     cudaFree(d_total_);
     cudaFreeHost(h_total_);
     cudaFree(d_sum_);
@@ -263,6 +291,36 @@ void MLIPStep::prepare(const double* d_x, const double* d_y, const double* d_z, 
         box_lo[a] = g.lo[a] - reach;
         box_hi[a] = g.hi[a] + reach;
     }
+    // Edges that cannot change the energy of an owned atom are not built: the receivers of the last layer are the owned atoms,
+    // each earlier layer needs receivers one cutoff further out, so a receiver farther than (layers - 1) cutoffs from every
+    // owned atom is never used. The distance to the subdomain box (plus the drift of the atoms) bounds that from above.
+    EdgeBuilder::Prune prune;
+    const EdgeBuilder::Prune* prune_ptr = nullptr;
+    pruned_ = false;
+    if (g.owned_receivers_only && !(g.prune_row == 0 || g.prune_row == 1)) {
+        throw std::invalid_argument("MLIPStep::prepare: owned_receivers_only needs prune_row (the model's receiver row)");
+    }
+    if (g.prune_row == 0 || g.prune_row == 1) {
+        const int64_t n_nodes = shift_active_ ? n_md : n_ext;     // the atoms the model sees (images are nodes without shifts)
+        ensure(d_ok_, cap_ok_, static_cast<size_t>(std::max<int64_t>(n_nodes, 1)));
+        Region box;
+        for (int a = 0; a < 3; ++a) {
+            box.lo[a] = g.lo[a];
+            box.hi[a] = g.hi[a];
+        }
+        const double reach = std::max(g.depth - cutoff, 0.0) + g.slack;
+        if (n_nodes > 0 && g.owned_receivers_only) {
+            mark_owned_kernel<<<blocks_for(n_nodes), kThreads, 0, stream>>>(n_nodes, n_owned, d_ok_);
+            MLIP_STEP_CUDA_CHECK(cudaGetLastError());
+        } else if (n_nodes > 0) {
+            mark_receivers_kernel<<<blocks_for(n_nodes), kThreads, 0, stream>>>(n_nodes, x, y, z, box, reach * reach, d_ok_);
+            MLIP_STEP_CUDA_CHECK(cudaGetLastError());
+        }
+        prune.d_receiver_ok = d_ok_;
+        prune.row = g.prune_row;
+        prune_ptr = &prune;
+        pruned_ = true;
+    }
     if (shift_active_) {
         EdgeBuilder::Images images;
         images.n_centers = n_md;
@@ -270,9 +328,9 @@ void MLIPStep::prepare(const double* d_x, const double* d_y, const double* d_z, 
         images.d_shift_x = d_ext_sx_;
         images.d_shift_y = d_ext_sy_;
         images.d_shift_z = d_ext_sz_;
-        edges_.build(x, y, z, n_ext, cutoff, stream, box_lo, box_hi, &images);
+        edges_.build(x, y, z, n_ext, cutoff, stream, box_lo, box_hi, &images, prune_ptr);
     } else {
-        edges_.build(x, y, z, n_ext, cutoff, stream, box_lo, box_hi);
+        edges_.build(x, y, z, n_ext, cutoff, stream, box_lo, box_hi, nullptr, prune_ptr);
     }
 }
 
@@ -300,9 +358,10 @@ MLIPOutputs MLIPStep::outputs(bool need_energy) const {
     return out;
 }
 
-void MLIPStep::add_forces(double* d_fx, double* d_fy, double* d_fz, cudaStream_t stream) {
-    if (n_md_ <= 0) return;
-    add_forces_kernel<<<blocks_for(n_md_), kThreads, 0, stream>>>(n_md_, d_fx_, d_fy_, d_fz_,
+void MLIPStep::add_forces(double* d_fx, double* d_fy, double* d_fz, cudaStream_t stream, int64_t n_target) {
+    const int64_t n_out = (n_target < 0 || n_target > n_md_) ? n_md_ : n_target;
+    if (n_out <= 0) return;
+    add_forces_kernel<<<blocks_for(n_out), kThreads, 0, stream>>>(n_out, n_md_, d_fx_, d_fy_, d_fz_,
                                                                    (have_images_ && !shift_active_) ? d_counts_ : nullptr, d_offsets_,
                                                                    d_fx, d_fy, d_fz);
     MLIP_STEP_CUDA_CHECK(cudaGetLastError());

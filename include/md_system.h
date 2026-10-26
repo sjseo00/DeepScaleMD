@@ -57,6 +57,9 @@ private:
     Real physical_cutoff;
     Real verlet_skin_ = 2.0;
     Real mlip_ghost_depth_ = 0.0;   // set when an MLIP that needs real ghost atoms (libtorch) is selected
+    bool mlip_replicated_ = false;  // a subdomain is narrower than the MLIP's ghost layer: every rank computes all atoms
+    bool builtin_forces_enabled_ = true;   // force_calculation.mode has "builtin" (the classical short-range kernels run)
+    bool mlip_replicated_reported_ = false;
 
     // decomposition: (advanced, optional YAML, nested as advanced.decomposition.*)
     // overrides for the dsDecompX process-grid policy; empty/sentinel means "unset",
@@ -109,7 +112,8 @@ private:
     bool bonded_redundant_ = false;
     void resize_particle_storage(size_t count);
     void initialize_decomposition_runtime();
-    void check_mlip_halo_fits(Real halo_width) const;
+    // True when every decomposed axis has a subdomain at least as wide as the halo (this rank only; see sync_decomposition_domain).
+    bool mlip_halo_fits(Real halo_width) const;
 
 public:
     MDSystem();
@@ -172,13 +176,26 @@ public:
     Real get_physical_cutoff() const { return physical_cutoff; }
     void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
     void set_verlet_skin(Real skin) { verlet_skin_ = skin; }
+    // False for an MLIP-only run (mode: python): no classical short-range kernel runs, so the warning about ghost images that
+    // are received twice (warn_if_domain_narrower_than_two_halos) does not apply: the MLIP edge search uses the real positions
+    // of the atoms and images, no minimum-image convention, and the two copies of an atom are different periodic images.
+    void set_builtin_forces_enabled(bool enabled) { builtin_forces_enabled_ = enabled; }
 
     // An MLIP with LibTorch needs ghost atoms as deep as its receptive field (num_layers * cutoff, design 5.1), not just
     // the force cutoff. Re-applies the halo width right away. 0 (the default) leaves the halo to the force cutoff, so
     // runs without such an MLIP are unchanged.
     void set_mlip_ghost_depth(Real depth);
-    // Halo width in A: the larger of the force cutoff and the MLIP depth, plus the Verlet skin and a margin.
-    Real get_halo_width() const { return (physical_cutoff > mlip_ghost_depth_ ? physical_cutoff : mlip_ghost_depth_) + verlet_skin_ + 1.0; }
+    // Halo width in A: the larger of the force cutoff and the MLIP depth, plus the Verlet skin and a margin. When the MLIP's
+    // ghost layer does not fit into the subdomains (mlip_replicated()) the MLIP takes no ghosts from the halo, so the depth
+    // does not count.
+    Real get_halo_width() const {
+        const Real depth = mlip_replicated_ ? 0.0 : mlip_ghost_depth_;
+        return (physical_cutoff > depth ? physical_cutoff : depth) + verlet_skin_ + 1.0;
+    }
+    // True when a halo exchange cannot give the MLIP its ghost layer (a subdomain along a decomposed axis is narrower than
+    // ghost depth + skin + margin: one exchange reaches only the neighboring ranks). The same on all ranks; re-judged whenever the
+    // box changes. The libtorch MLIP then runs replicated: every rank computes all atoms (MLIPReplica), correct but no speed-up.
+    bool mlip_replicated() const { return mlip_replicated_; }
     // True when the box is split into more than one subdomain along the axis (0, 1, 2); the halo then provides ghosts there.
     bool axis_is_decomposed(int axis) const;
 
@@ -243,6 +260,12 @@ public:
     void end_halo_exchange_on_device(class ForceCalculatorCUDA& calculator);
     bool migrate_particles_on_device(class ForceCalculatorCUDA& calculator);
     void reverse_halo_on_device(class ForceCalculatorCUDA& calculator);
+    // Moves one application field along the halo plan of the last device halo exchange (dsDecompX forward_exchange /
+    // reverse_exchange): `data` is [rows, width] row-major in device memory, rows = owned atoms then ghost atoms, float or double
+    // (element_bytes 4 or 8). forward: the owners' rows are copied into the ghost rows; reverse: the ghost rows are added to the
+    // rows of their owners. Queued on `stream` (a cudaStream_t). The node features of a layer-exchange MLIP use it (MLIPHaloTransport).
+    void exchange_field_on_device(class ForceCalculatorCUDA& calculator, void* data, int64_t rows, int64_t width, int element_bytes,
+                                  bool reverse, void* stream);
 #endif
 
 };

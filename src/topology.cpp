@@ -319,6 +319,7 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
     std::string current_section = "";
     
     while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();    // a topology file written on Windows has CRLF line ends
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
         
         line.erase(0, line.find_first_not_of(" \t"));

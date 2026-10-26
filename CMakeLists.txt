@@ -96,7 +96,7 @@ if(DSDECOMPX_DIR)
             "Use a dsDecompX build dir, config dir, or install prefix.")
     endif()
 endif()
-find_package(dsDecompX 0.3 REQUIRED CONFIG)
+find_package(dsDecompX 1.0 REQUIRED CONFIG)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 if(_deepscalemd_uses_cuda AND NOT dsDecompX_WITH_CUDA)
@@ -192,6 +192,7 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/comm_backend.cpp
     src/md_simulation.cpp
     src/PythonBackend.cpp
+    src/MLIPRankComm.cpp
     src/PythonModules.cpp
     src/MLIPBackendFactory.cpp
     src/Elements.cpp
@@ -342,6 +343,7 @@ else()
         # load_mlip_metadata() from the MD sources, which the executable provides.
         add_library(dsmd_libtorch STATIC
             src/LibTorchBackend.cpp
+            src/HaloExchangeOp.cpp
             src/TorchScriptRunner.cpp
             src/AOTIRunner.cpp
             src/OpLibLoader.cpp)
@@ -356,7 +358,7 @@ else()
         set_property(TARGET deepscalemd APPEND PROPERTY BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib")
         set_property(TARGET deepscalemd APPEND PROPERTY INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib")
         # MD-side GPU work around the model (periodic images, edge list, force folding); only built with LibTorch.
-        target_sources(deepscalemd PRIVATE src/EdgeBuilder.cu src/MLIPStep.cu)
+        target_sources(deepscalemd PRIVATE src/EdgeBuilder.cu src/MLIPStep.cu src/MLIPReplica.cpp)
         message(STATUS "DeepScaleMD: LibTorch MLIP backend enabled (Torch ${Torch_VERSION}, ${Torch_DIR})")
     endif()
 

@@ -1,6 +1,9 @@
 
 #include "md_system.h"
 #include "force_calculator_cuda.h"
+#if __has_include(<mpi-ext.h>)
+#include <mpi-ext.h>   // Open MPI: MPIX_CUDA_AWARE_SUPPORT, MPIX_Query_cuda_support()
+#endif
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -930,6 +933,37 @@ void MDSystem::initialize_decomposition_runtime() {
         }
     }
     decomp_runtime_ = std::make_unique<dsdecompx::Decomp>(pp_comm_, config);
+#ifdef USE_CUDA
+    if (rank == 0 && decomp_runtime_->backend_kind() == dsdecompx::BackendKind::Mpi) {
+        if (decomp_runtime_->mpi_takes_device_pointers()) {
+            // The environment variable CUDA_AWARE_MPI=1 makes dsDecompX hand GPU pointers to MPI without asking the library.
+            // An MPI that is not CUDA-aware then dies in MPI_Waitall (Open MPI: "Read -1, expected N, errno = 14",
+            // segmentation fault in mca_btl_vader).
+            bool library_says_no = false;
+#if defined(MPIX_CUDA_AWARE_SUPPORT)
+            library_says_no = !(MPIX_CUDA_AWARE_SUPPORT && MPIX_Query_cuda_support() == 1);
+#endif
+            if (library_says_no) {
+                std::cerr << "[WARNING] The MPI halo exchange passes GPU buffers straight to MPI (CUDA_AWARE_MPI=1), but "
+                             "this Open MPI reports that it was built without CUDA support. An MPI that is not CUDA-aware "
+                             "crashes at the first exchange (\"Read -1, expected N, errno = 14\", segmentation fault in "
+                             "mca_btl_vader). Use a CUDA-aware MPI (for example the hpcx module, or Open MPI configured "
+                             "--with-cuda) or an NCCL build of dsDecompX, and remove CUDA_AWARE_MPI=1 otherwise. A "
+                             "CUDA-aware MPI that works through UCX can report 'no CUDA' as well; then this warning is wrong "
+                             "and can be ignored."
+                          << std::endl;
+            }
+        } else if (size > 1) {
+            // No CUDA_AWARE_MPI=1 and the MPI library does not report CUDA support: dsDecompX then refuses to move GPU
+            // particles through MPI ("selected backend cannot migrate GPU-resident particles") at the first exchange.
+            std::cerr << "[WARNING] This MPI is not CUDA-aware (or does not say so), and the halo exchange needs one, so the "
+                         "run will stop at the first exchange. Use a CUDA-aware MPI (the hpcx module, or Open MPI "
+                         "configured --with-cuda; set CUDA_AWARE_MPI=1 if it works through UCX but does not report CUDA) or "
+                         "an NCCL build of dsDecompX."
+                      << std::endl;
+        }
+    }
+#endif
 
     const auto& topology = decomp_runtime_->topology();
     if (rank==0) {
@@ -960,7 +994,7 @@ void MDSystem::initialize_decomposition_runtime() {
 // and the short-range energy and forces near the domain faces are counted twice.
 void MDSystem::warn_if_domain_narrower_than_two_halos(Real halo_width) {
     static bool warned = false;
-    if (warned || rank != 0 || !decomp_runtime_) return;
+    if (warned || rank != 0 || !decomp_runtime_ || !builtin_forces_enabled_) return;
     const auto& dimensions = decomp_runtime_->topology().dimensions();
     const auto& local = decomp_runtime_->topology().local_domain();
     const char axis_name[3] = {'x', 'y', 'z'};
@@ -991,27 +1025,21 @@ bool MDSystem::axis_is_decomposed(int axis) const {
 }
 
 // One halo exchange reaches only the neighboring ranks. A model that needs ghosts deeper than a neighbor's whole
-// subdomain would need atoms from ranks further away; the forces would be wrong without any error, so refuse to run.
-void MDSystem::check_mlip_halo_fits(Real halo_width) const {
-    if (mlip_ghost_depth_ <= 0.0 || !decomp_runtime_) return;
+// subdomain would need atoms from ranks further away: its ghost layer does not fit, and the forces would be wrong without
+// any error if the run went on with the halo. The caller then switches the MLIP to the replicated step instead.
+bool MDSystem::mlip_halo_fits(Real halo_width) const {
+    if (mlip_ghost_depth_ <= 0.0 || !decomp_runtime_) return true;
     const auto& dimensions = decomp_runtime_->topology().dimensions();
     const auto& local = decomp_runtime_->topology().local_domain();
-    const char axis_name[3] = {'x', 'y', 'z'};
     for (int axis = 0; axis < 3; ++axis) {
         const Real width = local.upper[axis] - local.lower[axis];
-        if (dimensions[axis] > 1 && width < halo_width) {
-            throw std::runtime_error(
-                std::string("MLIP ghost layer does not fit: ghost depth ") + std::to_string(mlip_ghost_depth_) +
-                " A + skin + margin = " + std::to_string(halo_width) + " A is deeper than this rank's subdomain along " +
-                axis_name[axis] + " (" + std::to_string(width) + " A). One halo exchange reaches only the neighboring "
-                "ranks, so the forces would be wrong. Use fewer ranks along that axis, a larger box, or a model with a "
-                "smaller cutoff or fewer layers.");
-        }
+        if (dimensions[axis] > 1 && width < halo_width) return false;
     }
+    return true;
 }
 
 void MDSystem::sync_decomposition_domain() {
-    const Real halo_width = get_halo_width();
+    Real halo_width = get_halo_width();
     // For single-rank MPI the full box is the domain, but the bounds still
     // need refreshing after an NPT box change.
     if (size == 1) {
@@ -1038,8 +1066,23 @@ void MDSystem::sync_decomposition_domain() {
     decomp_runtime_->update_domain(domain);
 
     const auto& local = decomp_runtime_->topology().local_domain();
+    if (mlip_ghost_depth_ > 0.0) {
+        // Judged with the full ghost depth; a collective, so every rank takes the same path (subdomain widths can differ).
+        mlip_replicated_ = false;
+        const bool replicated = decomp_runtime_->any_rank_true(!mlip_halo_fits(get_halo_width()));
+        if (replicated && !mlip_replicated_reported_ && rank == 0) {
+            std::cerr << "[MLIP] A subdomain is narrower than the ghost layer of the model (ghost depth "
+                      << mlip_ghost_depth_ << " A + skin + margin = " << get_halo_width()
+                      << " A): one halo exchange reaches only the neighboring ranks, so it cannot give the model its ghost atoms. "
+                         "Every rank therefore takes the atoms of all ranks and computes the whole system (correct, but the "
+                         "extra ranks give no speed-up). Use fewer ranks along the narrow axis or a larger box to split the work."
+                      << std::endl;
+        }
+        mlip_replicated_reported_ = mlip_replicated_reported_ || replicated;
+        mlip_replicated_ = replicated;
+        halo_width = get_halo_width();   // the force cutoff's halo when replicated
+    }
     decomp_runtime_->set_halo_width(halo_width);
-    check_mlip_halo_fits(halo_width);
     warn_if_domain_narrower_than_two_halos(halo_width);
     // Update box subdomain bounds used by neighbor list builder and integrator
     box.xlo = local.lower[0]; box.xhi = local.upper[0];
@@ -1381,6 +1424,33 @@ void MDSystem::reverse_halo_on_device(ForceCalculatorCUDA& calculator) {
     dsdecompx::ParticleInfo storage(
         owned, particles.ghost_count(), calculator);
     decomp_runtime_->reverse_halo(storage, calculator.get_force_stream());
+}
+
+void MDSystem::exchange_field_on_device(ForceCalculatorCUDA& calculator, void* data, int64_t rows, int64_t width,
+                                        int element_bytes, bool reverse, void* stream) {
+    const size_t owned = get_local_particles();
+    const size_t ghosts = particles.ghost_count();
+    if (rows != static_cast<int64_t>(owned + ghosts)) {
+        throw std::runtime_error("MDSystem::exchange_field_on_device: the field has " + std::to_string(rows) + " rows, but the halo has " +
+                                 std::to_string(owned) + " owned + " + std::to_string(ghosts) +
+                                 " ghost atoms: the model's atoms must be the MD atoms (periodic images as edge shifts, not as atoms)");
+    }
+    if (!decomp_runtime_) throw std::runtime_error("dsDecompX is not initialized");
+    const std::string name = "mlip_features";
+    dsdecompx::ParticleInfo storage(owned, ghosts, calculator);
+    if (element_bytes == 4) {
+        storage.add_field<float>(name, static_cast<float*>(data), static_cast<size_t>(rows), static_cast<size_t>(width));
+    } else if (element_bytes == 8) {
+        storage.add_field<double>(name, static_cast<double*>(data), static_cast<size_t>(rows), static_cast<size_t>(width));
+    } else {
+        throw std::runtime_error("MDSystem::exchange_field_on_device: element size " + std::to_string(element_bytes) + " is not float or double");
+    }
+    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    if (reverse) {
+        decomp_runtime_->reverse_exchange(storage, {{name, dsdecompx::ReduceOp::Sum}}, cuda_stream);
+    } else {
+        decomp_runtime_->forward_exchange(storage, {name}, cuda_stream);
+    }
 }
 #endif
 

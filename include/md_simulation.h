@@ -33,6 +33,7 @@ class ConstraintSolver;
 class PmeServer;
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
 class MLIPStep;
+class MLIPReplica;
 #endif
 #ifdef USE_CUDA
 class PmeServerCuda;
@@ -60,9 +61,11 @@ private:
     std::unique_ptr<Thermostat> thermostat;
     std::unique_ptr<Barostat> barostat;
     std::unique_ptr<NeighborList> neighbor_list_;
+    std::unique_ptr<MLIPRankComm> mlip_comm_;   // the other ranks, for an MLIP that computes all atoms on every rank
     std::unique_ptr<MLIPBackend> mlip_backend_;
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
     std::unique_ptr<MLIPStep> mlip_step_;   // only when an MLIP that wants an edge list (libtorch) is selected
+    std::unique_ptr<MLIPReplica> mlip_replica_;   // made when the libtorch MLIP has to run replicated (MDSystem::mlip_replicated)
 #endif
     std::unique_ptr<PmeServer> pme_server_;  // non-null only on dedicated PME-group ranks (CPU/SYCL builds)
 #ifdef USE_CUDA
@@ -232,6 +235,7 @@ private:
     enum class TimingTraceMode { Off, Step, Every };
     TimingTraceMode timing_trace_mode_ = TimingTraceMode::Off;
     bool timing_trace_force_ = false;
+    bool tf32_ = false;                  // advanced.tf32: libtorch MLIP matrix products in TF32
 
     struct StepTiming {
         double nlist_build_ms = 0.0;
@@ -355,6 +359,8 @@ private:
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
     // The libtorch MLIP on this rank's GPU arrays: images, edges, model, forces, virial, reverse halo (design 4, 5, 8).
     void compute_mlip_step_forces(bool need_energy, Real& energy);
+    // The same when a subdomain is narrower than the model's ghost layer: all atoms of all ranks on every rank.
+    void compute_mlip_replicated_forces(bool need_energy, Real& energy);
 #endif
     void reverse_halo_for_bonded_if_needed();
     // CUDA multi-rank: re-derive the device bonded topology if the owned/ghost

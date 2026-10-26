@@ -2,6 +2,7 @@
 
 #include "PythonModules.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -55,7 +56,7 @@ struct PyRef {
 
 }  // namespace
 
-PythonBackend::PythonBackend(const MLIPConfig& cfg) {
+PythonBackend::PythonBackend(const MLIPConfig& cfg) : comm_(cfg.comm) {
 #ifndef ENABLE_PYTHON_INTERFACE
     throw std::runtime_error(
         "mlip_backend 'python' needs a build with the embedded Python interface (configure with -DENABLE_PYTHON=ON; "
@@ -76,6 +77,10 @@ PythonBackend::PythonBackend(const MLIPConfig& cfg) {
         std::cout << "  model_size: " << py.model_size << std::endl;
         std::cout << "  device:     " << py.device << std::endl;
         std::cout << "  dtype:      " << py.dtype << std::endl;
+        if (comm_ && comm_->size() > 1) {
+            std::cout << "  " << comm_->size() << " MPI ranks: every rank computes all atoms of the system with this Python MLIP "
+                      << "(correct, but no speed-up; mlip_backend: libtorch is the multi-GPU path)" << std::endl;
+        }
     }
     initialize_ml_model(py, cfg.type_to_z);
 }
@@ -99,7 +104,7 @@ void PythonBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
         cuda_check(cudaMemcpyAsync(h_fx_.data(), out.d_fx, bytes, cudaMemcpyDeviceToHost, in.stream), "copy fx");
         cuda_check(cudaMemcpyAsync(h_fy_.data(), out.d_fy, bytes, cudaMemcpyDeviceToHost, in.stream), "copy fy");
         cuda_check(cudaMemcpyAsync(h_fz_.data(), out.d_fz, bytes, cudaMemcpyDeviceToHost, in.stream), "copy fz");
-        if (staged_type_count_ != in.n_all) {
+        if (staged_type_count_ != in.n_all || (comm_ && comm_->size() > 1)) {   // several ranks: atoms change owners
             h_type_.resize(n);
             cuda_check(cudaMemcpyAsync(h_type_.data(), in.d_type, n * sizeof(int), cudaMemcpyDeviceToHost,
                                        in.stream), "copy type");
@@ -107,7 +112,7 @@ void PythonBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
         }
         cuda_check(cudaStreamSynchronize(in.stream), "synchronize before Python");
 
-        call_python(h_x_.data(), h_y_.data(), h_z_.data(), h_type_.data(), n,
+        run_on_host(h_x_.data(), h_y_.data(), h_z_.data(), h_type_.data(), n, static_cast<size_t>(in.n_owned),
                     h_fx_.data(), h_fy_.data(), h_fz_.data(), in.cell, in.pbc);
 
         cuda_check(cudaMemcpyAsync(out.d_fx, h_fx_.data(), bytes, cudaMemcpyHostToDevice, in.stream), "upload fx");
@@ -119,8 +124,33 @@ void PythonBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
     }
 #endif
 
-    call_python(in.d_x, in.d_y, in.d_z, in.d_type, n, out.d_fx, out.d_fy, out.d_fz, in.cell, in.pbc);
+    run_on_host(in.d_x, in.d_y, in.d_z, in.d_type, n, static_cast<size_t>(in.n_owned), out.d_fx, out.d_fy, out.d_fz, in.cell,
+                in.pbc);
     out.energy = last_energy_;
+}
+
+void PythonBackend::run_on_host(const double* x, const double* y, const double* z, const int* type, size_t n, size_t n_owned,
+                                double* fx, double* fy, double* fz, const double* cell, const bool* pbc) {
+    if (!comm_ || comm_->size() <= 1) {
+        call_python(x, y, z, type, n, fx, fy, fz, cell, pbc);
+        return;
+    }
+    const int64_t mine = static_cast<int64_t>(n_owned);
+    gather_mine_first(*comm_, x, mine, g_x_, g_scratch_d_);
+    gather_mine_first(*comm_, y, mine, g_y_, g_scratch_d_);
+    gather_mine_first(*comm_, z, mine, g_z_, g_scratch_d_);
+    gather_mine_first(*comm_, type, mine, g_type_, g_scratch_i_);
+    const size_t total = g_x_.size();
+    g_fx_.assign(total, 0.0);
+    g_fy_.assign(total, 0.0);
+    g_fz_.assign(total, 0.0);
+    call_python(g_x_.data(), g_y_.data(), g_z_.data(), g_type_.data(), total, g_fx_.data(), g_fy_.data(), g_fz_.data(), cell,
+                pbc);
+    for (size_t i = 0; i < n_owned; ++i) {
+        fx[i] += g_fx_[i];
+        fy[i] += g_fy_[i];
+        fz[i] += g_fz_[i];
+    }
 }
 
 #ifdef ENABLE_PYTHON_INTERFACE
@@ -147,10 +177,10 @@ void PythonBackend::initialize_python(const std::string& module_path) {
     if (!ec) {
         PyRun_SimpleString(("sys.path.insert(0, '" + python_quoted(configured.string()) + "')").c_str());
     }
-    PyRun_SimpleString("sys.path.append('./mlip_python')");
-    PyRun_SimpleString("sys.path.append('../mlip_python')");
-    PyRun_SimpleString("sys.path.append(os.path.join(os.getcwd(), 'mlip_python'))");
-    PyRun_SimpleString("sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'mlip_python'))");
+    PyRun_SimpleString("sys.path.append('./MLIP_tools/mlip_python')");
+    PyRun_SimpleString("sys.path.append('../MLIP_tools/mlip_python')");
+    PyRun_SimpleString("sys.path.append(os.path.join(os.getcwd(), 'MLIP_tools', 'mlip_python'))");
+    PyRun_SimpleString("sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'MLIP_tools', 'mlip_python'))");
 
     std::cout << "Python interpreter initialized for the MLIP" << std::endl;
     std::cout << "Python MLIP module path: " << (ec ? module_path : configured.string()) << std::endl;
@@ -242,14 +272,15 @@ void PythonBackend::call_python(const double* x, const double* y, const double* 
     PyRef positions(PyArray_SimpleNewFromData(2, pos_dims, NPY_DOUBLE, pos_buf_.data()));
     if (!positions.object) python_failure("cannot wrap the positions as a NumPy array");
 
-    if (!py_cached_atom_types_ || cached_n_particles_ != n_particles) {
+    if (!py_cached_atom_types_ || cached_types_.size() != n_particles ||
+        !std::equal(cached_types_.begin(), cached_types_.end(), type)) {
         Py_XDECREF((PyObject*)py_cached_atom_types_);
         npy_intp type_dims[1] = {(npy_intp)n_particles};
         py_cached_atom_types_ = (void*)PyArray_SimpleNew(1, type_dims, NPY_INT32);
         if (!py_cached_atom_types_) python_failure("cannot allocate the atom type array");
         int32_t* type_data = (int32_t*)PyArray_DATA((PyArrayObject*)py_cached_atom_types_);
         for (size_t i = 0; i < n_particles; ++i) type_data[i] = static_cast<int32_t>(type[i]);
-        cached_n_particles_ = n_particles;
+        cached_types_.assign(type, type + n_particles);
     }
 
     npy_intp cell_dims[1] = {3};

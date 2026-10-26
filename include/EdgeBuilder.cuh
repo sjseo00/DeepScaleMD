@@ -24,6 +24,14 @@ public:
         const double* d_shift_z = nullptr;
     };
 
+    // Leaves out edges that cannot change the energy of the owned atoms (MLIPStep chooses them). d_receiver_ok: one byte per node
+    // the model sees (the real atom: with Images the atom a neighbor copies, otherwise the atom itself); an edge is made only
+    // when its receiver has a nonzero byte. row: which row of edge_index receives (0 = i, the center; 1 = j, the neighbor).
+    struct Prune {
+        const unsigned char* d_receiver_ok = nullptr;
+        int row = 1;
+    };
+
     EdgeBuilder();
     ~EdgeBuilder();
     EdgeBuilder(const EdgeBuilder&) = delete;
@@ -40,9 +48,10 @@ public:
     // entries) holds i, row 1 holds j. Edges are grouped by i in cell order; the order is deterministic.
     //
     // With `images`: only edges centered on a real atom, neighbors as real atoms, and edge_shift() (see Images).
+    // With `prune`: only the edges whose receiver is marked (see Prune); nullptr keeps every edge.
     int64_t build(const double* d_x, const double* d_y, const double* d_z, int64_t n, double cutoff,
                   cudaStream_t stream, const double* lo = nullptr, const double* hi = nullptr,
-                  const Images* images = nullptr);
+                  const Images* images = nullptr, const Prune* prune = nullptr);
 
     const int64_t* edge_index() const { return d_edges_; }
     // double [3 * E] on the device, row-major [E, 3]; valid after a build() with images (else not written).

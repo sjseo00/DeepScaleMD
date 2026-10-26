@@ -1,11 +1,13 @@
 #include "LibTorchBackend.h"
 
 #include "AOTIRunner.h"
+#include "HaloExchangeOp.h"
 #include "OpLibLoader.h"
 #include "PythonModules.h"
 #include "TorchModelRunner.h"
 #include "TorchScriptRunner.h"
 
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/version.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -21,7 +23,7 @@
 
 namespace {
 
-// 1 eV in kcal/mol; the same value as EV_TO_KCAL_PER_MOL in mlip_python/mlip_interface.py, so results of the
+// 1 eV in kcal/mol; the same value as EV_TO_KCAL_PER_MOL in MLIP_tools/mlip_python/mlip_interface.py, so results of the
 // python and libtorch backends compare directly (design A.6).
 constexpr double kEvToKcalPerMol = 23.0609;
 
@@ -79,6 +81,8 @@ struct LibTorchBackend::Impl {
     void warm_up() {
         const auto real = torch::TensorOptions().device(device).dtype(dtype);
         const auto integer = torch::TensorOptions().device(device).dtype(torch::kInt64);
+        // A layer-exchange model takes the atoms after n_owned as ghost atoms and exchanges their features: both atoms are owned here.
+        const int64_t n_owned = metadata.layer_exchange ? 2 : 1;
         torch::Tensor pos = torch::zeros({2, 3}, real);
         pos[1][0] = 0.5 * metadata.cutoff;
         torch::Tensor z = torch::full({2}, static_cast<int64_t>(metadata.elements.front()), integer);
@@ -86,7 +90,7 @@ struct LibTorchBackend::Impl {
         torch::Tensor shift = torch::zeros({2, 3}, real);
         torch::NoGradGuard no_grad;
         for (int call = 0; call < kWarmupCalls; ++call) {
-            std::vector<torch::Tensor> out = run(pos, z, edges, shift, 1);
+            std::vector<torch::Tensor> out = run(pos, z, edges, shift, n_owned);
             if (out.size() != (metadata.edge_shifts ? 4u : 3u) || out[2].sizes() != torch::IntArrayRef({2, 3})) {
                 throw std::runtime_error("LibTorchBackend: the model returned unexpected shapes on the warm-up input");
             }
@@ -131,6 +135,21 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
     s.device = torch::Device(torch::kCUDA, c10::cuda::current_device());
     s.type_to_z = torch::tensor(table, torch::kInt64).to(s.device);
 
+    // float32 matrix products on the TF32 tensor cores (advanced.tf32): about 3x the FP32 rate on an A100, with TF32's 10 mantissa bits
+    // in the products (the sums stay float32). Global for the process; kernels of cuEquivariance / OpenEquivariance have their own
+    // arithmetic and are not affected.
+    if (cfg.allow_tf32) {
+        const cudaDeviceProp& props = *at::cuda::getDeviceProperties(s.device.index());
+        at::globalContext().setFloat32MatmulPrecision("high");
+        if (props.major < 8) {
+            std::cerr << "LibTorchBackend: warning: advanced.tf32 is set, but " << props.name << " (sm_" << props.major << props.minor
+                      << ") has no TF32 tensor cores: nothing changes" << std::endl;
+        } else if (cfg.verbose) {
+            std::cerr << "[MLIP] advanced.tf32: float32 matrix products run in TF32 on " << props.name << " (the forces carry TF32 "
+                      << "rounding: check step 0 against a run without it)" << std::endl;
+        }
+    }
+
     // 2b. versions: what the model was converted with against what runs here (design 7.4)
     {
         int cuda_version = 0;
@@ -164,6 +183,7 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
         }
     }
     load_op_libs(meta.required_op_libs);
+    ensure_halo_exchange_op_registered();   // dsmd::halo_exchange, called by a layer-exchange model
 
     // 4. the runner for this file format
     if (meta.backend == "torchscript") {
@@ -192,6 +212,8 @@ LibTorchBackend::~LibTorchBackend() = default;
 double LibTorchBackend::cutoff() const { return impl_->metadata.cutoff; }
 double LibTorchBackend::ghost_cutoff() const { return impl_->metadata.ghost_cutoff; }
 bool LibTorchBackend::uses_edge_shifts() const { return impl_->metadata.edge_shifts; }
+int LibTorchBackend::edge_receiver_row() const { return impl_->metadata.edge_receiver_row; }
+bool LibTorchBackend::exchanges_layers() const { return impl_->metadata.layer_exchange; }
 const MLIPMetadata& LibTorchBackend::metadata() const { return impl_->metadata; }
 
 void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
@@ -215,6 +237,8 @@ void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
 
     // Our own operations record no graph; the wrapper inside the model turns grad mode on for the force.
     torch::NoGradGuard no_grad;
+    // The transport the model's dsmd::halo_exchange calls (forward pass and the backward pass of the force) use; none on a single rank.
+    HaloTransportScope halo_scope(in.halo);
 
     const auto real64 = torch::TensorOptions().device(s.device).dtype(torch::kFloat64);
     const auto int32 = torch::TensorOptions().device(s.device).dtype(torch::kInt32);

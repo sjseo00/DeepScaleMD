@@ -29,6 +29,12 @@ struct MLIPMetadata {
     std::string target_gpu;                   // "sm_90" (or "cpu": a test package); required for aoti
     bool edge_shifts = false;                 // optional field: the model takes periodic images as per-edge shift vectors (a fifth
                                               // input) and returns the virial (a fourth output); torchscript only
+    int edge_receiver_row = -1;               // optional field edge_receiver_row (0 or 1): the row of edge_index the model sums its
+                                              // messages onto; -1 = not given (every edge is kept, see EdgeBuilder::Prune)
+    bool layer_exchange = false;              // optional field: the model exchanges its node features between the message-passing
+                                              // layers (the operator dsmd::halo_exchange, HaloExchangeOp.h), so it needs ghost atoms
+                                              // only one cutoff deep, and edges only onto owned atoms; torchscript only, needs
+                                              // edge_shifts and edge_receiver_row
 };
 
 // Parses and validates the JSON text. Throws std::runtime_error whose message starts with `source` and names

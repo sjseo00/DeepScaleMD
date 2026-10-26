@@ -25,7 +25,7 @@ AOTIRunner::AOTIRunner(const std::string& model_file, const torch::Device& devic
         if (key->second != wanted) {
             throw std::runtime_error("AOTIRunner: '" + model_file + "' was compiled for the " + key->second +
                                      " but is being loaded for the " + wanted +
-                                     "; convert it again for this device (python -m mlip_convert ... --device " + wanted + ")");
+                                     "; convert it again for this device (PYTHONPATH=MLIP_tools python -m mlip_convert ... --device " + wanted + ")");
         }
     }
 }

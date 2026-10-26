@@ -3,6 +3,9 @@
 
 // No LibTorch headers here: MD code and PythonBackend must build without LibTorch.
 
+#include "MLIPHaloTransport.h"
+#include "MLIPRankComm.h"
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -33,6 +36,9 @@ struct MLIPInputs {
     bool host_memory = false;                 // d_* pointers (and MLIPOutputs) are host memory: CPU calculator
     double cell[3] = {0.0, 0.0, 0.0};         // orthorhombic box lengths (A); used by PythonBackend
     bool pbc[3] = {false, false, false};      // periodic flags; used by PythonBackend
+    MLIPHaloTransport* halo = nullptr;        // how a layer-exchange model (exchanges_layers()) moves node features between the ranks
+                                              // (the MD's halo exchange); nullptr = no ghost atoms to exchange with (one rank, or the
+                                              // replicated step)
 };
 
 // Outputs are in MD units (kcal/mol, kcal/mol/A); the backend converts from model units.
@@ -49,7 +55,7 @@ struct MLIPOutputs {
 
 // The former mlip_config section keys (docs/04): everything the Python MLIP path takes.
 struct PythonMLIPConfig {
-    std::string module_path = "mlip_python";  // python_mlip_path: the directory with ml_forces.py (relative to the working directory, or absolute)
+    std::string module_path = "MLIP_tools/mlip_python";  // python_mlip_path: the directory with ml_forces.py (relative to the working directory, or absolute)
     std::string model_path;                   // mlip_config.model_path
     std::string model_type;                   // mlip_config.model_type, or force_calculation.type if empty
     std::string model_size = "small";
@@ -63,7 +69,11 @@ struct MLIPConfig {
     std::string model_path;                   // converted model folder (libtorch)
     std::vector<int> type_to_z;               // MD type id -> atomic number
     bool verbose = false;                     // print progress messages (MPI rank 0 only)
+    bool allow_tf32 = false;                  // libtorch: float32 matrix products on the TF32 tensor cores (advanced.tf32); faster, ~10 bits
+                                              // of mantissa in the products; needs an Ampere or newer GPU
     PythonMLIPConfig python;                  // used when backend == "python"
+    MLIPRankComm* comm = nullptr;             // the other MPI ranks (not owned); nullptr = a single process. PythonBackend uses it
+                                              // on several ranks: every rank then computes all atoms (see PythonBackend.h)
 };
 
 class MLIPBackend {
@@ -75,6 +85,12 @@ public:
     // True: the model takes periodic images as edge shifts (MLIPInputs::d_edge_shift) and gives the virial, so the MD side
     // does not copy atoms across the periodic boundary for it.
     virtual bool uses_edge_shifts() const { return false; }
+    // 0 or 1: the row of the edge list that the model sums its messages onto, so the MD can leave out the edges that cannot change
+    // the energy of the owned atoms (EdgeBuilder::Prune); -1 = not known, every edge is kept.
+    virtual int edge_receiver_row() const { return -1; }
+    // True: the model exchanges node features between its layers (metadata layer_exchange). The MD then gives it ghost atoms only
+    // one cutoff deep, builds edges onto owned atoms only (MLIPStepGeometry::owned_receivers_only), and sets MLIPInputs::halo.
+    virtual bool exchanges_layers() const { return false; }
 };
 
 // Defined in MLIPBackendFactory.cpp. An empty cfg.backend means "python".
