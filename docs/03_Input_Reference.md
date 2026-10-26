@@ -175,7 +175,7 @@ completeness.
 | `mlip_backend` | `python`, `libtorch` | `python` | `python` calls a Python adapter in an embedded interpreter (CPU or CUDA). `libtorch` runs a converted model from C++ and needs a CUDA build configured with `-DENABLE_LIBTORCH=ON`. |
 | `mlip_model` | path | none | `libtorch` only (required): the converted model folder. |
 | `python_mlip_path` | path | `mlip_python` | `python` only: the folder with `ml_forces.py`. Relative to the directory you start `dsMD` in. |
-| `mlip_elements:` (section) | `type name: element` lines | automatic | Names the chemical element of each atom type when `dsMD` cannot tell. See [Preparing a system](04_Preparing_a_System.md#element-names-for-mlips). `mlip_type_to_z` is no longer accepted and stops the run. |
+| `mlip_elements:` (section) | `type name: element` lines | automatic | Names the chemical element of each atom type when `dsMD` cannot tell. See [MLIP](06_MLIP.md#which-element-is-each-atom-type). `mlip_type_to_z` is no longer accepted and stops the run. |
 | `mlip_config:` (section; alias `mace_config`) | | | Settings for `mlip_backend: python`. Keys below. |
 | `mlip_config.model_path` | path | none | Model file for the adapter. |
 | `mlip_config.model_type` | text | `force_calculation.type` | Adapter name, such as `mace_mp`. |

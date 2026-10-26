@@ -2,40 +2,32 @@
 
 ## Contents
 
-- [Which route to take](#which-route-to-take)
-- [Coordinate file (XYZ)](#coordinate-file-xyz)
-- [Legacy topology (`.top`)](#legacy-topology-top)
-- [dsMD_input package](#dsmd_input-package)
-- [Converting from other engines](#converting-from-other-engines)
-- [Element names for MLIPs](#element-names-for-mlips)
+- [1. Coordinate file and legacy topology](#1-coordinate-file-and-legacy-topology)
+- [2. Converting from other MD engines](#2-converting-from-other-md-engines)
 - [Limitations](#limitations)
 
 `dsMD` needs two things about your system: **where the atoms are** (a coordinate file) and
-**what the atoms are** (a topology). This page describes the file formats and how to produce
-them, from a hand-written file to a converted CHARMM, GROMACS, NAMD, or LAMMPS setup.
+**what the atoms are** (a topology). There are two ways to get them:
 
-## Which route to take
+| Your system | Use |
+|---|---|
+| Lennard-Jones liquid, simple molecules, machine-learned potentials | an `.xyz` file and a legacy `.top` file ([section 1](#1-coordinate-file-and-legacy-topology)) |
+| Protein, lipid, solvated biomolecule, anything set up in NAMD, GROMACS, CHARMM, or LAMMPS | a package made by a converter ([section 2](#2-converting-from-other-md-engines)) |
 
-| Your system | Use | Section |
-|---|---|---|
-| Lennard-Jones liquid, simple molecules, anything with only atom types, masses, charges, and a few bonded terms | `.xyz` + legacy `.top` written by hand or by a script | [Legacy topology](#legacy-topology-top) |
-| Protein, lipid, solvated biomolecule, or anything from NAMD/GROMACS/LAMMPS/CHARMM | `dsMD_input` package made by a converter | [dsMD_input package](#dsmd_input-package) and [Converters](#converting-from-other-engines) |
-| A machine-learned potential | `.xyz` + `.top` giving only types, masses, and elements | [Element names for MLIPs](#element-names-for-mlips) |
-
-The route decides which keys go in the input file:
+The input file names the files in one of two ways:
 
 ```yaml
-# legacy:  two files
+# section 1: two files
 coordinate_file: water100.xyz
 topology_file:   water100.top
 
-# dsMD_input:  a manifest that names the three files
+# section 2: the manifest of a converted package
 input_system: out/my_system/manifest.yaml
 ```
 
-## Coordinate file (XYZ)
+## 1. Coordinate file and legacy topology
 
-A standard XYZ file:
+### Coordinate file (XYZ)
 
 ```text
 3
@@ -46,36 +38,19 @@ H  -0.757   0.586   0.000
 ```
 
 - Line 1 is the number of atoms. Line 2 is skipped.
-- Each atom line starts with an element symbol and three coordinates in **Å**. Extra columns are
-  ignored.
-- The order of the atoms is the order of the topology: atom 1 here is atom 1 (legacy) or atom 0
-  (`dsMD_input`) there. The atom count has to match, or the run stops.
-- With a `dsMD_input` topology, the element symbol has to equal the topology's element for that
-  atom, or the run stops with an element-order mismatch.
-- Make the box in the input file enclose the system. `dsMD` moves all atoms together so that the
-  mean position of the atoms in the file sits at the center of the box, and the box size is the one you give
-  in `box_x`, `box_y`, `box_z`. It does not read a box from the XYZ file.
+- Each atom line is an element symbol and three coordinates in **Å**. Extra columns are ignored.
+- The order of the atoms is the order of the topology, and the atom counts have to match.
+- The box is not read from the file. Give it in the input file (`box_x`, `box_y`, `box_z`). `dsMD`
+  moves the atoms so that their mean position sits at the center of the box.
 - There are no velocities in the file. They are generated from `target_temperature`.
 
-Starting structures with overlapping atoms make the first forces huge. Either build the structure
-without overlaps, or add a short [`minimize:`](03_Input_Reference.md#energy-minimization-minimize)
-section so that FIRE relaxes it first (the ApoA1 example does this).
+Overlapping atoms make the first forces huge. Build the structure without overlaps, or add a short
+[`minimize:`](03_Input_Reference.md#energy-minimization-minimize) section so that FIRE relaxes it first.
 
-### Making a starting structure
+### Legacy topology (`.top`)
 
-`dsMD` reads any XYZ file, so any builder works. The repository has three small generators:
-
-| Script | Makes | Example |
-|---|---|---|
-| `examples/mlip_water100/make_water_box.py` | A random water box, relaxed with a flexible TIP3P-like force field, as `<out>.xyz` and `<out>.top`. Prints the box edge. Needs numpy. | `python examples/mlip_water100/make_water_box.py --molecules 100 --out water100` |
-| `benchmarks/engine/make_lj.py` | An FCC argon lattice (4 atoms per cell) as `coordinates.xyz` and `topology.top`, plus a LAMMPS data file. Standard library only. | `python make_lj.py lj_S 32 32 32` writes `systems/lj_S/` |
-| `examples/lj_32000/generate_lj_system.py` | A random LJ system with a minimum atom distance, as `coordinates.xyz` and a LAMMPS data file. It does not write a topology. | edit the numbers in the `__main__` block, then run it |
-
-## Legacy topology (`.top`)
-
-A text file in sections, written in a GROMACS-like style. It is read when `parameter_file` is not
-set. Lines starting with `;` or `#`, and empty lines, are skipped. Section names are not case
-sensitive. Fields are separated by whitespace.
+A text file in sections, in a GROMACS-like style. Lines starting with `;` or `#` and empty lines are
+skipped. It is used when `parameter_file` is not set.
 
 ```text
 [ atomtypes ]
@@ -113,273 +88,120 @@ sensitive. Fields are separated by whitespace.
 ; atom_i atom_j atom_k atom_l  dihedral_type_name
 ```
 
-Rules, all from the file reader:
-
-- **Atom numbers start at 1.**
-- `[ atomtypes ]` has five columns in this order: name, mass, charge, **sigma**, **epsilon**. Mass
-  and charge of every atom come from its type. Extra columns in `[ atoms ]` after the type
-  (a mass and charge column in some files) are ignored.
+- Atom numbers start at 1. Mass and charge of an atom come from its type.
 - A bond, angle, or dihedral refers to its parameters by the **joined type names**: the bond type
-  `O H` is called `O-H`, the angle type `H O H` is `H-O-H`, a dihedral type is `A-B-C-D`. The name
-  in the `[ bonds ]` line must match.
-- Energies: bonds are `½ k (r − r0)²`, angles are `½ k (θ − θ0)²`, dihedrals are
-  `k (1 + cos(n φ − phase))`.
-- Lennard-Jones between different types uses Lorentz–Berthelot mixing: σ is the mean and ε the
-  geometric mean.
-- This format has no section for exclusions, special 1-4 pairs, impropers, or constraints. It
-  does not generate exclusions either, so atoms that are bonded to each other still feel the
-  Lennard-Jones and Coulomb terms. Use it for simple systems and for MLIP runs. For a
-  biomolecular force field, use the `dsMD_input` package.
-- The element column of trajectory `.xyz` files comes from the topology, and this format has no
-  element column. Frames written in `xyz` format therefore have an **empty element** field. Use
-  `dump`, `dcd`, or a `dsMD_input` topology if you need element names in the output.
+  `O H` is called `O-H`, the angle type `H O H` is `H-O-H`.
+- Energies: bonds `½ k (r − r0)²`, angles `½ k (θ − θ0)²`, dihedrals `k (1 + cos(n φ − phase))`.
+- Lennard-Jones between different types uses Lorentz–Berthelot mixing.
+- There are no exclusions, 1-4 pairs, impropers, or constraints, so bonded atoms still feel the
+  Lennard-Jones and Coulomb terms. Use this format for simple systems and for MLIP runs. For a
+  biomolecular force field, use a converted package (section 2).
+- There is no element column, so frames written in `xyz` format have an empty element field. Use
+  `dump` or `dcd` output if you need the elements.
 
-Examples to copy: `examples/lj_32000/topology_32000.top` (argon),
-`examples/mlip_water100/water100.top` (flexible water for a machine-learned potential).
 
-## dsMD_input package
+### Preparing a system for an MLIP
 
-This is the format for classical force fields. It is a folder with four files that you normally
-get from a [converter](#converting-from-other-engines) rather than write:
+A machine-learned potential only needs the positions, the box, and the **element** of every atom,
+so the `.xyz` and a minimal `.top` (atom types and masses) are enough:
+
+```bash
+python examples/mlip_water100/make_water_box.py --molecules 100 --out water100
+```
+
+This writes `water100.xyz` and `water100.top` and prints the box edge for `box_x/y/z`. Getting a
+model, converting it, and running it are in [MLIP](06_MLIP.md). How `dsMD` finds the element of
+each atom type is described there too ([which element is each atom type](06_MLIP.md#which-element-is-each-atom-type)).
+
+## 2. Converting from other MD engines
+
+A converted system is a folder (a `dsMD_input` package) with four files:
 
 ```text
 my_system/
 ├── manifest.yaml        # ties the files together
-├── coordinates.xyz      # atom positions (Å)
+├── coordinates.xyz
 ├── topology.dsMDtop     # atoms, bonds, angles, dihedrals, exclusions, ...
-└── parameters.dsMDprm   # atom types, pair parameters, bond/angle/torsion parameters
+└── parameters.dsMDprm   # atom types and force-field parameters
 ```
 
-Point the input file at the manifest:
+Supported engines:
 
-```yaml
-input_system: my_system/manifest.yaml
-```
+| Engine | Reads |
+|---|---|
+| NAMD | the config file (it names the PSF, PDB, and parameter files) |
+| GROMACS | `.top` (with `#include`), `.gro`, optional `.mdp` |
+| CHARMM | PSF, PDB, parameter files, optional stream file |
+| LAMMPS | input script and data file (units `real`) |
+| SPICA | LAMMPS `lj/spica` or `mie/cut` input and data file |
 
-`dsMD` reads `coordinate_file`, `topology_file`, and `parameter_file` from the manifest, and
-resolves them relative to the manifest. A key of the same name in the input file wins.
+If the source has run settings (NAMD config, GROMACS `.mdp`, CHARMM stream file, LAMMPS script), the
+converter also writes a DeepScaleMD input file, `input_dsmd.yaml`.
 
-### Manifest
+### The menu: `ff_cli_ui`
 
-```yaml
-schema_version: 1                # required, must be 1
-format: dsMD_input               # required, must be exactly this
-coordinate_file: coordinates.xyz
-topology_file: topology.dsMDtop
-parameter_file: parameters.dsMDprm
-forcefield_family: charmm        # informational
-forcefield_variant: charmm22-apoa1
-polarizable: false
-```
-
-### Conventions
-
-Length in Å, energy in kcal/mol, charge in elementary charges, angles in degrees. **Atom IDs
-start at 0** and have to be contiguous. Atom type IDs also start at 0 and have to be contiguous.
-Lines starting with `;` or `#` are comments.
-
-### Topology file (`topology.dsMDtop`)
-
-| Section | Line format | Notes |
-|---|---|---|
-| `[meta]` | `schema_version 1`, `atom_count N` | Both required. `atom_count` has to equal the number of atoms. |
-| `[atoms]` | `atom_id element type_id mass charge [molecule_id residue_id]` | One line per atom, IDs in order. |
-| `[bonds]` | `atom_i atom_j bond_param_id` | |
-| `[angles]` | `atom_i atom_j atom_k angle_param_id` | |
-| `[dihedrals]` | `atom_i atom_j atom_k atom_l torsion_param_id` | Proper torsions. |
-| `[impropers]` | `atom_i atom_j atom_k atom_l improper_param_id` | |
-| `[exclusions]` | `atom_i atom_j` | Pairs with no nonbonded interaction. |
-| `[special_pairs]` | `atom_i atom_j pair_param_id lj_scale coulomb_scale` | Scaled 1-4 pairs. Each must also be in `[exclusions]`. |
-| `[constraints]` | `atom_i atom_j distance(Å)` | Rigid bonds; SHAKE/RATTLE. |
-| `[virtual_sites]` | | Rejected: not supported. |
-
-Besides the pairs you list in `[exclusions]`, `dsMD` adds the 1-2 pairs of every bond, the 1-3
-pairs of every angle, and the 1-4 pairs of every dihedral to the exclusions itself.
-
-### Parameter file (`parameters.dsMDprm`)
-
-| Section | Line format | Notes |
-|---|---|---|
-| `[meta]` | `schema_version 1`, `energy_unit kcal_per_mol`, `length_unit angstrom`, `charge_unit elementary_charge` | Other units are rejected. |
-| `[nonbonded]` | `component 0 mie n=12 m=6`, optionally `cutoff=` | Exactly one Mie component. Any `cutoff=` on the line is ignored; the cutoff comes from `cutoff_distance`. Exponents `(12, 6)`, or `(9, 6)` for SPICA coarse-grained models. A `component 1 coulomb method=pme` line is allowed and is the electrostatics (PME). |
-| `[atom_types]` | `type_id name` | Contiguous from 0. |
-| `[pair_parameters]` | `component_id type_i type_j sigma epsilon` | A **complete** table: every type pair must be given exactly once. The order of the two types does not matter, but listing both `(i, j)` and `(j, i)` is an error. |
-| `[bond_parameters]` | `param_id harmonic k r0` | `½ k (r − r0)²`. |
-| `[angle_parameters]` | `param_id harmonic k theta0_deg` | `½ k (θ − θ0)²`. |
-| `[torsion_parameters]` | `param_id periodic k phase_deg multiplicity` | `k (1 + cos(n φ − phase))`. Several lines for one torsion type are separate IDs. |
-| `[improper_parameters]` | `param_id periodic k phase_deg multiplicity` or `param_id harmonic k phi0_deg` | |
-| `[special_pair_parameters]` | `param_id sigma epsilon` | Explicit 1-4 Lennard-Jones parameters. Without one, the mixed parameters are used. |
-
-Every bonded term refers to a parameter ID that has to exist, or the load stops with the file name
-and line number. `examples/dsMD_input_lj/` is a two-atom package small enough to read in full;
-`examples/apoa1/dsMD_input/` is a real biomolecular package.
-
-## Converting from other engines
-
-`FF_tools/python_converter/` turns inputs from other MD engines into a `dsMD_input` package, and turns the
-run settings of the same input into a DeepScaleMD input file (`input_dsmd.yaml`). It needs only
-the Python 3 standard library and is not part of the C++ build. Every input is a named
-`--option`. If you prefer not to type the command, a numbered menu asks for the engine and the files and runs it for you
-([The menu: `ff_cli_ui`](#the-menu-ff_cli_ui)).
+The easiest way is the numbered menu in `FF_tools/ff_cli_ui/`. It asks for the engine and the files,
+shows the converter command, and runs it after you confirm. It needs only the Python standard
+library. Run it from the repository root:
 
 ```bash
-# NAMD: the config names the PSF, parameters, PDB, box, and run settings
-python FF_tools/python_converter/convert_namd.py --namd input.namd --out out/my_system \
-    --ff-name charmm22-apoa1
-
-# GROMACS
-python FF_tools/python_converter/convert_gromacs.py --top system.top --gro system.gro \
-    --mdp md.mdp --out out/my_system --ff-name amber99sb-ildn \
-    -I /path/to/gromacs/share/gromacs/top
-
-# CHARMM files given one by one
-python FF_tools/python_converter/convert_charmm.py --psf system.psf --pdb system.pdb \
-    --param par_all36.prm --param toppar_water_ions.str \
-    --box 62.0 62.0 62.0 --inp run.inp --out out/my_system --ff-name charmm36
-
-# LAMMPS (the input script is also the run input)
-python FF_tools/python_converter/convert_lammps.py --input system.in --out out/my_system \
-    --ff-name opls-aa
-
-# SPICA coarse-grained (LAMMPS lj/spica or mie/cut)
-python FF_tools/python_converter/convert_spica.py --input system.in --data system.data \
-    --out out/my_system --ff-name spica-2019
+PYTHONPATH=FF_tools python -m ff_cli_ui                          # or: bash FF_tools/ff_cli_ui/run.sh
+PYTHONPATH=FF_tools python -m ff_cli_ui --folder examples/apoa1  # where to look for input files first
 ```
 
-| Engine | Reads | Run input that becomes `input_dsmd.yaml` | Box |
-|---|---|---|---|
-| NAMD | PSF, PDB, XPLOR/CHARMM parameters, named in the config | The config (`--namd`) | From the config, or `--box` |
-| GROMACS | `.top` (with `#include`), `.gro` | `.mdp` (`--mdp`, optional) | From the `.gro` (orthorhombic only) |
-| CHARMM | PSF, PDB, parameter files | Stream file (`--inp`, optional) | `--box` or the stream file |
-| LAMMPS | Input script and data file (units `real`) | The script | From the data file |
-| SPICA | LAMMPS `lj/spica` or `mie/cut` input and data | The script | From the data file |
+The steps are: choose the engine, choose the input files (the menu lists matching files under a
+folder, `L` types a path, `N` skips an optional file), set the options (force-field name, box,
+`--allow-lossy`, ...), and choose the output folder. `b` goes back one step and `q` quits.
 
-What the converters write into `out/my_system/`: `manifest.yaml`, `coordinates.xyz`,
-`topology.dsMDtop`, `parameters.dsMDprm`, and `input_dsmd.yaml` when there is a run input. The
-generated YAML carries the temperature, timestep, steps, minimization (as FIRE), box, cutoff,
-switch distance, skin, neighbor interval, thermostat, barostat, output intervals, and PME grid
-spacing, converted to DeepScaleMD units.
+### The converters
 
-Useful options of the shared run-input conversion:
+Without the menu, run the converter for your engine directly. They are in
+`FF_tools/python_converter/`, need only the Python 3 standard library, and every input is a named
+option:
 
-| Option | Meaning |
-|---|---|
-| `--precision {mixed,double}` | Value written to `force_calculation.precision`. The converters default to `mixed`, which is the faster setting; `dsMD` itself defaults to `double`. |
-| `--nonbonded-kernel {list,tiled,graph}` | Value written to `force_calculation.nonbonded_kernel` (`list` needs `mixed`). |
-| `--input-system PATH` | Value written to `input_system` (default `manifest.yaml`). |
-| `--min-force-tolerance F` | FIRE tolerance in kcal/mol/Å when the source gives none. Default 1.0. |
-| `--allow-lossy` | Turn an unsupported term or setting from an error into a warning, and drop it. |
+```bash
+# NAMD
+python FF_tools/python_converter/convert_namd.py --namd input.namd --out out/my_system --ff-name charmm22-apoa1
 
-Run `dsMD` from inside the output folder, because `input_system` is resolved against the
-directory you start from:
+# GROMACS
+python FF_tools/python_converter/convert_gromacs.py --top system.top --gro system.gro --mdp md.mdp \
+    --out out/my_system --ff-name amber99sb-ildn
+
+# CHARMM
+python FF_tools/python_converter/convert_charmm.py --psf system.psf --pdb system.pdb \
+    --param par_all36.prm --box 62.0 62.0 62.0 --out out/my_system --ff-name charmm36
+
+# LAMMPS
+python FF_tools/python_converter/convert_lammps.py --input system.in --out out/my_system --ff-name opls-aa
+
+# SPICA
+python FF_tools/python_converter/convert_spica.py --input system.in --data system.data --out out/my_system --ff-name spica-2019
+```
+
+Options, the unsupported settings of each engine, and the file formats of the package are in
+`FF_tools/python_converter/README.md`.
+
+### Running the converted system
+
+Run `dsMD` from inside the output folder, because `input_system` is resolved against the directory
+you start from:
 
 ```bash
 cd out/my_system && /path/to/dsMD input_dsmd.yaml
 ```
 
-Or keep your own input file and point it at the package:
-`input_system: out/my_system/manifest.yaml`.
+Or keep your own input file and set `input_system: out/my_system/manifest.yaml`. Example (ApoA1 from
+NAMD): `examples/apoa1/` holds a converted package in `dsMD_input/` and `input_dsMD.yaml`.
 
-A setting `dsMD` cannot reproduce makes the converter stop with an error that names it, and so
-does anything it cannot represent exactly. The main ones: constraints in the *run* settings,
-multiple time stepping, thermostats or barostats `dsMD` does not have, anisotropic pressure
-coupling, PME turned off, different van der Waals and Coulomb cutoffs, force switching, tail
-corrections, CMAP, polarizable models, virtual sites, NBFIX overrides, tilted boxes. The full
-list per engine is in `FF_tools/python_converter/README.md`.
-
-### The menu: `ff_cli_ui`
-
-`FF_tools/ff_cli_ui/` is a numbered menu over the converters above. It asks which engine you use and which files to convert, builds
-the `convert_*.py` command, shows it, and runs it after you confirm. It does not change the converters: it prints their exit code and
-their `error: ...` message as they are. It uses only the Python standard library, so there is nothing to install. Run it from the
-repository root:
-
-```bash
-PYTHONPATH=FF_tools python -m ff_cli_ui                           # or: bash FF_tools/ff_cli_ui/run.sh
-PYTHONPATH=FF_tools python -m ff_cli_ui --list                    # only list the supported engines and input files
-PYTHONPATH=FF_tools python -m ff_cli_ui --dry-run                 # go through the menus, print the command, run nothing
-PYTHONPATH=FF_tools python -m ff_cli_ui --folder examples/apoa1   # folder where the input files are looked for first
-```
-
-The steps:
-
-1. **Engine**: NAMD, GROMACS, CHARMM (PSF + parameter files + PDB), LAMMPS, or SPICA.
-2. **Input files**: give a folder and the menu lists the files with the right extension under it (up to three levels deep). Type `L` to
-   enter a path yourself, and `N` to skip an optional file. The files asked for are:
-
-   | Engine | Files | Run input that becomes `input_dsmd.yaml` |
-   |---|---|---|
-   | NAMD | one config (it names the structure, coordinates, parameters, and box) | the config |
-   | GROMACS | `.top`, `.gro`, `.mdp` (optional) | the `.mdp` |
-   | CHARMM | `.psf`, several parameter files (merged in the order you pick them), `.pdb`, `.inp` (optional) | the `.inp` |
-   | LAMMPS | input script, data file (optional) | the input script |
-   | SPICA | input script, data file (optional) | the input script |
-
-   Without a run input (no GROMACS `.mdp`, no CHARMM `.inp`), only the four package files are written and there is no `input_dsmd.yaml`.
-3. **Options**: the force field name, the GROMACS `-I` folder, the box (required for CHARMM without an `.inp`; for NAMD, leaving it empty
-   takes `cellBasisVector` from the config), how dihedrals are read, the 1-4 electrostatic scaling, and `--allow-lossy`. When there is a
-   run input you can also set the `input_dsmd.yaml` values: precision, nonbonded kernel, FIRE tolerance, and `input_system`
-   (defaults: `mixed` and `list`).
-4. **Output folder** (default `out/<input file name>`). The menu shows the exact command and asks for confirmation. If the folder
-   already has files, it asks once more.
-
-At every step `b` goes back one step and `q` quits. Defaults and allowed values are the converters' own. What the converters cannot
-convert is listed in `FF_tools/python_converter/README.md`. After a conversion, compare energies and forces with the original engine on a
-small system before a production run. The menu for machine-learned potentials is described in
-[the MLIP page](06_MLIP.md#33-the-menu-mlip_cli_ui).
-
-### Example: ApoA1 from NAMD
-
-```bash
-python FF_tools/python_converter/convert_namd.py \
-  --namd examples/apoa1/apoa1.namd \
-  --out examples/apoa1/dsMD_input \
-  --ff-name charmm22-apoa1
-cd examples/apoa1
-/path/to/dsMD input_dsMD.yaml
-```
-
-`examples/apoa1/input_dsMD.yaml` holds `input_system: dsMD_input/manifest.yaml`, which is why it
-has to be started from inside `examples/apoa1`.
-
-**Check the physics after converting.** The converter carries parameters and topology across; it
-does not recompute what the source engine would. Compare the potential energy and forces of a
-small test system against the source engine before a long run.
-
-## Element names for MLIPs
-
-A machine-learned potential needs the chemical element of every atom. `dsMD` works out the
-element of each **atom type** from three places, and uses what they agree on:
-
-1. the element column of a `dsMD_input` topology,
-2. the element symbol in the coordinate file,
-3. the mass of the type (15.999 is O, 1.008 is H, ...).
-
-If one of them is missing, the others are used. If they disagree, or none gives an answer, `dsMD`
-stops and prints the lines to add. You can always set the elements yourself, using the atom
-**type names** from the topology:
-
-```yaml
-mlip_elements:
-  OW: O
-  HW: H
-```
-
-So for an MLIP run you need at least a topology that lists the atoms with types and masses (the
-legacy `.top` is enough), plus the coordinates and box. The details of models and settings are in
-[MLIP](06_MLIP.md).
+The converter carries parameters and topology across; it does not recompute what the source engine
+would. Compare the potential energy and forces of a small test system against the source engine
+before a long run.
 
 ## Limitations
 
 - The box is orthorhombic. Converters reject tilted boxes.
-- Mie `(9, 6)` (SPICA) is implemented on the GPU backend only. The CPU backend supports
-  `(12, 6)`.
-- Constraints in a `dsMD_input` topology (`[constraints]`) work with the `velocity_verlet`
-  integrator. Constraints that connect atoms on different MPI ranks are not supported.
 - The legacy `.top` format does not support exclusions, 1-4 pairs, impropers, or constraints.
 - `[virtual_sites]` sections are rejected.
-- The SPICA converter reads one column layout of the older `pair_coeff` form from memory and has
-  not been checked against a real SPICA run. Compare the generated `parameters.dsMDprm` to your
-  `pair_coeff` lines (see `FF_tools/python_converter/README.md`).
+- The SPICA converter has not been checked against a real SPICA run.
 
 Next: [Classical MD](05_Classical_MD.md) or [MLIP](06_MLIP.md).

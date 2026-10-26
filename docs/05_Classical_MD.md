@@ -105,7 +105,7 @@ python FF_tools/python_converter/convert_namd.py \
 ```
 
 This writes the `dsMD_input` package and an `input_dsmd.yaml` that reproduces the NAMD run
-settings. Other engines are in [Preparing a system](04_Preparing_a_System.md#converting-from-other-engines).
+settings. Other engines are in [Preparing a system](04_Preparing_a_System.md#2-converting-from-other-md-engines).
 
 **2. Look at the input file.** `examples/apoa1/input_dsMD.yaml` is the input used by the
 examples:
