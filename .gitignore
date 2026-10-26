@@ -15,6 +15,7 @@ examples/apoa1/*
 !examples/apoa1/input_dsMD.yaml
 !examples/apoa1/README_DSMD.md
 test*/
+!/tests/
 obj/
 bin/
 CMakeFiles/

@@ -50,8 +50,8 @@ class UMAAdapter(MLIPAdapter):
         print(f"[UMA] Loading model: {model_path}  device={self.device}  task={task}")
         try:
             from fairchem.core.units.mlip_unit.predict import InferenceSettings
-            # external_graph_gen=True → FAIRChemCalculator가 직접 radius-graph를 생성
-            # (False이면 r_edges=False → AtomicData에 edges가 없어 "No edges found" 오류 발생)
+            # external_graph_gen=True -> FAIRChemCalculator builds the radius graph itself
+            # (if False, r_edges=False -> AtomicData has no edges and "No edges found" is raised)
             inf_settings = InferenceSettings(external_graph_gen=True)
             predict_unit = MLIPPredictUnit(
                 model_path, device=self.device, inference_settings=inf_settings

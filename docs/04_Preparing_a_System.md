@@ -206,32 +206,33 @@ and line number. `examples/dsMD_input_lj/` is a two-atom package small enough to
 
 ## Converting from other engines
 
-`python_converter/` turns inputs from other MD engines into a `dsMD_input` package, and turns the
+`FF_tools/python_converter/` turns inputs from other MD engines into a `dsMD_input` package, and turns the
 run settings of the same input into a DeepScaleMD input file (`input_dsmd.yaml`). It needs only
 the Python 3 standard library and is not part of the C++ build. Every input is a named
-`--option`.
+`--option`. A numbered menu asks for the engine and the files and types the command:
+`PYTHONPATH=FF_tools python -m ff_cli_ui`.
 
 ```bash
 # NAMD: the config names the PSF, parameters, PDB, box, and run settings
-python python_converter/convert_namd.py --namd input.namd --out out/my_system \
+python FF_tools/python_converter/convert_namd.py --namd input.namd --out out/my_system \
     --ff-name charmm22-apoa1
 
 # GROMACS
-python python_converter/convert_gromacs.py --top system.top --gro system.gro \
+python FF_tools/python_converter/convert_gromacs.py --top system.top --gro system.gro \
     --mdp md.mdp --out out/my_system --ff-name amber99sb-ildn \
     -I /path/to/gromacs/share/gromacs/top
 
 # CHARMM files given one by one
-python python_converter/convert_charmm.py --psf system.psf --pdb system.pdb \
+python FF_tools/python_converter/convert_charmm.py --psf system.psf --pdb system.pdb \
     --param par_all36.prm --param toppar_water_ions.str \
     --box 62.0 62.0 62.0 --inp run.inp --out out/my_system --ff-name charmm36
 
 # LAMMPS (the input script is also the run input)
-python python_converter/convert_lammps.py --input system.in --out out/my_system \
+python FF_tools/python_converter/convert_lammps.py --input system.in --out out/my_system \
     --ff-name opls-aa
 
 # SPICA coarse-grained (LAMMPS lj/spica or mie/cut)
-python python_converter/convert_spica.py --input system.in --data system.data \
+python FF_tools/python_converter/convert_spica.py --input system.in --data system.data \
     --out out/my_system --ff-name spica-2019
 ```
 
@@ -274,12 +275,12 @@ does anything it cannot represent exactly. The main ones: constraints in the *ru
 multiple time stepping, thermostats or barostats `dsMD` does not have, anisotropic pressure
 coupling, PME turned off, different van der Waals and Coulomb cutoffs, force switching, tail
 corrections, CMAP, polarizable models, virtual sites, NBFIX overrides, tilted boxes. The full
-list per engine is in `python_converter/README.md`.
+list per engine is in `FF_tools/python_converter/README.md`.
 
 ### Example: ApoA1 from NAMD
 
 ```bash
-python python_converter/convert_namd.py \
+python FF_tools/python_converter/convert_namd.py \
   --namd examples/apoa1/apoa1.namd \
   --out examples/apoa1/dsMD_input \
   --ff-name charmm22-apoa1
@@ -328,6 +329,6 @@ legacy `.top` is enough), plus the coordinates and box. The details of models an
 - `[virtual_sites]` sections are rejected.
 - The SPICA converter reads one column layout of the older `pair_coeff` form from memory and has
   not been checked against a real SPICA run. Compare the generated `parameters.dsMDprm` to your
-  `pair_coeff` lines (see `python_converter/README.md`).
+  `pair_coeff` lines (see `FF_tools/python_converter/README.md`).
 
 Next: [Classical MD](05_Classical_MD.md) or [MLIP](06_MLIP.md).

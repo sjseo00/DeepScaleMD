@@ -385,7 +385,7 @@ void LeapFrogIntegratorCUDA::integrate(ParticleData& particles, const Simulation
 
     launch_leap_frog_kernel(d_x, d_y, d_z,
                             d_vx, d_vy, d_vz,
-                            d_fx, d_fy, d_fz,  // 위치 업데이트에서는 힘 미사용
+                            d_fx, d_fy, d_fz,  // forces are not used in the position update
                             d_mass, dt, n,
                             box.lx, box.ly, box.lz,
                             box.periodic_x, box.periodic_y, box.periodic_z,

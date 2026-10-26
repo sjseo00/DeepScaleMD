@@ -111,7 +111,9 @@ DeepScaleMD/
 │   ├── mlip_python/       # Python MLIP adapters
 │   ├── mlip_convert/      # converter: MLIP -> LibTorch model folder
 │   └── mlip_cli_ui/       # menu around mlip_convert
-├── python_converter/   # converters from NAMD, GROMACS, LAMMPS, CHARMM inputs
+├── FF_tools/
+│   ├── python_converter/  # converters from NAMD, GROMACS, LAMMPS, CHARMM inputs
+│   └── ff_cli_ui/         # menu around python_converter
 ├── examples/           # runnable inputs: Lennard-Jones, classical, MLIP
 ├── benchmarks/         # benchmark inputs and tools
 ├── tests/              # tests (MLIP tests are built by hand, see tests/mlip)

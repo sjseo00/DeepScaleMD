@@ -86,7 +86,7 @@ The same steps apply to your own system.
 **1. Convert the system.** From the repository root:
 
 ```bash
-python python_converter/convert_namd.py \
+python FF_tools/python_converter/convert_namd.py \
   --namd examples/apoa1/apoa1.namd \
   --out examples/apoa1/dsMD_input \
   --ff-name charmm22-apoa1

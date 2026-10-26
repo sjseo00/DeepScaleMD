@@ -1,4 +1,4 @@
-"""NequIP adapter (design 3.4, 11장 확인 결과 nequip 0.19.1).
+"""NequIP adapter (design 3.4, as checked in section 11: nequip 0.19.1).
 
 What the installed nequip does, which this adapter relies on:
   * a model is a nequip.nn.GraphModel. Called as model(data) with the dict

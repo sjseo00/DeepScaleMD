@@ -1,4 +1,4 @@
-"""MACE adapter (design 3.4, 11장 확인 결과 mace-torch 0.3.16).
+"""MACE adapter (design 3.4, as checked in section 11: mace-torch 0.3.16).
 
 What the installed mace does, which this adapter relies on:
   * the model is called as model(data, training=False, compute_force=False) with a dict

@@ -1,5 +1,5 @@
-"""Angle (three-body) index lists from the standard edge list, with torch operations (design 3.4: "3체 모델은 edge_index에서
-angle(triplet) 목록을 torch 연산으로 만들기").
+"""Angle (three-body) index lists from the standard edge list, with torch operations (design 3.4: "three-body models build the
+angle (triplet) list from edge_index with torch operations").
 
 Three-body models (CHGNet, M3GNet/MatterSim) work on pairs of bonds that share an atom. Their own converters build the pairs
 from a periodic structure with a neighbor search; here the neighbor pairs are given (the symmetric directed edge list of the

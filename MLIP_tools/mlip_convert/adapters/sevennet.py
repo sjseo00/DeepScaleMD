@@ -1,4 +1,4 @@
-"""SevenNet adapter (design 3.4, 11장 확인 결과 sevenn 0.13.0).
+"""SevenNet adapter (design 3.4, as checked in section 11: sevenn 0.13.0).
 
 What the installed sevenn does, which this adapter relies on:
   * a model is an sevenn.nn.sequential.AtomGraphSequential (SevenNetCheckpoint(...).build_model()). Deployment for LAMMPS

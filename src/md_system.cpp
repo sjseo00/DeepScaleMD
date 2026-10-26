@@ -202,11 +202,11 @@ void MDSystem::initialize_velocities(Real temperature) {
                   << std::endl;
     }
 
-    // LAMMPS real units 상수
+    // LAMMPS real units constants
     // (g/mol)*(Å/fs)^2 -> kcal/mol
 
     if (rank == 0) {
-        // 1) 가우시안 랜덤 속도 생성
+        // 1) Generate Gaussian random velocities
         std::random_device rd;
         std::mt19937 gen(rd());
         std::normal_distribution<Real> dist(0.0, 1.0);
@@ -217,7 +217,7 @@ void MDSystem::initialize_velocities(Real temperature) {
             particles.vz[i] = dist(gen);
         }
         
-        // 2) center-of-mass 속도 제거
+        // 2) Remove center-of-mass velocity
         Real total_vx = 0.0, total_vy = 0.0, total_vz = 0.0;
         Real total_mass = 0.0;
         
@@ -238,23 +238,23 @@ void MDSystem::initialize_velocities(Real temperature) {
             particles.vz[i] -= cm_vz;
         }
         
-        // 3) 현재 KE 계산 (먼저 g/mol·Å^2/fs^2 단위로)
-        Real current_ke = 0.0; // 아직은 단위: (g/mol)*(Å/fs)^2
+        // 3) Compute current KE (first in g/mol·Å^2/fs^2 units)
+        Real current_ke = 0.0; // units so far: (g/mol)*(Å/fs)^2
         for (size_t i = 0; i < particles.num_particles; i++) {
             Real v2 = particles.vx[i]*particles.vx[i]
                     + particles.vy[i]*particles.vy[i]
                     + particles.vz[i]*particles.vz[i];
             current_ke += 0.5 * particles.mass[i] * v2;
         }
-        // LAMMPS real 유닛과 동일하게 kcal/mol 로 변환
-        current_ke *= mvv2e;  // 이제 current_ke 단위: kcal/mol
+        // Convert to kcal/mol, same as LAMMPS real units
+        current_ke *= mvv2e;  // current_ke is now in kcal/mol
 
-        // 4) 타겟 KE (자유도 = 3N - 3 : COM 제거했으므로)
+        // 4) Target KE (degrees of freedom = 3N - 3, since COM motion was removed)
         const size_t dof = 3 * particles.num_particles - 3;
         Real target_ke = 0.5 * static_cast<Real>(dof) * kB * temperature;
-        // = (dof/2) k_B T   (단위: kcal/mol)
+        // = (dof/2) k_B T   (units: kcal/mol)
 
-        // 5) 스케일 팩터 계산 (둘 다 kcal/mol 이라 단위 일치)
+        // 5) Compute scale factor (both are in kcal/mol, so the units match)
         Real scale_factor = std::sqrt(target_ke / current_ke);
         
         for (size_t i = 0; i < particles.num_particles; i++) {
@@ -263,7 +263,7 @@ void MDSystem::initialize_velocities(Real temperature) {
             particles.vz[i] *= scale_factor;
         }
         
-        // 6) 체크용으로 다시 KE 계산
+        // 6) Recompute KE as a check
         current_ke = 0.0;
         for (size_t i = 0; i < particles.num_particles; i++) {
             Real v2 = particles.vx[i]*particles.vx[i]
@@ -273,7 +273,7 @@ void MDSystem::initialize_velocities(Real temperature) {
         }
         current_ke *= mvv2e;  // kcal/mol
 
-        // 실제 온도도 한 번 출력해 보면 디버깅에 좋음
+        // Printing the actual temperature is also useful for debugging
         Real current_T = (2.0 * current_ke) / (kB * static_cast<Real>(dof));
 
         if (rank == 0) {
