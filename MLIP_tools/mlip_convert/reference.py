@@ -12,7 +12,8 @@ from torch import Tensor
 
 from .adapters.base import MLIPAdapter
 from .geometry import brute_force_edges, fold_ghost_forces, periodic_ghosts
-from .wrapper import MDShiftWrapper, MDWrapper
+from . import halo_op
+from .wrapper import MDLayerShiftWrapper, MDShiftWrapper, MDWrapper
 
 FORMAT_VERSION = 1
 
@@ -60,7 +61,11 @@ def make_reference_structure(adapter: MLIPAdapter, n_owned: int = 12, seed: int 
     ghost_pos, owner = periodic_ghosts(pos_owned, box, adapter.ghost_cutoff + extra_depth)
     pos = torch.cat([pos_owned, ghost_pos])
     z = torch.cat([z_owned, z_owned[owner]])
-    return ReferenceStructure(pos, z, brute_force_edges(pos, adapter.cutoff), n_owned, owner, box_length)
+    edges = brute_force_edges(pos, adapter.cutoff)
+    if adapter.layer_exchange:
+        # Layer exchange: only the owned atoms receive edges (a ghost never runs a layer, it gets its features from its owner).
+        edges = edges[:, edges[adapter.edge_receiver_row] < n_owned]
+    return ReferenceStructure(pos, z, edges, n_owned, owner, box_length)
 
 
 def make_reference(wrapper, adapter: MLIPAdapter, dtype: torch.dtype, device: str = "cpu", **structure_options) -> Dict:
@@ -70,15 +75,23 @@ def make_reference(wrapper, adapter: MLIPAdapter, dtype: torch.dtype, device: st
     z = s.atomic_numbers.to(device)
     edges = s.edge_index.to(device)
     n_owned = torch.tensor(s.n_owned).to(device)
+    layered = isinstance(wrapper, MDLayerShiftWrapper)
     with torch.no_grad():
-        if isinstance(wrapper, MDShiftWrapper):      # periodic images are atoms here, so every edge shift is zero
+        if layered:
+            # The ghosts are copies of owned atoms of this same structure: the exchange is a copy inside this process.
+            shift = torch.zeros((edges.shape[1], 3), dtype=dtype, device=device)
+            with halo_op.local_ghosts(s.ghost_owner):
+                energy, atom_energy, forces, _ = wrapper(pos, z, edges, shift, n_owned)
+        elif isinstance(wrapper, MDShiftWrapper):    # periodic images are atoms here, so every edge shift is zero
             shift = torch.zeros((edges.shape[1], 3), dtype=dtype, device=device)
             energy, atom_energy, forces, _ = wrapper(pos, z, edges, shift, n_owned)
         else:
             energy, atom_energy, forces = wrapper(pos, z, edges, n_owned)
     energy, atom_energy, forces = energy.cpu(), atom_energy.cpu(), forces.cpu()
     folded = fold_ghost_forces(forces.double(), s.n_owned, s.ghost_owner)   # what the reverse communication gives
+    extra = {"layer_exchange": True, "ghost_owner": s.ghost_owner.tolist()} if layered else {}
     return {
+        **extra,
         "format_version": FORMAT_VERSION,
         "dtype": str(dtype).replace("torch.", ""),
         "n_owned": int(s.n_owned),

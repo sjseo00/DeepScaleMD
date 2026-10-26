@@ -17,7 +17,7 @@ DEFAULT_ELEMENTS = (18,)
 
 def _no_accel(accel, arch) -> None:
     if accel != "e3nn":
-        raise ValueError(f"arch '{arch}' has no acceleration option: --accel is for mace, nequip and sevennet")
+        raise ValueError(f"arch '{arch}' has no acceleration option: --accel is for mace, nequip, sevennet and bam")
 
 
 def _no_model(model_path, head, arch) -> None:
@@ -120,15 +120,13 @@ def _build_tensornet(elements, cutoff, seed, model_path, head, dtype, accel, dev
 
 
 def _build_bam(elements, cutoff, seed, model_path, head, dtype, accel, device) -> MLIPAdapter:
-    if accel != "e3nn":
-        raise ValueError("arch 'bam' supports --accel e3nn only so far")
     if not model_path:
         raise ValueError("arch 'bam' needs --model <BAM checkpoint .pkl file>")
     if elements or cutoff is not None or head:
         raise ValueError("arch 'bam' takes its elements and cutoff from the model; do not pass --elements, --cutoff or --head")
     from .bam import BAMAdapter, load_bam_model   # imported here: bam_torch is optional
-    model, checkpoint = load_bam_model(model_path, accel=accel)
-    return BAMAdapter(model, checkpoint, model_name=Path(model_path).stem)
+    model, checkpoint = load_bam_model(model_path, accel=accel, dtype=dtype)
+    return BAMAdapter(model, checkpoint, model_name=Path(model_path).stem, accel=accel)
 
 
 ADAPTERS: Dict[str, Callable[..., MLIPAdapter]] = {

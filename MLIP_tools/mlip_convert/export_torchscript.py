@@ -8,6 +8,7 @@ from typing import Dict
 
 import torch
 
+from . import halo_op
 from .wrapper import MDWrapper
 
 
@@ -33,7 +34,11 @@ def check_torchscript(path, reference: Dict, dtype: torch.dtype, device: str = "
         z = torch.tensor(reference["atomic_numbers"], dtype=torch.int64, device=device)
         edges = torch.tensor(reference["edge_index"], dtype=torch.int64, device=device)
         n_owned = torch.tensor(reference["n_owned"], dtype=torch.int64, device=device)
-        if edge_shifts:      # the reference structure has its periodic images as atoms: every edge shift is zero
+        if reference.get("layer_exchange"):
+            # the ghosts are copies of owned atoms of the reference structure: the exchange is a copy inside this process
+            with halo_op.local_ghosts(torch.tensor(reference["ghost_owner"], dtype=torch.int64)):
+                energy, _, forces, _ = model(pos, z, edges, torch.zeros((edges.shape[1], 3), dtype=dtype, device=device), n_owned)
+        elif edge_shifts:      # the reference structure has its periodic images as atoms: every edge shift is zero
             energy, _, forces, _ = model(pos, z, edges, torch.zeros((edges.shape[1], 3), dtype=dtype, device=device), n_owned)
         else:
             energy, _, forces = model(pos, z, edges, n_owned)

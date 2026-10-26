@@ -153,6 +153,12 @@ def _float_dropout(module: torch.nn.Module) -> None:
 
 class CHGNetAdapter(MLIPAdapter):
     model_family = "chgnet"
+    supports_shifts = True
+    # Pruning only, no layer exchange: the bond and angle states live on the edges and each bond belongs to both its atoms, so what
+    # a rank would have to send between the layers are states of edges, not node features (docs/mlip_converter_models.md).
+    # The atoms are updated by sums over the edges centered on them (edge_index[0]); an edge whose center is farther than
+    # (num_layers - 1) cutoffs from the owned atoms does not reach them (checked: tests/mlip/test_layer_exchange_more_models.py).
+    edge_receiver_row = 0
 
     def __init__(self, model: torch.nn.Module, model_name: str = "chgnet"):
         from chgnet.model import CHGNet
@@ -203,19 +209,30 @@ class CHGNetAdapter(MLIPAdapter):
         return [8, 1] if 1 in self.elements and 8 in self.elements else self.elements[:2]
 
     def forward(self, pos: Tensor, species: Tensor, edge_index: Tensor) -> Tensor:
+        return self.forward_with_shifts(pos, species, edge_index, torch.zeros((edge_index.shape[1], 3), dtype=pos.dtype, device=pos.device))
+
+    def forward_with_shifts(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:
         n_atoms = pos.shape[0]
         z = species + 1
         center = edge_index[0]
         neighbor = edge_index[1]
         n_edges = center.shape[0]
 
-        vec = pos[center] - pos[neighbor]
+        vec = pos[center] - pos[neighbor] - edge_shift         # chgnet: center - neighbor; the shift is added to pos[neighbor] - pos[center]
         length = torch.norm(vec, dim=1)
         unit = vec / length[:, None]
 
-        # undirected bonds: the pair of a directed edge and its reverse (an unordered pair of atoms)
-        key = torch.minimum(center, neighbor) * n_atoms + torch.maximum(center, neighbor)
-        unique_keys, directed2undirected = torch.unique(key, sorted=True, return_inverse=True)
+        # undirected bonds: the pair of a directed edge and its reverse (the same two atoms, the opposite shift): the key of an edge
+        # is its two atoms in index order and the shift as seen from the first of them (a bond of an atom with its own image has
+        # the same atom twice: the shift with a positive first nonzero component)
+        negative = (edge_shift[:, 0] < 0) | ((edge_shift[:, 0] == 0) & (edge_shift[:, 1] < 0)) | (
+            (edge_shift[:, 0] == 0) & (edge_shift[:, 1] == 0) & (edge_shift[:, 2] < 0))
+        swap = (center > neighbor) | ((center == neighbor) & negative)
+        first = torch.where(swap, neighbor, center)
+        second = torch.where(swap, center, neighbor)
+        key_shift = torch.where(swap[:, None], -edge_shift, edge_shift)
+        key = torch.cat([first[:, None].to(pos.dtype), second[:, None].to(pos.dtype), key_shift], dim=1)
+        unique_keys, directed2undirected = torch.unique(key, sorted=True, return_inverse=True, dim=0)
         n_undirected = unique_keys.shape[0]
         # one directed edge speaks for each undirected bond (its length is taken by an index, so the gradient reaches the
         # positions once; a scatter of the lengths would hand the gradient to both directed edges)

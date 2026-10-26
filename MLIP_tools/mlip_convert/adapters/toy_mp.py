@@ -27,6 +27,8 @@ class ToyMPAdapter(MLIPAdapter):
     model_name = "toy_mp"
     num_layers = NUM_LAYERS
     supports_shifts = True
+    supports_layer_exchange = True
+    edge_receiver_row = 0       # messages are summed onto the center atom, edge_index[0]
 
     def __init__(self, elements: Sequence[int] = (18,), cutoff: float = 5.0, hidden: int = 8,
                  num_rbf: int = 6, seed: int = 0):
@@ -67,6 +69,34 @@ class ToyMPAdapter(MLIPAdapter):
             h = h + torch.tanh(aggregated)
 
         return h @ self.readout.to(pos.dtype) + self.bias.to(pos.dtype)[species]
+
+    def forward_layered(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor, n_owned: int) -> Tensor:
+        # Only the owned atoms are receivers (edge_index[0] < n_owned); after each layer but the last the owned features go to
+        # the ghost copies. The ghost rows of h are never read for anything but as senders of the next layer.
+        n_all = pos.shape[0]
+        n_ghost = n_all - n_owned
+        center = edge_index[0]
+        neighbor = edge_index[1]
+        vec = pos[neighbor] - pos[center] + edge_shift
+        r = torch.sqrt((vec * vec).sum(dim=1))
+
+        envelope = 0.5 * (torch.cos(math.pi * r / self.cutoff) + 1.0)
+        envelope = torch.where(r < self.cutoff, envelope, torch.zeros_like(envelope))
+        rbf = torch.exp(-((r.unsqueeze(1) - self.rbf_centers.to(pos.dtype).unsqueeze(0)) / self.rbf_width) ** 2)
+
+        h = self.embedding.to(pos.dtype)[species]
+        num_layers = self.w_rbf.shape[0]
+        for layer in range(num_layers):
+            radial = rbf @ self.w_rbf[layer].to(pos.dtype)
+            message = radial * (h[neighbor] @ self.w_node[layer].to(pos.dtype)) * envelope.unsqueeze(1)
+            aggregated = torch.zeros_like(h).index_add(0, center, message)
+            h = h + torch.tanh(aggregated)
+            if layer < num_layers - 1:
+                h = torch.ops.dsmd.halo_exchange(h[:n_owned], n_ghost)
+
+        energy = h @ self.readout.to(pos.dtype) + self.bias.to(pos.dtype)[species]
+        owned = torch.arange(n_all, device=pos.device) < n_owned
+        return torch.where(owned, energy, torch.zeros_like(energy))
 
     def forward_with_shifts(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:
         center = edge_index[0]

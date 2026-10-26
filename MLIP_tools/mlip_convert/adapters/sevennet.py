@@ -110,17 +110,65 @@ def load_sevennet_model(path, modal: Optional[str] = None, accel: str = "e3nn") 
     return model
 
 
+def _owned_rows(data: Dict[str, Tensor], n_owned: int) -> Dict[str, Tensor]:
+    """The dict of a layer's modules with the per-atom tensors cut to the owned atoms (the first n_owned rows). The other entries
+    (the edge tensors, the modal tensors of a multi-modal model) are shared as they are."""
+    owned: Dict[str, Tensor] = {}
+    for key, value in data.items():
+        if key == "x" or key == "node_attr" or key == "atom_type":
+            owned[key] = value[:n_owned]
+        else:
+            owned[key] = value
+    return owned
+
+
+class _OwnedRowsLayer(torch.nn.Module):
+    """One interaction layer of a SevenNet model (the modules of sevenn's own sequence, the same weights), for a rank that owns
+    n_owned atoms and has ghost atoms after them. The convolution is the only step that needs the ghost rows: they are the senders
+    of messages (and the self interaction in front of it makes the features that are sent). Everything else of the layer, the
+    self connection in front, the second self interaction, the sum with the self connection and the gate, works on the owned rows
+    only (only owned atoms receive edges). The ghost rows would otherwise be computed again on every rank and the work would not
+    fall when ranks are added. Returns the dict of the owned atoms."""
+
+    def __init__(self, intro: torch.nn.Module, interaction_1: torch.nn.Module, convolution: torch.nn.Module,
+                 interaction_2: torch.nn.Module, outro: torch.nn.Module, gate: torch.nn.Module):
+        super().__init__()
+        self.intro = intro
+        self.interaction_1 = interaction_1
+        self.convolution = convolution
+        self.interaction_2 = interaction_2
+        self.outro = outro
+        self.gate = gate
+
+    def forward(self, data: Dict[str, Tensor], n_owned: int) -> Dict[str, Tensor]:
+        owned = _owned_rows(data, n_owned)
+        owned = self.intro(owned)                  # the self connection of the features that enter the layer
+        data = self.interaction_1(data)            # all rows: the senders include the ghosts
+        data = self.convolution(data)              # sums onto the receivers (edge_index[0]), which are owned atoms
+        owned["x"] = data["x"][:n_owned]
+        owned = self.interaction_2(owned)
+        owned = self.outro(owned)
+        owned = self.gate(owned)
+        return owned
+
 class SevenNetAdapter(MLIPAdapter):
     model_family = "sevennet"
     e3nn_compile = True
     supports_shifts = True
+    supports_layer_exchange = True
+    edge_receiver_row = 0       # sevenn: the convolution sends from edge_index[1] and sums onto edge_index[0]
 
     def __init__(self, model: torch.nn.Module, modal: Optional[str] = None, model_name: str = "sevennet",
                  accel: str = "e3nn"):
         by_index = sorted(model.type_map.items(), key=lambda item: item[1])
         if [index for _, index in by_index] != list(range(len(by_index))):
             raise ValueError(f"unexpected SevenNet type_map (species indices are not 0..n-1): {model.type_map}")
-        super().__init__([int(z) for z, _ in by_index])
+        # A model can have placeholder species with atomic number 0 (SevenNet-Omni has one): they are not elements, so the adapter's
+        # species are the real elements only, and type_index turns a species into the model's own index (the identity when every
+        # species is an element).
+        real = [(int(z), index) for z, index in by_index if int(z) >= 1]
+        super().__init__([z for z, _ in real])
+        self.register_buffer("type_index", torch.tensor([index for _, index in real], dtype=torch.int64))
         self.accel = accel
         self.model = model
         self.model_name = model_name
@@ -129,6 +177,35 @@ class SevenNetAdapter(MLIPAdapter):
         if self.num_layers < 1:
             raise ValueError("this SevenNet model has no convolution layer")
         self.head_name = modal
+
+    def enable_layer_exchange(self) -> None:
+        """Switches layer exchange on and sorts the modules of the model into what runs before the layers (on all atoms), the layers
+        (owned atoms, ghost atoms only as senders) and what runs after them (owned atoms). They share the weights of the model.
+        Needs the layout sevenn builds: per layer t the modules {t}_self_connection_intro, {t}_self_interaction_1, {t}_convolution,
+        {t}_self_interaction_2, {t}_self_connection_outro, {t}_equivariant_gate, one after the other."""
+        from sevenn.nn.linear import AtomReduce
+        names = list(self.model._modules.keys())
+        steps = ["self_connection_intro", "self_interaction_1", "convolution", "self_interaction_2", "self_connection_outro",
+                 "equivariant_gate"]
+        if "0_self_connection_intro" not in names:
+            raise ValueError("layer exchange: this SevenNet model has no module 0_self_connection_intro, so its layers are not "
+                             f"the ones forward_layered knows (modules: {names})")
+        first = names.index("0_self_connection_intro")
+        position = first
+        layers = []
+        for t in range(self.num_layers):
+            expected = [f"{t}_{step}" for step in steps]
+            if names[position:position + len(steps)] != expected:
+                raise ValueError(f"layer exchange: layer {t} of this SevenNet model is not {expected} (it is "
+                                 f"{names[position:position + len(steps)]})")
+            layers.append(_OwnedRowsLayer(*[self.model._modules[name] for name in expected]))
+            position += len(steps)
+        super().enable_layer_exchange()
+        self.pre_modules = torch.nn.ModuleList([self.model._modules[name] for name in names[:first]])
+        self.layer_blocks = torch.nn.ModuleList(layers)
+        # the sum over the atoms (AtomReduce) is not needed: the per-atom energies are returned
+        self.post_modules = torch.nn.ModuleList([self.model._modules[name] for name in names[position:]
+                                                 if not isinstance(self.model._modules[name], AtomReduce)])
 
     def package_versions(self) -> Dict[str, Optional[str]]:
         import e3nn
@@ -143,6 +220,7 @@ class SevenNetAdapter(MLIPAdapter):
         return self.elements[:2]
 
     def forward(self, pos: Tensor, species: Tensor, edge_index: Tensor) -> Tensor:
+        species = self.type_index[species]
         n_atoms = pos.shape[0]
         data: Dict[str, Tensor] = {
             "x": species,
@@ -154,7 +232,37 @@ class SevenNetAdapter(MLIPAdapter):
         out = self.model(data)
         return out["atomic_energy"].squeeze(-1).to(pos.dtype)
 
+    def forward_layered(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor, n_owned: int) -> Tensor:
+        """sevenn's sequence of modules with the node features of the owned atoms sent to their ghost copies before every layer but
+        the first: the modules before the layers run on all atoms, each layer on the owned atoms (ghosts only as senders), the
+        modules after the last layer on the owned atoms. Only the owned atoms are receivers of edges. Returns the per-atom energies
+        [N], zero for the ghost atoms."""
+        species = self.type_index[species]
+        n_all = pos.shape[0]
+        n_ghost = n_all - n_owned
+        data: Dict[str, Tensor] = {
+            "x": species,
+            "edge_index": edge_index,
+            "edge_vec": pos[edge_index[1]] - pos[edge_index[0]] + edge_shift,
+            "num_atoms": torch.tensor([n_all], dtype=torch.long, device=pos.device),
+            "nlocal": torch.tensor([n_all], dtype=torch.long, device=pos.device),
+        }
+        for module in self.pre_modules:
+            data = module(data)
+        owned: Dict[str, Tensor] = {}
+        layer = 0
+        for block in self.layer_blocks:
+            owned = block(data, n_owned)
+            if layer < self.num_layers - 1:
+                data["x"] = torch.ops.dsmd.halo_exchange(owned["x"], n_ghost)
+            layer += 1
+        for module in self.post_modules:
+            owned = module(owned)
+        energy = owned["atomic_energy"].squeeze(-1).to(pos.dtype)
+        return torch.cat([energy, torch.zeros(n_ghost, dtype=pos.dtype, device=pos.device)])
+
     def forward_with_shifts(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:
+        species = self.type_index[species]
         n_atoms = pos.shape[0]
         data: Dict[str, Tensor] = {
             "x": species,

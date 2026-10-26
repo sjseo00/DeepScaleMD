@@ -19,7 +19,7 @@ matgl.load_model; nothing is downloaded: the published models (TensorNet-MatPES,
 load_model(<name>), which this converter does not call: download the folder yourself and pass its path.
 Not supported: intensive models, a model with state attributes (include_state), repulsion terms (calc_repuls), the DGL backend.
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -68,7 +68,9 @@ class _Embedding(torch.nn.Module):
         self.units = int(source.units)
         self.cutoff = float(source.cutoff)
 
-    def forward(self, node_type: Tensor, edge_index: Tensor, edge_attr: Tensor, bond_dist: Tensor, bond_vec: Tensor) -> Tensor:
+    def forward(self, node_type: Tensor, edge_index: Tensor, edge_attr: Tensor, bond_dist: Tensor, bond_vec: Tensor,
+                n_nodes: int) -> Tensor:
+        # edge_index[1] is the atom an edge feeds (the matgl convention); n_nodes rows are computed, the first n_nodes atoms
         x = self.emb(node_type)
         C = cosine_cutoff(bond_dist, self.cutoff)
         W1 = self.distance_proj1(edge_attr) * C.view(-1, 1)
@@ -82,7 +84,6 @@ class _Embedding(torch.nn.Module):
             W1, W2, W3)
         zij = torch.cat([x[edge_index[0]], x[edge_index[1]]], dim=-1)
         Zij = self.emb2(zij)
-        n_nodes = x.size(0)
         scalars = scatter_add(Zij[..., None, None] * Iij, edge_index[1], dim_size=n_nodes)
         skew_matrices = scatter_add(Zij[..., None, None] * Aij, edge_index[1], dim_size=n_nodes)
         traceless_tensors = scatter_add(Zij[..., None, None] * Sij, edge_index[1], dim_size=n_nodes)
@@ -101,7 +102,9 @@ class _Embedding(torch.nn.Module):
 
 
 class _Interaction(torch.nn.Module):
-    """matgl TensorNetInteraction.forward on plain tensors."""
+    """matgl TensorNetInteraction.forward on plain tensors. forward_layered is the same layer for a rank with ghost atoms: the node
+    tensors it works on are those of the owned atoms, and the pieces the messages need from the senders (the three irreducible parts
+    of every atom's tensor after the first linear layers) are sent to the ghost copies with one halo exchange."""
 
     def __init__(self, source):
         super().__init__()
@@ -111,27 +114,26 @@ class _Interaction(torch.nn.Module):
         self.units = int(source.units)
         self.cutoff = float(source.cutoff)
         self.o3 = source.equivariance_invariance_group == "O(3)"
+        for index in range(3):
+            if self.linears_tensor[index].bias is not None:
+                raise ValueError("TensorNet: the linear layers in front of the messages have a bias, which the layer exchange "
+                                 "cannot send in its compact form")
 
-    def forward(self, edge_index: Tensor, bond_dist: Tensor, edge_attr: Tensor, X: Tensor) -> Tensor:
+    def _edge_weights(self, bond_dist: Tensor, edge_attr: Tensor) -> Tensor:
         C = cosine_cutoff(bond_dist, self.cutoff)
         for linear_scalar in self.linears_scalar:
             edge_attr = self.act(linear_scalar(edge_attr))
-        edge_attr = (edge_attr * C.view(-1, 1)).reshape(edge_attr.shape[0], self.units, 3)
+        return (edge_attr * C.view(-1, 1)).reshape(edge_attr.shape[0], self.units, 3)
 
+    def _node_parts(self, X: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         X = X / (tensor_norm(X) + 1)[..., None, None]
         scalars, skew_matrices, traceless_tensors = decompose_tensor(X)
         scalars = self.linears_tensor[0](scalars.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         skew_matrices = self.linears_tensor[1](skew_matrices.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         traceless_tensors = self.linears_tensor[2](traceless_tensors.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        Y = scalars + skew_matrices + traceless_tensors
+        return X, scalars + skew_matrices + traceless_tensors, scalars, skew_matrices, traceless_tensors
 
-        dst = edge_index[1]
-        Im, Am, Sm = new_radial_tensor(scalars[dst], skew_matrices[dst], traceless_tensors[dst],
-                                       edge_attr[..., 0], edge_attr[..., 1], edge_attr[..., 2])
-        n_nodes = X.size(0)
-        msg = (scatter_add(Im, edge_index[0], dim_size=n_nodes) + scatter_add(Am, edge_index[0], dim_size=n_nodes)
-               + scatter_add(Sm, edge_index[0], dim_size=n_nodes))
-
+    def _finish(self, X: Tensor, Y: Tensor, msg: Tensor) -> Tensor:
         if self.o3:
             A = torch.matmul(msg, Y)
             B = torch.matmul(Y, msg)
@@ -150,9 +152,57 @@ class _Interaction(torch.nn.Module):
         dX = scalars + skew_matrices + traceless_tensors
         return X + dX + torch.matmul(dX, dX)
 
+    def forward(self, edge_index: Tensor, bond_dist: Tensor, edge_attr: Tensor, X: Tensor) -> Tensor:
+        weights = self._edge_weights(bond_dist, edge_attr)
+        X, Y, scalars, skew_matrices, traceless_tensors = self._node_parts(X)
+        dst = edge_index[1]
+        Im, Am, Sm = new_radial_tensor(scalars[dst], skew_matrices[dst], traceless_tensors[dst],
+                                       weights[..., 0], weights[..., 1], weights[..., 2])
+        n_nodes = X.size(0)
+        msg = (scatter_add(Im, edge_index[0], dim_size=n_nodes) + scatter_add(Am, edge_index[0], dim_size=n_nodes)
+               + scatter_add(Sm, edge_index[0], dim_size=n_nodes))
+        return self._finish(X, Y, msg)
+
+    def forward_layered(self, edge_index: Tensor, bond_dist: Tensor, edge_attr: Tensor, X: Tensor, n_ghost: int) -> Tensor:
+        """X [n_owned, units, 3, 3] of the owned atoms; returns the same for the next layer. edge_index has only edges whose
+        receiver (edge_index[0]) is an owned atom."""
+        weights = self._edge_weights(bond_dist, edge_attr)
+        X, Y, scalars, skew_matrices, traceless_tensors = self._node_parts(X)
+        n_owned = X.size(0)
+        # The three parts are one scalar (times the unit matrix), a skew matrix (3 numbers) and a symmetric traceless matrix
+        # (5 numbers) per channel, because the linear layers act on the channels only: 9 numbers per channel go to the ghosts.
+        packed = torch.stack([scalars[..., 0, 0],
+                              skew_matrices[..., 0, 1], skew_matrices[..., 0, 2], skew_matrices[..., 1, 2],
+                              traceless_tensors[..., 0, 0], traceless_tensors[..., 1, 1], traceless_tensors[..., 0, 1],
+                              traceless_tensors[..., 0, 2], traceless_tensors[..., 1, 2]], dim=-1)
+        packed = torch.ops.dsmd.halo_exchange(packed.reshape(n_owned, self.units * 9), n_ghost)
+        packed = packed.reshape(n_owned + n_ghost, self.units, 9)
+        eye = torch.eye(3, 3, device=packed.device, dtype=packed.dtype)
+        zero = torch.zeros_like(packed[..., 0])
+        scalars = packed[..., 0][..., None, None] * eye
+        skew_matrices = torch.stack([torch.stack([zero, packed[..., 1], packed[..., 2]], dim=-1),
+                                     torch.stack([-packed[..., 1], zero, packed[..., 3]], dim=-1),
+                                     torch.stack([-packed[..., 2], -packed[..., 3], zero], dim=-1)], dim=-2)
+        traceless_tensors = torch.stack([torch.stack([packed[..., 4], packed[..., 6], packed[..., 7]], dim=-1),
+                                         torch.stack([packed[..., 6], packed[..., 5], packed[..., 8]], dim=-1),
+                                         torch.stack([packed[..., 7], packed[..., 8], -packed[..., 4] - packed[..., 5]],
+                                                     dim=-1)], dim=-2)
+        dst = edge_index[1]
+        Im, Am, Sm = new_radial_tensor(scalars[dst], skew_matrices[dst], traceless_tensors[dst],
+                                       weights[..., 0], weights[..., 1], weights[..., 2])
+        msg = (scatter_add(Im, edge_index[0], dim_size=n_owned) + scatter_add(Am, edge_index[0], dim_size=n_owned)
+               + scatter_add(Sm, edge_index[0], dim_size=n_owned))
+        return self._finish(X, Y, msg)
+
 
 class TensorNetAdapter(MLIPAdapter):
     model_family = "tensornet"
+    supports_shifts = True
+    supports_layer_exchange = True
+    # Both the embedding and the interaction layers sum onto one atom per edge; the embedding is written here with the
+    # receiver in edge_index[0] (matgl has it in edge_index[1]: the edge list is symmetric, so it is the same sum), as the
+    # interaction layers have it.
+    edge_receiver_row = 0
 
     def __init__(self, loaded: torch.nn.Module, model_name: str = "tensornet"):
         from ase.data import atomic_numbers
@@ -189,7 +239,9 @@ class TensorNetAdapter(MLIPAdapter):
         super().__init__(z)
         self.model_name = model_name
         self.cutoff = float(model.cutoff)
-        self.num_layers = int(model.num_layers)
+        # The embedding sums over the edges of every atom too: the features of the atoms one cutoff further out go into it, so
+        # the energy of an atom depends on atoms (nblocks + 1) cutoffs away: the embedding counts as a layer here.
+        self.num_layers = int(model.num_layers) + 1
         self.bond_expansion = model.bond_expansion
         self.embedding = _Embedding(model.tensor_embedding)
         self.interactions = torch.nn.ModuleList([_Interaction(layer) for layer in model.layers])
@@ -208,12 +260,33 @@ class TensorNetAdapter(MLIPAdapter):
         return [8, 1] if 1 in self.elements and 8 in self.elements else self.elements[:2]
 
     def forward(self, pos: Tensor, species: Tensor, edge_index: Tensor) -> Tensor:
-        bond_vec = pos[edge_index[1]] - pos[edge_index[0]]
+        return self.forward_with_shifts(pos, species, edge_index, torch.zeros((edge_index.shape[1], 3), dtype=pos.dtype, device=pos.device))
+
+    def forward_with_shifts(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:
+        bond_vec = pos[edge_index[1]] - pos[edge_index[0]] + edge_shift
         bond_dist = torch.norm(bond_vec, dim=1)
         edge_attr = self.bond_expansion(bond_dist)
-        X = self.embedding(species, edge_index, edge_attr, bond_dist, bond_vec)
+        # the embedding with the receiver in row 0: the edge seen from its other end (swapped atoms, opposite vector)
+        X = self.embedding(species, edge_index.flip(0), edge_attr, bond_dist, -bond_vec, pos.shape[0])
         for layer in self.interactions:
             X = layer(edge_index, bond_dist, edge_attr, X)
+        return self._readout(X, species)
+
+    def forward_layered(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor, n_owned: int) -> Tensor:
+        """The embedding and the interaction layers of matgl's TensorNet for a rank with ghost atoms: only the owned atoms are
+        computed (the only receivers of edges), the pieces of their tensors that the next layer's messages need are sent to the ghost
+        copies after the embedding and after every layer but the last. Per atom energies [N], zero for the ghost atoms."""
+        n_ghost = pos.shape[0] - n_owned
+        bond_vec = pos[edge_index[1]] - pos[edge_index[0]] + edge_shift
+        bond_dist = torch.norm(bond_vec, dim=1)
+        edge_attr = self.bond_expansion(bond_dist)
+        X = self.embedding(species, edge_index.flip(0), edge_attr, bond_dist, -bond_vec, n_owned)
+        for layer in self.interactions:
+            X = layer.forward_layered(edge_index, bond_dist, edge_attr, X, n_ghost)
+        energy = self._readout(X, species[:n_owned])
+        return torch.cat([energy, torch.zeros(n_ghost, dtype=energy.dtype, device=energy.device)])
+
+    def _readout(self, X: Tensor, species: Tensor) -> Tensor:
         scalars, skew_matrices, traceless_tensors = decompose_tensor(X)
         x = torch.cat((tensor_norm(scalars), tensor_norm(skew_matrices), tensor_norm(traceless_tensors)), dim=-1)
         x = self.linear(self.out_norm(x))

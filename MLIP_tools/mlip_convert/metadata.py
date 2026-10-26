@@ -26,7 +26,7 @@ def collect_versions(extra: Optional[Dict[str, Optional[str]]] = None) -> Dict[s
 
 def build_metadata(adapter: MLIPAdapter, *, backend: str, dtype: str, head: Optional[str] = None,
                    required_op_libs: Sequence[str] = (), required_python_modules: Sequence[str] = (),
-                   target_gpu: Optional[str] = None, edge_shifts: bool = False,
+                   target_gpu: Optional[str] = None, edge_shifts: bool = False, layer_exchange: bool = False,
                    extra_versions: Optional[Dict[str, Optional[str]]] = None) -> dict:
     head = head if head is not None else adapter.head_name
     extra_versions = {**adapter.package_versions(), **(extra_versions or {})}
@@ -51,6 +51,12 @@ def build_metadata(adapter: MLIPAdapter, *, backend: str, dtype: str, head: Opti
         metadata["target_gpu"] = target_gpu
     if edge_shifts:                 # the model takes edge_shift as an input and returns the virial (MDShiftWrapper)
         metadata["edge_shifts"] = True
+    if adapter.edge_receiver_row is not None:   # lets the MD leave out the edges that cannot matter on a rank with ghosts
+        metadata["edge_receiver_row"] = int(adapter.edge_receiver_row)
+    if layer_exchange:
+        # The model calls dsmd::halo_exchange between its layers: ghost atoms one cutoff deep are enough (ghost_cutoff above is
+        # the cutoff then, num_layers stays the number of layers), and only owned atoms receive edges. Torchscript only.
+        metadata["layer_exchange"] = True
     return metadata
 
 

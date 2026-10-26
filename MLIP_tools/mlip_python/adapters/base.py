@@ -77,6 +77,7 @@ class MLIPAdapter(ABC):
         # ── GPU caches ────────────────────────────────────────────────────────
         self._atom_types_gpu: Optional[object]  = None   # torch.Tensor on GPU
         self._n_atoms_cached: int               = 0
+        self._atom_types_host: Optional[np.ndarray] = None   # the atom types _atom_types_gpu was made from
 
         # Pinned-memory staging buffers (faster PCIe DMA)
         self._pos_buf:    Optional[np.ndarray]  = None   # (N,3) float64 pinned
@@ -87,6 +88,7 @@ class MLIPAdapter(ABC):
 
         # ASE Atoms cache (avoid re-creating every step)
         self._atoms: Optional[object]           = None
+        self._atoms_types: Optional[np.ndarray] = None   # the atom types _atoms was made from
 
     # ── Abstract interface ────────────────────────────────────────────────────
 
@@ -130,13 +132,15 @@ class MLIPAdapter(ABC):
         n = len(atom_types)
 
         # 1. Atom-types GPU tensor – upload ONCE, reuse every step.
-        if self._atom_types_gpu is None or self._n_atoms_cached != n:
+        # (re-uploaded only when they change: on several MPI ranks the atoms change owners and order)
+        if (self._atom_types_gpu is None or self._n_atoms_cached != n
+                or not np.array_equal(self._atom_types_host, atom_types)):
             self._atom_types_gpu = torch.tensor(
                 atom_types.astype(np.int64), dtype=torch.long,
                 device=self.device
             )
+            self._atom_types_host = np.array(atom_types, copy=True)
             self._n_atoms_cached = n
-            # (no need to re-upload atom_types in subsequent steps)
 
         # 2. Pinned staging buffers – allocated once per system size.
         if self._pos_buf is None or len(self._pos_buf) != n:
@@ -181,7 +185,9 @@ class MLIPAdapter(ABC):
         """
         from ase import Atoms
         n = len(positions)
-        if self._atoms is None or len(self._atoms) != n:
+        if (self._atoms is None or len(self._atoms) != n
+                or not np.array_equal(self._atoms_types, atom_types)):
+            self._atoms_types = np.array(atom_types, copy=True)   # several MPI ranks: the same count can be other atoms
             symbols = _atom_types_to_symbols(atom_types, self.type_to_z)
             cell_arg = cell if cell is not None else [100.0, 100.0, 100.0]
             pbc_arg  = [bool(p) for p in pbc] if pbc is not None else True

@@ -32,6 +32,7 @@ class ToyPairAdapter(MLIPAdapter):
     model_name = "toy_pair"
     num_layers = 1
     supports_shifts = True
+    edge_receiver_row = 0       # the edge energy goes to the center atom, edge_index[0]
 
     def __init__(self, elements: Sequence[int] = (18,),
                  epsilon: Sequence[float] = (0.238 * KCAL_PER_MOL_TO_EV,),

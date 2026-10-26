@@ -61,6 +61,50 @@ class MDWrapper(torch.nn.Module):
         return energy.reshape(1), atom_energy.detach(), force
 
 
+class MDLayerShiftWrapper(torch.nn.Module):
+    """MDShiftWrapper for a model that exchanges node features between its layers (metadata layer_exchange).
+
+    Same inputs and outputs as MDShiftWrapper. The atoms are the n_owned owned ones first and then their ghost copies, which are
+    only one cutoff deep, and edge_index has only the edges whose receiver is an owned atom. The model runs
+    adapter.forward_layered, which calls the op dsmd::halo_exchange between its layers; the op (and its adjoint in the backward
+    pass below) is what moves data between the ranks, so forces and the virial of this rank are the gradients of this rank's
+    owned energy, and the sum over the ranks is the whole system's, as for the other wrappers.
+    """
+    def __init__(self, adapter: MLIPAdapter):
+        super().__init__()
+        if not adapter.supports_layer_exchange:
+            raise ValueError(f"the {adapter.model_family} adapter does not support layer exchange")
+        self.adapter = adapter
+        self.register_buffer("z_to_index", make_z_to_index(adapter.elements))
+
+    def forward(self, pos: Tensor, atomic_numbers: Tensor, edge_index: Tensor, edge_shift: Tensor,
+                n_owned: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        # grad mode: see MDWrapper.forward
+        previous_grad_mode = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+        pos = pos.detach().requires_grad_(True)
+        strain = torch.zeros((), dtype=pos.dtype, device=pos.device).requires_grad_(True)
+        scale = 1.0 + strain
+        species = self.z_to_index[atomic_numbers]
+        owned_count = int(n_owned)
+        atom_energy = self.adapter.forward_layered(pos * scale, species, edge_index, edge_shift * scale, owned_count)
+        owned = torch.arange(pos.shape[0], device=pos.device) < n_owned
+        energy = torch.where(owned, atom_energy, torch.zeros_like(atom_energy)).sum()
+        grads = torch.autograd.grad([energy], [pos, strain], allow_unused=True)
+        grad = grads[0]
+        grad_strain = grads[1]
+        if grad is None:
+            force = torch.zeros_like(pos)
+        else:
+            force = -grad
+        if grad_strain is None:
+            virial = torch.zeros(1, dtype=pos.dtype, device=pos.device)
+        else:
+            virial = -grad_strain.reshape(1)
+        torch.set_grad_enabled(previous_grad_mode)
+        return energy.reshape(1), atom_energy.detach(), force, virial
+
+
 class MDShiftWrapper(torch.nn.Module):
     """MDWrapper for models that take periodic images as edge shifts instead of as extra atoms (edge_shifts in metadata.json).
 

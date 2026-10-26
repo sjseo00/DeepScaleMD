@@ -101,6 +101,11 @@ def load_mattersim_model(path) -> torch.nn.Module:
 
 class MatterSimAdapter(MLIPAdapter):
     model_family = "mattersim"
+    supports_shifts = True
+    supports_layer_exchange = True
+    # The atoms are updated by a sum over the edges centered on them (edge_index[0]); an edge's own state depends only on its two
+    # atoms and on the other edges of the same center, so an edge onto a far center cannot reach an owned atom.
+    edge_receiver_row = 0
 
     def __init__(self, model: torch.nn.Module, model_name: str = "mattersim"):
         from mattersim.forcefield.m3gnet.m3gnet import M3Gnet
@@ -129,12 +134,27 @@ class MatterSimAdapter(MLIPAdapter):
         return [8, 1] if 1 in self.elements and 8 in self.elements else self.elements[:2]
 
     def forward(self, pos: Tensor, species: Tensor, edge_index: Tensor) -> Tensor:
+        return self.forward_with_shifts(pos, species, edge_index, torch.zeros((edge_index.shape[1], 3), dtype=pos.dtype, device=pos.device))
+
+    def forward_with_shifts(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:
+        # mattersim's edge vector is pos[center] - pos[neighbor]; the shift of an edge (i, j) is added to pos[j] - pos[i]
+        return self._energies(pos, species, edge_index, edge_shift, pos.shape[0], False)
+
+    def forward_layered(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor, n_owned: int) -> Tensor:
+        """The blocks of M3Gnet.forward with the atom features of the owned atoms sent to their ghost copies before every block but
+        the first. Only owned atoms are centers of edges, so their energies are the only ones computed; the ghost atoms are senders
+        (the second atom of an edge) and their rows, which a block leaves as they were, are replaced by the next exchange. Per atom
+        energies [N], zero for the ghost atoms."""
+        return self._energies(pos, species, edge_index, edge_shift, n_owned, True)
+
+    def _energies(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor, n_owned: int, layered: bool) -> Tensor:
         n_atoms = pos.shape[0]
         n_edges = edge_index.shape[1]
+        n_ghost = n_atoms - n_owned
         z = species + 1
         center = edge_index[0]
 
-        edge_vector = pos[center] - pos[edge_index[1]]
+        edge_vector = pos[center] - pos[edge_index[1]] - edge_shift
         edge_length = torch.linalg.norm(edge_vector, dim=1)
         left, right = ordered_edge_pairs(center, edge_length, self.threebody_cutoff, n_atoms)
         three_body_indices = torch.stack([left, right], dim=1)
@@ -153,8 +173,15 @@ class MatterSimAdapter(MLIPAdapter):
         edge_attr = self.edge_encoder(edge_attr)
         three_basis = self.sbf(triple_edge_length, torch.acos(cos_jik))
 
+        first = True
         for conv in self.graph_conv:
+            if layered and not first:
+                atom_attr = torch.ops.dsmd.halo_exchange(atom_attr[:n_owned], n_ghost)
+            first = False
             atom_attr, edge_attr = conv(atom_attr, edge_attr, edge_attr_zero, edge_index, three_basis, three_body_indices,
                                         edge_length, left, n_atoms, n_edges)
-        energies_i = self.final(atom_attr).view(-1)
-        return self.normalizer(energies_i, z)
+        if not layered:
+            energies_i = self.final(atom_attr).view(-1)
+            return self.normalizer(energies_i, z)
+        energies_owned = self.normalizer(self.final(atom_attr[:n_owned]).view(-1), z[:n_owned])
+        return torch.cat([energies_owned, torch.zeros(n_ghost, dtype=energies_owned.dtype, device=energies_owned.device)])

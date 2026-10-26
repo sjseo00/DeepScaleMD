@@ -78,8 +78,8 @@ class MACEAdapter(MLIPAdapter):
                     self._calculator = mace_mp(model=model_size, **options)
 
             if self.device == "cuda":
-                gpu = torch.cuda.get_device_name(0)
-                mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+                gpu = torch.cuda.get_device_name(torch.cuda.current_device())   # the GPU of this MPI rank
+                mem = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1e9
                 print(f"[MACE] ✅ Running on GPU: {gpu} ({mem:.1f} GB)")
                 self._gpu_warmup()
             else:

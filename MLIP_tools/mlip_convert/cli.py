@@ -24,7 +24,7 @@ from .export_aoti import export_aoti, tracing_friendly_e3nn
 from .export_torchscript import check_torchscript, export_torchscript
 from .metadata import build_metadata, write_metadata
 from .reference import make_reference, make_reference_structure, write_reference
-from .wrapper import MDShiftWrapper, MDWrapper
+from .wrapper import MDLayerShiftWrapper, MDShiftWrapper, MDWrapper
 
 DTYPES = {"float32": torch.float32, "float64": torch.float64}
 BACKENDS = ("torchscript", "aoti")
@@ -35,8 +35,13 @@ def convert(arch: str, output_dir, *, backend: str = "torchscript", dtype: Optio
             elements: Optional[Sequence[int]] = None, cutoff: Optional[float] = None, seed: int = 0,
             model: Optional[str] = None, head: Optional[str] = None, device: Optional[str] = None,
             accel: str = "e3nn", reference_atoms: int = 12, reference_seed: int = 0,
-            edge_shifts: Optional[bool] = None) -> Dict[str, Path]:
+            edge_shifts: Optional[bool] = None, layer_exchange: bool = False) -> Dict[str, Path]:
     """Build the adapter, wrap it, export it and write the three files. Returns their paths by name.
+
+    layer_exchange: the model sends the node features of the owned atoms to their ghost copies between its message-passing layers
+    (the op dsmd::halo_exchange, halo_op.py), so a rank needs ghost atoms one cutoff deep instead of num_layers cutoffs; the
+    MD program needs a transport for the op (dsDecompX) to run it on several ranks. TorchScript only, for models whose adapter
+    supports it (toy_mp, mace, nequip, sevennet, bam, mattersim, tensornet, painn, deepmd; not chgnet, allegro).
 
     edge_shifts: the model takes periodic images as edge shifts (metadata edge_shifts) instead of as extra atoms. None = when the
     adapter supports it and the backend is torchscript."""
@@ -50,6 +55,8 @@ def convert(arch: str, output_dir, *, backend: str = "torchscript", dtype: Optio
         raise ValueError("--device is for --backend aoti, or with --accel (a TorchScript file runs on any device)")
     if accel in ("openeq", "flash") and device is None:
         device = "cuda"      # the OpenEquivariance and FlashTP kernels are built for, and run on, a GPU
+    if layer_exchange and backend != "torchscript":
+        raise ValueError("--layer-exchange is only available with --backend torchscript")
     if backend == "aoti":
         if accel != "e3nn":
             raise ValueError(f"--accel {accel} is not supported with --backend aoti yet")
@@ -58,11 +65,11 @@ def convert(arch: str, output_dir, *, backend: str = "torchscript", dtype: Optio
             return _convert(arch, output_dir, backend, dtype, elements, cutoff, seed, model, head, device or "cuda", accel,
                             reference_atoms, reference_seed, edge_shifts)
     return _convert(arch, output_dir, backend, dtype, elements, cutoff, seed, model, head, device, accel, reference_atoms,
-                    reference_seed, edge_shifts)
+                    reference_seed, edge_shifts, layer_exchange)
 
 
 def _convert(arch, output_dir, backend, dtype, elements, cutoff, seed, model, head, device, accel, reference_atoms,
-             reference_seed, edge_shifts=None) -> Dict[str, Path]:
+             reference_seed, edge_shifts=None, layer_exchange=False) -> Dict[str, Path]:
     adapter = build_adapter(arch, elements=elements, cutoff=cutoff, seed=seed, model_path=model, head=head,
                             dtype=DTYPES[dtype or "float64"], accel=accel, device=device)
     kernels = resolve_accel(adapter.accel)       # fails early, with what to install, when the packages are missing
@@ -82,7 +89,18 @@ def _convert(arch, output_dir, backend, dtype, elements, cutoff, seed, model, he
         raise ValueError("edge shifts are only available with --backend torchscript")
     elif edge_shifts and not adapter.supports_shifts:
         raise ValueError(f"the {adapter.model_family} adapter does not take edge shifts")
-    wrapper = (MDShiftWrapper(adapter) if edge_shifts else MDWrapper(adapter)).eval()
+    if layer_exchange:
+        if not adapter.supports_layer_exchange:
+            raise ValueError(f"the {adapter.model_family} adapter does not support --layer-exchange (supported: toy_mp, mace, nequip, sevennet, bam, mattersim, tensornet, painn, deepmd)")
+        if adapter.edge_receiver_row is None or not adapter.supports_shifts:
+            raise ValueError(f"the {adapter.model_family} adapter needs edge_receiver_row and edge shifts for --layer-exchange")
+        if edge_shifts is False or backend != "torchscript":
+            raise ValueError("--layer-exchange needs edge shifts (the TorchScript backend); do not pass --no-edge-shifts")
+        if getattr(adapter, "has_extra_inputs", False):
+            raise ValueError("this MACE model has extra node inputs (joint embedding): --layer-exchange does not support it")
+        edge_shifts = True
+        adapter.enable_layer_exchange()     # the ghost layer of the reference structure and of the model is one cutoff deep
+    wrapper = (MDLayerShiftWrapper(adapter) if layer_exchange else MDShiftWrapper(adapter) if edge_shifts else MDWrapper(adapter)).eval()
     if backend == "torchscript" and device is not None:
         wrapper = wrapper.to(device)      # a model with GPU kernels (cueq, openeq, flash) is built on the GPU: check and save it there
 
@@ -108,7 +126,8 @@ def _convert(arch, output_dir, backend, dtype, elements, cutoff, seed, model, he
         shutil.move(str(staged), str(paths["model"]))
     write_metadata(paths["metadata"], build_metadata(
         adapter, backend=backend, dtype=dtype, target_gpu=target_gpu, required_op_libs=kernels.required_op_libs,
-        required_python_modules=kernels.required_python_modules, edge_shifts=edge_shifts, extra_versions=kernels.versions))
+        required_python_modules=kernels.required_python_modules, edge_shifts=edge_shifts, layer_exchange=layer_exchange,
+        extra_versions=kernels.versions))
     write_reference(paths["reference"], reference)
     return paths
 
@@ -123,12 +142,30 @@ def _element_list(text: str) -> List[int]:
     return values
 
 
+def list_heads(arch: str, model: Optional[str]) -> List[str]:
+    """The heads (mace) or modals (sevennet) of a model that has several; an empty list for a model with one, or for another
+    architecture. A SevenNet multi-modal model cannot be converted without --head, a MACE model takes its last head without one."""
+    if arch not in ("mace", "sevennet"):
+        return []
+    if not model or not Path(model).is_file():
+        raise ValueError(f"--list-heads needs --model <model file> that exists: {model}")
+    if arch == "sevennet":
+        from sevenn.checkpoint import SevenNetCheckpoint
+        return [str(name) for name in (SevenNetCheckpoint(str(model)).build_model().modal_map or [])]
+    from .adapters.mace import load_mace_model
+    heads = list(getattr(load_mace_model(model, torch.float64), "heads", None) or [])
+    return [str(name) for name in heads] if len(heads) > 1 else []
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m mlip_convert",
         description="Convert an MLIP into the standard LibTorch model folder (model + metadata.json + reference.json).")
     parser.add_argument("arch", choices=sorted(ADAPTERS), help="model architecture")
-    parser.add_argument("-o", "--output", required=True, help="output folder")
+    parser.add_argument("-o", "--output", help="output folder (required, except with --list-heads)")
+    parser.add_argument("--list-heads", action="store_true",
+                        help="print the heads (arch mace) or modals (arch sevennet) of --model that has several, one 'head: <name>' line "
+                             "each, and exit without converting")
     parser.add_argument("--backend", default="torchscript", choices=BACKENDS)
     parser.add_argument("--device", choices=("cuda", "cpu"),
                         help="device an AOTI package is compiled for (default cuda; cpu is for tests, the MD backend refuses "
@@ -148,18 +185,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head", help="model head to fix (arch mace), or the modal (arch sevennet), for models with several")
     parser.add_argument("--no-edge-shifts", action="store_true",
                         help="give the model periodic images as extra atoms (the older, slower interface) instead of as edge shifts")
+    parser.add_argument("--layer-exchange", action="store_true",
+                        help="the model exchanges node features between its layers (ghost atoms one cutoff deep instead of "
+                             "layers x cutoff; for several MPI ranks; toy_mp and mace, torchscript only)")
     parser.add_argument("--reference-atoms", type=int, default=12, help="owned atoms in reference.json")
     parser.add_argument("--reference-seed", type=int, default=0)
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.list_heads:
+        try:
+            for name in list_heads(args.arch, args.model):
+                print(f"head: {name}")
+        except (ValueError, RuntimeError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if not args.output:
+        parser.error("the following arguments are required: -o/--output")
     try:
         paths = convert(args.arch, args.output, backend=args.backend, dtype=args.dtype, elements=args.elements,
                         cutoff=args.cutoff, seed=args.seed, model=args.model, head=args.head, device=args.device,
                         accel=args.accel, reference_atoms=args.reference_atoms,
-                        reference_seed=args.reference_seed, edge_shifts=False if args.no_edge_shifts else None)
+                        reference_seed=args.reference_seed, edge_shifts=False if args.no_edge_shifts else None,
+                        layer_exchange=args.layer_exchange)
     except (ValueError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

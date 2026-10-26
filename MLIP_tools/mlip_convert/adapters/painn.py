@@ -17,7 +17,7 @@ What the installed schnetpack does, which this adapter relies on:
 Not supported (the adapter refuses them): electronic embeddings (total charge, spin), a postprocessor other than CastTo32/64
 and AddOffsets, intensive offsets, an output module other than one extensive Atomwise energy.
 """
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -25,11 +25,24 @@ from torch import Tensor
 from .base import MLIPAdapter
 
 
+def schnetpack_compat() -> None:
+    """schnetpack 2.1.1 does `from torch.utils.data.dataloader import _collate_fn_t, T_co`; newer torch (2.6 and later) no longer has `T_co`
+    there, which makes `import schnetpack` fail. The name is a plain type variable that schnetpack only uses in annotations: put it back
+    before schnetpack is imported."""
+    import typing
+    import torch.utils.data.dataloader as dataloader
+    if not hasattr(dataloader, "T_co"):
+        dataloader.T_co = typing.TypeVar("T_co", covariant=True)
+    if not hasattr(dataloader, "_collate_fn_t"):
+        dataloader._collate_fn_t = typing.Callable
+
+
 def load_painn_model(path) -> torch.nn.Module:
     """The schnetpack model of a file written by torch.save(model, ...) (the `best_model` of a training run)."""
     from pathlib import Path
     if not Path(path).is_file():
         raise ValueError(f"PaiNN model file not found: {path}")
+    schnetpack_compat()
     model = torch.load(str(path), map_location="cpu", weights_only=False)
     if not isinstance(model, torch.nn.Module):
         raise ValueError(f"{path} does not hold a schnetpack model (torch.save of the whole model): got {type(model).__name__}")
@@ -41,8 +54,12 @@ def load_painn_model(path) -> torch.nn.Module:
 
 class PaiNNAdapter(MLIPAdapter):
     model_family = "painn"
+    supports_shifts = True
+    supports_layer_exchange = True
+    edge_receiver_row = 0       # the messages of an interaction layer are summed onto idx_i = edge_index[0]
 
     def __init__(self, model: torch.nn.Module, elements: Sequence[int], model_name: str = "painn"):
+        schnetpack_compat()
         import schnetpack as spk
         from schnetpack.atomistic import Atomwise
         from schnetpack.representation import PaiNN
@@ -115,12 +132,11 @@ class PaiNNAdapter(MLIPAdapter):
         return self.elements[:3]
 
     def forward(self, pos: Tensor, species: Tensor, edge_index: Tensor) -> Tensor:
-        idx_i = edge_index[0]
-        idx_j = edge_index[1]
-        z = self.atomic_numbers[species]
-        r_ij = pos[idx_j] - pos[idx_i]
-        n_atoms = pos.shape[0]
+        return self.forward_with_shifts(pos, species, edge_index, torch.zeros((edge_index.shape[1], 3), dtype=pos.dtype, device=pos.device))
 
+    def _filters(self, pos: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tuple[List[Tensor], Tensor]:
+        # PaiNN.forward: r_ij = R[idx_j] - R[idx_i] + offsets; the shift of an edge is the offsets
+        r_ij = pos[edge_index[1]] - pos[edge_index[0]] + edge_shift
         d_ij = torch.norm(r_ij, dim=1, keepdim=True)
         dir_ij = r_ij / d_ij
         phi_ij = self.radial_basis(d_ij)
@@ -129,7 +145,15 @@ class PaiNNAdapter(MLIPAdapter):
         if self.share_filters:
             filter_list = [filters] * self.n_interactions
         else:
-            filter_list = torch.split(filters, 3 * self.n_atom_basis, dim=-1)
+            filter_list = list(torch.split(filters, 3 * self.n_atom_basis, dim=-1))
+        return filter_list, dir_ij
+
+    def forward_with_shifts(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:
+        idx_i = edge_index[0]
+        idx_j = edge_index[1]
+        z = self.atomic_numbers[species]
+        n_atoms = pos.shape[0]
+        filter_list, dir_ij = self._filters(pos, edge_index, edge_shift)
 
         q = self.embedding(z).unsqueeze(1)
         qs = q.shape
@@ -141,3 +165,34 @@ class PaiNNAdapter(MLIPAdapter):
 
         y = self.outnet(q).squeeze(-1)
         return y + self.energy_per_species.to(y.dtype)[species]
+
+    def forward_layered(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor, n_owned: int) -> Tensor:
+        """PaiNN.forward for a rank with ghost atoms: the interaction of a layer runs on all rows (the messages are summed onto the
+        owned atoms only, idx_i = edge_index[0]), the intra-atomic mixing and everything after it on the owned rows only, and the
+        scalar and vector features of the owned atoms are sent to their ghost copies before every layer but the first (the first
+        layer's features come from the species alone, which the ghost atoms have). Per atom energies [N], zero for the ghosts."""
+        idx_i = edge_index[0]
+        idx_j = edge_index[1]
+        z = self.atomic_numbers[species]
+        n_atoms = pos.shape[0]
+        n_ghost = n_atoms - n_owned
+        filter_list, dir_ij = self._filters(pos, edge_index, edge_shift)
+
+        q = self.embedding(z).unsqueeze(1)
+        qs = q.shape
+        mu = torch.zeros((qs[0], 3, qs[2]), dtype=q.dtype, device=q.device)
+        width = self.n_atom_basis
+        first = True
+        for i, (interaction, mixing) in enumerate(zip(self.interactions, self.mixing)):
+            if not first:
+                packed = torch.cat([q.reshape(n_owned, width), mu.reshape(n_owned, 3 * width)], dim=1)
+                packed = torch.ops.dsmd.halo_exchange(packed, n_ghost)
+                q = packed[:, :width].reshape(n_atoms, 1, width)
+                mu = packed[:, width:].reshape(n_atoms, 3, width)
+            first = False
+            q, mu = interaction(q, mu, filter_list[i], dir_ij, idx_i, idx_j, n_atoms)
+            q, mu = mixing(q[:n_owned], mu[:n_owned])
+        q = q.squeeze(1)
+
+        y = self.outnet(q).squeeze(-1) + self.energy_per_species.to(q.dtype)[species[:n_owned]]
+        return torch.cat([y, torch.zeros(n_ghost, dtype=y.dtype, device=y.device)])

@@ -41,7 +41,7 @@ class State:
     action: str = "convert"
     candidate: Optional[Candidate] = None
     model: Optional[str] = None            # the --model value: file, folder or nequip.net address
-    options: Dict[str, str]
+    options: Dict[str, object]
     output: Optional[Path] = None
 
     def __init__(self):
@@ -68,6 +68,8 @@ def step_mlip(st: State, cfg: Settings) -> bool:
     items = []
     for m in MLIPS.values():
         modes = ("LibTorch + Python" if m.convert_arch and m.python_type else "LibTorch only" if m.convert_arch else "Python MLIP only")
+        if m.layer_exchange:
+            modes += ", layer exchange for several GPUs"
         items.append((m.title, modes))
     st.mlip = list(MLIPS.values())[ui.choose("Which MLIP?", items, back=False)]
     if st.mlip.note:
@@ -208,6 +210,14 @@ def _elements_ok(text: str) -> Optional[str]:
     return None if values and all(1 <= v <= 118 for v in values) else "atomic numbers between 1 and 118"
 
 
+def _extra_ok(layered: bool) -> Callable[[str], Optional[str]]:
+    def check(text: str) -> Optional[str]:
+        if layered and "--no-edge-shifts" in text:
+            return "layer exchange needs edge shifts: leave out --no-edge-shifts"
+        return None
+    return check
+
+
 def step_options(st: State, cfg: Settings) -> Optional[bool]:
     m = st.mlip
     o = st.options
@@ -234,18 +244,38 @@ def step_options(st: State, cfg: Settings) -> Optional[bool]:
                                                                   for a in m.accels], default=0)]
         if o["accel"] != "e3nn":      # an e3nn file runs on any device, the other kernels are built for the GPU
             print(ui.dim(f"  device: cuda (--accel {o['accel']} is converted and checked on the GPU; CPU is not supported)"))
+    if m.layer_exchange and o["backend"] == "torchscript":
+        if m.layer_exchange_local:
+            pick = ui.choose("Several GPUs (MPI ranks): do the ranks compute the atoms around their part of the box too?", [
+                ("ordinary", "every rank computes its ghost atoms as well as its own; fine for one GPU"),
+                ("owned atoms only", "a rank computes only its own atoms (the ghost atoms stay one cutoff deep, nothing is exchanged: "
+                                     "this model is local)")], default=0)
+        else:
+            pick = ui.choose("Several GPUs (MPI ranks): how do the ranks get the atoms around their part of the box?", [
+                ("ordinary", "ghost atoms layers x cutoff deep (12 A for MACE), every rank computes its ghost atoms itself; fine for one GPU"),
+                ("layer exchange", "ghost atoms one cutoff deep, the ranks send node features between the layers, no edge is computed twice")],
+                default=0)
+        o["layer_exchange"] = pick == 1
+        if o["layer_exchange"]:
+            print(ui.dim("  --layer-exchange: needs edge shifts (the default)" + ("" if m.layer_exchange_local else
+                         ", and a dsMD built with the dsDecompX that has forward_exchange")))
+            if o.get("accel", "e3nn") != "e3nn":
+                print(ui.yellow(f"  layer exchange has been tried with the e3nn kernels only, not with {o['accel']}"))
+    elif m.layer_exchange:
+        print(ui.dim("  layer exchange: not available with the AOTInductor backend (TorchScript only)"))
     if m.has_heads:
-        o["head"] = ui.ask("Head / modal to fix (Enter = the model's default)", "", allow_empty=True)
+        o["head"] = ui.ask("Head / modal to fix (Enter = ask after the model is downloaded, if it has several)", "", allow_empty=True)
     if m.needs_elements:
         o["elements"] = ui.ask("Atomic numbers the model was trained on, e.g. 1,6,7,8", validate=_elements_ok)
-    o["extra"] = ui.ask("Extra mlip_convert arguments, e.g. --cutoff 5.0 --no-edge-shifts (Enter = none)", "", allow_empty=True)
+    o["extra"] = ui.ask("Extra mlip_convert arguments, e.g. --cutoff 5.0 --no-edge-shifts (Enter = none)", "", allow_empty=True,
+                        validate=_extra_ok(bool(o.get("layer_exchange"))))
     return True
 
 
 def step_output(st: State, cfg: Settings) -> bool:
     m = st.mlip
     if st.action == "convert":
-        default = f"models/libtorch_{m.key}"
+        default = f"models/libtorch_{m.key}" + ("_layer" if st.options.get("layer_exchange") else "")
         label = "Output folder for model.pt, metadata.json, reference.json"
     else:
         default = f"models/python_{m.key}"
@@ -273,6 +303,8 @@ def build_convert_command(st: State, cfg: Settings, model: Optional[str]) -> Lis
         cmd += ["--dtype", o["dtype"]]
     if o.get("accel") and o["accel"] != "e3nn":
         cmd += ["--accel", o["accel"], "--device", "cuda"]
+    if o.get("layer_exchange"):
+        cmd.append("--layer-exchange")
     if o.get("head"):
         cmd += ["--head", o["head"]]
     if o.get("elements"):
@@ -298,6 +330,10 @@ def step_run(st: State, cfg: Settings) -> bool:
         cmd = build_convert_command(st, cfg, model)
         print(f"  download: {cfg.download_dir}" if c.needs_download else "  download: nothing to download")
         print(f"  output  : {st.output}")
+        if st.options.get("layer_exchange"):
+            print("  ghost   : one cutoff deep, " + ("only the atoms of a rank are computed (a local model: nothing to exchange)"
+                                                       if st.mlip.layer_exchange_local else "node features exchanged between the layers")
+                  + " (layer exchange, for several GPUs)")
         print("\n  command :\n    " + ui.bold(command_text(cmd, cfg.python if cfg.python == sys.executable else None)))
     else:
         print(f"  output  : {st.output}  (the model file is saved here, with mlip_config.yaml)")
@@ -324,6 +360,23 @@ def step_run(st: State, cfg: Settings) -> bool:
     return _run_convert(st, cfg, path)
 
 
+def _model_heads(st: State, cfg: Settings, model: str) -> List[str]:
+    """The heads (MACE) or modals (SevenNet) of the model file, asked of the converter in the model's own environment (this menu cannot
+    import the MLIP packages): the names, or [] for a model with one head or when they cannot be read."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    cmd = [cfg.python, "-m", "mlip_convert", st.mlip.convert_arch, "--model", model, "--list-heads"]
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(ui.yellow(f"  could not read the heads of the model: {error}"))
+        return []
+    if done.returncode != 0:
+        print(ui.yellow("  could not read the heads of the model: " + (done.stderr.strip().splitlines() or ["?"])[-1]))
+        return []
+    return [line[len("head: "):].strip() for line in done.stdout.splitlines() if line.startswith("head: ")]
+
+
 def _run_convert(st: State, cfg: Settings, model: Optional[str]) -> bool:
     m = st.mlip
     if not package_installed(cfg.python, m.package):
@@ -332,9 +385,19 @@ def _run_convert(st: State, cfg: Settings, model: Optional[str]) -> bool:
         print(f"  Activate the environment of this model, or install it:  {shown} -m pip install {m.pip}")
         print("  (another interpreter: run this program with  --python /path/to/env/bin/python)")
         return True
+    if m.has_heads and model and not st.options.get("head"):
+        heads = _model_heads(st, cfg, model)
+        if len(heads) > 1:      # a SevenNet multi-modal model cannot be converted without one; MACE takes its last head
+            kind = "heads" if m.convert_arch == "mace" else "modals"
+            default = len(heads) - 1 if m.convert_arch == "mace" else None
+            pick = ui.choose(f"This model has several {kind}: which one to fix in the converted model?",
+                             [(h, "the default of MACE's own export" if i == default else "") for i, h in enumerate(heads)],
+                             default=default, back=False)
+            st.options["head"] = heads[pick]
     cmd = build_convert_command(st, cfg, model)
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    print("\ncommand :\n    " + ui.bold(command_text(cmd, cfg.python if cfg.python == sys.executable else None)))
     print("\nConverting ...\n")
     code = subprocess.call(cmd, env=env)
     if code != 0:
@@ -347,12 +410,21 @@ def _run_convert(st: State, cfg: Settings, model: Optional[str]) -> bool:
     if meta.exists():
         try:
             data = json.loads(meta.read_text(encoding="utf-8"))
-            shown = {k: data[k] for k in ("model_family", "elements", "cutoff", "num_layers", "dtype", "backend", "edge_shifts") if k in data}
+            shown = {k: data[k] for k in ("model_family", "elements", "cutoff", "num_layers", "ghost_cutoff", "dtype", "backend", "edge_shifts", "layer_exchange") if k in data}
             print("  metadata: " + ", ".join(f"{k}={v}" for k, v in shown.items()))
         except (OSError, ValueError):
             pass
     print("\nUse it in the dsMD input file:\n")
     print(f"  mlip_backend: libtorch\n  mlip_model:   {st.output.as_posix()}")
+    if st.options.get("layer_exchange"):
+        print()
+        if st.mlip.layer_exchange_local:
+            print("  Layer exchange: with several MPI ranks a rank computes only its own atoms (this model is local: nothing is sent). The")
+            print("  input file is the same as for an ordinary model. The first-step line then reads '[MLIP] first step (layer exchange: ...)'.")
+        else:
+            print("  Layer exchange: with several MPI ranks the ranks send node features between the layers. The input file is the same as")
+            print("  for an ordinary model; dsMD must be built with the dsDecompX that has forward_exchange. The first-step line then reads")
+            print("  '[MLIP] first step (layer exchange: ...)'.")
     return True
 
 
@@ -408,6 +480,7 @@ def list_catalog() -> None:
     for m in MLIPS.values():
         modes = "libtorch" if m.convert_arch else ""
         modes += (" + " if modes and m.python_type else "") + ("python" if m.python_type else "")
+        modes += " + layer-exchange" if m.layer_exchange else ""
         print(f"{m.key:<10} {m.title}   [{modes}]")
         for s in m.sources:
             print(f"{'':<10}   - {s.label}" + (f"  ({s.ref})" if s.ref else ""))
