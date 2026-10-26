@@ -1,5 +1,13 @@
 # 7. Performance tuning
 
+## Contents
+
+- [Step 1. Measure](#step-1-measure)
+- [Step 2. Settings that matter, by symptom](#step-2-settings-that-matter-by-symptom)
+- [Step 3. Build settings](#step-3-build-settings)
+- [A checklist](#a-checklist)
+- [Limitations](#limitations)
+
 This page is for a run that is slower than you expect. It shows how to see where the time goes,
 and which settings move it. Every setting named here is described in the [Input
 reference](03_Input_Reference.md).

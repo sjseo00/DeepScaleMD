@@ -1,5 +1,15 @@
 # 4. Preparing a system
 
+## Contents
+
+- [Which route to take](#which-route-to-take)
+- [Coordinate file (XYZ)](#coordinate-file-xyz)
+- [Legacy topology (`.top`)](#legacy-topology-top)
+- [dsMD_input package](#dsmd_input-package)
+- [Converting from other engines](#converting-from-other-engines)
+- [Element names for MLIPs](#element-names-for-mlips)
+- [Limitations](#limitations)
+
 `dsMD` needs two things about your system: **where the atoms are** (a coordinate file) and
 **what the atoms are** (a topology). This page describes the file formats and how to produce
 them, from a hand-written file to a converted CHARMM, GROMACS, NAMD, or LAMMPS setup.
@@ -209,8 +219,8 @@ and line number. `examples/dsMD_input_lj/` is a two-atom package small enough to
 `FF_tools/python_converter/` turns inputs from other MD engines into a `dsMD_input` package, and turns the
 run settings of the same input into a DeepScaleMD input file (`input_dsmd.yaml`). It needs only
 the Python 3 standard library and is not part of the C++ build. Every input is a named
-`--option`. A numbered menu asks for the engine and the files and types the command:
-`PYTHONPATH=FF_tools python -m ff_cli_ui`.
+`--option`. If you prefer not to type the command, a numbered menu asks for the engine and the files and runs it for you
+([The menu: `ff_cli_ui`](#the-menu-ff_cli_ui)).
 
 ```bash
 # NAMD: the config names the PSF, parameters, PDB, box, and run settings
@@ -276,6 +286,47 @@ multiple time stepping, thermostats or barostats `dsMD` does not have, anisotrop
 coupling, PME turned off, different van der Waals and Coulomb cutoffs, force switching, tail
 corrections, CMAP, polarizable models, virtual sites, NBFIX overrides, tilted boxes. The full
 list per engine is in `FF_tools/python_converter/README.md`.
+
+### The menu: `ff_cli_ui`
+
+`FF_tools/ff_cli_ui/` is a numbered menu over the converters above. It asks which engine you use and which files to convert, builds
+the `convert_*.py` command, shows it, and runs it after you confirm. It does not change the converters: it prints their exit code and
+their `error: ...` message as they are. It uses only the Python standard library, so there is nothing to install. Run it from the
+repository root:
+
+```bash
+PYTHONPATH=FF_tools python -m ff_cli_ui                           # or: bash FF_tools/ff_cli_ui/run.sh
+PYTHONPATH=FF_tools python -m ff_cli_ui --list                    # only list the supported engines and input files
+PYTHONPATH=FF_tools python -m ff_cli_ui --dry-run                 # go through the menus, print the command, run nothing
+PYTHONPATH=FF_tools python -m ff_cli_ui --folder examples/apoa1   # folder where the input files are looked for first
+```
+
+The steps:
+
+1. **Engine**: NAMD, GROMACS, CHARMM (PSF + parameter files + PDB), LAMMPS, or SPICA.
+2. **Input files**: give a folder and the menu lists the files with the right extension under it (up to three levels deep). Type `L` to
+   enter a path yourself, and `N` to skip an optional file. The files asked for are:
+
+   | Engine | Files | Run input that becomes `input_dsmd.yaml` |
+   |---|---|---|
+   | NAMD | one config (it names the structure, coordinates, parameters, and box) | the config |
+   | GROMACS | `.top`, `.gro`, `.mdp` (optional) | the `.mdp` |
+   | CHARMM | `.psf`, several parameter files (merged in the order you pick them), `.pdb`, `.inp` (optional) | the `.inp` |
+   | LAMMPS | input script, data file (optional) | the input script |
+   | SPICA | input script, data file (optional) | the input script |
+
+   Without a run input (no GROMACS `.mdp`, no CHARMM `.inp`), only the four package files are written and there is no `input_dsmd.yaml`.
+3. **Options**: the force field name, the GROMACS `-I` folder, the box (required for CHARMM without an `.inp`; for NAMD, leaving it empty
+   takes `cellBasisVector` from the config), how dihedrals are read, the 1-4 electrostatic scaling, and `--allow-lossy`. When there is a
+   run input you can also set the `input_dsmd.yaml` values: precision, nonbonded kernel, FIRE tolerance, and `input_system`
+   (defaults: `mixed` and `list`).
+4. **Output folder** (default `out/<input file name>`). The menu shows the exact command and asks for confirmation. If the folder
+   already has files, it asks once more.
+
+At every step `b` goes back one step and `q` quits. Defaults and allowed values are the converters' own. What the converters cannot
+convert is listed in `FF_tools/python_converter/README.md`. After a conversion, compare energies and forces with the original engine on a
+small system before a production run. The menu for machine-learned potentials is described in
+[the MLIP page](06_MLIP.md#33-the-menu-mlip_cli_ui).
 
 ### Example: ApoA1 from NAMD
 

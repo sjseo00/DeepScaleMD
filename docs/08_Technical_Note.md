@@ -1,13 +1,5 @@
 # 8. Technical Note: How DeepScaleMD Works
 
-DeepScaleMD repeatedly answers two questions: **what force acts on each atom, and where should that atom move next?** Its algorithms answer these questions while sharing work across CPU cores, GPUs, and computers.
-
-This note starts each topic with the problem it solves. Technical names follow the explanation in parentheses. Code links are for readers who want to inspect the implementation; you do not need to open them to follow the explanation.
-
-This description covers the source tree reviewed on October 23, 2026, including uncommitted changes. Implemented features are not necessarily tested on every machine or with every model. No simulation or performance benchmark was run for this documentation update.
-
-For commands and examples, see [Input reference](03_Input_Reference.md) and [MLIP](06_MLIP.md).
-
 ## Contents
 
 1. [One simulation step](#1-one-simulation-step)
@@ -28,6 +20,14 @@ For commands and examples, see [Input reference](03_Input_Reference.md) and [MLI
 16. [Making the learned model faster](#16-making-the-learned-model-faster)
 17. [Writing results and measuring performance](#17-writing-results-and-measuring-performance)
 18. [Current limits and checking results](#18-current-limits-and-checking-results)
+
+DeepScaleMD repeatedly answers two questions: **what force acts on each atom, and where should that atom move next?** Its algorithms answer these questions while sharing work across CPU cores, GPUs, and computers.
+
+This note starts each topic with the problem it solves. Technical names follow the explanation in parentheses. Code links are for readers who want to inspect the implementation; you do not need to open them to follow the explanation.
+
+This description covers the source tree reviewed on October 23, 2026, including uncommitted changes. Implemented features are not necessarily tested on every machine or with every model. No simulation or performance benchmark was run for this documentation update.
+
+For commands and examples, see [Input reference](03_Input_Reference.md) and [MLIP](06_MLIP.md).
 
 ## 1. One simulation step
 

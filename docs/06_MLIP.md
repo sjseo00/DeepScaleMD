@@ -1,9 +1,5 @@
 # 06. Machine-Learned Potentials (MLIP)
 
-This page explains how to run DeepScaleMD with a machine-learned interatomic potential (MLIP) such as MACE, NequIP, SevenNet or MatterSim,
-from the model file to a running simulation. It assumes dsMD is already built ([01_Installation](01_Installation.md)) and that you
-can run a plain example ([02_Quick_Start](02_Quick_Start.md)).
-
 ## Contents
 
 1. [Overview and choosing a path](#1-overview-and-choosing-a-path)
@@ -12,6 +8,10 @@ can run a plain example ([02_Quick_Start](02_Quick_Start.md)).
 4. [Supported models](#4-supported-models)
 5. [Multi-GPU MLIP](#5-multi-gpu-mlip)
 6. [Tutorial: water box](#6-tutorial-water-box)
+
+This page explains how to run DeepScaleMD with a machine-learned interatomic potential (MLIP) such as MACE, NequIP, SevenNet or MatterSim,
+from the model file to a running simulation. It assumes dsMD is already built ([01_Installation](01_Installation.md)) and that you
+can run a plain example ([02_Quick_Start](02_Quick_Start.md)).
 
 ---
 

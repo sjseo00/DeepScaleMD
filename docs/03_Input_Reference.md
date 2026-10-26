@@ -1,8 +1,5 @@
 # 3. Input reference
 
-This is the dictionary of every key `dsMD` reads from the YAML input file: its type, default,
-unit, and meaning. The other pages link here for the details and do not repeat the tables.
-
 ## Contents
 
 - [File format](#file-format)
@@ -19,6 +16,9 @@ unit, and meaning. The other pages link here for the details and do not repeat t
 - [Advanced (`advanced:`)](#advanced-advanced)
 - [Complete examples](#complete-examples)
 - [Limitations](#limitations)
+
+This is the dictionary of every key `dsMD` reads from the YAML input file: its type, default,
+unit, and meaning. The other pages link here for the details and do not repeat the tables.
 
 ## File format
 

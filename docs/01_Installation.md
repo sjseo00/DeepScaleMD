@@ -1,12 +1,21 @@
 # 1. Installation
 
+## Contents
+
+- [Requirements](#requirements)
+- [Step 1. Build and install dsDecompX](#step-1-build-and-install-dsdecompx)
+- [Step 2. Build DeepScaleMD](#step-2-build-deepscalemd)
+- [Optional builds](#optional-builds)
+- [Check the build](#check-the-build)
+- [Limitations](#limitations)
+
 This page builds `dsMD`, the DeepScaleMD executable. You build two things, in this order:
 
 1. **dsDecompX**, the domain-decomposition library, installed as a CMake package.
 2. **DeepScaleMD** itself, which finds that package.
 
 
-DeepScaleMD never compiles the files in `dsDecompX/src`. It links the installed library, so thelibrary has to be built and installed first.
+DeepScaleMD never compiles the files in `dsDecompX/src`. It links the installed library, so the library has to be built and installed first.
 
 The code uses POSIX headers, so build on Linux.
 
@@ -87,7 +96,7 @@ The data-plane backends are chosen when dsDecompX is built:
 | `ENABLE_NVSHMEM` | `AUTO` (default), `ON`, `OFF` | Same for NVSHMEM.                                                     |
 
 
-If both are found, `AUTO` at run time prefers NVSHMEM, then NCCL, then MPI among the ones that werecompiled in. If your site has NVSHMEM installed but you want MPI or NCCL, configure with`-DENABLE_NVSHMEM=OFF`.
+If both are found, `AUTO` at run time prefers NVSHMEM, then NCCL, then MPI among the ones that were compiled in. If your site has NVSHMEM installed but you want MPI or NCCL, configure with`-DENABLE_NVSHMEM=OFF`.
 
 ## Step 2. Build DeepScaleMD
 
@@ -144,7 +153,7 @@ The configure step stops with a message if the dsDecompX package does not match 
 | `CMAKE_PREFIX_PATH`                          | paths                                        | empty               | Extra install prefixes (ADIOS2, HDF5, ...).                                                                                           |
 
 
-The configure step prints which optional pieces it found. Look for these lines (the NCCL linesappear in CUDA builds):
+The configure step prints which optional pieces it found. Look for these lines (the NCCL lines appear in CUDA builds):
 
 ```text
 DeepScaleMD: found libfftw3_omp ...       (or "NOT found")  
@@ -167,7 +176,7 @@ cmake -S . -B build/deepscalemd-cuda ... \
 -DCMAKE_PREFIX_PATH="/path/to/adios2;/path/to/hdf5"
 ```
 
-ADIOS2 must be built with `-DADIOS2_USE_MPI=ON`, and HDF5 with `--enable-parallel`. A serial HDF5is rejected at configure time. Both options work with either backend. If you ask for `bp` or`h5md` in the input file without having built the writer, `dsMD` stops at start-up and says whichCMake option is missing.
+ADIOS2 must be built with `-DADIOS2_USE_MPI=ON`, and HDF5 with `--enable-parallel`. A serial HDF5is rejected at configure time. Both options work with either backend. If you ask for `bp` or`h5md` in the input file without having built the writer, `dsMD` stops at start-up and says which CMake option is missing.
 
 ### LibTorch MLIP backend
 
@@ -184,7 +193,7 @@ cmake --build build/deepscalemd-mlip -j
 
 Things that have to agree:
 
-- The `torch` in that environment should have the same `major.minor` version as the one you willlater use to convert models, and its CUDA series should match your CUDA Toolkit (12.x with 12.x).
+- The `torch` in that environment should have the same `major.minor` version as the one you will later use to convert models, and its CUDA series should match your CUDA Toolkit (12.x with 12.x).
 - LibTorch must use the cxx11 libstdc++ ABI. The configure step stops if it does not.
 - A recent `torch` needs GCC 9 or newer for its headers.
 
@@ -196,7 +205,7 @@ The python environment you need for running MLIPs is described in [MLIP](06_MLIP
 build/deepscalemd-cpu/bin/dsMD --help
 ```
 
-prints a one-line usage message (`Usage: <path-to-dsMD> [config_file]`). Then run the example in the next page. The CMake tests (a fewsmall classical-force-field cases and a trajectory check) run with:
+prints a one-line usage message (`Usage: <path-to-dsMD> [config_file]`). Then run the example in the next page. The CMake tests (a few small classical-force-field cases and a trajectory check) run with:
 
 ```bash
 (cd build/deepscalemd-cpu && ctest)
@@ -205,7 +214,7 @@ prints a one-line usage message (`Usage: <path-to-dsMD> [config_file]`). Then ru
 ## Limitations
 
 - SYCL: the CMake option and a force backend source exist, but the backend has no PME and ismarked as under development in the project README. This documentation covers CPU and CUDA only.
-- A stale `dsdecompx.hpp` earlier on your include path (for example through `CPATH` or`~/.local/include`) can shadow the one that belongs to the library you built. `dsMD` checks thetwo against each other when a multi-rank run starts and stops with a "headers and library do not match" error;the fix is to remove the stale header and rebuild both.
+- A stale `dsdecompx.hpp` earlier on your include path (for example through `CPATH` or`~/.local/include`) can shadow the one that belongs to the library you built. `dsMD` checks the two against each other when a multi-rank run starts and stops with a "headers and library do not match" error; the fix is to remove the stale header and rebuild both.
 - Windows is not a supported build platform.
 
 Next: [Quick start](02_Quick_Start.md).

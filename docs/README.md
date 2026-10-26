@@ -1,8 +1,8 @@
 # DeepScaleMD documentation
 
-DeepScaleMD (`dsMD`) is a parallel molecular dynamics program for large systems. It runsclassical force fields and machine-learned interatomic potentials (MLIPs) on CPUs or GPUs,with MPI domain decomposition provided by the [dsDecompX](../dsDecompX/README.md) library.
+DeepScaleMD (`dsMD`) is a parallel molecular dynamics program for large systems. It runs classical force fields and machine-learned interatomic potentials (MLIPs) on CPUs or GPUs, with MPI domain decomposition provided by the [dsDecompX](../dsDecompX/README.md) library.
 
-These pages take you from an empty machine to a finished simulation. Each page answers onequestion, and ends with a link to the next one.
+These pages take you from an empty machine to a finished simulation. Each page answers one question, and ends with a link to the next one.
 
 ## Contents
 

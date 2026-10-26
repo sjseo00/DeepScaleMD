@@ -1,5 +1,13 @@
 # 2. Quick start
 
+## Contents
+
+- [Run the example](#run-the-example)
+- [The input file](#the-input-file)
+- [What you see on screen](#what-you-see-on-screen)
+- [What it writes](#what-it-writes)
+- [Change something](#change-something)
+
 This page runs one small simulation, explains the input file line by line, and shows what the
 program prints and writes. You need a built `dsMD` ([Installation](01_Installation.md)).
 
