@@ -17,7 +17,7 @@ DEFAULT_ELEMENTS = (18,)
 
 def _no_accel(accel, arch) -> None:
     if accel != "e3nn":
-        raise ValueError(f"arch '{arch}' has no acceleration option: --accel is for mace, nequip, sevennet and bam")
+        raise ValueError(f"arch '{arch}' has no acceleration option: --accel is for mace, nequip, sevennet, bam and so3lr")
 
 
 def _no_model(model_path, head, arch) -> None:
@@ -129,6 +129,51 @@ def _build_bam(elements, cutoff, seed, model_path, head, dtype, accel, device) -
     return BAMAdapter(model, checkpoint, model_name=Path(model_path).stem, accel=accel)
 
 
+def _build_uma(elements, cutoff, seed, model_path, head, dtype, accel, device, composition=None, charge=None, spin=None) -> MLIPAdapter:
+    _no_accel(accel, "uma")
+    if not model_path:
+        raise ValueError("arch 'uma' needs --model <UMA checkpoint .pt file> (the weights are gated: download them yourself from "
+                         "Hugging Face facebook/UMA; this converter downloads nothing)")
+    if elements or cutoff is not None:
+        raise ValueError("arch 'uma' takes its elements and cutoff from the model; do not pass --elements or --cutoff")
+    from .uma import UMAAdapter   # imported here: fairchem-core is optional
+    return UMAAdapter.from_checkpoint(model_path, task=head, composition=composition, charge=charge, spin=spin)
+
+
+def _build_esen(elements, cutoff, seed, model_path, head, dtype, accel, device, composition=None, charge=None, spin=None) -> MLIPAdapter:
+    _no_accel(accel, "esen")
+    if not model_path:
+        raise ValueError("arch 'esen' needs --model <eSEN checkpoint .pt file of fairchem 2.x, e.g. esen_sm_conserving_all.pt> (the "
+                         "weights are gated: download them yourself from Hugging Face facebook/OMol25; this converter downloads nothing)")
+    if elements or cutoff is not None:
+        raise ValueError("arch 'esen' takes its elements and cutoff from the model; do not pass --elements or --cutoff")
+    from .esen import ESENAdapter   # imported here: fairchem-core is optional
+    return ESENAdapter.from_checkpoint(model_path, task=head, composition=composition, charge=charge, spin=spin)
+
+
+def _build_orb(elements, cutoff, seed, model_path, head, dtype, accel, device, charge=None, spin=None) -> MLIPAdapter:
+    _no_accel(accel, "orb")
+    if not model_path:
+        raise ValueError("arch 'orb' needs --model <orb-v3 conservative checkpoint .ckpt> (this converter downloads nothing)")
+    if elements or cutoff is not None:
+        raise ValueError("arch 'orb' takes its elements and cutoff from the model; do not pass --elements or --cutoff")
+    from .orb import ORBAdapter   # imported here: orb-models is optional
+    return ORBAdapter.from_checkpoint(model_path, architecture=head, charge=charge, spin=spin)
+
+
+def _build_so3lr(elements, cutoff, seed, model_path, head, dtype, accel, device, charge=None, spin=None, **kspace) -> MLIPAdapter:
+    if accel not in ("e3nn", "so3lr_fused"):
+        raise ValueError(f"arch 'so3lr' takes --accel e3nn (plain PyTorch, the default) or so3lr_fused (its CUDA operator), not {accel}")
+    if not model_path:
+        raise ValueError("arch 'so3lr' needs --model <SO3LR Tauri model folder (params.pkl, hyperparameters.json), e.g. "
+                         "<so3lr checkout>/so3lr/models/so3lr-tauri-m-2606, or a model name of the installed so3lr package>")
+    if elements or head:
+        raise ValueError("arch 'so3lr' takes its elements and head from the model; do not pass --elements or --head "
+                         "(--cutoff is the long-range cutoff, default 12 A)")
+    from .so3lr import SO3LRAdapter   # needs numpy only (the JAX package so3lr is not imported)
+    return SO3LRAdapter.from_model(model_path, lr_cutoff=cutoff, charge=charge, spin=spin, accel=accel, **kspace)
+
+
 ADAPTERS: Dict[str, Callable[..., MLIPAdapter]] = {
     "toy_pair": _build_toy_pair,
     "toy_mp": _build_toy_mp,
@@ -142,13 +187,26 @@ ADAPTERS: Dict[str, Callable[..., MLIPAdapter]] = {
     "deepmd": _build_deepmd,
     "tensornet": _build_tensornet,
     "bam": _build_bam,
+    "uma": _build_uma,
+    "esen": _build_esen,
+    "orb": _build_orb,
+    "so3lr": _build_so3lr,
 }
+
+# Settings that only some models have (cli: --composition, --charge, --spin), passed to their builder as keyword arguments.
+MODEL_OPTIONS: Dict[str, tuple] = {"uma": ("composition", "charge", "spin"), "esen": ("composition", "charge", "spin"), "orb": ("charge", "spin"), "so3lr": ("charge", "spin", "kspace", "kspace_smearing", "kspace_dispersion_smearing",
+                                           "kspace_spacing", "kspace_dispersion_spacing", "kspace_order")}
 
 
 def build_adapter(arch: str, elements: Optional[Sequence[int]] = None, cutoff: Optional[float] = None, seed: int = 0,
                   model_path: Optional[str] = None, head: Optional[str] = None,
                   dtype: torch.dtype = torch.float64, accel: str = "e3nn",
-                  device: Optional[str] = None) -> MLIPAdapter:
+                  device: Optional[str] = None, options: Optional[Dict] = None) -> MLIPAdapter:
     if arch not in ADAPTERS:
         raise ValueError(f"unknown architecture '{arch}'; available: {', '.join(sorted(ADAPTERS))}")
-    return ADAPTERS[arch](tuple(elements) if elements else None, cutoff, seed, model_path, head, dtype, accel, device)
+    options = dict(options or {})
+    for key in options:
+        if key not in MODEL_OPTIONS.get(arch, ()):
+            raise ValueError(f"--{key} is not an option of arch '{arch}'"
+                             + (f" (it takes {', '.join('--' + k for k in MODEL_OPTIONS[arch])})" if arch in MODEL_OPTIONS else ""))
+    return ADAPTERS[arch](tuple(elements) if elements else None, cutoff, seed, model_path, head, dtype, accel, device, **options)

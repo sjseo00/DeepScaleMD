@@ -28,8 +28,11 @@ public:
     double cutoff() const override;
     double ghost_cutoff() const override;
     bool uses_edge_shifts() const override;
+    bool gives_virial_diagonal() const override;
     int edge_receiver_row() const override;
     bool exchanges_layers() const override;
+    bool needs_whole_system() const override;
+    const MLIPKspaceSettings* kspace_settings() const override;
     const MLIPMetadata& metadata() const;
 
 private:

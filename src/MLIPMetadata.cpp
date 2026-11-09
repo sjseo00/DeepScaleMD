@@ -99,7 +99,7 @@ MLIPMetadata parse_mlip_metadata(const std::string& json_text, const std::string
         r.fail("unsupported format_version " + std::to_string(m.format_version) + " (this build reads 1)");
     }
 
-    m.backend = r.choice_field(root, "backend", "backend", {"torchscript", "aoti"});
+    m.backend = r.choice_field(root, "backend", "backend", {"torchscript", "aoti", "pytorch"});
     m.model_family = r.string_field(root, "model_family", "model_family");
     m.model_name = r.string_field(root, "model_name", "model_name");
 
@@ -137,7 +137,7 @@ MLIPMetadata parse_mlip_metadata(const std::string& json_text, const std::string
 
     if (const JsonValue* head = r.optional(root, "head", JsonValue::Type::String, "head")) m.head = head->string;
 
-    m.accel = r.choice_field(root, "accel", "accel", {"e3nn", "cueq", "openeq", "flash"});
+    m.accel = r.choice_field(root, "accel", "accel", {"e3nn", "cueq", "openeq", "flash", "so3lr_fused"});
 
     if (const JsonValue* libs = r.optional(root, "required_op_libs", JsonValue::Type::Array, "required_op_libs")) {
         for (size_t i = 0; i < libs->array.size(); ++i) {
@@ -180,16 +180,56 @@ MLIPMetadata parse_mlip_metadata(const std::string& json_text, const std::string
     if (const JsonValue* shifts = r.optional(root, "edge_shifts", JsonValue::Type::Bool, "edge_shifts")) {
         m.edge_shifts = shifts->boolean;
     }
+    if (const JsonValue* diag = r.optional(root, "virial_diagonal", JsonValue::Type::Bool, "virial_diagonal")) {
+        m.virial_diagonal = diag->boolean;
+    }
+    if (m.virial_diagonal && !m.edge_shifts) {
+        r.fail("field 'virial_diagonal' needs 'edge_shifts': only a model with edge shifts returns a virial");
+    }
     if (const JsonValue* row = r.optional(root, "edge_receiver_row", JsonValue::Type::Number, "edge_receiver_row")) {
         m.edge_receiver_row = r.integer_in_range(*row, "edge_receiver_row", 0, 1);
     }
-    if (m.edge_shifts && m.backend != "torchscript") {
-        r.fail("field 'edge_shifts' is only available with backend 'torchscript'");
+    // edge shifts and layer exchange need the wrapper itself (a TorchScript file, or the Python one of a "pytorch" folder)
+    const bool runs_wrapper = m.backend == "torchscript" || m.backend == "pytorch";
+    if (m.edge_shifts && !runs_wrapper) {
+        r.fail("field 'edge_shifts' is only available with backend 'torchscript' or 'pytorch'");
     }
     if (m.layer_exchange) {
-        if (m.backend != "torchscript") r.fail("field 'layer_exchange' is only available with backend 'torchscript'");
+        if (!runs_wrapper) r.fail("field 'layer_exchange' is only available with backend 'torchscript' or 'pytorch'");
         if (!m.edge_shifts) r.fail("field 'layer_exchange' needs 'edge_shifts': the ghost atoms are only the halo's, periodic images must be edge shifts");
         if (m.edge_receiver_row < 0) r.fail("field 'layer_exchange' needs 'edge_receiver_row': the edges must go onto the owned atoms only");
+    }
+    if (const JsonValue* whole = r.optional(root, "whole_system", JsonValue::Type::Bool, "whole_system")) {
+        m.whole_system = whole->boolean;
+    }
+    if (m.whole_system && m.layer_exchange) {
+        r.fail("fields 'whole_system' and 'layer_exchange' exclude each other: a model that reads the whole system is never split over ranks");
+    }
+    if (const JsonValue* ks = r.optional(root, "kspace", JsonValue::Type::Object, "kspace")) {
+        // a model with k-space terms (so3lr --kspace pme): dsMD computes the reciprocal sums (MLIPKspace.h)
+        r.choice_field(*ks, "method", "kspace.method", {"pme"});
+        m.kspace.enabled = true;
+        m.kspace.electrostatics = r.require(*ks, "electrostatics", JsonValue::Type::Bool, "kspace.electrostatics").boolean;
+        m.kspace.dispersion = r.require(*ks, "dispersion", JsonValue::Type::Bool, "kspace.dispersion").boolean;
+        const auto positive = [&](const char* key) {
+            const std::string path = std::string("kspace.") + key;
+            const double v = r.require(*ks, key, JsonValue::Type::Number, path).number;
+            if (!(v > 0.0)) r.fail("field '" + path + "' must be positive");
+            return v;
+        };
+        m.kspace.smearing = positive("smearing");
+        m.kspace.dispersion_smearing = positive("dispersion_smearing");
+        m.kspace.grid_spacing = positive("grid_spacing");
+        m.kspace.dispersion_grid_spacing = positive("dispersion_grid_spacing");
+        m.kspace.order = r.integer_in_range(r.require(*ks, "order", JsonValue::Type::Number, "kspace.order"), "kspace.order", 4, 6);
+        if (m.kspace.order == 5) r.fail("field 'kspace.order' must be 4 or 6");
+        if (!runs_wrapper) r.fail("field 'kspace' is only available with backend 'torchscript' or 'pytorch'");
+    }
+    if (const JsonValue* python_path = r.optional(root, "python_path", JsonValue::Type::String, "python_path")) {
+        m.python_path = python_path->string;
+    }
+    if (m.backend == "pytorch" && (m.python_path.empty() || m.python_path[0] != '/')) {
+        r.fail("backend 'pytorch' needs field 'python_path' (the absolute path of the folder that holds mlip_convert)");
     }
     if (m.backend == "aoti" && m.target_gpu.empty()) {
         r.fail("backend 'aoti' needs field 'target_gpu' (the compiled GPU architecture, e.g. 'sm_90')");

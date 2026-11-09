@@ -24,6 +24,10 @@ class Topology;
 class ForceFieldParams;
 class SimulationBox;
 
+// A constraint cluster of at most this many constraints (a water, an X-H group of an all-hydrogen-bond topology) is
+// solved by one GPU thread; bigger ones (a chain with all bonds constrained) by the slower Jacobi iteration.
+constexpr int kMaxClusterConstraints = 8;
+
 class ForceCalculatorCUDA : public ForceCalculator,
                             public dsdecompx::ParticleInfo::Provider {
 public:
@@ -35,6 +39,10 @@ public:
     void finalize() override;
     void compute_forces(MDSystem& system) override;
     void calculate_kinetic_energy(MDSystem& system) override;
+    // The diagonal of the virial tensor (get_virial_diag) and of the kinetic energy tensor
+    // (get_kinetic_energy_diag) for anisotropic pressure coupling: set_virial_tensor_enabled(true) before the
+    // first force phase. The diagonal is read back with the scalar virial (same steps, same conditions).
+    bool supports_virial_tensor() const override { return true; }
 
     void initial_upload_to_device(MDSystem& system);     // Initial 1-time upload
     void download_from_device(MDSystem& system);         // Download for output/checkpoint
@@ -48,10 +56,36 @@ public:
     void complete_velocity_update_on_device(MDSystem& system, Real dt, const std::string& integrator_type);
 
     void snapshot_constraint_positions(MDSystem& system);
+    // Diagonal of the virial tensor of the constraint forces of this rank's last apply_rattle_on_device() (kcal/mol;
+    // see ConstraintSolver::get_virial_diag): a constraint counts on the rank that owns its atom of the lower global id.
+    void get_constraint_virial(Real out[3]) const {
+        for (int a = 0; a < 3; ++a) out[a] = h_constraint_virial_[a];
+    }
+    // Puts back a virial read with get_constraint_virial (see ConstraintSolver::set_virial_diag).
+    void set_constraint_virial(const Real virial[3]) {
+        for (int a = 0; a < 3; ++a) h_constraint_virial_[a] = virial[a];
+    }
+    // Both return false when a constraint cluster did not converge. A cluster of at most kMaxClusterConstraints
+    // constraints is solved by one thread (Gauss-Seidel), larger ones by the Jacobi iteration over the whole list.
     bool apply_shake_on_device(MDSystem& system, Real dt,
                                 int max_iterations = 500, Real position_tolerance = 1e-8);
-    bool apply_rattle_on_device(MDSystem& system,
-                                 int max_iterations = 500, Real velocity_tolerance = 1e-8);
+    // The velocity step also measures the constraint virial (see get_constraint_virial): dt is the integrator step.
+    // start_of_run: the velocities are those of a virtual half step before step 0 (the velocities of
+    // save_constraint_velocities() plus the half-step kick of the forces), and the multipliers are those of the
+    // constraint force at that time: the target of r.v of a pair is -dt/2 |v|^2 (the centripetal term) instead of 0,
+    // with v the saved velocities. A normal step has that term automatically, because its velocities carry the
+    // radial part of the position correction.
+    bool apply_rattle_on_device(MDSystem& system, Real dt,
+                                 int max_iterations = 500, Real velocity_tolerance = 1e-8,
+                                 bool start_of_run = false);
+    // Copies all velocities (owned and ghost) to a scratch area and back; the start-of-run virial measurement kicks
+    // the velocities and must leave them as they were.
+    void save_constraint_velocities(MDSystem& system);
+    void restore_constraint_velocities(MDSystem& system);
+    // After a barostat step scaled every position by mu[a] along axis a (the box in `box` is the new one): puts the
+    // atoms of every constraint cluster back to their rigid shape around the scaled centre of mass. total_particles
+    // is the number of owned and ghost atoms.
+    void restore_constraint_clusters_rigid(const SimulationBox& box, const Real mu[3], size_t total_particles);
 
     Real compute_max_displacement_on_device(size_t num_local_particles, const SimulationBox& box);
     // The same measurement without waiting for the GPU: launches the reduction for the current
@@ -135,6 +169,9 @@ public:
     bool is_pme_cluster_spread_enabled() const { return pme_use_cluster_spread_; }
     // Target PME grid spacing in A (0 = automatic: min(1, 0.25 / alpha)); ignored with a PME rank group.
     void set_pme_grid_spacing(Real spacing) { pme_grid_spacing_ = spacing; }
+    // force_calculation.pme_ranks: 2 in a build with cuFFTMp: the reciprocal solve of several ranks runs as
+    // a distributed FFT over all of them (see pme_dist_ensure). Without cuFFTMp the replicated solve is kept.
+    void set_pme_distributed_enabled(bool enabled) { pme_distributed_requested_ = enabled; }
 
     void set_timing_breakdown_enabled(bool enabled) override { timing_breakdown_enabled_ = enabled; }
     // When false, compute_forces() leaves potential energy / virial on the device:
@@ -204,7 +241,9 @@ protected:
     int disp_lag_pending_ = -1;                // slot launched by the previous call (-1: none)
     long long disp_ref_epoch_ = 0;             // bumped whenever the reference positions are replaced
     // Pinned landing zone for per-step scalar readbacks: [0]=potential energy, [1]=virial,
-    // [2]=kinetic energy. A D2H copy into a pageable stack variable is staged and blocks the
+    // [2]=kinetic energy, [3] spare, [4..6]=virial diagonal W_xx W_yy W_zz, [7..9]=kinetic energy
+    // diagonal (the last two only while the virial tensor is enabled; 12 Reals are allocated).
+    // A D2H copy into a pageable stack variable is staged and blocks the
     // host inside cudaMemcpyAsync until the preceding kernels finish.
     Real* h_scalars_ = nullptr;
     Real* d_fire_reduce_;   // [power, f_norm_sq, v_norm_sq, f_max_sq], lazily allocated
@@ -272,8 +311,8 @@ protected:
     size_t exclusion_atom_count;
 
     Real* d_potential_energy;
-    Real* d_kinetic_energy;
-    Real* d_virial;              // NEW: Device memory for virial calculation
+    Real* d_kinetic_energy;      // [0] kinetic energy, [1..3] its diagonal (virial tensor enabled only)
+    Real* d_virial;              // [0] virial trace, [1..3] its diagonal W_xx W_yy W_zz (virial tensor enabled only)
 
     bool ml_buffers_pinned = false;
 
@@ -318,17 +357,66 @@ protected:
     Real*   d_special_pair_sigma;
     Real*   d_special_pair_epsilon;
 
+    // The local constraints, num_constraints_cached in all. The constraints of the small clusters (at most
+    // kMaxClusterConstraints each) are stored cluster after cluster: cluster k owns the entries
+    // [d_constraint_cluster_first_[k], + d_constraint_cluster_size_[k]) of d_constraint_atom1/2/distance, and one thread
+    // solves it. The constraints of larger clusters are in d_constraint_big_*.
     size_t num_constraints_cached;
     size_t* d_constraint_atom1;
     size_t* d_constraint_atom2;
     Real*   d_constraint_distance;
+    size_t num_constraint_clusters_ = 0;
+    int* d_constraint_cluster_first_ = nullptr;
+    int* d_constraint_cluster_size_ = nullptr;
+    size_t num_big_constraints_ = 0;
+    size_t* d_constraint_big_atom1 = nullptr;
+    size_t* d_constraint_big_atom2 = nullptr;
+    Real*   d_constraint_big_distance = nullptr;
+    size_t num_big_clusters_ = 0;                  // the big constraints are stored cluster after cluster too
+    int* d_constraint_big_cluster_first_ = nullptr;
+    int* d_constraint_big_cluster_size_ = nullptr;
+    // Scratch of restore_constraint_clusters_rigid() for the big clusters (one thread walks a whole cluster): the
+    // constraint graph as linked lists per atom slot, a visited flag, the walk's queue and the unwrapped positions.
+    int* d_rigid_head_ = nullptr;
+    int* d_rigid_mark_ = nullptr;
+    int* d_rigid_next_ = nullptr;
+    int* d_rigid_queue_ = nullptr;
+    Real* d_rigid_ux_ = nullptr;
+    Real* d_rigid_uy_ = nullptr;
+    Real* d_rigid_uz_ = nullptr;
 
     size_t constraint_scratch_capacity_;
     Real* d_constraint_pre_x_;
     Real* d_constraint_pre_y_;
     Real* d_constraint_pre_z_;
-    Real* d_constraint_max_error_; // single device scalar, reused every iteration
+    Real* d_constraint_max_error_; // single device scalar, reused every iteration of the Jacobi path
     void ensure_constraint_scratch_capacity(size_t n);
+    // Constraint virial: the velocity step (RATTLE) sums the multiplier of every constraint over its iterations; the
+    // force on the pair that these multipliers stand for belongs to the end of the step, the time of the forces, the
+    // kinetic energy and the pressure that are printed with it. d_constraint_scalars_ = {Wxx, Wyy, Wzz, number of
+    // clusters that did not converge}, copied to the pinned h_constraint_scalars_; Jacobi path: one multiplier sum per
+    // constraint in d_constraint_g_total_.
+    Real* d_constraint_g_total_ = nullptr;
+    size_t constraint_g_capacity_ = 0;
+    Real* d_constraint_scalars_ = nullptr;
+    Real* h_constraint_scalars_ = nullptr;
+    Real h_constraint_virial_[3] = {0.0, 0.0, 0.0};
+    void ensure_constraint_solver_buffers();
+    // Fills the cluster tables from the constraints of the host lists, grouping by cluster (host path of the upload).
+    void upload_constraint_clusters(const std::vector<size_t>& c1, const std::vector<size_t>& c2,
+                                    const std::vector<Real>& cd);
+    // Constraint clusters (see MDSystem): per global atom the cluster id or -1, per constraint its cluster, and per
+    // cluster whether this rank owns one of its atoms (rebuilt with every bonded topology build).
+    int* d_constraint_cluster_of_atom_ = nullptr;   // [bonded_num_ids_]
+    int* d_constraint_cluster_of_term_ = nullptr;   // [num_global_constraints_]
+    int* d_constraint_cluster_active_ = nullptr;    // [constraint_cluster_count_]
+    size_t constraint_cluster_count_ = 0;
+    // The global constraints sorted by cluster (CSR): cluster c owns the terms
+    // d_constraint_cluster_terms_[offset[c] .. offset[c + 1]), global constraint indices.
+    int* d_constraint_cluster_offset_ = nullptr;    // [constraint_cluster_count_ + 1]
+    int* d_constraint_cluster_terms_ = nullptr;     // [num_global_constraints_]
+    size_t num_global_big_constraints_ = 0;         // constraints in clusters larger than kMaxClusterConstraints
+    size_t num_global_big_clusters_ = 0;            // and the number of those clusters
 
     size_t allocated_particles;
     int max_types;
@@ -344,7 +432,7 @@ protected:
     void* d_global_constraints_ = nullptr;  size_t num_global_constraints_ = 0;
     int bonded_num_ids_ = 0;                // global atom ids are below this
     int* d_bonded_slot_of_ = nullptr;       // [bonded_num_ids_] lowest local slot of each global id
-    int* d_bonded_counts_ = nullptr;        // [8] kept terms per type, then the unknown-type count
+    int* d_bonded_counts_ = nullptr;        // [11] kept terms per type, the unknown-type count, the constraint counts
     int* h_bonded_counts_ = nullptr;        // pinned copy
     void ensure_global_bonded_topology(MDSystem& system);
     std::vector<int> bonded_layout_global_ids_;
@@ -438,6 +526,11 @@ protected:
     int pair_entry_splits();
     // The energy and virial are read back only on some steps; kernels that add to them skip it otherwise.
     bool energy_wanted_now() const { return energy_readback_needed_ || timing_breakdown_enabled_; }
+    // Where the bonded and special-pair kernels add the diagonal of the virial tensor (3 Reals after the
+    // trace in d_virial); null when the tensor is off or the virial is not wanted this step.
+    Real* virial_diag_out() const {
+        return (virial_tensor_enabled_ && energy_wanted_now()) ? d_virial + 1 : nullptr;
+    }
     int sm_count_ = 0;
     cudaEvent_t pme_grid_ready_event_ = nullptr;
     cudaEvent_t pme_done_event_ = nullptr;  // all PME work on pme_stream_ (energy included) is done
@@ -502,6 +595,22 @@ protected:
     std::vector<int> pme_dmpi_boxes_;           // 6 ints per rank, filled by the headers that arrive
     void pme_dmpi_queue_pack(size_t grid_size, size_t local_particles,
                              Real inv_box_x, Real inv_box_y, Real inv_box_z);
+    // Distributed reciprocal solve (cuFFTMp, force_calculation.pme_ranks: 2): the box a rank's charges
+    // cover is cut at the X-slabs of the ranks and every piece is sent to the rank owning that slab (and
+    // summed there), a distributed R2C FFT (X-slabs to Y-slabs), the solve on the local Y-slab and the
+    // inverse FFT follow, and the potential of each piece goes back to the rank it came from. No rank
+    // holds the summed grid and no rank repeats the FFT. Energy and virial are partial sums over the
+    // local k-space slab (summed over the ranks by the callers, no 1/P).
+    bool pme_distributed_requested_ = false;
+    bool pme_dist_tried_ = false;
+    bool pme_dist_active_ = false;
+    bool pme_sum_via_dist_ = false;   // this step's reciprocal solve is the distributed one
+    struct PmeDist;                   // cuFFTMp plans, slab layout, exchange lists (force_calculator_cuda.cu)
+    PmeDist* pme_dist_ = nullptr;
+    bool pme_dist_ensure();
+    void pme_dist_post();
+    void pme_dist_complete(bool want_energy, Real inv_box_x, Real inv_box_y, Real inv_box_z);
+    void pme_dist_destroy();
 
     bool device_supports_clusters_ = false;
     bool pme_use_cluster_spread_ = false;
@@ -577,7 +686,8 @@ __global__ void pme_solve_poisson_kernel(
     Real* reciprocal_energy_out, Real prefactor, Real alpha,
     int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    Real energy_scale = 1.0);  // 1/P when P ranks each add the full-box value
+    Real energy_scale = 1.0,   // 1/P when P ranks each add the full-box value
+    int y_begin = 0, int y_count = -1);  // the half-spectrum rows ky = y_begin .. y_begin + y_count - 1 the array holds (-1 = all)
 
 template <typename T, int ORDER>
 __global__ void pme_interpolate_forces_kernel(
@@ -600,7 +710,9 @@ __global__ void pme_reciprocal_virial_kernel(
     Real* virial, Real prefactor, Real alpha,
     int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    Real energy_scale = 1.0);
+    Real energy_scale = 1.0,
+    bool tensor = false,   // also add the diagonal W_xx, W_yy, W_zz to virial[1..3]
+    int y_begin = 0, int y_count = -1);  // as for pme_solve_poisson_kernel
 
 __global__ void compute_bond_forces_kernel(
     Real* x, Real* y, Real* z,
@@ -678,7 +790,8 @@ public:
     void run(int total_steps, Real cutoff);
 
 private:
-    void step();
+    // tensor: also reply with the diagonal of the reciprocal virial (the PP ranks use the virial tensor)
+    void step(bool tensor);
     void ensure_initialized();
     void free_resources();
 

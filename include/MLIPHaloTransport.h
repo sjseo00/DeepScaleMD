@@ -31,6 +31,9 @@ public:
     // The ghost rows are added to the rows of their owners (on this or another rank); on return the owned rows hold the sums
     // (the contents of the ghost rows are not defined any more).
     virtual void reverse(const MLIPHaloBuffer& buffer) = 0;
+    // data[0..count) (host memory) := the element-wise sum of every rank's data, the same on every rank: for the few numbers a
+    // model sums over the whole system (op dsmd::allreduce_sum; so3lr: the charge sum that fixes the total charge).
+    virtual void sum_over_ranks(double* data, int64_t count) = 0;
 };
 
 #endif // MLIP_HALO_TRANSPORT_H

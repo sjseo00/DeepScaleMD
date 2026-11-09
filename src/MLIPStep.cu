@@ -130,6 +130,16 @@ __global__ void virial_terms_kernel(int64_t n, const double* x, const double* y,
     terms[p] = x[p] * fx[p] + y[p] * fy[p] + z[p] * fz[p];
 }
 
+// terms[a * n + p] = r_a F_a of atom p (the diagonal of the virial tensor, one row per axis)
+__global__ void virial_diag_terms_kernel(int64_t n, const double* x, const double* y, const double* z, const double* fx,
+                                         const double* fy, const double* fz, double* terms) {
+    const int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    if (p >= n) return;
+    terms[p] = x[p] * fx[p];
+    terms[n + p] = y[p] * fy[p];
+    terms[2 * n + p] = z[p] * fz[p];
+}
+
 // ok[i] = the node is within `reach` of the box [lo, hi] (Euclidean distance to the box); a NaN position gives 0 (EdgeBuilder
 // reports it).
 struct Region {
@@ -164,8 +174,8 @@ inline unsigned blocks_for(int64_t n) { return static_cast<unsigned>((n + kThrea
 MLIPStep::MLIPStep() {
     MLIP_STEP_CUDA_CHECK(cudaMalloc(&d_total_, sizeof(long long)));
     MLIP_STEP_CUDA_CHECK(cudaMallocHost(&h_total_, sizeof(long long)));
-    MLIP_STEP_CUDA_CHECK(cudaMalloc(&d_sum_, sizeof(double)));
-    MLIP_STEP_CUDA_CHECK(cudaMallocHost(&h_sum_, sizeof(double)));
+    MLIP_STEP_CUDA_CHECK(cudaMalloc(&d_sum_, 3 * sizeof(double)));
+    MLIP_STEP_CUDA_CHECK(cudaMallocHost(&h_sum_, 3 * sizeof(double)));
 }
 
 MLIPStep::~MLIPStep() {
@@ -390,4 +400,33 @@ double MLIPStep::virial(cudaStream_t stream) {
     MLIP_STEP_CUDA_CHECK(cudaMemcpyAsync(h_sum_, d_sum_, sizeof(double), cudaMemcpyDeviceToHost, stream));
     MLIP_STEP_CUDA_CHECK(cudaStreamSynchronize(stream));
     return *h_sum_;
+}
+
+void MLIPStep::virial_diag(cudaStream_t stream, double out[3]) {
+    if (shift_active_) {
+        if (!model_virial_diag_valid_) {
+            throw std::runtime_error("MLIPStep::virial_diag: the model with edge shifts returned only the trace of the virial; an "
+                                     "anisotropic or semi-isotropic barostat needs a model converted with the diagonal (metadata "
+                                     "virial_diagonal: convert it again)");
+        }
+        for (int a = 0; a < 3; ++a) out[a] = model_virial_diag_[a];
+        return;
+    }
+    out[0] = out[1] = out[2] = 0.0;
+    if (n_all_ <= 0) return;
+    ensure(d_terms_, cap_terms_, static_cast<size_t>(3 * n_all_));
+    size_t bytes = 0;
+    cub::DeviceReduce::Sum(nullptr, bytes, d_terms_, d_sum_, static_cast<int>(n_all_), stream);
+    ensure(d_temp_, cap_temp_, bytes);
+    const double* x = have_images_ ? d_ext_x_ : md_x_;
+    const double* y = have_images_ ? d_ext_y_ : md_y_;
+    const double* z = have_images_ ? d_ext_z_ : md_z_;
+    virial_diag_terms_kernel<<<blocks_for(n_all_), kThreads, 0, stream>>>(n_all_, x, y, z, d_fx_, d_fy_, d_fz_, d_terms_);
+    for (int a = 0; a < 3; ++a) {
+        cub::DeviceReduce::Sum(d_temp_, bytes, d_terms_ + a * n_all_, d_sum_ + a, static_cast<int>(n_all_), stream);
+    }
+    MLIP_STEP_CUDA_CHECK(cudaGetLastError());
+    MLIP_STEP_CUDA_CHECK(cudaMemcpyAsync(h_sum_, d_sum_, 3 * sizeof(double), cudaMemcpyDeviceToHost, stream));
+    MLIP_STEP_CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int a = 0; a < 3; ++a) out[a] = h_sum_[a];
 }

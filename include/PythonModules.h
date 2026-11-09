@@ -6,7 +6,7 @@
 // Puts the site-packages of the active Python environment ($VIRTUAL_ENV, $CONDA_PREFIX) at the front of sys.path of the
 // embedded interpreter, so that the packages of the environment the user activated (torch, the model packages) are found without
 // PYTHONPATH. Does nothing when neither variable is set or the environment has no site-packages for this Python version.
-// The caller holds the GIL. Both embedded-Python users (PythonBackend and import_python_modules) call it right after starting
+// The caller holds the GIL. Both embedded-Python users (AseBackend and import_python_modules) call it right after starting
 // the interpreter.
 void add_active_python_environment();
 

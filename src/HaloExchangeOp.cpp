@@ -71,15 +71,50 @@ public:
 
 at::Tensor exchange_autograd(const at::Tensor& feats, int64_t n_ghost) { return HaloExchangeFunction::apply(feats, n_ghost); }
 
+// dsmd::allreduce_sum: x (a few numbers, any shape) -> the element-wise sum of x over all ranks, the same on every rank. Without a
+// transport (one rank) a copy. The sum goes through the host in float64 (the transport's sum_over_ranks); the result has the
+// dtype and device of x.
+at::Tensor sum_forward(const at::Tensor& x) {
+    TORCH_CHECK(x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble, "dsmd::allreduce_sum: x must be float32 or float64");
+    at::Tensor host = x.detach().to(at::kCPU, at::kDouble).contiguous().clone();   // waits for the kernels that made x
+    if (g_transport != nullptr && host.numel() > 0) g_transport->sum_over_ranks(host.data_ptr<double>(), host.numel());
+    return host.to(x.device(), x.scalar_type());
+}
+
+// sum S = x_1 + ... + x_P on every rank and the total loss L = L_1 + ... + L_P: dL/dx_r = sum over r' of dL_r'/dS, the sum of the
+// incoming gradients over the ranks. The backward is the same allreduce.
+class AllreduceSumFunction : public torch::autograd::Function<AllreduceSumFunction> {
+public:
+    static at::Tensor forward(torch::autograd::AutogradContext*, const at::Tensor& x) {
+        at::AutoDispatchBelowAutograd below_autograd;
+        return sum_forward(x);
+    }
+
+    static torch::autograd::variable_list backward(torch::autograd::AutogradContext*, torch::autograd::variable_list grad_outputs) {
+        return {sum_forward(grad_outputs[0])};
+    }
+};
+
+at::Tensor sum_autograd(const at::Tensor& x) { return AllreduceSumFunction::apply(x); }
+
 }  // namespace
 
 // FRAGMENT: other code may add operators to the namespace (the Python side of the op uses it for the same schema when a model is
 // built in a process of its own).
-TORCH_LIBRARY_FRAGMENT(dsmd, m) { m.def("halo_exchange(Tensor feats, int n_ghost) -> Tensor"); }
+TORCH_LIBRARY_FRAGMENT(dsmd, m) {
+    m.def("halo_exchange(Tensor feats, int n_ghost) -> Tensor");
+    m.def("allreduce_sum(Tensor x) -> Tensor");
+}
 
-TORCH_LIBRARY_IMPL(dsmd, CompositeExplicitAutograd, m) { m.impl("halo_exchange", &exchange_forward); }
+TORCH_LIBRARY_IMPL(dsmd, CompositeExplicitAutograd, m) {
+    m.impl("halo_exchange", &exchange_forward);
+    m.impl("allreduce_sum", &sum_forward);
+}
 
-TORCH_LIBRARY_IMPL(dsmd, Autograd, m) { m.impl("halo_exchange", &exchange_autograd); }
+TORCH_LIBRARY_IMPL(dsmd, Autograd, m) {
+    m.impl("halo_exchange", &exchange_autograd);
+    m.impl("allreduce_sum", &sum_autograd);
+}
 
 void ensure_halo_exchange_op_registered() {}
 

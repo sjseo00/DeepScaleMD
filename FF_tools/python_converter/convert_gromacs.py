@@ -13,9 +13,10 @@ Example:
 
 The topology and coordinates become the dsMD_input package (OUT_DIR/manifest.yaml, ...).
 With --mdp the run settings (temperature, dt, nsteps, thermostat, barostat, cutoffs, PME
-grid, output) become OUT_DIR/input_dsmd.yaml as well. A setting DeepScaleMD cannot
-reproduce is an error unless --allow-lossy is given. dsMD reads `input_system` relative to
-the directory it is started in, so the default `manifest.yaml` is meant for
+grid, output) become OUT_DIR/input_dsmd.yaml as well, and `constraints = h-bonds | all-bonds`
+turns the topology's bonds (with hydrogen / all) into the package's [constraints]. A setting
+DeepScaleMD cannot reproduce is an error unless --allow-lossy is given. dsMD reads
+`input_system` relative to the directory it is started in, so the default `manifest.yaml` is meant for
     cd OUT_DIR && dsMD input_dsmd.yaml
 """
 
@@ -28,7 +29,7 @@ import sys
 import dsmd_input
 from progress import stage
 from canonical_model import ConversionError
-from gromacs_mdp import mdp_run_settings, parse_mdp
+from gromacs_mdp import constraint_mode, mdp_run_settings, parse_mdp
 from gromacs_reader import convert
 from writer import write_package
 
@@ -56,13 +57,17 @@ def main(argv=None) -> int:
     yaml_path = None
     try:
         yaml_args = dsmd_input.yaml_options(args)
-        system = convert(args.top, args.gro, args.out_dir,
-                          forcefield_variant=args.ff_name,
-                          include_dirs=args.include_dirs)
-        settings = None
+        mdp = None
         if args.mdp:
             stage(f"reading run file {os.path.basename(args.mdp)}")
-            settings = mdp_run_settings(parse_mdp(args.mdp), system.box)
+            mdp = parse_mdp(args.mdp)
+        system = convert(args.top, args.gro, args.out_dir,
+                          forcefield_variant=args.ff_name,
+                          include_dirs=args.include_dirs,
+                          constrain=constraint_mode(mdp) if mdp is not None else "none")
+        settings = None
+        if mdp is not None:
+            settings = mdp_run_settings(mdp, system.box)
             warnings = dsmd_input.check(settings, args.allow_lossy)
         write_package(system, args.out_dir, source_engine="gromacs",
                       source_files=[args.top, args.gro] + ([args.mdp] if args.mdp else []))

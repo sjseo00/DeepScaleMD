@@ -20,10 +20,12 @@ What the installed bam_torch does, which this adapter relies on:
   * cutoff = the model's cutoff, num_layers = nlayers, so the ghost depth is nlayers x cutoff (BAM-MP-core: 5 x 6 = 30 A).
 Kernels (--accel): e3nn (the default), openeq (OpenEquivariance: BAM's "fast" interaction block only, weights as e3nn) and cueq
 (cuEquivariance: its own weight layout, so only a checkpoint trained with it loads). openeq and cueq are built the way BAM builds
-them (cueq_config / oeq_config) and need a GPU for their fast kernels; the layered path was written against the e3nn modules and has
-only been run with e3nn so far.
-Not supported: models other than "race" (the multihead "race_unified", BAM's own "mace"); OpenEquivariance's fused convolution
-(oeq_conv_fusion); a checkpoint whose valid_scale_shift is one number for the whole structure instead of one per
+them (cueq_config / oeq_config) and need a GPU for their fast kernels. A checkpoint trained with oeq_conv_fusion (BAM-MP-DeNS) has
+OpenEquivariance's fused convolution in its "fast" block: the tensor product, the gather and the sum onto the receivers run in one
+kernel, so no tensor of the size of the edge list x the irreps is stored for the backward pass (the e3nn kernels store several per
+layer: 0.60 MB per edge for BAM-MP-DeNS against 0.15 MB with the fused kernel, measured on one GH200). The layered path runs that kernel too.
+Not supported: models other than "race" (the multihead "race_unified", BAM's own "mace"); a checkpoint whose valid_scale_shift is
+one number for the whole structure instead of one per
 species: it is a constant that does not change forces, and is left out (the energy is then off by that constant).
 """
 import copy
@@ -141,6 +143,31 @@ def load_bam_model(path, accel: str = "e3nn", dtype: Optional[torch.dtype] = Non
     return model, checkpoint
 
 
+class _BlockParts(torch.nn.Module):
+    """The modules of a bam_torch interaction block that _RaceLayer calls, the same objects (the same weights), without the block's
+    own forward: TorchScript compiles the forward of every submodule, and the one of a block with OpenEquivariance's fused
+    convolution calls the convolution the e3nn way when scripted, which does not exist for it."""
+
+    def __init__(self, block: torch.nn.Module, slow: bool):
+        super().__init__()
+        self.skip_tp_node = block.skip_tp_node
+        self.linear_up = block.linear_up
+        self.conv_tp_weights = block.conv_tp_weights
+        self.conv_tp = block.conv_tp
+        self.linear_down = block.linear_down
+        if block.l_separated_layer_norm:
+            self.separated_layer_norm = block.separated_layer_norm
+        if slow:
+            self.concatenate_irreps_tensor = block.concatenate_irreps_tensor
+            self.tensor_regroup_by_irreps = block.tensor_regroup_by_irreps
+            self.tensor_irreps_array_product = block.tensor_irreps_array_product
+        scale = block.inv_sqrt_avg_num_neighbors
+        if isinstance(scale, Tensor):
+            self.register_buffer("inv_sqrt_avg_num_neighbors", scale)
+        else:
+            self.inv_sqrt_avg_num_neighbors = scale
+
+
 class _RaceLayer(torch.nn.Module):
     """One layer of the RACE model (the interaction block, the product block and the readout of bam_torch's RACE.forward, the same
     modules and weights), for a rank that owns n_owned atoms and has ghost atoms after them. The block of bam_torch works on every
@@ -150,15 +177,16 @@ class _RaceLayer(torch.nn.Module):
     product block and the readout, is done on the n_owned rows. The two block kinds of bam_torch differ in the tensor product
     ("slow": the full tensor product, concatenated and weighted; "fast": the weighted channel-wise one). Returns the features of the
     owned atoms after the layer and their energy of the layer."""
-    __constants__ = ["slow", "per_layer_x", "rms_norm", "layer_norm"]
+    __constants__ = ["slow", "fused", "per_layer_x", "rms_norm", "layer_norm"]
 
     def __init__(self, block: torch.nn.Module, product: torch.nn.Module, readout: torch.nn.Module, slow: bool,
                  linear_x: Optional[torch.nn.Module], per_layer_x: bool, rms_norm: bool):
         super().__init__()
-        self.block = block
+        self.block = _BlockParts(block, slow)
         self.product = product
         self.readout = readout
         self.slow = slow
+        self.fused = bool(getattr(block, "_use_oeq_conv_fusion", False))      # OpenEquivariance gathers and sums by itself
         self.per_layer_x = per_layer_x
         self.rms_norm = rms_norm
         self.layer_norm = bool(block.l_separated_layer_norm)
@@ -182,13 +210,20 @@ class _RaceLayer(torch.nn.Module):
             mji = self.block.concatenate_irreps_tensor(tensors=[up[sender], mji], axis=-1)
             mji = self.block.tensor_regroup_by_irreps(mji)
             mji = self.block.tensor_irreps_array_product(mix, mji)
+        elif self.fused:
+            radial = self.block.conv_tp_weights(edge_feats)
+            if edge_cutoff is not None:
+                radial = radial * edge_cutoff
+            # a row for every node (ghost rows get no edge and stay zero): the first n_owned rows are the owned atoms
+            summed = self.block.conv_tp(up, edge_attrs, radial, receiver, sender)[:n_owned]
         else:
             radial = self.block.conv_tp_weights(edge_feats)
             if edge_cutoff is not None:
                 radial = radial * edge_cutoff
             mji = self.block.conv_tp(up[sender], edge_attrs, radial)
-        message = mji.new_zeros([n_owned] + [size for size in mji.shape[1:]]).index_add_(0, receiver, mji)
-        message = message * self.block.inv_sqrt_avg_num_neighbors
+        if not self.fused:
+            summed = mji.new_zeros([n_owned] + [size for size in mji.shape[1:]]).index_add_(0, receiver, mji)
+        message = summed * self.block.inv_sqrt_avg_num_neighbors
         message = self.block.linear_down(message) * self.block.inv_sqrt_avg_num_neighbors
         if self.per_layer_x:
             x = self.linear_x(entering)
@@ -210,8 +245,8 @@ class _RaceLayered(torch.nn.Module):
 
     def __init__(self, model: torch.nn.Module):
         super().__init__()
-        if getattr(model, "dens", False):
-            raise ValueError("layer exchange: this BAM model has the DeNS heads (dens), which forward_layered does not run")
+        # A DeNS model (dens=True) adds its force encoder and noise head only when the input carries "dens_forces" (training
+        # of the denoising task); without it both are skipped, so the energy of forward_layered is the model's own.
         self.cutoff = float(model.cutoff)
         self.node_embedding = model.node_embedding
         self.radial_embedding = model.radial_embedding
@@ -233,15 +268,13 @@ class _RaceLayered(torch.nn.Module):
             kind = type(block).__name__
             if kind not in ("ConcatenateRaceInteractionBlock", "RaceInteractionBlock"):
                 raise ValueError(f"layer exchange: the BAM interaction block {kind} is not one forward_layered knows")
-            if getattr(block, "_use_oeq_conv_fusion", False):
-                raise ValueError("layer exchange: the OpenEquivariance fused convolution of BAM is not supported")
             layers.append(_RaceLayer(block, model.products[index], model.readouts[index], kind == "ConcatenateRaceInteractionBlock",
                                      model.linear_x[index] if self.per_layer_x else None, self.per_layer_x,
                                      bool(model.x_feats_rms_norm)))
         self.layers = torch.nn.ModuleList(layers)
 
     def forward(self, pos: Tensor, species: Tensor, node_attrs: Tensor, edge_index: Tensor, edge_shift: Tensor,
-                n_owned: int) -> Tensor:
+                n_owned: int, exchange: bool = True) -> Tensor:
         n_ghost = pos.shape[0] - n_owned
         vectors = (pos[edge_index[1]] - pos[edge_index[0]] + edge_shift) / self.cutoff
         lengths = torch.norm(vectors, dim=1)
@@ -267,7 +300,7 @@ class _RaceLayered(torch.nn.Module):
         energies: List[Tensor] = []
         layer = 0
         for block in self.layers:
-            if layer > 0:
+            if layer > 0 and exchange:
                 node_feats = torch.ops.dsmd.halo_exchange(node_feats, n_ghost)
             node_feats, energy = block(skip_attrs, node_feats, edge_attrs, edge_feats, edge_index, edge_cutoff, x_shared, n_owned)
             energies.append(energy)
@@ -283,6 +316,7 @@ class BAMAdapter(MLIPAdapter):
     supports_shifts = True
     supports_layer_exchange = True
     edge_receiver_row = 1       # bam_torch: edge_index[0] = sender, edge_index[1] = receiver (the messages are summed onto it)
+    __constants__ = ["fused"]
 
     def __init__(self, model: torch.nn.Module, checkpoint: Dict, model_name: str = "bam", accel: str = "e3nn"):
         uniq = {int(z): int(index) for z, index in checkpoint["uniq_element"].items()}
@@ -291,7 +325,15 @@ class BAMAdapter(MLIPAdapter):
             raise ValueError(f"the species indices of uniq_element are not 0..{len(uniq) - 1}: {sorted(uniq.values())}")
         super().__init__(elements)
         self.accel = accel
-        self.model = model
+        # A model with OpenEquivariance's fused convolution cannot be scripted as bam_torch wrote it (its block calls the convolution
+        # the e3nn way when scripting), and TorchScript compiles the forward of every submodule. Its energy is computed by the layers
+        # of _RaceLayered (without exchange when there is no layer exchange) and the model itself is not kept as a submodule.
+        self.fused = any(getattr(block, "_use_oeq_conv_fusion", False) for block in model.interactions)
+        if self.fused:
+            self.layered = _RaceLayered(model)
+            self.model = None
+        else:
+            self.model = model
         self.model_name = model_name
         self.cutoff = float(model.cutoff)
         self.num_layers = int(model.nlayers)
@@ -317,7 +359,7 @@ class BAMAdapter(MLIPAdapter):
     def enable_layer_exchange(self) -> None:
         """Switches layer exchange on and builds the layers that forward_layered runs (they share the weights of the model; they
         are not built otherwise, so a model converted without layer exchange is scripted exactly as before)."""
-        layered = _RaceLayered(self.model)
+        layered = self.layered if self.fused else _RaceLayered(self.model)
         super().enable_layer_exchange()
         self.layered = layered
 
@@ -338,6 +380,10 @@ class BAMAdapter(MLIPAdapter):
 
     def _atom_energy(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:
         n_atoms = pos.shape[0]
+        if self.fused:
+            node_attrs = self.species_one_hot.to(pos.dtype)[species]
+            energy = self.layered(pos, species, node_attrs, edge_index, edge_shift, n_atoms, False).to(pos.dtype)
+            return energy + self.atom_ref.to(pos.dtype)[species]
         n_edges = edge_index.shape[1]
         data: Dict[str, Tensor] = {
             "positions": pos,

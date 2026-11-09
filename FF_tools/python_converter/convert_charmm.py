@@ -15,8 +15,10 @@ replacing what an earlier one defines.
 
 No box size is stored in a PSF or a plain PDB, so it must be supplied with --box
 (Angstrom) unless the --inp stream defines it (CRYStal DEFIne). With --inp, the run
-settings (DYNAmics, MINImize, NBONds, CRYStal) become OUT_DIR/input_dsmd.yaml too; a setting
-DeepScaleMD cannot reproduce is an error unless --allow-lossy is given. To convert from a
+settings (DYNAmics, MINImize, NBONds, CRYStal) become OUT_DIR/input_dsmd.yaml too, and
+`SHAKe BONH PARAm` / `SHAKe BOND PARAm` become the package's [constraints] (lengths from the
+parameter files); a setting DeepScaleMD cannot reproduce is an error unless --allow-lossy is
+given. To convert from a
 NAMD config file instead, use convert_namd.py. dsMD reads `input_system` relative to the
 directory it is started in, so the default `manifest.yaml` is meant for
     cd OUT_DIR && dsMD input_dsmd.yaml
@@ -84,7 +86,8 @@ def main(argv=None) -> int:
                           forcefield_variant=args.ff_name,
                           allow_lossy=args.allow_lossy,
                           dihedral_terms=args.dihedral_terms,
-                          e14fac=args.e14fac)
+                          e14fac=args.e14fac,
+                          constraints=settings.constraints if settings else "none")
         write_package(system, args.out_dir, source_engine="charmm",
                       source_files=[args.psf] + args.params + [args.pdb]
                                    + ([args.inp] if args.inp else []))
@@ -101,7 +104,7 @@ def main(argv=None) -> int:
     print(f"Wrote {args.out_dir}/manifest.yaml" + (f" and {yaml_path}" if yaml_path else "") + " "
           f"({len(system.atoms)} atoms, {len(system.bonds)} bonds, "
           f"{len(system.angles)} angles, {len(system.torsions)} dihedrals, "
-          f"{len(system.special_pairs)} special pairs)")
+          f"{len(system.special_pairs)} special pairs, {len(system.constraints)} constraints)")
     return 0
 
 

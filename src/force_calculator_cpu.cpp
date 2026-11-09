@@ -295,6 +295,20 @@ inline void accumulate_pair_contribution(Real force_mag, Real pe_pair, Real dx, 
     }
 }
 
+// With the virial tensor: the same pair, plus its diagonal virial force_mag * d_a^2 (the force on i is
+// force_mag * d, W_aa = d_a F_a) under the same ownership rule as the scalar virial.
+inline void accumulate_pair_contribution_tensor(Real force_mag, Real pe_pair, Real dx, Real dy, Real dz, Real r2,
+                                                bool owner, Real& fxp, Real& fyp, Real& fzp,
+                                                Real& pe_tile, Real& vir_tile,
+                                                Real& wx_tile, Real& wy_tile, Real& wz_tile) {
+    accumulate_pair_contribution(force_mag, pe_pair, dx, dy, dz, r2, owner, fxp, fyp, fzp, pe_tile, vir_tile);
+    if (owner) {
+        wx_tile += force_mag * dx * dx;
+        wy_tile += force_mag * dy * dy;
+        wz_tile += force_mag * dz * dz;
+    }
+}
+
 inline void commit_reaction_force(int j_atom, Real jfx, Real jfy, Real jfz,
                                   Real* fx_out, Real* fy_out, Real* fz_out) {
     fx_out[j_atom] += jfx;
@@ -316,6 +330,23 @@ inline void commit_directed_pair_contribution(
     } else if (i_owns_cross_rank_pair) {
         local_pe += pair_energy;
         local_virial += r2 * force_mag;
+    }
+}
+
+// Same as commit_directed_pair_contribution, plus the diagonal virial with the identical weights
+// (half for a pair of two owned atoms, which both rows visit; full for the lower-id side of a cross-rank pair).
+inline void commit_directed_pair_contribution_tensor(
+        Real force_mag, Real pair_energy, Real dx, Real dy, Real dz, Real r2,
+        bool j_is_local, bool i_owns_cross_rank_pair,
+        Real& fix, Real& fiy, Real& fiz, Real& local_pe, Real& local_virial,
+        Real& local_wx, Real& local_wy, Real& local_wz) {
+    commit_directed_pair_contribution(force_mag, pair_energy, dx, dy, dz, r2, j_is_local,
+                                      i_owns_cross_rank_pair, fix, fiy, fiz, local_pe, local_virial);
+    const Real weight = j_is_local ? 0.5 : (i_owns_cross_rank_pair ? 1.0 : 0.0);
+    if (weight != 0.0) {
+        local_wx += weight * force_mag * dx * dx;
+        local_wy += weight * force_mag * dy * dy;
+        local_wz += weight * force_mag * dz * dz;
     }
 }
 
@@ -706,6 +737,15 @@ void ForceCalculatorCPU::initialize() {
 void ForceCalculatorCPU::finalize() {
 }
 
+void ForceCalculatorCPU::set_virial_tensor_enabled(bool enabled) {
+    virial_tensor_enabled_ = enabled;
+    pme_engine_.set_virial_tensor_enabled(enabled);
+    for (int a = 0; a < 3; ++a) {
+        last_virial_diag[a] = 0.0;
+        last_kinetic_energy_diag[a] = 0.0;
+    }
+}
+
 void ForceCalculatorCPU::compute_forces(MDSystem& system) {
     ParticleData& particles = system.get_particles();
     
@@ -716,7 +756,10 @@ void ForceCalculatorCPU::compute_forces(MDSystem& system) {
     last_potential_energy = 0.0;
     last_kinetic_energy = 0.0;
     last_virial = 0.0;
-    
+    if (virial_tensor_enabled_) {
+        for (int a = 0; a < 3; ++a) last_virial_diag[a] = 0.0;
+    }
+
     ForceManager& force_manager = system.get_force_manager();
     const auto& force_config = force_manager.get_config();
 
@@ -776,9 +819,9 @@ void ForceCalculatorCPU::compute_forces(MDSystem& system) {
     Real batch_out[2] = { 0.0, 0.0 };
     // Rescoped to pp_comm(): PME-group ranks (when force_calculation.pme_ranks
     // > 0) never reach this call at all (see MDSimulation::initialize_impl's
-    // early-return to PmeServer), and every PP rank already has the PME
-    // group's reciprocal energy/virial folded in exactly once via
-    // pme_reciprocal_end's cross-group broadcast, so summing over pp_comm()
+    // early-return to PmeServer), and every PP rank has its 1/P share of the
+    // reciprocal energy/virial folded in by pme_reciprocal_end (the whole
+    // value arrives on every rank, by broadcast), so summing over pp_comm()
     // (== MPI_COMM_WORLD when no split is configured) gives the correct
     // grand total either way.
     MPI_Allreduce(batch_in, batch_out, 2, MPI_DOUBLE, MPI_SUM, PmePpSplit::instance().pp_comm());
@@ -832,8 +875,10 @@ void ForceCalculatorCPU::compute_graph_nonbonded(MDSystem& system,
     if (lj_pair_counts_.size() != nlocal) lj_pair_counts_.resize(nlocal);
     Real local_pe = 0.0;
     Real local_virial = 0.0;
+    const bool tensor = virial_tensor_enabled_;
+    Real local_wx = 0.0, local_wy = 0.0, local_wz = 0.0;
 
-    #pragma omp parallel for schedule(dynamic, 64) reduction(+:local_pe,local_virial)
+    #pragma omp parallel for schedule(dynamic, 64) reduction(+:local_pe,local_virial,local_wx,local_wy,local_wz)
     for (long ii = 0; ii < static_cast<long>(nlocal); ++ii) {
         const size_t i = static_cast<size_t>(ii);
         Real fix = 0.0, fiy = 0.0, fiz = 0.0;
@@ -849,6 +894,7 @@ void ForceCalculatorCPU::compute_graph_nonbonded(MDSystem& system,
             Real dy = p.y[i] - p.y[j];
             Real dz = p.z[i] - p.z[j];
             if (!mpi_box || j < nlocal) box.apply_minimum_image(dx, dy, dz);
+            else box.apply_minimum_image_unsplit(dx, dy, dz);   // a ghost: only the axes this rank does not split
             const Real r2 = dx * dx + dy * dy + dz * dz;
             if (r2 >= cutoff_sq || r2 < 1e-10) continue;
 
@@ -878,9 +924,16 @@ void ForceCalculatorCPU::compute_graph_nonbonded(MDSystem& system,
                 force_mag += coulomb_force;
             }
 
-            commit_directed_pair_contribution(force_mag, pair_energy, dx, dy, dz, r2,
-                                              j < nlocal, gid_i < gid_j,
-                                              fix, fiy, fiz, local_pe, local_virial);
+            if (tensor) {
+                commit_directed_pair_contribution_tensor(force_mag, pair_energy, dx, dy, dz, r2,
+                                                         j < nlocal, gid_i < gid_j,
+                                                         fix, fiy, fiz, local_pe, local_virial,
+                                                         local_wx, local_wy, local_wz);
+            } else {
+                commit_directed_pair_contribution(force_mag, pair_energy, dx, dy, dz, r2,
+                                                  j < nlocal, gid_i < gid_j,
+                                                  fix, fiy, fiz, local_pe, local_virial);
+            }
         }
         p.fx[i] += fix;
         p.fy[i] += fiy;
@@ -890,6 +943,11 @@ void ForceCalculatorCPU::compute_graph_nonbonded(MDSystem& system,
 
     last_potential_energy += local_pe;
     last_virial += local_virial;
+    if (tensor) {
+        last_virial_diag[0] += local_wx;
+        last_virial_diag[1] += local_wy;
+        last_virial_diag[2] += local_wz;
+    }
     }); // run_nonbonded_with_pme_overlap
 }
 
@@ -1055,8 +1113,23 @@ inline void widen_ps_to_pd2(__m256 v, __m256d& lo, __m256d& hi) {
     hi = _mm256_cvtps_pd(_mm256_extractf128_ps(v, 1));
 }
 
+// Diagonal virial of the float kernel: (force_mag already masked to the lanes that count) * d_a^2 per lane,
+// widened into the double accumulators, like the scalar virial next to it.
+inline void accumulate_virial_diag_ps(__m256 masked_force_mag, __m256 dx, __m256 dy, __m256 dz,
+                                      __m256d* wx, __m256d* wy, __m256d* wz) {
+    __m256d lo, hi;
+    widen_ps_to_pd2(_mm256_mul_ps(masked_force_mag, _mm256_mul_ps(dx, dx)), lo, hi);
+    wx[0] = _mm256_add_pd(wx[0], lo); wx[1] = _mm256_add_pd(wx[1], hi);
+    widen_ps_to_pd2(_mm256_mul_ps(masked_force_mag, _mm256_mul_ps(dy, dy)), lo, hi);
+    wy[0] = _mm256_add_pd(wy[0], lo); wy[1] = _mm256_add_pd(wy[1], hi);
+    widen_ps_to_pd2(_mm256_mul_ps(masked_force_mag, _mm256_mul_ps(dz, dz)), lo, hi);
+    wz[0] = _mm256_add_pd(wz[0], lo); wz[1] = _mm256_add_pd(wz[1], hi);
+}
+
+template <bool TENSOR>
 inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx& ctx,
-                                    Real& local_pe, Real& local_virial) {
+                                    Real& local_pe, Real& local_virial,
+                                    Real& local_wx, Real& local_wy, Real& local_wz) {
     constexpr int TILE_SIZE = kCpuTileSize;
     const size_t tbase = static_cast<size_t>(T) * TILE_SIZE;
     const uint8_t i_local8 = ctx.local_mask_of[T];
@@ -1095,6 +1168,10 @@ inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx&
     __m256d fiz[2] = {_mm256_setzero_pd(), _mm256_setzero_pd()};
     __m256d pe_acc[2] = {_mm256_setzero_pd(), _mm256_setzero_pd()};
     __m256d vir_acc[2] = {_mm256_setzero_pd(), _mm256_setzero_pd()};
+    // Diagonal virial accumulators, only touched in the TENSOR instantiation.
+    __m256d wx_acc[2] = {_mm256_setzero_pd(), _mm256_setzero_pd()};
+    __m256d wy_acc[2] = {_mm256_setzero_pd(), _mm256_setzero_pd()};
+    __m256d wz_acc[2] = {_mm256_setzero_pd(), _mm256_setzero_pd()};
     __m256i lj_cnt_vec = _mm256_setzero_si256();
     const __m256i lj_cnt_one = _mm256_set1_epi32(1);
 
@@ -1221,6 +1298,10 @@ inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx&
                 widen_ps_to_pd2(vir_lj, vir_lo, vir_hi);
                 pe_acc[0] = _mm256_add_pd(pe_acc[0], pe_lo); pe_acc[1] = _mm256_add_pd(pe_acc[1], pe_hi);
                 vir_acc[0] = _mm256_add_pd(vir_acc[0], vir_lo); vir_acc[1] = _mm256_add_pd(vir_acc[1], vir_hi);
+                if (TENSOR) {
+                    accumulate_virial_diag_ps(_mm256_and_ps(energy_mask_lj, force_mag), dx, dy, dz,
+                                              wx_acc, wy_acc, wz_acc);
+                }
             }
             if (ctx.do_coulomb) {
                 const __m256 energy_mask_c = _mm256_and_ps(cutoff_mask, owner_bits);
@@ -1231,6 +1312,10 @@ inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx&
                 widen_ps_to_pd2(vir_c_m, vir_lo, vir_hi);
                 pe_acc[0] = _mm256_add_pd(pe_acc[0], pe_lo); pe_acc[1] = _mm256_add_pd(pe_acc[1], pe_hi);
                 vir_acc[0] = _mm256_add_pd(vir_acc[0], vir_lo); vir_acc[1] = _mm256_add_pd(vir_acc[1], vir_hi);
+                if (TENSOR) {
+                    accumulate_virial_diag_ps(_mm256_and_ps(energy_mask_c, force_mag_c), dx, dy, dz,
+                                              wx_acc, wy_acc, wz_acc);
+                }
             }
 
             if (slot_local) {
@@ -1255,6 +1340,11 @@ inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx&
         _mm256_storeu_pd(fi_z + h * 4, fiz[h]);
         pe_tile += hsum256_pd(pe_acc[h]);
         vir_tile += hsum256_pd(vir_acc[h]);
+        if (TENSOR) {
+            local_wx += hsum256_pd(wx_acc[h]);
+            local_wy += hsum256_pd(wy_acc[h]);
+            local_wz += hsum256_pd(wz_acc[h]);
+        }
     }
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(lj_cnt_arr), lj_cnt_vec);
 
@@ -1272,8 +1362,10 @@ inline void process_tile_avx2_mixed(int T, int tid, const TiledNonbondedTileCtx&
 #endif  // __AVX2__ (mixed precision)
 
 #if defined(__AVX512F__)
+template <bool TENSOR>
 inline void process_tile_avx512(int T, int tid, const TiledNonbondedTileCtx& ctx,
-                                Real& local_pe, Real& local_virial) {
+                                Real& local_pe, Real& local_virial,
+                                Real& local_wx, Real& local_wy, Real& local_wz) {
     constexpr int TILE_SIZE = kCpuTileSize;
     const size_t tbase = static_cast<size_t>(T) * TILE_SIZE;
     const uint8_t i_local8 = ctx.local_mask_of[T];
@@ -1297,6 +1389,8 @@ inline void process_tile_avx512(int T, int tid, const TiledNonbondedTileCtx& ctx
     const __mmask8 i_local = static_cast<__mmask8>(i_local8);
     __m512d fix = _mm512_setzero_pd(), fiy = _mm512_setzero_pd(), fiz = _mm512_setzero_pd();
     __m512d pe_acc = _mm512_setzero_pd(), vir_acc = _mm512_setzero_pd();
+    // Diagonal virial accumulators, only touched in the TENSOR instantiation.
+    __m512d wx_acc = _mm512_setzero_pd(), wy_acc = _mm512_setzero_pd(), wz_acc = _mm512_setzero_pd();
     __m512i lj_cnt_vec = _mm512_setzero_si512();
     const __m512i lj_cnt_one = _mm512_set1_epi64(1);
 
@@ -1395,11 +1489,23 @@ inline void process_tile_avx512(int T, int tid, const TiledNonbondedTileCtx& ctx
                 const __mmask8 energy_mask_lj = lj_mask & owner_bits;
                 pe_acc = _mm512_add_pd(pe_acc, _mm512_maskz_mov_pd(energy_mask_lj, pe_pair));
                 vir_acc = _mm512_add_pd(vir_acc, _mm512_maskz_mov_pd(energy_mask_lj, _mm512_mul_pd(r2, force_mag)));
+                if (TENSOR) {
+                    const __m512d fm = _mm512_maskz_mov_pd(energy_mask_lj, force_mag);
+                    wx_acc = _mm512_add_pd(wx_acc, _mm512_mul_pd(fm, _mm512_mul_pd(dx, dx)));
+                    wy_acc = _mm512_add_pd(wy_acc, _mm512_mul_pd(fm, _mm512_mul_pd(dy, dy)));
+                    wz_acc = _mm512_add_pd(wz_acc, _mm512_mul_pd(fm, _mm512_mul_pd(dz, dz)));
+                }
             }
             if (ctx.do_coulomb) {
                 const __mmask8 energy_mask_c = cutoff_mask & owner_bits;
                 pe_acc = _mm512_add_pd(pe_acc, _mm512_maskz_mov_pd(energy_mask_c, pe_c));
                 vir_acc = _mm512_add_pd(vir_acc, _mm512_maskz_mov_pd(energy_mask_c, _mm512_mul_pd(r2, force_mag_c)));
+                if (TENSOR) {
+                    const __m512d fm = _mm512_maskz_mov_pd(energy_mask_c, force_mag_c);
+                    wx_acc = _mm512_add_pd(wx_acc, _mm512_mul_pd(fm, _mm512_mul_pd(dx, dx)));
+                    wy_acc = _mm512_add_pd(wy_acc, _mm512_mul_pd(fm, _mm512_mul_pd(dy, dy)));
+                    wz_acc = _mm512_add_pd(wz_acc, _mm512_mul_pd(fm, _mm512_mul_pd(dz, dz)));
+                }
             }
 
             if (slot_local) {
@@ -1417,6 +1523,11 @@ inline void process_tile_avx512(int T, int tid, const TiledNonbondedTileCtx& ctx
     _mm512_storeu_pd(fi_z, fiz);
     const Real pe_tile = _mm512_reduce_add_pd(pe_acc);
     const Real vir_tile = _mm512_reduce_add_pd(vir_acc);
+    if (TENSOR) {
+        local_wx += _mm512_reduce_add_pd(wx_acc);
+        local_wy += _mm512_reduce_add_pd(wy_acc);
+        local_wz += _mm512_reduce_add_pd(wz_acc);
+    }
     int64_t lj_cnt_arr[TILE_SIZE];
     _mm512_storeu_si512(reinterpret_cast<__m512i*>(lj_cnt_arr), lj_cnt_vec);
 
@@ -1432,8 +1543,10 @@ inline void process_tile_avx512(int T, int tid, const TiledNonbondedTileCtx& ctx
     local_virial += vir_tile;
 }
 #elif defined(__AVX2__)
+template <bool TENSOR>
 inline void process_tile_avx2(int T, int tid, const TiledNonbondedTileCtx& ctx,
-                              Real& local_pe, Real& local_virial) {
+                              Real& local_pe, Real& local_virial,
+                              Real& local_wx, Real& local_wy, Real& local_wz) {
     constexpr int TILE_SIZE = kCpuTileSize;  // 8, processed as two 4-wide halves
     const size_t tbase = static_cast<size_t>(T) * TILE_SIZE;
     const uint8_t i_local8 = ctx.local_mask_of[T];
@@ -1451,6 +1564,8 @@ inline void process_tile_avx2(int T, int tid, const TiledNonbondedTileCtx& ctx,
     __m256d xi[2], yi[2], zi[2], qi_vec[2];
     __m128i type_i_vec[2], gid_i_vec[2];
     __m256d fix[2], fiy[2], fiz[2], pe_acc[2], vir_acc[2];
+    // Diagonal virial accumulators, only touched in the TENSOR instantiation.
+    __m256d wx_acc[2], wy_acc[2], wz_acc[2];
     __m256i lj_cnt_vec[2];
     const __m256i lj_cnt_one = _mm256_set1_epi64x(1);
     unsigned i_local4[2];
@@ -1464,6 +1579,7 @@ inline void process_tile_avx2(int T, int tid, const TiledNonbondedTileCtx& ctx,
         gid_i_vec[h]  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(i_gid_s + off));
         fix[h] = fiy[h] = fiz[h] = _mm256_setzero_pd();
         pe_acc[h] = vir_acc[h] = _mm256_setzero_pd();
+        wx_acc[h] = wy_acc[h] = wz_acc[h] = _mm256_setzero_pd();
         lj_cnt_vec[h] = _mm256_setzero_si256();
         i_local4[h] = (static_cast<unsigned>(i_local8) >> (h * 4)) & 0x0Fu;
     }
@@ -1579,12 +1695,24 @@ inline void process_tile_avx2(int T, int tid, const TiledNonbondedTileCtx& ctx,
                     pe_acc[h] = _mm256_add_pd(pe_acc[h], _mm256_and_pd(energy_mask_lj, pe_pair));
                     vir_acc[h] = _mm256_add_pd(vir_acc[h],
                         _mm256_and_pd(energy_mask_lj, _mm256_mul_pd(r2, force_mag)));
+                    if (TENSOR) {
+                        const __m256d fm = _mm256_and_pd(energy_mask_lj, force_mag);
+                        wx_acc[h] = _mm256_add_pd(wx_acc[h], _mm256_mul_pd(fm, _mm256_mul_pd(dx, dx)));
+                        wy_acc[h] = _mm256_add_pd(wy_acc[h], _mm256_mul_pd(fm, _mm256_mul_pd(dy, dy)));
+                        wz_acc[h] = _mm256_add_pd(wz_acc[h], _mm256_mul_pd(fm, _mm256_mul_pd(dz, dz)));
+                    }
                 }
                 if (ctx.do_coulomb) {
                     const __m256d energy_mask_c = _mm256_and_pd(cutoff_mask, owner_bits);
                     pe_acc[h] = _mm256_add_pd(pe_acc[h], _mm256_and_pd(energy_mask_c, pe_c));
                     vir_acc[h] = _mm256_add_pd(vir_acc[h],
                         _mm256_and_pd(energy_mask_c, _mm256_mul_pd(r2, force_mag_c)));
+                    if (TENSOR) {
+                        const __m256d fm = _mm256_and_pd(energy_mask_c, force_mag_c);
+                        wx_acc[h] = _mm256_add_pd(wx_acc[h], _mm256_mul_pd(fm, _mm256_mul_pd(dx, dx)));
+                        wy_acc[h] = _mm256_add_pd(wy_acc[h], _mm256_mul_pd(fm, _mm256_mul_pd(dy, dy)));
+                        wz_acc[h] = _mm256_add_pd(wz_acc[h], _mm256_mul_pd(fm, _mm256_mul_pd(dz, dz)));
+                    }
                 }
 
                 if (slot_local) {
@@ -1609,6 +1737,11 @@ inline void process_tile_avx2(int T, int tid, const TiledNonbondedTileCtx& ctx,
         _mm256_storeu_pd(fi_z + h * 4, fiz[h]);
         pe_tile += hsum256_pd(pe_acc[h]);
         vir_tile += hsum256_pd(vir_acc[h]);
+        if (TENSOR) {
+            local_wx += hsum256_pd(wx_acc[h]);
+            local_wy += hsum256_pd(wy_acc[h]);
+            local_wz += hsum256_pd(wz_acc[h]);
+        }
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(lj_cnt_arr + h * 4), lj_cnt_vec[h]);
     }
 
@@ -1624,8 +1757,10 @@ inline void process_tile_avx2(int T, int tid, const TiledNonbondedTileCtx& ctx,
     local_virial += vir_tile;
 }
 #else
+template <bool TENSOR>
 inline void process_tile_scalar(int T, int tid, const TiledNonbondedTileCtx& ctx,
-                                Real& local_pe, Real& local_virial) {
+                                Real& local_pe, Real& local_virial,
+                                Real& local_wx, Real& local_wy, Real& local_wz) {
     constexpr int TILE_SIZE = kCpuTileSize;
     const size_t tbase = static_cast<size_t>(T) * TILE_SIZE;
     const uint8_t i_local8 = ctx.local_mask_of[T];
@@ -1644,6 +1779,7 @@ inline void process_tile_scalar(int T, int tid, const TiledNonbondedTileCtx& ctx
     int lj_cnt[TILE_SIZE];
     for (int lane = 0; lane < TILE_SIZE; ++lane) { fi_x[lane] = fi_y[lane] = fi_z[lane] = 0.0; lj_cnt[lane] = 0; }
     Real pe_tile = 0.0, vir_tile = 0.0;
+    Real wx_tile = 0.0, wy_tile = 0.0, wz_tile = 0.0;   // diagonal virial, only in the TENSOR instantiation
 
     for (int e = ctx.tile_offsets[T]; e < ctx.tile_offsets[T + 1]; ++e) {
         const std::uint64_t vmask_full = ctx.verlet_mask[e];
@@ -1702,8 +1838,14 @@ inline void process_tile_scalar(int T, int tid, const TiledNonbondedTileCtx& ctx
                     Real force_mag, pe_pair;
                     compute_lj_pair(r2, ctx.lj_c6[tij], ctx.lj_c12[tij], ctx.cutoff_sq,
                                     ctx.lj_switching_enabled, ctx.switch_sq, ctx.inv_denom, force_mag, pe_pair);
-                    accumulate_pair_contribution(force_mag, pe_pair, dx, dy, dz, r2, owner,
-                                                 fxp, fyp, fzp, pe_tile, vir_tile);
+                    if (TENSOR) {
+                        accumulate_pair_contribution_tensor(force_mag, pe_pair, dx, dy, dz, r2, owner,
+                                                            fxp, fyp, fzp, pe_tile, vir_tile,
+                                                            wx_tile, wy_tile, wz_tile);
+                    } else {
+                        accumulate_pair_contribution(force_mag, pe_pair, dx, dy, dz, r2, owner,
+                                                     fxp, fyp, fzp, pe_tile, vir_tile);
+                    }
                 }
 
                 if (ctx.do_coulomb) {
@@ -1711,8 +1853,14 @@ inline void process_tile_scalar(int T, int tid, const TiledNonbondedTileCtx& ctx
                     compute_coulomb_pair_real_space(excluded ? ctx.rs_table_excl : ctx.rs_table,
                                                     ctx.rs_r2_min, ctx.rs_inv_spacing, r2,
                                                     iq[lane], qj, ctx.k_coulomb, force_mag_c, pe_c);
-                    accumulate_pair_contribution(force_mag_c, pe_c, dx, dy, dz, r2, owner,
-                                                 fxp, fyp, fzp, pe_tile, vir_tile);
+                    if (TENSOR) {
+                        accumulate_pair_contribution_tensor(force_mag_c, pe_c, dx, dy, dz, r2, owner,
+                                                            fxp, fyp, fzp, pe_tile, vir_tile,
+                                                            wx_tile, wy_tile, wz_tile);
+                    } else {
+                        accumulate_pair_contribution(force_mag_c, pe_c, dx, dy, dz, r2, owner,
+                                                     fxp, fyp, fzp, pe_tile, vir_tile);
+                    }
                 }
 
                 fi_x[lane] += fxp; fi_y[lane] += fyp; fi_z[lane] += fzp;
@@ -1735,8 +1883,34 @@ inline void process_tile_scalar(int T, int tid, const TiledNonbondedTileCtx& ctx
     }
     local_pe += pe_tile;
     local_virial += vir_tile;
+    if (TENSOR) {
+        local_wx += wx_tile;
+        local_wy += wy_tile;
+        local_wz += wz_tile;
+    }
 }
 #endif  // __AVX512F__ / __AVX2__
+
+// One tile through the kernel of this build (mixed-precision AVX2, AVX-512, AVX2 or scalar). TENSOR also
+// accumulates the diagonal virial; the false instantiation is the code as it was before the tensor existed.
+template <bool TENSOR>
+inline void process_tile(int T, int tid, const TiledNonbondedTileCtx& ctx,
+                         Real& local_pe, Real& local_virial,
+                         Real& local_wx, Real& local_wy, Real& local_wz) {
+#if defined(__AVX2__)
+    if (ctx.use_mixed_precision) {
+        process_tile_avx2_mixed<TENSOR>(T, tid, ctx, local_pe, local_virial, local_wx, local_wy, local_wz);
+        return;
+    }
+#endif
+#if defined(__AVX512F__)
+    process_tile_avx512<TENSOR>(T, tid, ctx, local_pe, local_virial, local_wx, local_wy, local_wz);
+#elif defined(__AVX2__)
+    process_tile_avx2<TENSOR>(T, tid, ctx, local_pe, local_virial, local_wx, local_wy, local_wz);
+#else
+    process_tile_scalar<TENSOR>(T, tid, ctx, local_pe, local_virial, local_wx, local_wy, local_wz);
+#endif
+}
 
 void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, bool do_coulomb) {
     const char* label = do_lj ? (do_coulomb ? "LJ+PME" : "LJ") : "PME";
@@ -1800,6 +1974,8 @@ void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, b
 
     Real local_pe = 0.0;
     Real local_virial = 0.0;
+    const bool tensor = virial_tensor_enabled_;
+    Real local_wx = 0.0, local_wy = 0.0, local_wz = 0.0;
 
     if (lj_pair_counts_.size() != local_particles) {
         lj_pair_counts_.resize(local_particles);
@@ -1930,7 +2106,7 @@ void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, b
 
     const int num_tiles = nlist.num_tiles();
 
-    #pragma omp parallel reduction(+:local_pe, local_virial)
+    #pragma omp parallel reduction(+:local_pe, local_virial, local_wx, local_wy, local_wz)
     {
 #ifdef _OPENMP
         const int tid = omp_get_thread_num();
@@ -1948,24 +2124,11 @@ void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, b
         for (int T = 0; T < num_tiles; ++T) {
             if (tile_has_local && tile_has_local[T] == 0) continue;
             if (local_mask_of[T] == 0) continue;
-#if defined(__AVX2__)
-            if (ctx.use_mixed_precision) {
-                process_tile_avx2_mixed(T, tid, ctx, local_pe, local_virial);
-            } else
-#endif
-#if defined(__AVX512F__)
-            {
-                process_tile_avx512(T, tid, ctx, local_pe, local_virial);
+            if (tensor) {
+                process_tile<true>(T, tid, ctx, local_pe, local_virial, local_wx, local_wy, local_wz);
+            } else {
+                process_tile<false>(T, tid, ctx, local_pe, local_virial, local_wx, local_wy, local_wz);
             }
-#elif defined(__AVX2__)
-            {
-                process_tile_avx2(T, tid, ctx, local_pe, local_virial);
-            }
-#else
-            {
-                process_tile_scalar(T, tid, ctx, local_pe, local_virial);
-            }
-#endif
         }
     } // end omp parallel
 
@@ -1990,6 +2153,11 @@ void ForceCalculatorCPU::compute_tiled_nonbonded(MDSystem& system, bool do_lj, b
 
     last_potential_energy += local_pe;
     last_virial += local_virial;
+    if (tensor) {
+        last_virial_diag[0] += local_wx;
+        last_virial_diag[1] += local_wy;
+        last_virial_diag[2] += local_wz;
+    }
     }); // run_nonbonded_with_pme_overlap
 }
 
@@ -2116,7 +2284,9 @@ void ForceCalculatorCPU::pme_reciprocal_begin(MDSystem& system) {
         // deadlock partway through the MD loop). MDSimulation::finalize()
         // sends the matching zero/stop flag exactly once, after the last
         // call to this function for the whole run.
-        int continue_flag = 1;
+        // Bit 0 = "one more step follows", bit 1 (value 2) = send the diagonal of the reciprocal virial tensor
+        // back as well (see PmeServer::run()); a plain 1 is the protocol without the tensor.
+        int continue_flag = virial_tensor_enabled_ ? 3 : 1;
         MPI_Bcast(&continue_flag, 1, MPI_INT, pp_leader_root, split.inter_comm());
         Real box_dims[3] = {box.lx, box.ly, box.lz};
         MPI_Bcast(box_dims, 3, MPI_DOUBLE, pp_leader_root, split.inter_comm());
@@ -2168,6 +2338,8 @@ void ForceCalculatorCPU::pme_reciprocal_end(MDSystem& system) {
     PmePpSplit& split = PmePpSplit::instance();
     Real recip_energy = 0.0;
     Real recip_virial = 0.0;
+    const bool tensor = virial_tensor_enabled_;
+    Real recip_diag[3] = {0.0, 0.0, 0.0};   // W_xx, W_yy, W_zz of the reciprocal sum (tensor only)
 
     if (split.active()) {
         if (pme_reduce_pending_) {
@@ -2182,10 +2354,19 @@ void ForceCalculatorCPU::pme_reciprocal_end(MDSystem& system) {
         // colored/split preserving world-rank order.
         MPI_Bcast(pme_engine_.grid_data(), static_cast<int>(real_grid_size), MPI_DOUBLE,
                   0, split.inter_comm());
-        Real energy_virial[2] = {0.0, 0.0};
-        MPI_Bcast(energy_virial, 2, MPI_DOUBLE, 0, split.inter_comm());
-        recip_energy = energy_virial[0];
-        recip_virial = energy_virial[1];
+        if (tensor) {
+            // {E, W, W_xx, W_yy, W_zz}: the server sends five numbers when the continue flag had bit 1 set
+            Real energy_virial[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+            MPI_Bcast(energy_virial, 5, MPI_DOUBLE, 0, split.inter_comm());
+            recip_energy = energy_virial[0];
+            recip_virial = energy_virial[1];
+            for (int a = 0; a < 3; ++a) recip_diag[a] = energy_virial[2 + a];
+        } else {
+            Real energy_virial[2] = {0.0, 0.0};
+            MPI_Bcast(energy_virial, 2, MPI_DOUBLE, 0, split.inter_comm());
+            recip_energy = energy_virial[0];
+            recip_virial = energy_virial[1];
+        }
     } else {
         int mpi_size = 1, mpi_rank = 0;
         MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
@@ -2196,20 +2377,46 @@ void ForceCalculatorCPU::pme_reciprocal_end(MDSystem& system) {
         }
 
         if (mpi_rank == 0) {
-            recip_energy = pme_engine_.solve(recip_virial);
+            recip_energy = tensor ? pme_engine_.solve(recip_virial, recip_diag)
+                                  : pme_engine_.solve(recip_virial);
         }
 
         if (mpi_size > 1) {
             MPI_Bcast(pme_engine_.grid_data(), static_cast<int>(real_grid_size), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            Real energy_virial[2] = {recip_energy, recip_virial};
-            MPI_Bcast(energy_virial, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            recip_energy = energy_virial[0];
-            recip_virial = energy_virial[1];
+            if (tensor) {
+                Real energy_virial[5] = {recip_energy, recip_virial, recip_diag[0], recip_diag[1], recip_diag[2]};
+                MPI_Bcast(energy_virial, 5, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+                recip_energy = energy_virial[0];
+                recip_virial = energy_virial[1];
+                for (int a = 0; a < 3; ++a) recip_diag[a] = energy_virial[2 + a];
+            } else {
+                Real energy_virial[2] = {recip_energy, recip_virial};
+                MPI_Bcast(energy_virial, 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+                recip_energy = energy_virial[0];
+                recip_virial = energy_virial[1];
+            }
+        }
+    }
+
+    // Every PP rank now holds the WHOLE reciprocal energy and virial (rank 0 solved it, or the PME group sent it), and
+    // the callers add the ranks' energies (compute_forces) and virials (MDSimulation) up: each rank takes its 1/P share,
+    // as the CUDA path does. Without it a run on P ranks counted the reciprocal energy and virial P times.
+    {
+        int pp_size = 1;
+        MPI_Comm_size(split.active() ? split.pp_comm() : MPI_COMM_WORLD, &pp_size);
+        if (pp_size > 1) {
+            const Real share = 1.0 / static_cast<Real>(pp_size);
+            recip_energy *= share;
+            recip_virial *= share;
+            for (int a = 0; a < 3; ++a) recip_diag[a] *= share;
         }
     }
 
     last_potential_energy += recip_energy;
     last_virial += recip_virial;
+    if (tensor) {
+        for (int a = 0; a < 3; ++a) last_virial_diag[a] += recip_diag[a];
+    }
 
     pme_engine_.interpolate_forces(particles, local_particles, box);
 
@@ -2238,8 +2445,13 @@ void ForceCalculatorCPU::compute_bond_forces(MDSystem& system) {
     }
 
     Real local_pe = 0.0;
+    // The bonds' virial W = sum r.F (Urey-Bradley terms are bonds too). It was missing from this backend's scalar
+    // virial, and so from the CPU pressure, until the GPU one got it (2026-10-13 fix); both include it now. The
+    // diagonal components are added only while the tensor is enabled.
+    const bool tensor = virial_tensor_enabled_;
+    Real local_virial = 0.0, local_wx = 0.0, local_wy = 0.0, local_wz = 0.0;
     const long num_bonds = static_cast<long>(bonds.size());
-    #pragma omp parallel for reduction(+:local_pe) schedule(static)
+    #pragma omp parallel for reduction(+:local_pe, local_virial, local_wx, local_wy, local_wz) schedule(static)
     for (long bi = 0; bi < num_bonds; ++bi) {
         const auto& bond = bonds[static_cast<size_t>(bi)];
         size_t i = bond.atom1;
@@ -2256,7 +2468,7 @@ void ForceCalculatorCPU::compute_bond_forces(MDSystem& system) {
         Real r = std::sqrt(dx*dx + dy*dy + dz*dz);
         if (r < 1e-10) continue; // Avoid division by zero
 
-        const BondType& bond_type = topology.get_bond_type(*bond.type);
+        const BondType& bond_type = topology.get_bond_type(bond.type);
         Real k_bond = bond_type.k;    // Force constant
         Real r0 = bond_type.r0;       // Equilibrium distance
 
@@ -2267,6 +2479,14 @@ void ForceCalculatorCPU::compute_bond_forces(MDSystem& system) {
         Real fx = force_mag * dx;
         Real fy = force_mag * dy;
         Real fz = force_mag * dz;
+
+        // force on i is force_mag * d, so W_aa = d_a F_a = force_mag * d_a^2 and W = force_mag * r^2
+        local_virial += force_mag * (dx * dx + dy * dy + dz * dz);
+        if (tensor) {
+            local_wx += force_mag * dx * dx;
+            local_wy += force_mag * dy * dy;
+            local_wz += force_mag * dz * dz;
+        }
 
         #pragma omp atomic
         particles.fx[i] += fx;
@@ -2282,6 +2502,12 @@ void ForceCalculatorCPU::compute_bond_forces(MDSystem& system) {
         particles.fz[j] -= fz;
     }
     last_potential_energy += local_pe;
+    last_virial += local_virial;
+    if (tensor) {
+        last_virial_diag[0] += local_wx;
+        last_virial_diag[1] += local_wy;
+        last_virial_diag[2] += local_wz;
+    }
 }
 
 void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
@@ -2295,8 +2521,12 @@ void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
     }
 
     Real local_pe = 0.0;
+    // Diagonal virial tensor only: the trace of an angle's virial is zero (it is invariant under a uniform
+    // scaling), but its components are not.
+    const bool tensor = virial_tensor_enabled_;
+    Real local_wx = 0.0, local_wy = 0.0, local_wz = 0.0;
     const long num_angles = static_cast<long>(angles.size());
-    #pragma omp parallel for reduction(+:local_pe) schedule(static)
+    #pragma omp parallel for reduction(+:local_pe, local_wx, local_wy, local_wz) schedule(static)
     for (long ai = 0; ai < num_angles; ++ai) {
         const auto& angle = angles[static_cast<size_t>(ai)];
         size_t i = angle.atom1;  // First atom
@@ -2329,7 +2559,7 @@ void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
         
         Real theta = std::acos(cos_theta);
         
-        const AngleType& angle_type = topology.get_angle_type(*angle.type);
+        const AngleType& angle_type = topology.get_angle_type(angle.type);
         Real k_angle = angle_type.k;         // Force constant
         Real theta0 = angle_type.theta0;     // Equilibrium angle
         Real dtheta = theta - theta0;
@@ -2359,7 +2589,14 @@ void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
         Real fx_j = -(fx_i + fx_k);
         Real fy_j = -(fy_i + fy_k);
         Real fz_j = -(fz_i + fz_k);
-        
+
+        if (tensor) {
+            // sum_n r_n F_n = (r_i - r_j) F_i + (r_k - r_j) F_k, the forces adding up to zero
+            local_wx += dx_ij * fx_i + dx_kj * fx_k;
+            local_wy += dy_ij * fy_i + dy_kj * fy_k;
+            local_wz += dz_ij * fz_i + dz_kj * fz_k;
+        }
+
         #pragma omp atomic
         particles.fx[i] += fx_i;
         #pragma omp atomic
@@ -2380,6 +2617,11 @@ void ForceCalculatorCPU::compute_angle_forces(MDSystem& system) {
         particles.fz[k] += fz_k;
     }
     last_potential_energy += local_pe;
+    if (tensor) {
+        last_virial_diag[0] += local_wx;
+        last_virial_diag[1] += local_wy;
+        last_virial_diag[2] += local_wz;
+    }
 }
 
 void ForceCalculatorCPU::compute_dihedral_forces(MDSystem& system) {
@@ -2401,8 +2643,11 @@ void ForceCalculatorCPU::compute_torsion_forces(MDSystem& system,
 
     SimulationBox& box = system.get_box();
     Real local_pe = 0.0;
+    // Diagonal virial tensor only (dihedrals and impropers have no scalar virial: its trace is zero).
+    const bool tensor = virial_tensor_enabled_;
+    Real local_wx = 0.0, local_wy = 0.0, local_wz = 0.0;
     const long num_dihedrals = static_cast<long>(dihedrals.size());
-    #pragma omp parallel for reduction(+:local_pe) schedule(static)
+    #pragma omp parallel for reduction(+:local_pe, local_wx, local_wy, local_wz) schedule(static)
     for (long di = 0; di < num_dihedrals; ++di) {
         const auto& dihedral = dihedrals[static_cast<size_t>(di)];
         size_t i = dihedral.atom1;
@@ -2451,7 +2696,7 @@ void ForceCalculatorCPU::compute_torsion_forces(MDSystem& system,
                             (n1_x*n2_y - n1_y*n2_x) * dz_jk;
         Real phi = std::atan2(sin_phi_num, cos_phi_num * jk_mag);
 
-        const DihedralType& dihedral_type = topology.get_dihedral_type(*dihedral.type);
+        const DihedralType& dihedral_type = topology.get_dihedral_type(dihedral.type);
         Real k_dihedral = dihedral_type.k;
         Real phi0 = dihedral_type.phi0;  // Phase shift
         int n = dihedral_type.n;         // Multiplicity
@@ -2484,6 +2729,14 @@ void ForceCalculatorCPU::compute_torsion_forces(MDSystem& system,
         Real fky = -p * fiy + (q - 1.0) * fly;
         Real fkz = -p * fiz + (q - 1.0) * flz;
 
+        if (tensor) {
+            // sum_n r_n F_n relative to atom j: (r_i - r_j) F_i + (r_k - r_j) F_k + (r_l - r_j) F_l, with
+            // r_i - r_j = d_ij, r_k - r_j = -d_jk, r_l - r_j = -d_jk - d_kl (the d's are minimum-image)
+            local_wx += dx_ij * fix - dx_jk * fkx - (dx_jk + dx_kl) * flx;
+            local_wy += dy_ij * fiy - dy_jk * fky - (dy_jk + dy_kl) * fly;
+            local_wz += dz_ij * fiz - dz_jk * fkz - (dz_jk + dz_kl) * flz;
+        }
+
         #pragma omp atomic
         particles.fx[i] += fix;
         #pragma omp atomic
@@ -2510,6 +2763,11 @@ void ForceCalculatorCPU::compute_torsion_forces(MDSystem& system,
         particles.fz[l] += flz;
     }
     last_potential_energy += local_pe;
+    if (tensor) {
+        last_virial_diag[0] += local_wx;
+        last_virial_diag[1] += local_wy;
+        last_virial_diag[2] += local_wz;
+    }
 }
 
 void ForceCalculatorCPU::compute_special_pair_forces(MDSystem& system) {
@@ -2533,9 +2791,11 @@ void ForceCalculatorCPU::compute_special_pair_forces(MDSystem& system) {
     const Real k_coulomb = 332.0636; // kcal/mol*Angstrom / e^2 (matches the Ewald real-space routine)
     Real local_pe = 0.0;
     Real local_virial = 0.0;
+    const bool tensor = virial_tensor_enabled_;
+    Real local_wx = 0.0, local_wy = 0.0, local_wz = 0.0;
 
     const long num_pairs = static_cast<long>(pairs.size());
-    #pragma omp parallel for reduction(+:local_pe, local_virial) schedule(static)
+    #pragma omp parallel for reduction(+:local_pe, local_virial, local_wx, local_wy, local_wz) schedule(static)
     for (long pi = 0; pi < num_pairs; ++pi) {
         const auto& pair = pairs[static_cast<size_t>(pi)];
         size_t i = pair.atom1;
@@ -2593,6 +2853,11 @@ void ForceCalculatorCPU::compute_special_pair_forces(MDSystem& system) {
         if (force_mag == 0.0) continue;
 
         local_virial += r2 * force_mag; // W = r.F = r^2 * force_mag
+        if (tensor) {
+            local_wx += force_mag * dx * dx;
+            local_wy += force_mag * dy * dy;
+            local_wz += force_mag * dz * dz;
+        }
 
         Real fx = force_mag * dx;
         Real fy = force_mag * dy;
@@ -2614,6 +2879,11 @@ void ForceCalculatorCPU::compute_special_pair_forces(MDSystem& system) {
 
     last_potential_energy += local_pe;
     last_virial += local_virial;
+    if (tensor) {
+        last_virial_diag[0] += local_wx;
+        last_virial_diag[1] += local_wy;
+        last_virial_diag[2] += local_wz;
+    }
 }
 
 void ForceCalculatorCPU::calculate_kinetic_energy(MDSystem& system) {
@@ -2621,17 +2891,37 @@ void ForceCalculatorCPU::calculate_kinetic_energy(MDSystem& system) {
     size_t local_particles = system.get_local_particles();
     
     last_kinetic_energy = 0.0;
-    
+
+    if (virial_tensor_enabled_) {
+        // KE_a = sum 0.5 m v_a^2; the scalar is accumulated exactly as in the loop below, and the four numbers are
+        // reduced together (MPI_SUM per element: the scalar result is the one the single reduction gives).
+        Real ke_local[4] = {0.0, 0.0, 0.0, 0.0};   // {KE, KE_x, KE_y, KE_z}
+        for (size_t i = 0; i < local_particles; i++) {
+            Real v2 = particles.vx[i] * particles.vx[i] +
+                      particles.vy[i] * particles.vy[i] +
+                      particles.vz[i] * particles.vz[i];
+            ke_local[0] += 0.5 * particles.mass[i] * v2;
+            ke_local[1] += 0.5 * particles.mass[i] * particles.vx[i] * particles.vx[i];
+            ke_local[2] += 0.5 * particles.mass[i] * particles.vy[i] * particles.vy[i];
+            ke_local[3] += 0.5 * particles.mass[i] * particles.vz[i] * particles.vz[i];
+        }
+        Real ke_global[4] = {0.0, 0.0, 0.0, 0.0};
+        MPI_Allreduce(ke_local, ke_global, 4, MPI_DOUBLE, MPI_SUM, PmePpSplit::instance().pp_comm());
+        last_kinetic_energy = ke_global[0];
+        for (int a = 0; a < 3; ++a) last_kinetic_energy_diag[a] = ke_global[1 + a];
+        return;
+    }
+
     for (size_t i = 0; i < local_particles; i++) {
-        Real v2 = particles.vx[i] * particles.vx[i] + 
-                  particles.vy[i] * particles.vy[i] + 
+        Real v2 = particles.vx[i] * particles.vx[i] +
+                  particles.vy[i] * particles.vy[i] +
                   particles.vz[i] * particles.vz[i];
         last_kinetic_energy += 0.5 * particles.mass[i] * v2;
     }
-    
+
     if (system.get_rank() == 0) {
     }
-    
+
     Real global_ke = 0.0;
     MPI_Allreduce(&last_kinetic_energy, &global_ke, 1, MPI_DOUBLE, MPI_SUM,
                   PmePpSplit::instance().pp_comm());

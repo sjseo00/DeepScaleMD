@@ -1,10 +1,10 @@
-#ifndef MLIP_PYTHON_BACKEND_H
-#define MLIP_PYTHON_BACKEND_H
+#ifndef MLIP_ASE_BACKEND_H
+#define MLIP_ASE_BACKEND_H
 
-// The embedded-CPython MLIP path (MLIP_tools/mlip_python/ml_forces.py) behind MLIPBackend. Positions go to Python
+// The ASE mode (mlip_backend: ase): the embedded-CPython MLIP path (MLIP_tools/mlip_python/ml_forces.py) behind MLIPBackend. Positions go to Python
 // as host arrays and the returned forces are added to the MD force arrays. In a CUDA build the device
 // arrays are staged through host memory every call.
-// Python.h and NumPy are used only in PythonBackend.cpp (ENABLE_PYTHON_INTERFACE). A build without it refuses this
+// Python.h and NumPy are used only in AseBackend.cpp (ENABLE_PYTHON_INTERFACE). A build without it refuses this
 // backend when it is created; a failure in Python (import, model, force call) stops the run with the Python traceback,
 // it never turns into zero forces.
 //
@@ -12,7 +12,7 @@
 // (the ghosts would be taken for atoms of the system, next to their own periodic images, and the energy would count the ghosts
 // too). So every rank collects the owned atoms of all ranks, runs the whole system with the real box and periodic flags, and
 // keeps the forces of its own atoms; the energy is the whole system's on every rank. That is correct, but the work is the
-// same on every rank (no speed-up): the scalable multi-GPU path is mlip_backend: libtorch.
+// same on every rank (no speed-up): the scalable multi-GPU paths are mlip_backend: libtorch and pytorch.
 
 #include "MLIPBackend.h"
 
@@ -20,13 +20,13 @@
 #include <string>
 #include <vector>
 
-class PythonBackend : public MLIPBackend {
+class AseBackend : public MLIPBackend {
 public:
-    explicit PythonBackend(const MLIPConfig& cfg);
-    ~PythonBackend() override;
+    explicit AseBackend(const MLIPConfig& cfg);
+    ~AseBackend() override;
 
-    PythonBackend(const PythonBackend&) = delete;
-    PythonBackend& operator=(const PythonBackend&) = delete;
+    AseBackend(const AseBackend&) = delete;
+    AseBackend& operator=(const AseBackend&) = delete;
 
     void compute(const MLIPInputs& in, MLIPOutputs& out) override;
     double cutoff() const override { return 0.0; }        // ASE builds its own neighbor list
@@ -34,7 +34,7 @@ public:
 
 private:
     void initialize_python(const std::string& module_path);
-    void initialize_ml_model(const PythonMLIPConfig& py, const std::vector<int>& type_to_z);
+    void initialize_ml_model(const AseMLIPConfig& py, const std::vector<int>& type_to_z);
     void finalize_python();
     // The host arrays of this rank (n atoms, the first n_owned are owned): on one rank straight to call_python; on several the
     // atoms of all ranks go to call_python and the forces of the owned atoms are added to fx/fy/fz[0, n_owned).
@@ -69,4 +69,4 @@ private:
     std::vector<int> g_type_, g_scratch_i_;
 };
 
-#endif // MLIP_PYTHON_BACKEND_H
+#endif // MLIP_ASE_BACKEND_H

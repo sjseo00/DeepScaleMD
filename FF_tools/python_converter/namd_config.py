@@ -10,14 +10,23 @@ the directory of the config file.
 
 Settings that would make the converted run differ from what NAMD runs are not silently
 dropped: `exclude` other than scaled1-4 and `vdwGeometricSigma yes` raise ConversionError
-here, and everything DeepScaleMD cannot reproduce (rigid bonds, multiple time stepping,
-thermostats and barostats it does not have, ...) ends up in RunSettings.unsupported.
+here, and everything DeepScaleMD cannot reproduce (multiple time stepping, thermostats and
+barostats it does not have, x and y coupled by useConstantArea / useConstantRatio, ...) ends up
+in RunSettings.unsupported.
+
+`bincoordinates` (NAMD's binary restart positions) overrides the PDB of `coordinates`, as it does in
+NAMD; `binvelocities` is not read (the initial velocities are drawn at the target temperature).
+
+rigidBonds water / all (also on) become RunSettings.constraints, which the PSF reader turns into
+the package's [constraints]; useFlexibleCell yes lets the three axes follow the pressure on their
+own (the anisotropic barostat on xyz).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -35,6 +44,7 @@ class NamdConfig:
     warnings: List[str] = field(default_factory=list)
     settings: Dict[str, List[str]] = field(default_factory=dict)          # last value of each key
     commands: List[Tuple[str, List[str]]] = field(default_factory=list)   # every line, in order
+    bin_coordinates: Optional[str] = None     # NAMD's `bincoordinates`: the real start, it overrides `coordinates`
 
 
 _VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
@@ -78,7 +88,7 @@ def parse_namd_config(path: str) -> NamdConfig:
         raise ConversionError(f"cannot open NAMD config file: {path}")
     base_dir = os.path.dirname(os.path.abspath(path))
     variables: Dict[str, str] = {}
-    structure = coordinates = None
+    structure = coordinates = bin_coordinates = None
     parameters: List[str] = []
     vectors: Dict[int, Tuple[float, float, float]] = {}
     scale14 = 1.0
@@ -114,6 +124,8 @@ def parse_namd_config(path: str) -> NamdConfig:
             structure = resolve(args[0])
         elif key == "coordinates" and args:
             coordinates = resolve(args[0])
+        elif key == "bincoordinates" and args:
+            bin_coordinates = resolve(args[0])
         elif key == "parameters" and args:
             parameters.append(resolve(args[0]))
         elif key in ("cellbasisvector1", "cellbasisvector2", "cellbasisvector3"):
@@ -157,7 +169,24 @@ def parse_namd_config(path: str) -> NamdConfig:
     elif vectors:
         raise ConversionError(f"{path}: cellBasisVector1/2/3 must all be given")
 
-    return NamdConfig(structure, coordinates, parameters, box, scale14, [], settings, commands)
+    return NamdConfig(structure, coordinates, parameters, box, scale14, [], settings, commands, bin_coordinates)
+
+
+def read_namd_bin_coordinates(path: str, atom_count: int) -> List[Tuple[float, float, float]]:
+    """The positions of a NAMD binary coordinate file (`bincoordinates`): an int32 atom count, then three
+    float64 per atom, in the byte order of the machine that wrote it."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise ConversionError(f"cannot read the NAMD binary coordinates {path}: {exc}")
+    for order in ("<", ">"):
+        if len(raw) >= 4 and struct.unpack(order + "i", raw[:4])[0] == atom_count \
+                and len(raw) == 4 + 24 * atom_count:
+            values = struct.unpack(f"{order}{3 * atom_count}d", raw[4:])
+            return [tuple(values[3 * i:3 * i + 3]) for i in range(atom_count)]
+    raise ConversionError(f"{path} is not a NAMD binary coordinate file of {atom_count} atoms "
+                          f"(the PSF has {atom_count})")
 
 
 # ── run settings ─────────────────────────────────────────────────────────────
@@ -249,8 +278,12 @@ def namd_run_settings(config: NamdConfig,
         s.target_pressure_bar = _required(config, "berendsenpressuretarget", "berendsenPressure on")
         s.tau_p_ps = _required(config, "berendsenpressurerelaxationtime",
                                "berendsenPressure on") / 1000.0
-    if _on(cfg.get("useflexiblecell")):
-        s.unsupported.append("useFlexibleCell (anisotropic cell fluctuations)")
+    if _on(cfg.get("useflexiblecell")) and s.barostat != "none":
+        if _on(cfg.get("useconstantarea")) or _on(cfg.get("useconstantratio")):
+            s.unsupported.append("useFlexibleCell with useConstantArea / useConstantRatio (NAMD couples x and y; "
+                                 "DeepScaleMD scales each axis on its own)")
+        else:
+            s.barostat_coupling, s.barostat_axes = "anisotropic", "xyz"
 
     # electrostatics
     if not _on(cfg.get("pme")):
@@ -262,10 +295,16 @@ def namd_run_settings(config: NamdConfig,
         s.pme_spacing = _number(config, "pmegridspacing")
 
     # things DeepScaleMD does not do
-    if "rigidbonds" in cfg and cfg["rigidbonds"] and cfg["rigidbonds"][0].lower() not in ("none", "off", "no"):
-        s.unsupported.append(
-            f"rigidBonds {cfg['rigidbonds'][0]} (the converter writes no constraints, so bonds "
-            f"stay flexible)")
+    if cfg.get("rigidbonds"):
+        rigid = cfg["rigidbonds"][0].lower()
+        if rigid in ("all", "on"):
+            s.constraints = "hydrogen"          # NAMD: every bond to a hydrogen, the waters rigid
+        elif rigid == "water":
+            s.constraints = "water"
+        elif rigid not in ("none", "off", "no"):
+            s.unsupported.append(f"rigidBonds {cfg['rigidbonds'][0]} (NAMD takes none, water or all)")
+        if s.constraints != "none":
+            s.notes.append(f"rigidBonds {rigid}: the rigid bonds are the [constraints] section of topology.dsMDtop")
     for key, name in (("fullelectfrequency", "fullElectFrequency"), ("nonbondedfreq", "nonbondedFreq")):
         freq = _number(config, key)
         if freq is not None and freq > 1:

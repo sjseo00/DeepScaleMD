@@ -1,7 +1,8 @@
 """reference.json: a small verification structure (owned + ghost atoms) with the inputs and the expected outputs.
 
 The converter writes it from the eager wrapper; the C++ tests (TorchScriptRunner, LibTorchBackend) load the model and
-compare against it (design 3.5, 9.2). The ghost layer is `ghost_cutoff` deep, so the owned-atom results are exact.
+compare against it (design 3.5, 9.2). The ghost layer is `reference_ghost_depth` deep (ghost_cutoff, unless a model needs less),
+so the owned-atom results are exact.
 """
 import json
 from pathlib import Path
@@ -12,7 +13,7 @@ from torch import Tensor
 
 from .adapters.base import MLIPAdapter
 from .geometry import brute_force_edges, fold_ghost_forces, periodic_ghosts
-from . import halo_op
+from . import halo_op, kspace_op
 from .wrapper import MDLayerShiftWrapper, MDShiftWrapper, MDWrapper
 
 FORMAT_VERSION = 1
@@ -58,7 +59,7 @@ def make_reference_structure(adapter: MLIPAdapter, n_owned: int = 12, seed: int 
     elements = torch.tensor(adapter.reference_elements, dtype=torch.int64)
     z_owned = elements[torch.arange(n_owned) % len(elements)]
 
-    ghost_pos, owner = periodic_ghosts(pos_owned, box, adapter.ghost_cutoff + extra_depth)
+    ghost_pos, owner = periodic_ghosts(pos_owned, box, adapter.reference_ghost_depth + extra_depth)
     pos = torch.cat([pos_owned, ghost_pos])
     z = torch.cat([z_owned, z_owned[owner]])
     edges = brute_force_edges(pos, adapter.cutoff)
@@ -76,7 +77,8 @@ def make_reference(wrapper, adapter: MLIPAdapter, dtype: torch.dtype, device: st
     edges = s.edge_index.to(device)
     n_owned = torch.tensor(s.n_owned).to(device)
     layered = isinstance(wrapper, MDLayerShiftWrapper)
-    with torch.no_grad():
+    kspace = getattr(adapter, "kspace_metadata", None)      # --kspace: the reciprocal sums need the box of the owned atoms
+    with torch.no_grad(), kspace_op.maybe_context(kspace, [s.box, s.box, s.box]):
         if layered:
             # The ghosts are copies of owned atoms of this same structure: the exchange is a copy inside this process.
             shift = torch.zeros((edges.shape[1], 3), dtype=dtype, device=device)
@@ -90,6 +92,8 @@ def make_reference(wrapper, adapter: MLIPAdapter, dtype: torch.dtype, device: st
     energy, atom_energy, forces = energy.cpu(), atom_energy.cpu(), forces.cpu()
     folded = fold_ghost_forces(forces.double(), s.n_owned, s.ghost_owner)   # what the reverse communication gives
     extra = {"layer_exchange": True, "ghost_owner": s.ghost_owner.tolist()} if layered else {}
+    if kspace:
+        extra["kspace"] = dict(kspace)
     return {
         **extra,
         "format_version": FORMAT_VERSION,

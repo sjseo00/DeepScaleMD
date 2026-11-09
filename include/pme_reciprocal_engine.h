@@ -99,6 +99,18 @@ public:
     // the caller must MPI_Allreduce them over pme_comm to get the true total.
     Real solve(Real& virial_out);
 
+    // Diagonal of the reciprocal virial tensor for anisotropic pressure coupling. Off by default (no extra tables,
+    // no extra work, solve() unchanged). Switching it on drops the cached Green's function so that the next
+    // ensure_green_cached() also builds the per-axis tables; switching it off frees them.
+    void set_virial_tensor_enabled(bool enabled);
+    bool virial_tensor_enabled() const { return virial_tensor_enabled_; }
+
+    // Same as solve(Real&), and additionally writes this rank's W_xx, W_yy, W_zz of the reciprocal sum
+    // (W_aa = sum_k E_k (1 - 2 k_a^2/k^2 - k_a^2/(2 alpha^2)); the three add up to virial_out to rounding).
+    // Needs set_virial_tensor_enabled(true) and an ensure_green_cached() after it. Distributed mode: collective
+    // like solve(), and the three values are LOCAL partial sums as well.
+    Real solve(Real& virial_out, Real virial_diag_out[3]);
+
     // Interpolates forces from grid_data() (already inverse-FFT'd potential)
     // into particles' fx/fy/fz for its local atoms. Adds to existing forces.
     void interpolate_forces(ParticleData& particles, size_t local_particles,
@@ -136,6 +148,9 @@ private:
     fftw_plan pme_fft_plan_bwd_ = nullptr;  // c2r, Phi(k) -> Phi(r)
 
     std::vector<Real> pme_green_, pme_green_energy_, pme_green_virial_;
+    // Per-axis counterparts of pme_green_virial_ (x, y, z), only filled while the virial tensor is enabled.
+    bool virial_tensor_enabled_ = false;
+    std::vector<Real> pme_green_virial_axis_[3];
     Real pme_green_cached_lx_ = 0.0, pme_green_cached_ly_ = 0.0, pme_green_cached_lz_ = 0.0;
 
     std::vector<Real> pme_charge_spread_priv_;

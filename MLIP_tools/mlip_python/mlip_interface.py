@@ -4,7 +4,7 @@ mlip_interface.py  –  Unified MLIP Adapter Layer for DeepScaleMD
 
 Architecture
 ------------
-  C++ PythonBackend (src/PythonBackend.cpp, behind MLIPBackend, mlip_backend: python)
+  C++ AseBackend (src/AseBackend.cpp, behind MLIPBackend, mlip_backend: ase)
       → imports ml_forces
           → ml_forces.compute_force()
               → delegates here: mlip_interface.compute_forces()
@@ -25,12 +25,12 @@ GPU-efficiency design
                    transfer while the previous MACE step's D2H force copy is
                    still in flight.
   • torch.cuda.synchronize() : called only at the C++–Python handoff points
-                                that already exist in PythonBackend.
+                                that already exist in AseBackend.
 
 Which element is atom type k?  The input file's `mlip_type_to_z: [8, 1]` (MD type id -> atomic number) is passed to
 initialize() as `type_to_z`. Without it the old convention below is used.
 
-Failures are not hidden: a missing package or model makes initialize() return False (PythonBackend then stops the run), and
+Failures are not hidden: a missing package or model makes initialize() return False (AseBackend then stops the run), and
 an error in compute_forces() is raised, never answered with zero forces.
 """
 
@@ -53,8 +53,8 @@ from adapters.base import _atom_types_to_symbols          # noqa: F401
 # Unit conversion: all MLIP potentials return forces in eV/Å.
 # DeepScaleMD uses LAMMPS 'real' units internally (energy=kcal/mol, force=kcal/mol/Å).
 # Multiply MLIP forces by this factor before returning to C++.
-EV_PER_ANGSTROM_TO_KCAL_PER_MOL_ANGSTROM = 23.0609   # 1 eV/Å = 23.0609 kcal/(mol·Å)
-EV_TO_KCAL_PER_MOL = 23.0609                          # 1 eV  = 23.0609 kcal/mol
+EV_PER_ANGSTROM_TO_KCAL_PER_MOL_ANGSTROM = 23.0605   # 1 eV/Å = 23.0605 kcal/(mol·Å)
+EV_TO_KCAL_PER_MOL = 23.0605                          # 1 eV  = 23.0605 kcal/mol
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level state  (single active adapter per process)
@@ -110,6 +110,7 @@ def initialize(model_type: str = "mace",
         elif "chgnet" in path_lower:                             key = "chgnet"
         elif "sevennet" in path_lower or "7net" in path_lower:  key = "sevennet"
         elif "orb" in path_lower:                                key = "orb"
+        elif "esen" in path_lower:                               key = "esen"
         elif "uma" in path_lower or "fairchem" in path_lower:   key = "uma"
         elif "mattersim" in path_lower:                          key = "mattersim"
         elif "m3gnet" in path_lower or "tensornet" in path_lower or "matgl" in path_lower: key = "matgl"
@@ -147,7 +148,7 @@ def compute_forces(positions: np.ndarray, atom_types: np.ndarray,
     (LAMMPS 'real' units: energy=kcal/mol, force=kcal/mol/Å, time=fs).
 
     All MLIP adapters return forces in eV/Å; this function applies the
-    eV/Å → kcal/(mol·Å) conversion (× 23.0609) before returning to C++.
+    eV/Å → kcal/(mol·Å) conversion (× 23.0605) before returning to C++.
 
     Returns
     -------

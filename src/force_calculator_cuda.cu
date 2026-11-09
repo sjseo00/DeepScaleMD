@@ -32,6 +32,9 @@
 #include <mpi.h>
 #include <cmath>
 #include <cufft.h>
+#ifdef DSMD_WITH_CUFFTMP
+#include <cufftMp.h>
+#endif
 
 #define CUDA_CHECK(call) do { \
     cudaError_t error = call; \
@@ -84,11 +87,25 @@ __global__ void add_bonded_forces_kernel(Real* fx, Real* fy, Real* fz,
     bx[i] = 0.0; by[i] = 0.0; bz[i] = 0.0;
 }
 
+// scalar_a: the potential energy. scalar_b: the virial accumulator, VIRIAL_SLOTS Reals:
+// [0] trace, [1..3] the diagonal W_xx, W_yy, W_zz (the diagonal is only filled while the
+// virial tensor is enabled, see ForceCalculator::set_virial_tensor_enabled).
+constexpr int VIRIAL_SLOTS = 4;
+
+// Layout of the pinned landing zone h_scalars_ (see the header): [0] potential energy, [1] virial trace,
+// [2] kinetic energy, [3] spare, [4..6] virial diagonal, [7..9] kinetic energy diagonal.
+constexpr int H_SCALARS_VIRIAL_DIAG = 4;
+constexpr int H_SCALARS_KE_DIAG = 7;
+constexpr int H_SCALARS_SLOTS = 12;
+
 __global__ void clear_forces_and_scalars_kernel(Real* fx, Real* fy, Real* fz, size_t n,
                                                 Real* scalar_a, Real* scalar_b) {
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) { fx[i] = 0.0; fy[i] = 0.0; fz[i] = 0.0; }
-    if (i == 0) { *scalar_a = 0.0; *scalar_b = 0.0; }
+    if (i == 0) {
+        *scalar_a = 0.0;
+        for (int s = 0; s < VIRIAL_SLOTS; ++s) scalar_b[s] = 0.0;
+    }
 }
 
 __global__ void clear_forces_kernel(Real* fx, Real* fy, Real* fz, size_t n) {
@@ -314,7 +331,9 @@ __device__ __forceinline__ void load_lj_pair_params(
 // blocks makes the compiler use 72 registers (seven blocks, 28 warps) with no spills
 // (checked in the cubin resource usage: STACK 0, LOCAL 0). The double instantiation is left
 // unconstrained: the bound would make it spill.
-template <typename PairT>
+// TENSOR: also accumulate the diagonal of the virial tensor (virial[1..3]); the false instantiation
+// is the code of the scalar-virial kernel.
+template <typename PairT, bool TENSOR>
 __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_forces_tiled_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     long long* __restrict__ fx_fixed, long long* __restrict__ fy_fixed, long long* __restrict__ fz_fixed,
@@ -380,6 +399,7 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_
 
     Real fx_i_acc = 0.0, fy_i_acc = 0.0, fz_i_acc = 0.0;
     Real pe_acc = 0.0, virial_acc = 0.0;
+    Real virial_x_acc = 0.0, virial_y_acc = 0.0, virial_z_acc = 0.0;  // TENSOR only
     // Null on steps whose energy and virial nobody reads: the per-pair energy and
     // virial accumulation is skipped there.
     const bool want_energy = potential_energy != nullptr;
@@ -505,6 +525,11 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_
                     if (want_energy && (j_is_local || gid_i < gid_j)) {
                         pe_acc += static_cast<Real>(pe_pair);
                         virial_acc += static_cast<Real>(dxp * fx_pair + dyp * fy_pair + dzp * fz_pair);
+                        if constexpr (TENSOR) {
+                            virial_x_acc += static_cast<Real>(dxp * fx_pair);
+                            virial_y_acc += static_cast<Real>(dyp * fy_pair);
+                            virial_z_acc += static_cast<Real>(dzp * fz_pair);
+                        }
                     }
                 }
             }
@@ -537,6 +562,11 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_
     for (int offset = LJ_CLUSTER_SIZE / 2; offset > 0; offset /= 2) {
         pe_acc += __shfl_down_sync(FULL_MASK, pe_acc, offset, LJ_CLUSTER_SIZE);
         virial_acc += __shfl_down_sync(FULL_MASK, virial_acc, offset, LJ_CLUSTER_SIZE);
+        if constexpr (TENSOR) {
+            virial_x_acc += __shfl_down_sync(FULL_MASK, virial_x_acc, offset, LJ_CLUSTER_SIZE);
+            virial_y_acc += __shfl_down_sync(FULL_MASK, virial_y_acc, offset, LJ_CLUSTER_SIZE);
+            virial_z_acc += __shfl_down_sync(FULL_MASK, virial_z_acc, offset, LJ_CLUSTER_SIZE);
+        }
     }
     if (valid_pair && sub == 0) {
         if (pe_acc != 0.0) {
@@ -544,6 +574,11 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_lj_
         }
         if (virial_acc != 0.0) {
             atomicAdd(virial, virial_acc);
+        }
+        if constexpr (TENSOR) {
+            if (virial_x_acc != 0.0) atomicAdd(virial + 1, virial_x_acc);
+            if (virial_y_acc != 0.0) atomicAdd(virial + 2, virial_y_acc);
+            if (virial_z_acc != 0.0) atomicAdd(virial + 3, virial_z_acc);
         }
     }
 }
@@ -625,7 +660,8 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     size_t local_particles, size_t total_particles,
     Real cutoff_sq, Real k_coulomb, Real alpha,
-    int num_tiles)
+    int num_tiles,
+    bool tensor)  // also accumulate the diagonal of the virial tensor (virial[1..3])
 {
     const int global_lane = threadIdx.x % 32;
     const int group = global_lane / LJ_CLUSTER_SIZE;
@@ -665,6 +701,7 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
 
     Real fx_i_acc = 0.0, fy_i_acc = 0.0, fz_i_acc = 0.0;
     Real pe_acc = 0.0, virial_acc = 0.0;
+    Real virial_x_acc = 0.0, virial_y_acc = 0.0, virial_z_acc = 0.0;  // tensor only
 
     const int e_begin = valid_pair ? tile_pair_offsets[safe_tile_index] : 0;
     const int e_end   = valid_pair ? tile_pair_offsets[safe_tile_index + 1] : 0;
@@ -731,6 +768,9 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
                     Real fz_pair = static_cast<Real>(force_mag * dzp);
 
                     fx_i_acc += fx_pair; fy_i_acc += fy_pair; fz_i_acc += fz_pair;
+                    const Real virial_x_pair = static_cast<Real>(dxp) * fx_pair;
+                    const Real virial_y_pair = static_cast<Real>(dyp) * fy_pair;
+                    const Real virial_z_pair = static_cast<Real>(dzp) * fz_pair;
                     Real virial_pair = static_cast<Real>(dxp) * fx_pair +
                         static_cast<Real>(dyp) * fy_pair + static_cast<Real>(dzp) * fz_pair;
 
@@ -738,9 +778,15 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
                         my_fxj = -fx_pair; my_fyj = -fy_pair; my_fzj = -fz_pair;
                         pe_acc += static_cast<Real>(u_pair);
                         virial_acc += virial_pair;
+                        if (tensor) {
+                            virial_x_acc += virial_x_pair; virial_y_acc += virial_y_pair; virial_z_acc += virial_z_pair;
+                        }
                     } else if (gid_i < gid_j) {
                         pe_acc += static_cast<Real>(u_pair);
                         virial_acc += virial_pair;
+                        if (tensor) {
+                            virial_x_acc += virial_x_pair; virial_y_acc += virial_y_pair; virial_z_acc += virial_z_pair;
+                        }
                     }
                 }
             }
@@ -768,6 +814,11 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
     for (int offset = LJ_CLUSTER_SIZE / 2; offset > 0; offset /= 2) {
         pe_acc += __shfl_down_sync(FULL_MASK, pe_acc, offset, LJ_CLUSTER_SIZE);
         virial_acc += __shfl_down_sync(FULL_MASK, virial_acc, offset, LJ_CLUSTER_SIZE);
+        if (tensor) {  // kernel argument: uniform over the launch
+            virial_x_acc += __shfl_down_sync(FULL_MASK, virial_x_acc, offset, LJ_CLUSTER_SIZE);
+            virial_y_acc += __shfl_down_sync(FULL_MASK, virial_y_acc, offset, LJ_CLUSTER_SIZE);
+            virial_z_acc += __shfl_down_sync(FULL_MASK, virial_z_acc, offset, LJ_CLUSTER_SIZE);
+        }
     }
     if (valid_pair && sub == 0) {
         if (pe_acc != 0.0) {
@@ -775,6 +826,11 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
         }
         if (virial_acc != 0.0) {
             atomicAdd(virial, virial_acc);
+        }
+        if (tensor) {
+            if (virial_x_acc != 0.0) atomicAdd(virial + 1, virial_x_acc);
+            if (virial_y_acc != 0.0) atomicAdd(virial + 2, virial_y_acc);
+            if (virial_z_acc != 0.0) atomicAdd(virial + 3, virial_z_acc);
         }
     }
 }
@@ -785,7 +841,8 @@ __global__ void compute_electrostatic_forces_tiled_kernel(
 // blocks makes the compiler use 72 registers (seven blocks, 28 warps) with no spills
 // (checked in the cubin resource usage: STACK 0, LOCAL 0). The double instantiation is left
 // unconstrained: the bound would make it spill.
-template <typename PairT>
+// TENSOR: also accumulate the diagonal of the virial tensor (virial[1..3]), as in the LJ kernel.
+template <typename PairT, bool TENSOR>
 __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_nonbonded_forces_tiled_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     long long* __restrict__ fx_fixed, long long* __restrict__ fy_fixed, long long* __restrict__ fz_fixed,
@@ -857,6 +914,7 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_non
 
     Real fx_i_acc = 0.0, fy_i_acc = 0.0, fz_i_acc = 0.0;
     Real pe_acc = 0.0, virial_acc = 0.0;
+    Real virial_x_acc = 0.0, virial_y_acc = 0.0, virial_z_acc = 0.0;  // TENSOR only
     // Null on steps whose energy and virial nobody reads: the per-pair energy and
     // virial accumulation is skipped there.
     const bool want_energy = potential_energy != nullptr;
@@ -999,6 +1057,11 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_non
                     if (want_energy && (j_is_local || gid_i < gid_j)) {
                         pe_acc += static_cast<Real>(pe_pair);
                         virial_acc += static_cast<Real>(dxp * fx_pair + dyp * fy_pair + dzp * fz_pair);
+                        if constexpr (TENSOR) {
+                            virial_x_acc += static_cast<Real>(dxp * fx_pair);
+                            virial_y_acc += static_cast<Real>(dyp * fy_pair);
+                            virial_z_acc += static_cast<Real>(dzp * fz_pair);
+                        }
                     }
                 }
             }
@@ -1031,6 +1094,11 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_non
     for (int offset = LJ_CLUSTER_SIZE / 2; offset > 0; offset /= 2) {
         pe_acc += __shfl_down_sync(FULL_MASK, pe_acc, offset, LJ_CLUSTER_SIZE);
         virial_acc += __shfl_down_sync(FULL_MASK, virial_acc, offset, LJ_CLUSTER_SIZE);
+        if constexpr (TENSOR) {
+            virial_x_acc += __shfl_down_sync(FULL_MASK, virial_x_acc, offset, LJ_CLUSTER_SIZE);
+            virial_y_acc += __shfl_down_sync(FULL_MASK, virial_y_acc, offset, LJ_CLUSTER_SIZE);
+            virial_z_acc += __shfl_down_sync(FULL_MASK, virial_z_acc, offset, LJ_CLUSTER_SIZE);
+        }
     }
     if (valid_pair && sub == 0) {
         if (pe_acc != 0.0) {
@@ -1038,6 +1106,11 @@ __global__ void __launch_bounds__(128, (sizeof(PairT) == 4 ? 6 : 1)) compute_non
         }
         if (virial_acc != 0.0) {
             atomicAdd(virial, virial_acc);
+        }
+        if constexpr (TENSOR) {
+            if (virial_x_acc != 0.0) atomicAdd(virial + 1, virial_x_acc);
+            if (virial_y_acc != 0.0) atomicAdd(virial + 2, virial_y_acc);
+            if (virial_z_acc != 0.0) atomicAdd(virial + 3, virial_z_acc);
         }
     }
 }
@@ -1526,7 +1599,9 @@ __device__ __forceinline__ float nlist_warp_sum(float v) {
 // A pair takes the table path unless r^2 lies below the table (0.5 A^2); excluded pairs use it
 // too, with a short correction branch. The analytic formulas handle the rest, including the
 // pairs of an atom with itself (r^2 = 0). With ewald_intervals = 0 every pair is analytic.
-template <bool WANT_ENERGY, bool COULOMB, bool SMEM_TABLE, bool GHOSTS>
+// TENSOR (needs WANT_ENERGY): also accumulate the diagonal of the virial tensor into virial[1..3]; the
+// false instantiation is the scalar-virial kernel, unchanged.
+template <bool WANT_ENERGY, bool COULOMB, bool SMEM_TABLE, bool GHOSTS, bool TENSOR = false>
 __global__ void __launch_bounds__(128) compute_nonbonded_forces_list_kernel(
     const float4* __restrict__ posq, const int* __restrict__ slot_type,
     const int* __restrict__ tile_atoms, const int* __restrict__ tile_list_degree, int list_stride,
@@ -1600,6 +1675,7 @@ __global__ void __launch_bounds__(128) compute_nonbonded_forces_list_kernel(
 #pragma unroll
     for (int k = 0; k < LJ_CLUSTER_SIZE; ++k) { fax[k] = 0.0f; fay[k] = 0.0f; faz[k] = 0.0f; }
     double pe_acc = 0.0, virial_acc = 0.0;
+    double virial_x_acc = 0.0, virial_y_acc = 0.0, virial_z_acc = 0.0;  // TENSOR only
 
     const long long begin = static_cast<long long>(tile) * list_stride;
     const unsigned* row = list + begin;
@@ -1645,6 +1721,7 @@ __global__ void __launch_bounds__(128) compute_nonbonded_forces_list_kernel(
         const float own_b_value = own_b ? 1.0f : 0.0f;
         float fbx = 0.0f, fby = 0.0f, fbz = 0.0f;
         float pe_entry = 0.0f, virial_entry = 0.0f;
+        float virial_x_entry = 0.0f, virial_y_entry = 0.0f, virial_z_entry = 0.0f;  // TENSOR only
         bool touched = false;
 
 #pragma unroll
@@ -1710,6 +1787,12 @@ __global__ void __launch_bounds__(128) compute_nonbonded_forces_list_kernel(
                     }
                     pe_entry += pair_weight * pe_pair;
                     virial_entry += pair_weight * (force_mag * r2);
+                    if constexpr (TENSOR) {
+                        // W_aa of the pair is force_mag * d_a^2 (g_a = force_mag * d_a), same weight as the trace.
+                        virial_x_entry += pair_weight * (gx * dx);
+                        virial_y_entry += pair_weight * (gy * dy);
+                        virial_z_entry += pair_weight * (gz * dz);
+                    }
                 }
             }
         }
@@ -1724,6 +1807,11 @@ __global__ void __launch_bounds__(128) compute_nonbonded_forces_list_kernel(
             const float weight = same_tile ? 0.5f : 1.0f;
             pe_acc += static_cast<double>(weight * pe_entry);
             virial_acc += static_cast<double>(weight * virial_entry);
+            if constexpr (TENSOR) {
+                virial_x_acc += static_cast<double>(weight * virial_x_entry);
+                virial_y_acc += static_cast<double>(weight * virial_y_entry);
+                virial_z_acc += static_cast<double>(weight * virial_z_entry);
+            }
         }
 
         c_cur = c_nxt; c_nxt = c_n2;
@@ -1753,10 +1841,20 @@ __global__ void __launch_bounds__(128) compute_nonbonded_forces_list_kernel(
         for (int offset = 16; offset > 0; offset >>= 1) {
             pe_acc += __shfl_down_sync(WARP_FULL_MASK, pe_acc, offset);
             virial_acc += __shfl_down_sync(WARP_FULL_MASK, virial_acc, offset);
+            if constexpr (TENSOR) {
+                virial_x_acc += __shfl_down_sync(WARP_FULL_MASK, virial_x_acc, offset);
+                virial_y_acc += __shfl_down_sync(WARP_FULL_MASK, virial_y_acc, offset);
+                virial_z_acc += __shfl_down_sync(WARP_FULL_MASK, virial_z_acc, offset);
+            }
         }
         if (lane == 0) {
             if (pe_acc != 0.0) atomicAdd(potential_energy, pe_acc);
             if (virial_acc != 0.0) atomicAdd(virial, virial_acc);
+            if constexpr (TENSOR) {
+                if (virial_x_acc != 0.0) atomicAdd(virial + 1, virial_x_acc);
+                if (virial_y_acc != 0.0) atomicAdd(virial + 2, virial_y_acc);
+                if (virial_z_acc != 0.0) atomicAdd(virial + 3, virial_z_acc);
+            }
         }
     }
 }
@@ -1916,7 +2014,8 @@ __global__ void compute_nonbonded_forces_graph_kernel(
     int mie_n, int mie_m, Real mie_prefactor,
     Real cutoff_sq, Real switch_distance, Real switch_sq, Real inv_denom,
     Real k_coulomb, Real alpha, bool do_lj, bool do_coulomb,
-    int j_filter)
+    int j_filter,
+    bool tensor)  // also accumulate the diagonal of the virial tensor (virial[1..3])
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_local) return;
@@ -1927,6 +2026,7 @@ __global__ void compute_nonbonded_forces_graph_kernel(
     const int gid_i = global_id[i];
     Real fix = 0.0, fiy = 0.0, fiz = 0.0;
     Real pe_acc = 0.0, virial_acc = 0.0;
+    Real virial_x_acc = 0.0, virial_y_acc = 0.0, virial_z_acc = 0.0;  // tensor only
     const PairT cutoff2 = static_cast<PairT>(cutoff_sq);
     const PairT alpha_p = static_cast<PairT>(alpha);
     const PairT two_alpha_sqrt_pi = PairT(1.1283791670955126) * alpha_p;
@@ -1973,10 +2073,20 @@ __global__ void compute_nonbonded_forces_graph_kernel(
         const Real weight = (j < num_local) ? 0.5 : (gid_i < gid_j ? 1.0 : 0.0);
         pe_acc += weight * static_cast<Real>(pair_energy);
         virial_acc += weight * static_cast<Real>(r2 * force_mag);
+        if (tensor) {
+            virial_x_acc += weight * (fpair * static_cast<Real>(dx));
+            virial_y_acc += weight * (fpair * static_cast<Real>(dy));
+            virial_z_acc += weight * (fpair * static_cast<Real>(dz));
+        }
     }
     fx[i] += fix; fy[i] += fiy; fz[i] += fiz;
     if (pe_acc != 0.0) atomicAdd(potential_energy, pe_acc);
     if (virial_acc != 0.0) atomicAdd(virial, virial_acc);
+    if (tensor) {
+        if (virial_x_acc != 0.0) atomicAdd(virial + 1, virial_x_acc);
+        if (virial_y_acc != 0.0) atomicAdd(virial + 2, virial_y_acc);
+        if (virial_z_acc != 0.0) atomicAdd(virial + 3, virial_z_acc);
+    }
 }
 
 
@@ -2311,16 +2421,20 @@ __global__ void pme_solve_poisson_kernel(
     Real* reciprocal_energy_out, Real prefactor, Real alpha,
     int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    Real energy_scale)
+    Real energy_scale, int y_begin, int y_count)
 {
+    // The array holds the rows ky = y_begin .. y_begin + y_count - 1 of the half-spectrum (all rows by
+    // default); a distributed FFT leaves each rank a slab of them.
+    const int ycount = y_count < 0 ? grid_ny : y_count;
     int kx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ky = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ky_local = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ky = y_begin + ky_local;
     int kz = blockIdx.z * blockDim.z + threadIdx.z;
 
     Real energy_contrib = 0.0;
-    if (kx < grid_nx && ky < grid_ny && kz < grid_nzh) {
-        size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nzh
-                   + static_cast<size_t>(ky) * grid_nzh
+    if (kx < grid_nx && ky_local < ycount && kz < grid_nzh) {
+        size_t idx = static_cast<size_t>(kx) * ycount * grid_nzh
+                   + static_cast<size_t>(ky_local) * grid_nzh
                    + static_cast<size_t>(kz);
 
         if (kx == 0 && ky == 0 && kz == 0) {
@@ -2464,10 +2578,17 @@ __global__ void pme_grid_from_float_kernel(const float* __restrict__ in, Real* _
 
 // Adds the reciprocal energy/virial a PME server computed for the whole box.
 __global__ void pme_add_energy_virial_kernel(Real* potential_energy, Real* virial,
-                                             Real delta_energy, Real delta_virial)
+                                             Real delta_energy, Real delta_virial,
+                                             bool tensor, Real delta_virial_x, Real delta_virial_y,
+                                             Real delta_virial_z)
 {
     atomicAdd(potential_energy, delta_energy);
     if (virial) atomicAdd(virial, delta_virial);
+    if (virial && tensor) {
+        atomicAdd(virial + 1, delta_virial_x);
+        atomicAdd(virial + 2, delta_virial_y);
+        atomicAdd(virial + 3, delta_virial_z);
+    }
 }
 
 template <typename T>
@@ -2477,14 +2598,19 @@ __global__ void pme_reciprocal_virial_kernel(
     Real* virial, Real prefactor, Real alpha,
     int grid_nx, int grid_ny, int grid_nz, int grid_nzh,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    Real energy_scale)
+    Real energy_scale,
+    bool tensor,  // also add the diagonal W_xx, W_yy, W_zz to virial[1..3]
+    int y_begin, int y_count)  // the rows of the half-spectrum the array holds (see pme_solve_poisson_kernel)
 {
+    const int ycount = y_count < 0 ? grid_ny : y_count;
     int kx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ky = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ky_local = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ky = y_begin + ky_local;
     int kz = blockIdx.z * blockDim.z + threadIdx.z;
 
     Real virial_contrib = 0.0;
-    if (kx < grid_nx && ky < grid_ny && kz < grid_nzh && !(kx == 0 && ky == 0 && kz == 0)) {
+    Real virial_x_contrib = 0.0, virial_y_contrib = 0.0, virial_z_contrib = 0.0;
+    if (kx < grid_nx && ky_local < ycount && kz < grid_nzh && !(kx == 0 && ky == 0 && kz == 0)) {
         T kx_wave = (kx <= grid_nx/2) ? static_cast<T>(kx) : static_cast<T>(kx - grid_nx);
         T ky_wave = (ky <= grid_ny/2) ? static_cast<T>(ky) : static_cast<T>(ky - grid_ny);
         T kz_wave = static_cast<T>(kz);  // kz already in [0, nz/2], no wrap needed
@@ -2505,8 +2631,8 @@ __global__ void pme_reciprocal_virial_kernel(
         T gauss_screen = exp(-k_sq / (T(4) * alpha_sq));
         T green = static_cast<T>(prefactor) * gauss_screen / (k_sq * m_sq + T(1e-12));
 
-        size_t idx = static_cast<size_t>(kx) * grid_ny * grid_nzh
-                   + static_cast<size_t>(ky) * grid_nzh
+        size_t idx = static_cast<size_t>(kx) * ycount * grid_nzh
+                   + static_cast<size_t>(ky_local) * grid_nzh
                    + static_cast<size_t>(kz);
 
         T rho_real = fft_grid[idx].x;
@@ -2519,11 +2645,36 @@ __global__ void pme_reciprocal_virial_kernel(
         T virial_factor = T(1) - k_sq / (T(2) * alpha_sq);
         virial_contrib = static_cast<Real>(
             T(0.5) * static_cast<T>(pme_hermitian_weight(kz, grid_nz)) * virial_factor * green * rho_sq);
+
+        if (tensor) {
+            // Diagonal of the same tensor, W_aa = -dE/d(eps_aa) = sum_k E_k (1 - 2 k_a^2 (1/k^2 + 1/(4 alpha^2)))
+            // (box strain along a only: k_a -> k_a (1 - eps), V -> V (1 + eps)); the three factors add up to
+            // virial_factor above.
+            const T e_k = T(0.5) * static_cast<T>(pme_hermitian_weight(kz, grid_nz)) * green * rho_sq;
+            const T inv_k_sq = T(1) / k_sq;
+            const T inv_two_alpha_sq = T(1) / (T(2) * alpha_sq);
+            virial_x_contrib = static_cast<Real>(
+                e_k * (T(1) - kx_wave * kx_wave * (T(2) * inv_k_sq + inv_two_alpha_sq)));
+            virial_y_contrib = static_cast<Real>(
+                e_k * (T(1) - ky_wave * ky_wave * (T(2) * inv_k_sq + inv_two_alpha_sq)));
+            virial_z_contrib = static_cast<Real>(
+                e_k * (T(1) - kz_wave * kz_wave * (T(2) * inv_k_sq + inv_two_alpha_sq)));
+        }
     }
 
     const Real block_total = pme_block_sum(virial_contrib);
     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && block_total != 0.0) {
         atomicAdd(virial, block_total * energy_scale);
+    }
+    if (tensor) {  // kernel argument: uniform over the launch, every thread takes part in the block sums
+        const Real block_x = pme_block_sum(virial_x_contrib);
+        const Real block_y = pme_block_sum(virial_y_contrib);
+        const Real block_z = pme_block_sum(virial_z_contrib);
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            if (block_x != 0.0) atomicAdd(virial + 1, block_x * energy_scale);
+            if (block_y != 0.0) atomicAdd(virial + 2, block_y * energy_scale);
+            if (block_z != 0.0) atomicAdd(virial + 3, block_z * energy_scale);
+        }
     }
 }
 
@@ -2540,6 +2691,15 @@ __device__ __forceinline__ void block_atomic_add(Real* out, Real v) {
     }
 }
 
+// The three components of a block's virial tensor diagonal into out3[0..2] (null: tensor off, nothing
+// is summed). Same calling rules as block_atomic_add.
+__device__ __forceinline__ void block_atomic_add3(Real* out3, Real vx, Real vy, Real vz) {
+    if (!out3) return;  // kernel argument: uniform over the launch
+    block_atomic_add(out3, vx);
+    block_atomic_add(out3 + 1, vy);
+    block_atomic_add(out3 + 2, vz);
+}
+
 __global__ void compute_bond_forces_kernel(
     Real* x, Real* y, Real* z,
     Real* fx, Real* fy, Real* fz,
@@ -2551,10 +2711,12 @@ __global__ void compute_bond_forces_kernel(
     Real* virial,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    size_t local_particles) {
+    size_t local_particles,
+    Real* virial_diag) {  // W_xx, W_yy, W_zz accumulators (3 Reals), null: tensor off
 
     size_t bond_idx = blockIdx.x * blockDim.x + threadIdx.x;
     Real pe_block = 0.0, virial_block = 0.0;
+    Real vx_block = 0.0, vy_block = 0.0, vz_block = 0.0;
     do {
     if (bond_idx >= num_bonds) break;
 
@@ -2611,9 +2773,15 @@ __global__ void compute_bond_forces_kernel(
     // r.F of the bond (Urey-Bradley terms are bonds too). The trace of the virial of an angle,
     // dihedral or improper term is zero under isotropic scaling, so only bonds contribute.
     virial_block = owns_energy ? force_mag * r * r : 0.0;
+    if (virial_diag && owns_energy) {  // W_aa = force_mag * d_a^2, same ownership as the trace
+        vx_block = force_mag * dx * dx;
+        vy_block = force_mag * dy * dy;
+        vz_block = force_mag * dz * dz;
+    }
     } while (false);
     block_atomic_add(potential_energy, pe_block);
     block_atomic_add(virial, virial_block);
+    block_atomic_add3(virial_diag, vx_block, vy_block, vz_block);
 }
 
 __global__ void compute_angle_forces_kernel(
@@ -2626,10 +2794,12 @@ __global__ void compute_angle_forces_kernel(
     Real* potential_energy,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    size_t local_particles) {
+    size_t local_particles,
+    Real* virial_diag) {  // W_xx, W_yy, W_zz accumulators (3 Reals), null: tensor off
 
     size_t angle_idx = blockIdx.x * blockDim.x + threadIdx.x;
     Real pe_block = 0.0;
+    Real vx_block = 0.0, vy_block = 0.0, vz_block = 0.0;
     do {
     if (angle_idx >= num_angles) break;
 
@@ -2707,8 +2877,16 @@ __global__ void compute_angle_forces_kernel(
     if (k_is_local) { atomicAdd(&fx[k], fx_k); atomicAdd(&fy[k], fy_k); atomicAdd(&fz[k], fz_k); }
 
     pe_block = owns_energy ? pe : 0.0;
+    // The trace of an angle's virial is zero, its diagonal is not: W_aa = sum_n (r_n - r_j)_a F_n,a over the
+    // outer atoms (the centre's own term vanishes), counted once like the energy.
+    if (virial_diag && owns_energy) {
+        vx_block = dx_ij * fx_i + dx_kj * fx_k;
+        vy_block = dy_ij * fy_i + dy_kj * fy_k;
+        vz_block = dz_ij * fz_i + dz_kj * fz_k;
+    }
     } while (false);
     block_atomic_add(potential_energy, pe_block);
+    block_atomic_add3(virial_diag, vx_block, vy_block, vz_block);
 }
 
 __device__ __forceinline__ Real dihedral_torsion_body(
@@ -2718,7 +2896,8 @@ __device__ __forceinline__ Real dihedral_torsion_body(
     int* global_id, size_t local_particles,
     Real k_dih, Real phi0, int n_mult,
     Real box_x, Real box_y, Real box_z,
-    Real inv_box_x, Real inv_box_y, Real inv_box_z) {
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    bool want_virial, Real& wx, Real& wy, Real& wz) {  // want_virial: also return the term's W_xx, W_yy, W_zz
 
     const bool i_is_local = (i < local_particles);
     const bool j_is_local = (j < local_particles);
@@ -2814,6 +2993,14 @@ __device__ __forceinline__ Real dihedral_torsion_body(
     if (k_is_local) { atomicAdd(&fx[k], fx_k); atomicAdd(&fy[k], fy_k); atomicAdd(&fz[k], fz_k); }
     if (l_is_local) { atomicAdd(&fx[l], fx_l); atomicAdd(&fy[l], fy_l); atomicAdd(&fz[l], fz_l); }
 
+    // The trace of a dihedral's virial is zero, its diagonal is not: W_aa = sum_n (r_n - r_j)_a F_n,a over the
+    // other three atoms, with r_k - r_j = -d_jk and r_l - r_j = -(d_kl + d_jk); counted once like the energy.
+    if (want_virial && owns_energy) {
+        wx = dx_ij * fx_i - dx_jk * fx_k - (dx_kl + dx_jk) * fx_l;
+        wy = dy_ij * fy_i - dy_jk * fy_k - (dy_kl + dy_jk) * fy_l;
+        wz = dz_ij * fz_i - dz_jk * fz_k - (dz_kl + dz_jk) * fz_l;
+    }
+
     return owns_energy ? pe : 0.0;
 }
 
@@ -2828,18 +3015,22 @@ __global__ void compute_dihedral_forces_kernel(
     Real* potential_energy,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    size_t local_particles) {
+    size_t local_particles,
+    Real* virial_diag) {  // W_xx, W_yy, W_zz accumulators (3 Reals), null: tensor off
 
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     Real pe = 0.0;
+    Real wx = 0.0, wy = 0.0, wz = 0.0;
     if (idx < num_dihedrals) {
     pe = dihedral_torsion_body(
         dihedral_atom1[idx], dihedral_atom2[idx], dihedral_atom3[idx], dihedral_atom4[idx],
         x, y, z, fx, fy, fz, global_id, local_particles,
         dihedral_k[idx], dihedral_phi0[idx], dihedral_n[idx],
-        box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+        box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z,
+        virial_diag != nullptr, wx, wy, wz);
     }
     block_atomic_add(potential_energy, pe);
+    block_atomic_add3(virial_diag, wx, wy, wz);
 }
 
 __global__ void compute_improper_forces_kernel(
@@ -2853,18 +3044,22 @@ __global__ void compute_improper_forces_kernel(
     Real* potential_energy,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    size_t local_particles) {
+    size_t local_particles,
+    Real* virial_diag) {  // W_xx, W_yy, W_zz accumulators (3 Reals), null: tensor off
 
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     Real pe = 0.0;
+    Real wx = 0.0, wy = 0.0, wz = 0.0;
     if (idx < num_impropers) {
     pe = dihedral_torsion_body(
         improper_atom1[idx], improper_atom2[idx], improper_atom3[idx], improper_atom4[idx],
         x, y, z, fx, fy, fz, global_id, local_particles,
         improper_k[idx], improper_phi0[idx], improper_n[idx],
-        box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+        box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z,
+        virial_diag != nullptr, wx, wy, wz);
     }
     block_atomic_add(potential_energy, pe);
+    block_atomic_add3(virial_diag, wx, wy, wz);
 }
 
 __global__ void compute_special_pair_forces_kernel(
@@ -2882,10 +3077,12 @@ __global__ void compute_special_pair_forces_kernel(
     Real* virial,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
-    size_t local_particles) {
+    size_t local_particles,
+    Real* virial_diag) {  // W_xx, W_yy, W_zz accumulators (3 Reals), null: tensor off
 
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     Real pe_block = 0.0, virial_block = 0.0;
+    Real vx_block = 0.0, vy_block = 0.0, vz_block = 0.0;
     do {
     if (idx >= num_pairs) break;
 
@@ -2962,11 +3159,18 @@ __global__ void compute_special_pair_forces_kernel(
     Real fyp = force_mag * dy;
     Real fzp = force_mag * dz;
 
+    if (virial_diag && owns_energy) {  // W_aa = force_mag * d_a^2, same ownership as the trace
+        vx_block = dx * fxp;
+        vy_block = dy * fyp;
+        vz_block = dz * fzp;
+    }
+
     if (i_is_local) { atomicAdd(&fx[i], fxp); atomicAdd(&fy[i], fyp); atomicAdd(&fz[i], fzp); }
     if (j_is_local) { atomicAdd(&fx[j], -fxp); atomicAdd(&fy[j], -fyp); atomicAdd(&fz[j], -fzp); }
     } while (false);
     block_atomic_add(potential_energy, pe_block);
     block_atomic_add(virial, virial_block);
+    block_atomic_add3(virial_diag, vx_block, vy_block, vz_block);
 }
 
 __global__ void calculate_kinetic_energy_kernel(
@@ -2999,6 +3203,24 @@ __global__ void calculate_kinetic_energy_kernel(
     if (tid == 0) {
         atomicAdd(kinetic_energy, sdata[0]);
     }
+}
+
+// The diagonal of the kinetic energy tensor, KE_a = sum 0.5 m v_a^2, added to ke_diag[0..2] (the sum of
+// the three is what calculate_kinetic_energy_kernel gives). Launched next to it only while the virial
+// tensor is enabled; blockDim.x must be a multiple of 32 (pme_block_sum).
+__global__ void calculate_kinetic_energy_diag_kernel(
+    const Real* __restrict__ vx, const Real* __restrict__ vy, const Real* __restrict__ vz,
+    const Real* __restrict__ mass, Real* ke_diag, size_t n) {
+
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    Real kx = 0.0, ky = 0.0, kz = 0.0;
+    if (i < n) {
+        const Real half_m = 0.5 * mass[i];
+        kx = half_m * vx[i] * vx[i];
+        ky = half_m * vy[i] * vy[i];
+        kz = half_m * vz[i] * vz[i];
+    }
+    block_atomic_add3(ke_diag, kx, ky, kz);
 }
 
 
@@ -3066,8 +3288,10 @@ void ForceCalculatorCUDA::initialize() {
     device_supports_clusters_ = (prop.major >= 9);
 
     CUDA_CHECK(cudaMalloc(&d_potential_energy, sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&d_kinetic_energy, sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&d_virial, sizeof(Real)));  // NEW: virial for pressure calculation
+    // [0] the kinetic energy, [1..3] its diagonal KE_x, KE_y, KE_z (only while the virial tensor is enabled)
+    CUDA_CHECK(cudaMalloc(&d_kinetic_energy, 4 * sizeof(Real)));
+    // [0] the virial trace, [1..3] its diagonal W_xx, W_yy, W_zz (only while the virial tensor is enabled)
+    CUDA_CHECK(cudaMalloc(&d_virial, VIRIAL_SLOTS * sizeof(Real)));  // virial for pressure calculation
 
     CUDA_CHECK(cudaStreamCreate(&force_stream));
     {
@@ -3138,6 +3362,9 @@ void ForceCalculatorCUDA::finalize() {
     if (d_constraint_pre_y_) cudaFree(d_constraint_pre_y_);
     if (d_constraint_pre_z_) cudaFree(d_constraint_pre_z_);
     if (d_constraint_max_error_) cudaFree(d_constraint_max_error_);
+    if (d_constraint_g_total_) cudaFree(d_constraint_g_total_);
+    if (d_constraint_scalars_) cudaFree(d_constraint_scalars_);
+    if (h_constraint_scalars_) cudaFreeHost(h_constraint_scalars_);
     if (d_potential_energy) cudaFree(d_potential_energy);
     if (d_kinetic_energy) cudaFree(d_kinetic_energy);
     if (d_virial) cudaFree(d_virial);  // NEW: free virial memory
@@ -3248,6 +3475,11 @@ struct GlobalDihedralTerm { int a1, a2, a3, a4, n, ok; Real k, phi0; };
 struct GlobalSpecialTerm { int a1, a2; Real lj_scale, coulomb_scale, sigma, epsilon; };
 struct GlobalConstraintTerm { int a1, a2; Real distance; };
 
+// d_bonded_counts_: one counter per term type (bond, angle, dihedral, improper, special pair, constraint of a small
+// cluster), the unknown-type count, the constraints outside the halo, the small constraint clusters, the
+// constraints of big clusters and the big clusters.
+constexpr int kBondedCountSlots = 11;
+
 struct BondedSlotMap {
     const int* slot_of;
     int num_ids;
@@ -3349,19 +3581,56 @@ __global__ void bonded_select_special_pairs_kernel(
     sigma[idx] = term.sigma; epsilon[idx] = term.epsilon;
 }
 
-__global__ void bonded_select_constraints_kernel(
-    const GlobalConstraintTerm* __restrict__ terms, int n, BondedSlotMap map,
-    int* count, size_t* atom1, size_t* atom2, Real* distance) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n) return;
-    const GlobalConstraintTerm term = terms[t];
-    const int s1 = bonded_slot_of(map, term.a1), s2 = bonded_slot_of(map, term.a2);
-    const bool owner_owned = (term.a1 < term.a2) ? bonded_owned(s1, map.local) : bonded_owned(s2, map.local);
-    if (!owner_owned) return;  // constraints have no redundant form
-    if (s1 < 0 || s2 < 0) return;
-    const int idx = atomicAdd(count, 1);
-    atom1[idx] = static_cast<size_t>(s1); atom2[idx] = static_cast<size_t>(s2);
-    distance[idx] = term.distance;
+// Marks every constraint cluster that has an atom among this rank's owned slots (see MDSystem: a rank solves
+// whole clusters, the atoms of a cluster it does not own are its ghosts).
+__global__ void constraint_mark_active_clusters_kernel(
+    const int* __restrict__ global_id, int local, const int* __restrict__ cluster_of_atom, int num_ids,
+    int* cluster_active) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= local) return;
+    const int gid = global_id[s];
+    if (gid < 0 || gid >= num_ids) return;
+    const int cluster = cluster_of_atom[gid];
+    if (cluster >= 0) cluster_active[cluster] = 1;   // every writer stores the same value
+}
+
+// Every constraint of an active cluster, whatever rank owns its atoms, one thread per cluster. The constraints of a
+// cluster of at most kMaxClusterConstraints go to the front lists, contiguous, with the cluster's entry in
+// cluster_first/cluster_size (the cluster kernels solve one cluster per thread); the constraints of a bigger cluster
+// go to the big lists (the Jacobi kernels). outside counts constraints with an atom that is neither owned nor a ghost
+// here (a cluster larger than the halo); such a cluster is skipped.
+__global__ void bonded_select_constraint_clusters_kernel(
+    const GlobalConstraintTerm* __restrict__ terms, int num_clusters, BondedSlotMap map,
+    const int* __restrict__ cluster_offset, const int* __restrict__ cluster_terms,
+    const int* __restrict__ cluster_active,
+    int* small_count, int* cluster_count, int* big_count, int* big_cluster_count, int* outside,
+    size_t* atom1, size_t* atom2, Real* distance, int* cluster_first, int* cluster_size,
+    size_t* big_atom1, size_t* big_atom2, Real* big_distance, int* big_cluster_first, int* big_cluster_size) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= num_clusters || !cluster_active[c]) return;
+    const int begin = cluster_offset[c], n = cluster_offset[c + 1] - begin;
+    int missing = 0;
+    for (int j = 0; j < n; ++j) {
+        const GlobalConstraintTerm term = terms[cluster_terms[begin + j]];
+        if (bonded_slot_of(map, term.a1) < 0 || bonded_slot_of(map, term.a2) < 0) ++missing;
+    }
+    if (missing) { atomicAdd(outside, missing); return; }
+    const bool small = n <= kMaxClusterConstraints;
+    const int base = atomicAdd(small ? small_count : big_count, n);
+    {
+        const int k = atomicAdd(small ? cluster_count : big_cluster_count, 1);
+        (small ? cluster_first : big_cluster_first)[k] = base;
+        (small ? cluster_size : big_cluster_size)[k] = n;
+    }
+    size_t* out1 = small ? atom1 : big_atom1;
+    size_t* out2 = small ? atom2 : big_atom2;
+    Real* outd = small ? distance : big_distance;
+    for (int j = 0; j < n; ++j) {
+        const GlobalConstraintTerm term = terms[cluster_terms[begin + j]];
+        out1[base + j] = static_cast<size_t>(bonded_slot_of(map, term.a1));
+        out2[base + j] = static_cast<size_t>(bonded_slot_of(map, term.a2));
+        outd[base + j] = term.distance;
+    }
 }
 
 void ForceCalculatorCUDA::upload_bonded_topology_to_device(MDSystem& system) {
@@ -3461,14 +3730,80 @@ void ForceCalculatorCUDA::upload_bonded_topology_to_device(MDSystem& system) {
     for (const auto& c : system.get_local_constraints()) {
         h_c1.push_back(c.atom1); h_c2.push_back(c.atom2); h_cd.push_back(c.distance);
     }
-    num_constraints_cached = h_c1.size();
-    if (num_constraints_cached) {
-        ensure_bonded_array(d_constraint_atom1, num_constraints_cached); ensure_bonded_array(d_constraint_atom2, num_constraints_cached);
-        ensure_bonded_array(d_constraint_distance, num_constraints_cached);
-        copy_bonded_array(d_constraint_atom1, h_c1); copy_bonded_array(d_constraint_atom2, h_c2);
-        copy_bonded_array(d_constraint_distance, h_cd);
-    }
+    upload_constraint_clusters(h_c1, h_c2, h_cd);
     bonded_topology_on_device = true;
+}
+
+// The constraints of the host list grouped by cluster for the cluster kernels (the device builder of a rebuild groups
+// them itself, see bonded_select_constraint_clusters_kernel). A cluster is a connected group of constrained atoms.
+void ForceCalculatorCUDA::upload_constraint_clusters(const std::vector<size_t>& c1, const std::vector<size_t>& c2,
+                                                     const std::vector<Real>& cd) {
+    const size_t n = c1.size();
+    num_constraints_cached = n;
+    num_constraint_clusters_ = 0;
+    num_big_constraints_ = 0;
+    if (n == 0) return;
+
+    size_t slots = 0;
+    for (size_t t = 0; t < n; ++t) slots = std::max({slots, c1[t] + 1, c2[t] + 1});
+    std::vector<size_t> parent(slots);
+    for (size_t a = 0; a < slots; ++a) parent[a] = a;
+    auto find = [&](size_t a) {
+        while (parent[a] != a) {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        return a;
+    };
+    for (size_t t = 0; t < n; ++t) {
+        const size_t ra = find(c1[t]), rb = find(c2[t]);
+        if (ra != rb) parent[std::max(ra, rb)] = std::min(ra, rb);
+    }
+    // The constraints of every cluster, clusters in the order of their first constraint.
+    std::vector<int> cluster_of_root(slots, -1);
+    std::vector<std::vector<int>> members;
+    for (size_t t = 0; t < n; ++t) {
+        int& id = cluster_of_root[find(c1[t])];
+        if (id < 0) {
+            id = static_cast<int>(members.size());
+            members.emplace_back();
+        }
+        members[id].push_back(static_cast<int>(t));
+    }
+
+    std::vector<size_t> s1, s2, b1, b2;
+    std::vector<Real> sd, bd;
+    std::vector<int> first, size, big_first, big_size;
+    for (const auto& group : members) {
+        const bool small = group.size() <= static_cast<size_t>(kMaxClusterConstraints);
+        (small ? first : big_first).push_back(static_cast<int>((small ? s1 : b1).size()));
+        (small ? size : big_size).push_back(static_cast<int>(group.size()));
+        for (const int t : group) {
+            (small ? s1 : b1).push_back(c1[t]);
+            (small ? s2 : b2).push_back(c2[t]);
+            (small ? sd : bd).push_back(cd[t]);
+        }
+    }
+    num_constraint_clusters_ = first.size();
+    num_big_constraints_ = b1.size();
+    num_big_clusters_ = big_first.size();
+    ensure_bonded_array(d_constraint_atom1, s1.size()); ensure_bonded_array(d_constraint_atom2, s1.size());
+    ensure_bonded_array(d_constraint_distance, s1.size());
+    ensure_bonded_array(d_constraint_cluster_first_, first.size());
+    ensure_bonded_array(d_constraint_cluster_size_, first.size());
+    copy_bonded_array(d_constraint_atom1, s1); copy_bonded_array(d_constraint_atom2, s2);
+    copy_bonded_array(d_constraint_distance, sd);
+    copy_bonded_array(d_constraint_cluster_first_, first); copy_bonded_array(d_constraint_cluster_size_, size);
+    if (!b1.empty()) {
+        ensure_bonded_array(d_constraint_big_atom1, b1.size()); ensure_bonded_array(d_constraint_big_atom2, b1.size());
+        ensure_bonded_array(d_constraint_big_distance, b1.size());
+        copy_bonded_array(d_constraint_big_atom1, b1); copy_bonded_array(d_constraint_big_atom2, b2);
+        copy_bonded_array(d_constraint_big_distance, bd);
+        ensure_bonded_array(d_constraint_big_cluster_first_, big_first.size());
+        ensure_bonded_array(d_constraint_big_cluster_size_, big_first.size());
+        copy_bonded_array(d_constraint_big_cluster_first_, big_first);
+        copy_bonded_array(d_constraint_big_cluster_size_, big_size);
+    }
 }
 
 // Uploads the global topology (atoms of every term and its force-field parameters, looked up once
@@ -3542,9 +3877,48 @@ void ForceCalculatorCUDA::ensure_global_bonded_topology(MDSystem& system) {
     upload(gc, d_global_constraints_, num_global_constraints_);
 
     bonded_num_ids_ = max_gid + 1;
+    if (!constraints.empty()) {
+        // Constraint clusters (computed once by the MDSystem): cluster of every atom and of every constraint, and
+        // a flag per cluster that build_bonded_topology_on_device sets for the clusters this rank owns an atom of.
+        system.ensure_constraint_clusters();
+        constraint_cluster_count_ = system.constraint_cluster_count_;
+        std::vector<int> cluster_of_atom(static_cast<size_t>(bonded_num_ids_), -1);
+        std::copy(system.constraint_cluster_of_atom_.begin(), system.constraint_cluster_of_atom_.end(),
+                  cluster_of_atom.begin());
+        CUDA_CHECK(cudaMalloc(&d_constraint_cluster_of_atom_, cluster_of_atom.size() * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_constraint_cluster_of_atom_, cluster_of_atom.data(),
+                              cluster_of_atom.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_constraint_cluster_of_term_, system.constraint_cluster_of_term_.size() * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_constraint_cluster_of_term_, system.constraint_cluster_of_term_.data(),
+                              system.constraint_cluster_of_term_.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_constraint_cluster_active_, constraint_cluster_count_ * sizeof(int)));
+
+        // The constraints sorted by cluster (CSR), so that one thread can pick up a whole cluster.
+        std::vector<int> offset(constraint_cluster_count_ + 1, 0);
+        for (const int cluster : system.constraint_cluster_of_term_) ++offset[cluster + 1];
+        for (size_t c = 0; c < constraint_cluster_count_; ++c) offset[c + 1] += offset[c];
+        std::vector<int> terms(constraints.size()), cursor(offset.begin(), offset.end() - 1);
+        num_global_big_constraints_ = num_global_big_clusters_ = 0;
+        for (size_t t = 0; t < constraints.size(); ++t) {
+            terms[cursor[system.constraint_cluster_of_term_[t]]++] = static_cast<int>(t);
+        }
+        for (size_t c = 0; c < constraint_cluster_count_; ++c) {
+            const int n = offset[c + 1] - offset[c];
+            if (n > kMaxClusterConstraints) {
+                num_global_big_constraints_ += static_cast<size_t>(n);
+                ++num_global_big_clusters_;
+            }
+        }
+        CUDA_CHECK(cudaMalloc(&d_constraint_cluster_offset_, offset.size() * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_constraint_cluster_offset_, offset.data(), offset.size() * sizeof(int),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_constraint_cluster_terms_, terms.size() * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_constraint_cluster_terms_, terms.data(), terms.size() * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    }
     CUDA_CHECK(cudaMalloc(&d_bonded_slot_of_, static_cast<size_t>(bonded_num_ids_) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_bonded_counts_, 8 * sizeof(int)));
-    CUDA_CHECK(cudaMallocHost(&h_bonded_counts_, 8 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_bonded_counts_, kBondedCountSlots * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&h_bonded_counts_, kBondedCountSlots * sizeof(int)));
     bonded_global_ready_ = true;
 }
 
@@ -3579,6 +3953,15 @@ void ForceCalculatorCUDA::build_bonded_topology_on_device(MDSystem& system) {
     ensure_bonded_array(d_special_pair_epsilon, num_global_specials_);
     ensure_bonded_array(d_constraint_atom1, num_global_constraints_); ensure_bonded_array(d_constraint_atom2, num_global_constraints_);
     ensure_bonded_array(d_constraint_distance, num_global_constraints_);
+    ensure_bonded_array(d_constraint_cluster_first_, constraint_cluster_count_);
+    ensure_bonded_array(d_constraint_cluster_size_, constraint_cluster_count_);
+    if (num_global_big_constraints_) {
+        ensure_bonded_array(d_constraint_big_atom1, num_global_big_constraints_);
+        ensure_bonded_array(d_constraint_big_atom2, num_global_big_constraints_);
+        ensure_bonded_array(d_constraint_big_distance, num_global_big_constraints_);
+        ensure_bonded_array(d_constraint_big_cluster_first_, num_global_big_clusters_);
+        ensure_bonded_array(d_constraint_big_cluster_size_, num_global_big_clusters_);
+    }
 
     // Lowest slot of every global id (owned slots come first, so they win over ghost images).
     CUDA_CHECK(cudaMemsetAsync(d_bonded_slot_of_, 0x7f, static_cast<size_t>(bonded_num_ids_) * sizeof(int), force_stream));
@@ -3587,7 +3970,7 @@ void ForceCalculatorCUDA::build_bonded_topology_on_device(MDSystem& system) {
             d_global_id, map.total, d_bonded_slot_of_, bonded_num_ids_);
         CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaMemsetAsync(d_bonded_counts_, 0, 8 * sizeof(int), force_stream));
+    CUDA_CHECK(cudaMemsetAsync(d_bonded_counts_, 0, kBondedCountSlots * sizeof(int), force_stream));
 
     auto blocks_for = [](size_t n) { return static_cast<int>((n + 255) / 256); };
     if (num_global_bonds_) {
@@ -3620,14 +4003,26 @@ void ForceCalculatorCUDA::build_bonded_topology_on_device(MDSystem& system) {
             d_special_pair_lj_scale, d_special_pair_coulomb_scale, d_special_pair_sigma, d_special_pair_epsilon);
     }
     if (num_global_constraints_) {
-        bonded_select_constraints_kernel<<<blocks_for(num_global_constraints_), 256, 0, force_stream>>>(
-            static_cast<const GlobalConstraintTerm*>(d_global_constraints_), static_cast<int>(num_global_constraints_),
-            map, d_bonded_counts_ + 5, d_constraint_atom1, d_constraint_atom2, d_constraint_distance);
+        CUDA_CHECK(cudaMemsetAsync(d_constraint_cluster_active_, 0, constraint_cluster_count_ * sizeof(int),
+                                   force_stream));
+        if (map.local > 0) {
+            constraint_mark_active_clusters_kernel<<<blocks_for(static_cast<size_t>(map.local)), 256, 0, force_stream>>>(
+                d_global_id, map.local, d_constraint_cluster_of_atom_, bonded_num_ids_, d_constraint_cluster_active_);
+        }
+        bonded_select_constraint_clusters_kernel<<<blocks_for(constraint_cluster_count_), 256, 0, force_stream>>>(
+            static_cast<const GlobalConstraintTerm*>(d_global_constraints_), static_cast<int>(constraint_cluster_count_),
+            map, d_constraint_cluster_offset_, d_constraint_cluster_terms_, d_constraint_cluster_active_,
+            d_bonded_counts_ + 5, d_bonded_counts_ + 8, d_bonded_counts_ + 9, d_bonded_counts_ + 10,
+            d_bonded_counts_ + 7,
+            d_constraint_atom1, d_constraint_atom2, d_constraint_distance,
+            d_constraint_cluster_first_, d_constraint_cluster_size_,
+            d_constraint_big_atom1, d_constraint_big_atom2, d_constraint_big_distance,
+            d_constraint_big_cluster_first_, d_constraint_big_cluster_size_);
     }
     CUDA_CHECK(cudaGetLastError());
 
     // The counts size the launches of the bonded kernels: one small readback per rebuild.
-    CUDA_CHECK(cudaMemcpyAsync(h_bonded_counts_, d_bonded_counts_, 8 * sizeof(int),
+    CUDA_CHECK(cudaMemcpyAsync(h_bonded_counts_, d_bonded_counts_, kBondedCountSlots * sizeof(int),
                                cudaMemcpyDeviceToHost, force_stream));
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     num_bonds_cached = static_cast<size_t>(h_bonded_counts_[0]);
@@ -3635,12 +4030,22 @@ void ForceCalculatorCUDA::build_bonded_topology_on_device(MDSystem& system) {
     num_dihedrals_cached = static_cast<size_t>(h_bonded_counts_[2]);
     num_impropers_cached = static_cast<size_t>(h_bonded_counts_[3]);
     num_special_pairs_cached = static_cast<size_t>(h_bonded_counts_[4]);
-    num_constraints_cached = static_cast<size_t>(h_bonded_counts_[5]);
+    num_constraint_clusters_ = static_cast<size_t>(h_bonded_counts_[8]);
+    num_big_constraints_ = static_cast<size_t>(h_bonded_counts_[9]);
+    num_big_clusters_ = static_cast<size_t>(h_bonded_counts_[10]);
+    num_constraints_cached = static_cast<size_t>(h_bonded_counts_[5]) + num_big_constraints_;
     bonded_topology_on_device = true;
     if (h_bonded_counts_[6] > 0) {
         // The host builder throws the lookup error of the first such term; here only the count is known.
         throw std::runtime_error("bonded topology: " + std::to_string(h_bonded_counts_[6]) +
                                  " local term(s) have a type without force-field parameters");
+    }
+    if (h_bonded_counts_[7] > 0 && !(system.get_size() > 1 && system.get_ghost_count() == 0)) {
+        // (without ghosts, before the first halo exchange, a straddling cluster is incomplete by construction)
+        throw std::runtime_error(
+            "[Constraints] " + std::to_string(h_bonded_counts_[7]) + " constraint(s) belong to a cluster that has an "
+            "atom on this rank but have an atom that is neither owned nor in the halo: the halo (cutoff + skin + "
+            "margin) must reach the whole constrained cluster");
     }
 }
 
@@ -3689,6 +4094,23 @@ void ForceCalculatorCUDA::free_bonded_topology_device() {
     if (d_constraint_atom1) { cudaFree(d_constraint_atom1); d_constraint_atom1 = nullptr; }
     if (d_constraint_atom2) { cudaFree(d_constraint_atom2); d_constraint_atom2 = nullptr; }
     if (d_constraint_distance) { cudaFree(d_constraint_distance); d_constraint_distance = nullptr; }
+    if (d_constraint_cluster_first_) { cudaFree(d_constraint_cluster_first_); d_constraint_cluster_first_ = nullptr; }
+    if (d_constraint_cluster_size_) { cudaFree(d_constraint_cluster_size_); d_constraint_cluster_size_ = nullptr; }
+    if (d_constraint_big_atom1) { cudaFree(d_constraint_big_atom1); d_constraint_big_atom1 = nullptr; }
+    if (d_constraint_big_atom2) { cudaFree(d_constraint_big_atom2); d_constraint_big_atom2 = nullptr; }
+    if (d_constraint_big_distance) { cudaFree(d_constraint_big_distance); d_constraint_big_distance = nullptr; }
+    if (d_constraint_cluster_offset_) { cudaFree(d_constraint_cluster_offset_); d_constraint_cluster_offset_ = nullptr; }
+    if (d_constraint_cluster_terms_) { cudaFree(d_constraint_cluster_terms_); d_constraint_cluster_terms_ = nullptr; }
+    if (d_constraint_big_cluster_first_) { cudaFree(d_constraint_big_cluster_first_); d_constraint_big_cluster_first_ = nullptr; }
+    if (d_constraint_big_cluster_size_) { cudaFree(d_constraint_big_cluster_size_); d_constraint_big_cluster_size_ = nullptr; }
+    for (int** scratch : {&d_rigid_head_, &d_rigid_mark_, &d_rigid_next_, &d_rigid_queue_}) {
+        if (*scratch) { cudaFree(*scratch); *scratch = nullptr; }
+    }
+    for (Real** scratch : {&d_rigid_ux_, &d_rigid_uy_, &d_rigid_uz_}) {
+        if (*scratch) { cudaFree(*scratch); *scratch = nullptr; }
+    }
+    num_constraint_clusters_ = num_big_constraints_ = num_global_big_constraints_ = 0;
+    num_big_clusters_ = num_global_big_clusters_ = 0;
 
     if (d_global_bonds_) { cudaFree(d_global_bonds_); d_global_bonds_ = nullptr; }
     if (d_global_angles_) { cudaFree(d_global_angles_); d_global_angles_ = nullptr; }
@@ -3696,6 +4118,10 @@ void ForceCalculatorCUDA::free_bonded_topology_device() {
     if (d_global_impropers_) { cudaFree(d_global_impropers_); d_global_impropers_ = nullptr; }
     if (d_global_specials_) { cudaFree(d_global_specials_); d_global_specials_ = nullptr; }
     if (d_global_constraints_) { cudaFree(d_global_constraints_); d_global_constraints_ = nullptr; }
+    if (d_constraint_cluster_of_atom_) { cudaFree(d_constraint_cluster_of_atom_); d_constraint_cluster_of_atom_ = nullptr; }
+    if (d_constraint_cluster_of_term_) { cudaFree(d_constraint_cluster_of_term_); d_constraint_cluster_of_term_ = nullptr; }
+    if (d_constraint_cluster_active_) { cudaFree(d_constraint_cluster_active_); d_constraint_cluster_active_ = nullptr; }
+    constraint_cluster_count_ = 0;
     if (d_bonded_slot_of_) { cudaFree(d_bonded_slot_of_); d_bonded_slot_of_ = nullptr; }
     if (d_bonded_counts_) { cudaFree(d_bonded_counts_); d_bonded_counts_ = nullptr; }
     if (h_bonded_counts_) { cudaFreeHost(h_bonded_counts_); h_bonded_counts_ = nullptr; }
@@ -4204,7 +4630,7 @@ void ForceCalculatorCUDA::build_neighbor_list_on_device(MDSystem& system) {
     const Real physical_cutoff = system.get_physical_cutoff();
     const Real verlet_skin = std::max<Real>(0.0, search_radius - physical_cutoff);
 
-    // Only the machine-learned potential computes forces (force_calculation.mode: python): there is no builtin pair
+    // Only the machine-learned potential computes forces (force_calculation.mode: mlip): there is no builtin pair
     // kernel to feed, so the classical tile list is not built. (It also cannot be built for a box narrower than
     // 5 x (cutoff + skin) / 2, which a small MLIP test system easily is.) Only the displacement reference is kept.
     if (!builtin_forces_enabled_) {
@@ -4555,13 +4981,14 @@ void ForceCalculatorCUDA::compute_nonbonded_forces_list(MDSystem& system, bool w
     const int block = 128;  // four warps, one tile each
     const int blocks = (num_tiles + (block / 32) - 1) / (block / 32);
     const unsigned dummy_slot = static_cast<unsigned>(num_slots);
-    auto launch = [&](auto want_energy, auto coulomb, auto table_in_smem, auto has_ghosts) {
+    auto launch = [&](auto want_energy, auto coulomb, auto table_in_smem, auto has_ghosts, auto tensor) {
         constexpr bool energy_on = decltype(want_energy)::value;
         constexpr bool coulomb_on = decltype(coulomb)::value;
         constexpr bool smem_on = decltype(table_in_smem)::value;
         constexpr bool ghosts_on = decltype(has_ghosts)::value;
+        constexpr bool tensor_on = decltype(tensor)::value;
         const size_t smem_bytes = fixed_bytes(energy_on, coulomb_on) + (smem_on ? lj_table_bytes : 0);
-        compute_nonbonded_forces_list_kernel<energy_on, coulomb_on, smem_on, ghosts_on>
+        compute_nonbonded_forces_list_kernel<energy_on, coulomb_on, smem_on, ghosts_on, tensor_on>
             <<<blocks, block, smem_bytes, force_stream>>>(
             d_slot_posq_, d_slot_type_, d_tile_atoms, d_tile_list_degree_, tile_list_stride_,
             d_tile_list_, d_tile_list_shift_, reinterpret_cast<const float2*>(d_lj_c6c12_f_),
@@ -4575,17 +5002,24 @@ void ForceCalculatorCUDA::compute_nonbonded_forces_list(MDSystem& system, bool w
     };
     using yes = std::true_type;
     using no = std::false_type;
-    auto with_table = [&](auto want_energy, auto coulomb, auto has_ghosts) {
+    auto with_table = [&](auto want_energy, auto coulomb, auto has_ghosts, auto tensor) {
         const bool energy_on = decltype(want_energy)::value;
         const bool coulomb_on = decltype(coulomb)::value;
-        if (fixed_bytes(energy_on, coulomb_on) + lj_table_bytes <= 48 * 1024) launch(want_energy, coulomb, yes{}, has_ghosts);
-        else launch(want_energy, coulomb, no{}, has_ghosts);
+        if (fixed_bytes(energy_on, coulomb_on) + lj_table_bytes <= 48 * 1024) launch(want_energy, coulomb, yes{}, has_ghosts, tensor);
+        else launch(want_energy, coulomb, no{}, has_ghosts, tensor);
     };
+    // The diagonal of the virial tensor is summed only when the energy/virial is wanted (energy_on) and the
+    // tensor is enabled; every other instantiation is the scalar-virial kernel as before.
+    const bool tensor_virial = virial_tensor_enabled_ && pair_virial_out != nullptr;
     auto dispatch = [&](auto has_ghosts) {
         if (pair_energy_out) {
-            if (with_coulomb) with_table(yes{}, yes{}, has_ghosts); else with_table(yes{}, no{}, has_ghosts);
+            if (tensor_virial) {
+                if (with_coulomb) with_table(yes{}, yes{}, has_ghosts, yes{}); else with_table(yes{}, no{}, has_ghosts, yes{});
+            } else {
+                if (with_coulomb) with_table(yes{}, yes{}, has_ghosts, no{}); else with_table(yes{}, no{}, has_ghosts, no{});
+            }
         } else {
-            if (with_coulomb) with_table(no{}, yes{}, has_ghosts); else with_table(no{}, no{}, has_ghosts);
+            if (with_coulomb) with_table(no{}, yes{}, has_ghosts, no{}); else with_table(no{}, no{}, has_ghosts, no{});
         }
     };
     if (nlist_has_ghosts_ || phase != 0) dispatch(yes{}); else dispatch(no{});
@@ -4959,6 +5393,9 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
     const bool energy_wanted = energy_readback_needed_ || timing_breakdown_enabled_;
     Real* const pair_energy_out = energy_wanted ? d_potential_energy : nullptr;
     Real* const pair_virial_out = energy_wanted ? d_virial : nullptr;
+    // The diagonal of the virial is accumulated next to the trace, only when the tensor is enabled and the
+    // virial is wanted at all (the bonded kernels decide the same way in virial_diag_out()).
+    const bool tensor_pair_virial = virial_tensor_enabled_ && pair_virial_out != nullptr;
     if (use_fused_nonbonded) {
         ensure_ewald_initialized(system);
     }
@@ -5027,7 +5464,7 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
             params.mie_repulsive_exponent, params.mie_attractive_exponent,
             params.mie_prefactor, cutoff_sq, params.lj_switch_distance,
             switch_sq, inv_denom, k_coulomb, ewald_alpha_, ran_lj,
-            ran_electrostatic_cfg, j_filter);
+            ran_electrostatic_cfg, j_filter, virial_tensor_enabled_);
         CUDA_CHECK(cudaGetLastError());
     } else if (nlist_mode_active_ && (use_fused_nonbonded || ran_lj)) {
         compute_nonbonded_forces_list(system, use_fused_nonbonded, pair_energy_out, pair_virial_out,
@@ -5054,9 +5491,10 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
             ((num_lj_tiles_ + tiles_per_block - 1) / tiles_per_block) * entry_splits;
         // The scalar arguments are passed in the pair precision: as doubles the float kernel
         // converted every one of them inside its pair loop (FP64->FP32, a slow pipe).
-        auto launch_fused = [&](auto precision_tag) {
+        auto launch_fused = [&](auto precision_tag, auto tensor_tag) {
             using P = decltype(precision_tag);
-            compute_nonbonded_forces_tiled_kernel<P><<<tile_num_blocks, tile_block_size, 0, force_stream>>>(
+            constexpr bool tensor_on = decltype(tensor_tag)::value;
+            compute_nonbonded_forces_tiled_kernel<P, tensor_on><<<tile_num_blocks, tile_block_size, 0, force_stream>>>(
                 d_x, d_y, d_z, d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
                 d_type, d_global_id, d_charge,
                 d_tile_atoms, d_tile_pair_offsets, d_tile_pair_j, d_tile_pair_verlet_mask_,
@@ -5075,8 +5513,14 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
                 static_cast<P>(k_coulomb), static_cast<P>(ewald_alpha_),
                 num_lj_tiles_, j_filter, entry_splits);
         };
-        if (mixed_precision_enabled_) launch_fused(float{});
-        else launch_fused(double{});
+        // The diagonal of the virial is only summed when the virial is read back (pair_virial_out).
+        if (tensor_pair_virial) {
+            if (mixed_precision_enabled_) launch_fused(float{}, std::true_type{});
+            else launch_fused(double{}, std::true_type{});
+        } else {
+            if (mixed_precision_enabled_) launch_fused(float{}, std::false_type{});
+            else launch_fused(double{}, std::false_type{});
+        }
 
         flush_fixed_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
             d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
@@ -5092,9 +5536,10 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         const int entry_splits = pair_entry_splits();
         const int tile_num_blocks =
             ((num_lj_tiles_ + tiles_per_block - 1) / tiles_per_block) * entry_splits;
-        auto launch_lj = [&](auto precision_tag) {
+        auto launch_lj = [&](auto precision_tag, auto tensor_tag) {
             using P = decltype(precision_tag);
-            compute_lj_forces_tiled_kernel<P><<<tile_num_blocks, tile_block_size, 0, force_stream>>>(
+            constexpr bool tensor_on = decltype(tensor_tag)::value;
+            compute_lj_forces_tiled_kernel<P, tensor_on><<<tile_num_blocks, tile_block_size, 0, force_stream>>>(
                 d_x, d_y, d_z, d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
                 d_type, d_global_id,
                 d_tile_atoms, d_tile_pair_offsets, d_tile_pair_j, d_tile_pair_verlet_mask_,
@@ -5112,8 +5557,13 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
                 static_cast<P>(switch_sq), static_cast<P>(inv_denom),
                 num_lj_tiles_, j_filter, entry_splits);
         };
-        if (mixed_precision_enabled_) launch_lj(float{});
-        else launch_lj(double{});
+        if (tensor_pair_virial) {
+            if (mixed_precision_enabled_) launch_lj(float{}, std::true_type{});
+            else launch_lj(double{}, std::true_type{});
+        } else {
+            if (mixed_precision_enabled_) launch_lj(float{}, std::false_type{});
+            else launch_lj(double{}, std::false_type{});
+        }
 
         flush_fixed_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
             d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
@@ -5162,15 +5612,23 @@ void ForceCalculatorCUDA::run_force_phase(MDSystem& system, ForcePhase phase) {
         return;
     }
 
-    if (!h_scalars_) CUDA_CHECK(cudaMallocHost(&h_scalars_, 4 * sizeof(Real)));
+    if (!h_scalars_) CUDA_CHECK(cudaMallocHost(&h_scalars_, H_SCALARS_SLOTS * sizeof(Real)));
     CUDA_CHECK(cudaMemcpyAsync(&h_scalars_[0], d_potential_energy, sizeof(Real),
                          cudaMemcpyDeviceToHost, force_stream));
     CUDA_CHECK(cudaMemcpyAsync(&h_scalars_[1], d_virial, sizeof(Real),
                          cudaMemcpyDeviceToHost, force_stream));
+    if (virial_tensor_enabled_) {
+        // The diagonal W_xx, W_yy, W_zz accumulated next to the trace, read back with it.
+        CUDA_CHECK(cudaMemcpyAsync(&h_scalars_[H_SCALARS_VIRIAL_DIAG], d_virial + 1, 3 * sizeof(Real),
+                             cudaMemcpyDeviceToHost, force_stream));
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
     last_potential_energy = h_scalars_[0];
     last_virial = h_scalars_[1];
+    if (virial_tensor_enabled_) {
+        for (int a = 0; a < 3; ++a) last_virial_diag[a] = h_scalars_[H_SCALARS_VIRIAL_DIAG + a];
+    }
 
     if (time_components) {
         last_force_component_timings_.clear();
@@ -5227,7 +5685,8 @@ void ForceCalculatorCUDA::compute_bond_forces(MDSystem& system) {
         energy_wanted_now() ? d_virial : nullptr,
         box.lx, box.ly, box.lz,
         1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
-        local_particles
+        local_particles,
+        virial_diag_out()
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -5247,7 +5706,8 @@ void ForceCalculatorCUDA::compute_angle_forces(MDSystem& system) {
         num_angles_cached, energy_wanted_now() ? d_potential_energy : nullptr,
         box.lx, box.ly, box.lz,
         1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
-        local_particles
+        local_particles,
+        virial_diag_out()
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -5267,7 +5727,8 @@ void ForceCalculatorCUDA::compute_dihedral_forces(MDSystem& system) {
         num_dihedrals_cached, energy_wanted_now() ? d_potential_energy : nullptr,
         box.lx, box.ly, box.lz,
         1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
-        local_particles
+        local_particles,
+        virial_diag_out()
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -5287,7 +5748,8 @@ void ForceCalculatorCUDA::compute_improper_forces(MDSystem& system) {
         num_impropers_cached, energy_wanted_now() ? d_potential_energy : nullptr,
         box.lx, box.ly, box.lz,
         1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
-        local_particles
+        local_particles,
+        virial_diag_out()
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -5318,7 +5780,8 @@ void ForceCalculatorCUDA::compute_special_pair_forces(MDSystem& system) {
         energy_wanted_now() ? d_potential_energy : nullptr, energy_wanted_now() ? d_virial : nullptr,
         box.lx, box.ly, box.lz,
         1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
-        local_particles
+        local_particles,
+        virial_diag_out()
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -5342,10 +5805,16 @@ void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
         Real global_ke = 0.0;
         MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, PmePpSplit::instance().pp_comm());
         last_kinetic_energy = global_ke;
+        if (virial_tensor_enabled_) {
+            // A rank without atoms still takes part in the (collective) reduction of the diagonal.
+            Real local_diag[3] = {0.0, 0.0, 0.0};
+            MPI_Allreduce(local_diag, last_kinetic_energy_diag, 3, MPI_DOUBLE, MPI_SUM,
+                          PmePpSplit::instance().pp_comm());
+        }
         return;
     }
 
-    CUDA_CHECK(cudaMemsetAsync(d_kinetic_energy, 0, sizeof(Real), force_stream));
+    CUDA_CHECK(cudaMemsetAsync(d_kinetic_energy, 0, 4 * sizeof(Real), force_stream));
 
     int num_blocks = (local_particles + block_size - 1) / block_size;
     size_t shared_mem_size = block_size * sizeof(Real);
@@ -5353,10 +5822,20 @@ void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
     calculate_kinetic_energy_kernel<<<num_blocks, block_size, shared_mem_size, force_stream>>>(
         d_vx, d_vy, d_vz, d_mass, d_kinetic_energy, local_particles
     );
+    if (virial_tensor_enabled_) {
+        calculate_kinetic_energy_diag_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_vx, d_vy, d_vz, d_mass, d_kinetic_energy + 1, local_particles
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
 
-    if (!h_scalars_) CUDA_CHECK(cudaMallocHost(&h_scalars_, 4 * sizeof(Real)));
+    if (!h_scalars_) CUDA_CHECK(cudaMallocHost(&h_scalars_, H_SCALARS_SLOTS * sizeof(Real)));
     CUDA_CHECK(cudaMemcpyAsync(&h_scalars_[2], d_kinetic_energy, sizeof(Real),
                          cudaMemcpyDeviceToHost, force_stream));
+    if (virial_tensor_enabled_) {
+        CUDA_CHECK(cudaMemcpyAsync(&h_scalars_[H_SCALARS_KE_DIAG], d_kinetic_energy + 1, 3 * sizeof(Real),
+                             cudaMemcpyDeviceToHost, force_stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(force_stream));
 
     last_kinetic_energy = h_scalars_[2];
@@ -5365,6 +5844,13 @@ void ForceCalculatorCUDA::calculate_kinetic_energy(MDSystem& system) {
     Real global_ke = 0.0;
     MPI_Allreduce(&local_ke, &global_ke, 1, MPI_DOUBLE, MPI_SUM, PmePpSplit::instance().pp_comm());
     last_kinetic_energy = global_ke;
+    if (virial_tensor_enabled_) {
+        // The diagonal is reduced over the ranks like the scalar (one more collective, only with the tensor).
+        Real local_diag[3] = {h_scalars_[H_SCALARS_KE_DIAG], h_scalars_[H_SCALARS_KE_DIAG + 1],
+                              h_scalars_[H_SCALARS_KE_DIAG + 2]};
+        MPI_Allreduce(local_diag, last_kinetic_energy_diag, 3, MPI_DOUBLE, MPI_SUM,
+                      PmePpSplit::instance().pp_comm());
+    }
 }
 
 void ForceCalculatorCUDA::integrate_on_device(MDSystem& system, Real dt, const std::string& integrator_type) {
@@ -5452,12 +5938,16 @@ __device__ inline void atomicMax_real(Real* address, Real val) {
 }
 
 
+// Jacobi iteration for the constraints of clusters too big for one thread (a chain with all bonds constrained):
+// every constraint of the list is corrected from the positions of the last sweep, with atomics. Every constraint of
+// the list is solved, whichever rank owns its atoms: the list holds whole constraint clusters with an owned atom, the
+// other atoms are ghosts refreshed before SHAKE, and a ghost copy is corrected too (the next halo exchange
+// overwrites it with its owner's result).
 __global__ void shake_iteration_kernel(
     Real* x, Real* y, Real* z,
     Real* vx, Real* vy, Real* vz,
     const Real* __restrict__ pre_x, const Real* __restrict__ pre_y, const Real* __restrict__ pre_z,
     const Real* __restrict__ mass,
-    const int* __restrict__ global_id, size_t local_particles,
     const size_t* __restrict__ constraint_atom1, const size_t* __restrict__ constraint_atom2,
     const Real* __restrict__ constraint_distance,
     size_t num_constraints,
@@ -5472,14 +5962,6 @@ __global__ void shake_iteration_kernel(
 
     size_t i = constraint_atom1[idx];
     size_t j = constraint_atom2[idx];
-
-    bool i_is_local = (i < local_particles);
-    bool j_is_local = (j < local_particles);
-    if (!i_is_local && !j_is_local) return;
-    int gid_i = global_id[i];
-    int gid_j = global_id[j];
-    bool owner_is_i = (gid_i < gid_j);
-    if (!((owner_is_i && i_is_local) || (!owner_is_i && j_is_local))) return;
 
     Real d = constraint_distance[idx];
     Real d2 = d * d;
@@ -5522,31 +6004,26 @@ __global__ void shake_iteration_kernel(
     atomicAdd(&vz[j],  corr_z * inv_mj * inv_dt);
 }
 
+// The multiplier of every constraint is summed over the iterations in k_total (one thread per constraint, no atomic):
+// it is the constraint virial of the step (constraint_virial_kernel).
 __global__ void rattle_iteration_kernel(
     const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
     Real* vx, Real* vy, Real* vz,
     const Real* __restrict__ mass,
-    const int* __restrict__ global_id, size_t local_particles,
     const size_t* __restrict__ constraint_atom1, const size_t* __restrict__ constraint_atom2,
     size_t num_constraints,
     Real box_x, Real box_y, Real box_z,
     Real inv_box_x, Real inv_box_y, Real inv_box_z,
     Real velocity_tolerance,
-    Real* max_error) {
+    Real* max_error,
+    Real* k_total,
+    const Real* ref_vx, const Real* ref_vy, const Real* ref_vz, Real centripetal_dt) {
 
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_constraints) return;
 
     size_t i = constraint_atom1[idx];
     size_t j = constraint_atom2[idx];
-
-    bool i_is_local = (i < local_particles);
-    bool j_is_local = (j < local_particles);
-    if (!i_is_local && !j_is_local) return;
-    int gid_i = global_id[i];
-    int gid_j = global_id[j];
-    bool owner_is_i = (gid_i < gid_j);
-    if (!((owner_is_i && i_is_local) || (!owner_is_i && j_is_local))) return;
 
     Real dx = x[i] - x[j];
     Real dy = y[i] - y[j];
@@ -5559,13 +6036,20 @@ __global__ void rattle_iteration_kernel(
     Real dvy = vy[i] - vy[j];
     Real dvz = vz[i] - vz[j];
 
-    Real k_dot = dx * dvx + dy * dvy + dz * dvz;
+    // Start of the run (ref_vx set): the pair's r.v is to become -dt/2 |v_ref|^2, see apply_rattle_on_device.
+    Real target = 0.0;
+    if (ref_vx) {
+        const Real rx = ref_vx[i] - ref_vx[j], ry = ref_vy[i] - ref_vy[j], rz = ref_vz[i] - ref_vz[j];
+        target = -centripetal_dt * (rx * rx + ry * ry + rz * rz);
+    }
+    Real k_dot = dx * dvx + dy * dvy + dz * dvz - target;
     atomicMax_real(max_error, fabs(k_dot));
     if (fabs(k_dot) < velocity_tolerance) return;
 
     Real inv_mi = 1.0 / mass[i];
     Real inv_mj = 1.0 / mass[j];
     Real k = k_dot / ((inv_mi + inv_mj) * r2);
+    k_total[idx] += k;
 
     atomicAdd(&vx[i], -k * inv_mi * dx);
     atomicAdd(&vy[i], -k * inv_mi * dy);
@@ -5573,6 +6057,375 @@ __global__ void rattle_iteration_kernel(
     atomicAdd(&vx[j],  k * inv_mj * dx);
     atomicAdd(&vy[j],  k * inv_mj * dy);
     atomicAdd(&vz[j],  k * inv_mj * dz);
+}
+
+// The diagonal of the virial of the constraint forces from the velocity multipliers k_total of the RATTLE iterations
+// (Jacobi path): the velocity correction of the first atom of a constraint is -k r / m, the force that did it over
+// the half step dt/2 is G = -2 k r / (FORCE_TO_ACCEL dt), its virial r_a G_a = prefactor k r_a^2 with
+// prefactor = -2 / (FORCE_TO_ACCEL dt). r is the bond vector at the end of the step, like the forces and the kinetic
+// energy that the pressure of the step is made of. A constraint is counted by the rank that owns its atom of the
+// lower global id. Every thread of the block takes part in the block sums (no early return).
+__global__ void constraint_virial_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    const int* __restrict__ global_id, size_t local_particles,
+    const size_t* __restrict__ constraint_atom1, const size_t* __restrict__ constraint_atom2,
+    const Real* __restrict__ k_total, size_t num_constraints,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    Real prefactor, Real* virial3) {
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    Real wx = 0.0, wy = 0.0, wz = 0.0;
+    if (idx < num_constraints) {
+        const size_t i = constraint_atom1[idx];
+        const size_t j = constraint_atom2[idx];
+        const size_t lower = (global_id[i] < global_id[j]) ? i : j;
+        const Real k = k_total[idx];
+        if (lower < local_particles && k != 0.0) {
+            Real rx = x[i] - x[j];
+            Real ry = y[i] - y[j];
+            Real rz = z[i] - z[j];
+            apply_minimum_image_device(rx, ry, rz, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+            wx = prefactor * k * rx * rx;
+            wy = prefactor * k * ry * ry;
+            wz = prefactor * k * rz * rz;
+        }
+    }
+    block_atomic_add3(virial3, wx, wy, wz);
+}
+
+// One constraint cluster in registers, for the cluster kernels: the distinct atoms (local slots), the constraints as
+// pairs of indices into them, and the atoms' positions unwrapped along the constraints (the first atom keeps its
+// stored position, every other atom sits next to the atom it is bonded to by the minimum image), so that nothing
+// after the load needs the box.
+struct ConstraintCluster {
+    int n;     // constraints
+    int na;    // atoms
+    size_t slot[2 * kMaxClusterConstraints];
+    int ia[kMaxClusterConstraints];
+    int ib[kMaxClusterConstraints];
+    Real x[2 * kMaxClusterConstraints];
+    Real y[2 * kMaxClusterConstraints];
+    Real z[2 * kMaxClusterConstraints];
+};
+
+__device__ __forceinline__ void constraint_cluster_load(
+    ConstraintCluster& c, int first, int n,
+    const size_t* __restrict__ atom1, const size_t* __restrict__ atom2,
+    const Real* x, const Real* y, const Real* z,
+    Real box_x, Real box_y, Real box_z, Real inv_box_x, Real inv_box_y, Real inv_box_z) {
+    c.n = n;
+    c.na = 0;
+    for (int j = 0; j < n; ++j) {
+        const size_t s1 = atom1[first + j];
+        const size_t s2 = atom2[first + j];
+        int a = 0;
+        while (a < c.na && c.slot[a] != s1) ++a;
+        if (a == c.na) c.slot[c.na++] = s1;
+        c.ia[j] = a;
+        int b = 0;
+        while (b < c.na && c.slot[b] != s2) ++b;
+        if (b == c.na) c.slot[c.na++] = s2;
+        c.ib[j] = b;
+    }
+
+    bool placed[2 * kMaxClusterConstraints];
+    for (int a = 0; a < c.na; ++a) placed[a] = false;
+    c.x[0] = x[c.slot[0]];
+    c.y[0] = y[c.slot[0]];
+    c.z[0] = z[c.slot[0]];
+    placed[0] = true;
+    for (int pass = 0; pass < c.na; ++pass) {
+        bool any = false;
+        for (int j = 0; j < n; ++j) {
+            const int p = c.ia[j], q = c.ib[j];
+            if (placed[p] == placed[q]) continue;
+            const int from = placed[p] ? p : q;
+            const int to = placed[p] ? q : p;
+            Real dx = x[c.slot[to]] - x[c.slot[from]];
+            Real dy = y[c.slot[to]] - y[c.slot[from]];
+            Real dz = z[c.slot[to]] - z[c.slot[from]];
+            apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+            c.x[to] = c.x[from] + dx;
+            c.y[to] = c.y[from] + dy;
+            c.z[to] = c.z[from] + dz;
+            placed[to] = true;
+            any = true;
+        }
+        if (!any) break;
+    }
+    for (int a = 0; a < c.na; ++a) {   // a cluster is connected: every atom was placed above
+        if (placed[a]) continue;
+        c.x[a] = x[c.slot[a]];
+        c.y[a] = y[c.slot[a]];
+        c.z[a] = z[c.slot[a]];
+    }
+}
+
+// SHAKE of a whole cluster by one thread: Gauss-Seidel sweeps over its constraints in registers until every one holds
+// to the tolerance, then one store per atom. No atomics, no synchronisation between sweeps (the Jacobi kernels above
+// needed one kernel launch and one host round trip per sweep). The cluster's atoms belong to no other cluster, so no
+// two threads write the same atom. failed counts the clusters that did not converge.
+__global__ void shake_cluster_kernel(
+    Real* x, Real* y, Real* z,
+    Real* vx, Real* vy, Real* vz,
+    const Real* __restrict__ pre_x, const Real* __restrict__ pre_y, const Real* __restrict__ pre_z,
+    const Real* __restrict__ mass,
+    const int* __restrict__ cluster_first, const int* __restrict__ cluster_size, int num_clusters,
+    const size_t* __restrict__ atom1, const size_t* __restrict__ atom2, const Real* __restrict__ distance,
+    Real inv_dt,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    Real tolerance, int max_iterations, Real* failed) {
+
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= num_clusters) return;
+    const int first = cluster_first[k];
+
+    ConstraintCluster c;
+    constraint_cluster_load(c, first, cluster_size[k], atom1, atom2, x, y, z,
+                            box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+
+    Real inv_m[2 * kMaxClusterConstraints];
+    Real cx[2 * kMaxClusterConstraints], cy[2 * kMaxClusterConstraints], cz[2 * kMaxClusterConstraints];
+    for (int a = 0; a < c.na; ++a) {
+        inv_m[a] = 1.0 / mass[c.slot[a]];
+        cx[a] = cy[a] = cz[a] = 0.0;   // the displacement of the atom so far
+    }
+    Real ox[kMaxClusterConstraints], oy[kMaxClusterConstraints], oz[kMaxClusterConstraints];
+    Real d2[kMaxClusterConstraints];
+    for (int j = 0; j < c.n; ++j) {   // the bond vectors before the step fix the directions of the corrections
+        Real dx = pre_x[c.slot[c.ia[j]]] - pre_x[c.slot[c.ib[j]]];
+        Real dy = pre_y[c.slot[c.ia[j]]] - pre_y[c.slot[c.ib[j]]];
+        Real dz = pre_z[c.slot[c.ia[j]]] - pre_z[c.slot[c.ib[j]]];
+        apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+        ox[j] = dx; oy[j] = dy; oz[j] = dz;
+        const Real d = distance[first + j];
+        d2[j] = d * d;
+    }
+
+    bool converged = false;
+    for (int iteration = 0; iteration < max_iterations && !converged; ++iteration) {
+        Real max_error = 0.0;
+        for (int j = 0; j < c.n; ++j) {
+            const int a = c.ia[j], b = c.ib[j];
+            const Real dx = (c.x[a] + cx[a]) - (c.x[b] + cx[b]);
+            const Real dy = (c.y[a] + cy[a]) - (c.y[b] + cy[b]);
+            const Real dz = (c.z[a] + cz[a]) - (c.z[b] + cz[b]);
+            const Real diff = (dx * dx + dy * dy + dz * dz) - d2[j];
+            const Real error = fabs(diff) / d2[j];
+            max_error = fmax(max_error, error);
+            if (error < tolerance) continue;
+            const Real g_dot = ox[j] * dx + oy[j] * dy + oz[j] * dz;
+            if (fabs(g_dot) < 1e-12) continue; // Degenerate geometry; retry next sweep.
+            const Real g = diff / (2.0 * (inv_m[a] + inv_m[b]) * g_dot);
+            cx[a] -= g * ox[j] * inv_m[a];
+            cy[a] -= g * oy[j] * inv_m[a];
+            cz[a] -= g * oz[j] * inv_m[a];
+            cx[b] += g * ox[j] * inv_m[b];
+            cy[b] += g * oy[j] * inv_m[b];
+            cz[b] += g * oz[j] * inv_m[b];
+        }
+        converged = max_error < tolerance;
+    }
+
+    for (int a = 0; a < c.na; ++a) {
+        const size_t s = c.slot[a];
+        x[s] += cx[a];
+        y[s] += cy[a];
+        z[s] += cz[a];
+        vx[s] += cx[a] * inv_dt;
+        vy[s] += cy[a] * inv_dt;
+        vz[s] += cz[a] * inv_dt;
+    }
+    if (!converged) atomicAdd(failed, 1.0);
+}
+
+// RATTLE of a whole cluster by one thread (see shake_cluster_kernel), and its constraint virial: the multiplier sums
+// of the sweeps turn into the virial as in constraint_virial_kernel. Every thread of the block takes part in the block
+// sums (no early return).
+__global__ void rattle_cluster_kernel(
+    const Real* __restrict__ x, const Real* __restrict__ y, const Real* __restrict__ z,
+    Real* vx, Real* vy, Real* vz,
+    const Real* __restrict__ mass,
+    const int* __restrict__ global_id, size_t local_particles,
+    const int* __restrict__ cluster_first, const int* __restrict__ cluster_size, int num_clusters,
+    const size_t* __restrict__ atom1, const size_t* __restrict__ atom2,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    Real tolerance, int max_iterations, Real prefactor, Real* virial3, Real* failed,
+    const Real* ref_vx, const Real* ref_vy, const Real* ref_vz, Real centripetal_dt) {
+
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    Real wx = 0.0, wy = 0.0, wz = 0.0;
+    if (k < num_clusters) {
+        ConstraintCluster c;
+        constraint_cluster_load(c, cluster_first[k], cluster_size[k], atom1, atom2, x, y, z,
+                                box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+
+        Real inv_m[2 * kMaxClusterConstraints];
+        Real lvx[2 * kMaxClusterConstraints], lvy[2 * kMaxClusterConstraints], lvz[2 * kMaxClusterConstraints];
+        for (int a = 0; a < c.na; ++a) {
+            inv_m[a] = 1.0 / mass[c.slot[a]];
+            lvx[a] = vx[c.slot[a]];
+            lvy[a] = vy[c.slot[a]];
+            lvz[a] = vz[c.slot[a]];
+        }
+        Real k_sum[kMaxClusterConstraints];
+        Real target[kMaxClusterConstraints];   // what r.v of a pair is to become: 0, or at the start of the run
+        for (int j = 0; j < c.n; ++j) {        // -dt/2 |v_ref|^2 (see apply_rattle_on_device)
+            k_sum[j] = 0.0;
+            target[j] = 0.0;
+            if (ref_vx) {
+                const size_t sa = c.slot[c.ia[j]], sb = c.slot[c.ib[j]];
+                const Real rx = ref_vx[sa] - ref_vx[sb], ry = ref_vy[sa] - ref_vy[sb], rz = ref_vz[sa] - ref_vz[sb];
+                target[j] = -centripetal_dt * (rx * rx + ry * ry + rz * rz);
+            }
+        }
+
+        bool converged = false;
+        for (int iteration = 0; iteration < max_iterations && !converged; ++iteration) {
+            Real max_error = 0.0;
+            for (int j = 0; j < c.n; ++j) {
+                const int a = c.ia[j], b = c.ib[j];
+                const Real dx = c.x[a] - c.x[b];
+                const Real dy = c.y[a] - c.y[b];
+                const Real dz = c.z[a] - c.z[b];
+                const Real r2 = dx * dx + dy * dy + dz * dz;
+                if (r2 < 1e-20) continue;
+                const Real k_dot = dx * (lvx[a] - lvx[b]) + dy * (lvy[a] - lvy[b]) + dz * (lvz[a] - lvz[b]) - target[j];
+                max_error = fmax(max_error, fabs(k_dot));
+                if (fabs(k_dot) < tolerance) continue;
+                const Real multiplier = k_dot / ((inv_m[a] + inv_m[b]) * r2);
+                k_sum[j] += multiplier;
+                lvx[a] -= multiplier * inv_m[a] * dx;
+                lvy[a] -= multiplier * inv_m[a] * dy;
+                lvz[a] -= multiplier * inv_m[a] * dz;
+                lvx[b] += multiplier * inv_m[b] * dx;
+                lvy[b] += multiplier * inv_m[b] * dy;
+                lvz[b] += multiplier * inv_m[b] * dz;
+            }
+            converged = max_error < tolerance;
+        }
+
+        for (int a = 0; a < c.na; ++a) {
+            vx[c.slot[a]] = lvx[a];
+            vy[c.slot[a]] = lvy[a];
+            vz[c.slot[a]] = lvz[a];
+        }
+        for (int j = 0; j < c.n; ++j) {
+            const size_t sa = c.slot[c.ia[j]], sb = c.slot[c.ib[j]];
+            const size_t lower = (global_id[sa] < global_id[sb]) ? sa : sb;
+            if (lower >= local_particles || k_sum[j] == 0.0) continue;
+            const Real dx = c.x[c.ia[j]] - c.x[c.ib[j]];
+            const Real dy = c.y[c.ia[j]] - c.y[c.ib[j]];
+            const Real dz = c.z[c.ia[j]] - c.z[c.ib[j]];
+            wx += prefactor * k_sum[j] * dx * dx;
+            wy += prefactor * k_sum[j] * dy * dy;
+            wz += prefactor * k_sum[j] * dz * dz;
+        }
+        if (!converged) atomicAdd(failed, 1.0);
+    }
+    block_atomic_add3(virial3, wx, wy, wz);
+}
+
+// After a barostat step scaled every position by mu (x' = mu x, in the new box), the atoms of a constraint cluster no
+// longer fit their constraint lengths: every bond changed by a factor of about mu. The next SHAKE would push them back
+// and take that displacement for a constraint force, a spurious virial and a velocity kick. Here the cluster keeps its
+// scaled centre of mass and gets its old offsets from it back (the scaled offset is mu times the old one).
+__global__ void restore_cluster_rigid_kernel(
+    Real* x, Real* y, Real* z, const Real* __restrict__ mass,
+    const int* __restrict__ cluster_first, const int* __restrict__ cluster_size, int num_clusters,
+    const size_t* __restrict__ atom1, const size_t* __restrict__ atom2,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    Real mu_x, Real mu_y, Real mu_z) {
+
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= num_clusters) return;
+    ConstraintCluster c;
+    constraint_cluster_load(c, cluster_first[k], cluster_size[k], atom1, atom2, x, y, z,
+                            box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+    Real total = 0.0, comx = 0.0, comy = 0.0, comz = 0.0;
+    for (int a = 0; a < c.na; ++a) {
+        const Real m = mass[c.slot[a]];
+        total += m;
+        comx += m * c.x[a];
+        comy += m * c.y[a];
+        comz += m * c.z[a];
+    }
+    comx /= total; comy /= total; comz /= total;
+    const Real shrink_x = 1.0 - 1.0 / mu_x, shrink_y = 1.0 - 1.0 / mu_y, shrink_z = 1.0 - 1.0 / mu_z;
+    for (int a = 0; a < c.na; ++a) {
+        const size_t s = c.slot[a];
+        x[s] -= shrink_x * (c.x[a] - comx);
+        y[s] -= shrink_y * (c.y[a] - comy);
+        z[s] -= shrink_z * (c.z[a] - comz);
+    }
+}
+
+// The same for the clusters of more than kMaxClusterConstraints constraints, which do not fit in registers: one
+// thread walks a whole cluster. Its constraints are linked per atom slot (head/next, edge 2g + side for the
+// constraint g of the big list), the walk from the first atom (queue, at most n + 1 atoms in the segment starting at
+// 2 first) puts every atom next to the atom it was reached from by the minimum image (ux, uy, uz), then the atoms
+// move as in restore_cluster_rigid_kernel. The slot-indexed scratch arrays are only touched at the cluster's atoms.
+__global__ void restore_big_cluster_rigid_kernel(
+    Real* x, Real* y, Real* z, const Real* __restrict__ mass,
+    const int* __restrict__ cluster_first, const int* __restrict__ cluster_size, int num_clusters,
+    const size_t* __restrict__ atom1, const size_t* __restrict__ atom2,
+    int* head, int* mark, int* next, int* queue, Real* ux, Real* uy, Real* uz,
+    Real box_x, Real box_y, Real box_z,
+    Real inv_box_x, Real inv_box_y, Real inv_box_z,
+    Real mu_x, Real mu_y, Real mu_z) {
+
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= num_clusters) return;
+    const int first = cluster_first[k], n = cluster_size[k];
+
+    for (int g = first; g < first + n; ++g) {
+        head[atom1[g]] = -1; head[atom2[g]] = -1;
+        mark[atom1[g]] = 0; mark[atom2[g]] = 0;
+    }
+    for (int g = first; g < first + n; ++g) {
+        next[2 * g] = head[atom1[g]];     head[atom1[g]] = 2 * g;
+        next[2 * g + 1] = head[atom2[g]]; head[atom2[g]] = 2 * g + 1;
+    }
+
+    int* walk = queue + 2 * first;
+    const size_t root = atom1[first];
+    walk[0] = static_cast<int>(root);
+    int count = 1;
+    mark[root] = 1;
+    ux[root] = x[root]; uy[root] = y[root]; uz[root] = z[root];
+    for (int head_of_queue = 0; head_of_queue < count; ++head_of_queue) {
+        const size_t a = walk[head_of_queue];
+        for (int e = head[a]; e >= 0; e = next[e]) {
+            const size_t b = (e & 1) ? atom1[e >> 1] : atom2[e >> 1];
+            if (mark[b]) continue;
+            Real dx = x[b] - x[a], dy = y[b] - y[a], dz = z[b] - z[a];
+            apply_minimum_image_device(dx, dy, dz, box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z);
+            ux[b] = ux[a] + dx; uy[b] = uy[a] + dy; uz[b] = uz[a] + dz;
+            mark[b] = 1;
+            walk[count++] = static_cast<int>(b);
+        }
+    }
+
+    Real total = 0.0, comx = 0.0, comy = 0.0, comz = 0.0;
+    for (int i = 0; i < count; ++i) {
+        const size_t s = walk[i];
+        const Real m = mass[s];
+        total += m;
+        comx += m * ux[s];
+        comy += m * uy[s];
+        comz += m * uz[s];
+    }
+    comx /= total; comy /= total; comz /= total;
+    const Real shrink_x = 1.0 - 1.0 / mu_x, shrink_y = 1.0 - 1.0 / mu_y, shrink_z = 1.0 - 1.0 / mu_z;
+    for (int i = 0; i < count; ++i) {
+        const size_t s = walk[i];
+        x[s] -= shrink_x * (ux[s] - comx);
+        y[s] -= shrink_y * (uy[s] - comy);
+        z[s] -= shrink_z * (uz[s] - comz);
+    }
 }
 
 void ForceCalculatorCUDA::ensure_constraint_scratch_capacity(size_t n) {
@@ -5598,70 +6451,187 @@ void ForceCalculatorCUDA::snapshot_constraint_positions(MDSystem& system) {
                                cudaMemcpyDeviceToDevice, force_stream));
 }
 
+void ForceCalculatorCUDA::ensure_constraint_solver_buffers() {
+    if (d_constraint_scalars_) return;
+    CUDA_CHECK(cudaMalloc(&d_constraint_scalars_, 4 * sizeof(Real)));
+    CUDA_CHECK(cudaMallocHost(&h_constraint_scalars_, 4 * sizeof(Real)));
+}
+
 bool ForceCalculatorCUDA::apply_shake_on_device(MDSystem& system, Real dt,
                                                  int max_iterations, Real position_tolerance) {
     if (num_constraints_cached == 0) return true;
+    ensure_constraint_solver_buffers();
 
-    if (!d_constraint_max_error_) {
-        CUDA_CHECK(cudaMalloc(&d_constraint_max_error_, sizeof(Real)));
-    }
-
-    size_t local_particles = system.get_local_particles();
     SimulationBox& box = system.get_box();
-    Real inv_dt = 1.0 / dt;
-    int num_blocks = (num_constraints_cached + block_size - 1) / block_size;
+    const Real inv_dt = 1.0 / dt;
+    CUDA_CHECK(cudaMemsetAsync(d_constraint_scalars_ + 3, 0, sizeof(Real), force_stream));
 
-    Real host_max_error = 0.0;
-    bool converged = false;
-    for (int iter = 0; iter < max_iterations; ++iter) {
-        CUDA_CHECK(cudaMemsetAsync(d_constraint_max_error_, 0, sizeof(Real), force_stream));
-        shake_iteration_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+    if (num_constraint_clusters_) {
+        const int num_blocks = static_cast<int>((num_constraint_clusters_ + block_size - 1) / block_size);
+        shake_cluster_kernel<<<num_blocks, block_size, 0, force_stream>>>(
             d_x, d_y, d_z, d_vx, d_vy, d_vz,
-            d_constraint_pre_x_, d_constraint_pre_y_, d_constraint_pre_z_,
-            d_mass, d_global_id, local_particles,
+            d_constraint_pre_x_, d_constraint_pre_y_, d_constraint_pre_z_, d_mass,
+            d_constraint_cluster_first_, d_constraint_cluster_size_, static_cast<int>(num_constraint_clusters_),
             d_constraint_atom1, d_constraint_atom2, d_constraint_distance,
-            num_constraints_cached, inv_dt,
-            box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
-            position_tolerance, d_constraint_max_error_);
+            inv_dt, box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+            position_tolerance, max_iterations, d_constraint_scalars_ + 3);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpyAsync(&host_max_error, d_constraint_max_error_, sizeof(Real),
-                                   cudaMemcpyDeviceToHost, force_stream));
-        CUDA_CHECK(cudaStreamSynchronize(force_stream));
-        if (host_max_error < position_tolerance) { converged = true; break; }
     }
-    return converged;
+
+    bool converged = true;
+    if (num_big_constraints_) {
+        if (!d_constraint_max_error_) {
+            CUDA_CHECK(cudaMalloc(&d_constraint_max_error_, sizeof(Real)));
+        }
+        const int num_blocks = static_cast<int>((num_big_constraints_ + block_size - 1) / block_size);
+        converged = false;
+        for (int iter = 0; iter < max_iterations; ++iter) {
+            Real host_max_error = 0.0;
+            CUDA_CHECK(cudaMemsetAsync(d_constraint_max_error_, 0, sizeof(Real), force_stream));
+            shake_iteration_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+                d_x, d_y, d_z, d_vx, d_vy, d_vz,
+                d_constraint_pre_x_, d_constraint_pre_y_, d_constraint_pre_z_, d_mass,
+                d_constraint_big_atom1, d_constraint_big_atom2, d_constraint_big_distance,
+                num_big_constraints_, inv_dt,
+                box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+                position_tolerance, d_constraint_max_error_);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpyAsync(&host_max_error, d_constraint_max_error_, sizeof(Real),
+                                       cudaMemcpyDeviceToHost, force_stream));
+            CUDA_CHECK(cudaStreamSynchronize(force_stream));
+            if (host_max_error < position_tolerance) { converged = true; break; }
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(h_constraint_scalars_ + 3, d_constraint_scalars_ + 3, sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    return converged && h_constraint_scalars_[3] == 0.0;
 }
 
-bool ForceCalculatorCUDA::apply_rattle_on_device(MDSystem& system,
-                                                  int max_iterations, Real velocity_tolerance) {
+bool ForceCalculatorCUDA::apply_rattle_on_device(MDSystem& system, Real dt,
+                                                  int max_iterations, Real velocity_tolerance,
+                                                  bool start_of_run) {
+    h_constraint_virial_[0] = h_constraint_virial_[1] = h_constraint_virial_[2] = 0.0;
     if (num_constraints_cached == 0) return true;
+    ensure_constraint_solver_buffers();
 
-    if (!d_constraint_max_error_) {
-        CUDA_CHECK(cudaMalloc(&d_constraint_max_error_, sizeof(Real)));
-    }
-
-    size_t local_particles = system.get_local_particles();
+    const size_t local_particles = system.get_local_particles();
     SimulationBox& box = system.get_box();
-    int num_blocks = (num_constraints_cached + block_size - 1) / block_size;
+    const Real prefactor = -2.0 / (FORCE_TO_ACCEL * dt);
+    // The force that keeps a pair at its length satisfies r.a = -|v|^2 (the second derivative of the constant
+    // length). The velocities after a half step of that force are v_kick + dt/2 a_constraint, so r.v of a pair is to
+    // become -dt/2 |v|^2 with v the velocities before the kick: these are saved by save_constraint_velocities() in
+    // the scratch arrays. (In a normal step the velocities after the position correction already carry that radial
+    // part, and the plain condition r.v = 0 gives the same force.)
+    const Real* ref_vx = start_of_run ? d_constraint_pre_x_ : nullptr;
+    const Real* ref_vy = start_of_run ? d_constraint_pre_y_ : nullptr;
+    const Real* ref_vz = start_of_run ? d_constraint_pre_z_ : nullptr;
+    const Real centripetal_dt = 0.5 * dt;
+    CUDA_CHECK(cudaMemsetAsync(d_constraint_scalars_, 0, 4 * sizeof(Real), force_stream));
 
-    Real host_max_error = 0.0;
-    bool converged = false;
-    for (int iter = 0; iter < max_iterations; ++iter) {
-        CUDA_CHECK(cudaMemsetAsync(d_constraint_max_error_, 0, sizeof(Real), force_stream));
-        rattle_iteration_kernel<<<num_blocks, block_size, 0, force_stream>>>(
-            d_x, d_y, d_z, d_vx, d_vy, d_vz,
-            d_mass, d_global_id, local_particles,
+    if (num_constraint_clusters_) {
+        const int num_blocks = static_cast<int>((num_constraint_clusters_ + block_size - 1) / block_size);
+        rattle_cluster_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_vx, d_vy, d_vz, d_mass,
+            d_global_id, local_particles,
+            d_constraint_cluster_first_, d_constraint_cluster_size_, static_cast<int>(num_constraint_clusters_),
             d_constraint_atom1, d_constraint_atom2,
-            num_constraints_cached,
             box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
-            velocity_tolerance, d_constraint_max_error_);
+            velocity_tolerance, max_iterations, prefactor, d_constraint_scalars_, d_constraint_scalars_ + 3,
+            ref_vx, ref_vy, ref_vz, centripetal_dt);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpyAsync(&host_max_error, d_constraint_max_error_, sizeof(Real),
-                                   cudaMemcpyDeviceToHost, force_stream));
-        CUDA_CHECK(cudaStreamSynchronize(force_stream));
-        if (host_max_error < velocity_tolerance) { converged = true; break; }
     }
-    return converged;
+
+    bool converged = true;
+    if (num_big_constraints_) {
+        if (!d_constraint_max_error_) {
+            CUDA_CHECK(cudaMalloc(&d_constraint_max_error_, sizeof(Real)));
+        }
+        if (constraint_g_capacity_ < num_big_constraints_) {
+            if (d_constraint_g_total_) CUDA_CHECK(cudaFree(d_constraint_g_total_));
+            CUDA_CHECK(cudaMalloc(&d_constraint_g_total_, num_big_constraints_ * sizeof(Real)));
+            constraint_g_capacity_ = num_big_constraints_;
+        }
+        CUDA_CHECK(cudaMemsetAsync(d_constraint_g_total_, 0, num_big_constraints_ * sizeof(Real), force_stream));
+        const int num_blocks = static_cast<int>((num_big_constraints_ + block_size - 1) / block_size);
+        converged = false;
+        for (int iter = 0; iter < max_iterations; ++iter) {
+            Real host_max_error = 0.0;
+            CUDA_CHECK(cudaMemsetAsync(d_constraint_max_error_, 0, sizeof(Real), force_stream));
+            rattle_iteration_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+                d_x, d_y, d_z, d_vx, d_vy, d_vz, d_mass,
+                d_constraint_big_atom1, d_constraint_big_atom2,
+                num_big_constraints_,
+                box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+                velocity_tolerance, d_constraint_max_error_, d_constraint_g_total_,
+                ref_vx, ref_vy, ref_vz, centripetal_dt);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpyAsync(&host_max_error, d_constraint_max_error_, sizeof(Real),
+                                       cudaMemcpyDeviceToHost, force_stream));
+            CUDA_CHECK(cudaStreamSynchronize(force_stream));
+            if (host_max_error < velocity_tolerance) { converged = true; break; }
+        }
+        constraint_virial_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_global_id, local_particles,
+            d_constraint_big_atom1, d_constraint_big_atom2, d_constraint_g_total_, num_big_constraints_,
+            box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+            prefactor, d_constraint_scalars_);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(h_constraint_scalars_, d_constraint_scalars_, 4 * sizeof(Real),
+                               cudaMemcpyDeviceToHost, force_stream));
+    CUDA_CHECK(cudaStreamSynchronize(force_stream));
+    for (int a = 0; a < 3; ++a) h_constraint_virial_[a] = h_constraint_scalars_[a];
+    return converged && h_constraint_scalars_[3] == 0.0;
+}
+
+void ForceCalculatorCUDA::save_constraint_velocities(MDSystem& system) {
+    const size_t n = system.get_num_particles();
+    ensure_constraint_scratch_capacity(n);
+    CUDA_CHECK(cudaMemcpyAsync(d_constraint_pre_x_, d_vx, n * sizeof(Real), cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_constraint_pre_y_, d_vy, n * sizeof(Real), cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_constraint_pre_z_, d_vz, n * sizeof(Real), cudaMemcpyDeviceToDevice, force_stream));
+}
+
+void ForceCalculatorCUDA::restore_constraint_velocities(MDSystem& system) {
+    const size_t n = system.get_num_particles();
+    CUDA_CHECK(cudaMemcpyAsync(d_vx, d_constraint_pre_x_, n * sizeof(Real), cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_vy, d_constraint_pre_y_, n * sizeof(Real), cudaMemcpyDeviceToDevice, force_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_vz, d_constraint_pre_z_, n * sizeof(Real), cudaMemcpyDeviceToDevice, force_stream));
+}
+
+void ForceCalculatorCUDA::restore_constraint_clusters_rigid(const SimulationBox& box, const Real mu[3],
+                                                            size_t total_particles) {
+    if (num_constraint_clusters_) {
+        const int num_blocks = static_cast<int>((num_constraint_clusters_ + block_size - 1) / block_size);
+        restore_cluster_rigid_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_mass,
+            d_constraint_cluster_first_, d_constraint_cluster_size_, static_cast<int>(num_constraint_clusters_),
+            d_constraint_atom1, d_constraint_atom2,
+            box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+            mu[0], mu[1], mu[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (num_big_clusters_) {
+        ensure_bonded_array(d_rigid_head_, total_particles);
+        ensure_bonded_array(d_rigid_mark_, total_particles);
+        ensure_bonded_array(d_rigid_ux_, total_particles);
+        ensure_bonded_array(d_rigid_uy_, total_particles);
+        ensure_bonded_array(d_rigid_uz_, total_particles);
+        ensure_bonded_array(d_rigid_next_, 2 * num_big_constraints_);
+        ensure_bonded_array(d_rigid_queue_, 2 * num_big_constraints_);
+        const int num_blocks = static_cast<int>((num_big_clusters_ + block_size - 1) / block_size);
+        restore_big_cluster_rigid_kernel<<<num_blocks, block_size, 0, force_stream>>>(
+            d_x, d_y, d_z, d_mass,
+            d_constraint_big_cluster_first_, d_constraint_big_cluster_size_, static_cast<int>(num_big_clusters_),
+            d_constraint_big_atom1, d_constraint_big_atom2,
+            d_rigid_head_, d_rigid_mark_, d_rigid_next_, d_rigid_queue_, d_rigid_ux_, d_rigid_uy_, d_rigid_uz_,
+            box.lx, box.ly, box.lz, 1.0/box.lx, 1.0/box.ly, 1.0/box.lz,
+            mu[0], mu[1], mu[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 __global__ void compute_max_displacement_kernel(const Real* __restrict__ x, 
@@ -5995,6 +6965,7 @@ void ForceCalculatorCUDA::ensure_ewald_initialized(MDSystem& system) {
 }
 
 void ForceCalculatorCUDA::free_ewald_resources() {
+    pme_dist_destroy();
     if (d_pme_charge_grid_real_) { cudaFree(d_pme_charge_grid_real_); d_pme_charge_grid_real_ = nullptr; }
     if (d_pme_charge_grid_freq_) { cudaFree(d_pme_charge_grid_freq_); d_pme_charge_grid_freq_ = nullptr; }
     if (d_pme_charge_grid_f_) { cudaFree(d_pme_charge_grid_f_); d_pme_charge_grid_f_ = nullptr; }
@@ -6051,7 +7022,7 @@ void ForceCalculatorCUDA::compute_electrostatic_forces_real_space(MDSystem& syst
         box_x, box_y, box_z, inv_box_x, inv_box_y, inv_box_z,
         local_particles, num_particles,
         cutoff_sq, k_coulomb, ewald_alpha_,
-        num_lj_tiles_);
+        num_lj_tiles_, virial_tensor_enabled_);
     flush_fixed_forces_kernel<<<num_blocks, block_size, 0, force_stream>>>(
         d_force_fixed_x_, d_force_fixed_y_, d_force_fixed_z_,
         d_fx, d_fy, d_fz, local_particles);
@@ -6262,6 +7233,76 @@ __global__ void pme_pack_box_kernel(const T* __restrict__ grid, T* __restrict__ 
     }
 }
 
+// --- distributed reciprocal solve (cuFFTMp, force_calculation.pme_ranks: 2) ---------------------------------
+// The pieces of a rank's packed box (rows = x-planes, ly x lz points each, starting at y0, z0 periodic) are
+// added to / read back from the X-slab of the rank that owns those planes. The slab holds plane x_local0 + a
+// at row (x_local0 + a) and pads each z row to z_stride elements (the in-place R2C layout of cuFFTMp).
+template <typename T>
+__global__ void pme_dist_unpack_add_kernel(T* __restrict__ slab, const T* __restrict__ packed,
+                                           int rows, int ly, int lz, int x_local0, int y0, int z0,
+                                           int grid_ny, int grid_nz, int z_stride) {
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const size_t total = static_cast<size_t>(rows) * ly;
+    for (size_t row = static_cast<size_t>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+         row < total; row += static_cast<size_t>(gridDim.x) * warps_per_block) {
+        const int b = static_cast<int>(row % static_cast<size_t>(ly));
+        const int a = static_cast<int>(row / static_cast<size_t>(ly));
+        int gy = y0 + b; if (gy >= grid_ny) gy -= grid_ny;
+        T* target = slab + (static_cast<size_t>(x_local0 + a) * grid_ny + gy) * z_stride;
+        const T* source = packed + row * lz;
+        for (int c = lane; c < lz; c += 32) {
+            int gz = z0 + c; if (gz >= grid_nz) gz -= grid_nz;
+            target[gz] += source[c];
+        }
+    }
+}
+
+template <typename T>
+__global__ void pme_dist_pack_slab_kernel(const T* __restrict__ slab, T* __restrict__ packed,
+                                          int rows, int ly, int lz, int x_local0, int y0, int z0,
+                                          int grid_ny, int grid_nz, int z_stride) {
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const size_t total = static_cast<size_t>(rows) * ly;
+    for (size_t row = static_cast<size_t>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+         row < total; row += static_cast<size_t>(gridDim.x) * warps_per_block) {
+        const int b = static_cast<int>(row % static_cast<size_t>(ly));
+        const int a = static_cast<int>(row / static_cast<size_t>(ly));
+        int gy = y0 + b; if (gy >= grid_ny) gy -= grid_ny;
+        const T* source = slab + (static_cast<size_t>(x_local0 + a) * grid_ny + gy) * z_stride;
+        T* target = packed + row * lz;
+        for (int c = lane; c < lz; c += 32) {
+            int gz = z0 + c; if (gz >= grid_nz) gz -= grid_nz;
+            target[c] = source[gz];
+        }
+    }
+}
+
+// The inverse of pme_pack_box_kernel: writes the packed box back into the grid (only the box is written).
+template <typename T>
+__global__ void pme_unpack_box_kernel(T* __restrict__ grid, const T* __restrict__ packed,
+                                      const int* __restrict__ box,
+                                      int grid_nx, int grid_ny, int grid_nz) {
+    const int x0 = box[0], lx = box[1], y0 = box[2], ly = box[3], z0 = box[4], lz = box[5];
+    const size_t rows = static_cast<size_t>(lx) * ly;
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    for (size_t row = static_cast<size_t>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+         row < rows; row += static_cast<size_t>(gridDim.x) * warps_per_block) {
+        const int b = static_cast<int>(row % static_cast<size_t>(ly));
+        const int a = static_cast<int>(row / static_cast<size_t>(ly));
+        int gx = x0 + a; if (gx >= grid_nx) gx -= grid_nx;
+        int gy = y0 + b; if (gy >= grid_ny) gy -= grid_ny;
+        T* target = grid + (static_cast<size_t>(gx) * grid_ny + gy) * grid_nz;
+        const T* source = packed + row * lz;
+        for (int c = lane; c < lz; c += 32) {
+            int gz = z0 + c; if (gz >= grid_nz) gz -= grid_nz;
+            target[gz] = source[c];
+        }
+    }
+}
+
 // Queues, behind the spread on pme_stream_, everything the exchange needs from the device: the box
 // the spread charges cover, that box packed into a contiguous buffer, and the box itself on the host.
 void ForceCalculatorCUDA::pme_dmpi_queue_pack(size_t grid_size, size_t local_particles,
@@ -6274,7 +7315,8 @@ void ForceCalculatorCUDA::pme_dmpi_queue_pack(size_t grid_size, size_t local_par
     // share of the grid each) are close to the least that has to be received.
     const size_t whole_grid_traffic = grid_size * (pme_float_ ? sizeof(float) : sizeof(Real)) *
                                       static_cast<size_t>(pme_pp_size_ > 1 ? pme_pp_size_ - 1 : 0);
-    pme_dmpi_box_enabled_ = !pme_pp_single_node_ || whole_grid_traffic >= PME_DMPI_BOX_MIN_NODE_TRAFFIC;
+    pme_dmpi_box_enabled_ = pme_sum_via_dist_ || !pme_pp_single_node_ ||
+                            whole_grid_traffic >= PME_DMPI_BOX_MIN_NODE_TRAFFIC;
     if (!h_pme_box_) CUDA_CHECK(cudaMallocHost(&h_pme_box_, 6 * sizeof(int)));
     if (!pme_dmpi_box_enabled_) {
         const int whole[6] = {0, ewald_grid_x_, 0, ewald_grid_y_, 0, ewald_grid_z_};
@@ -6402,7 +7444,14 @@ void ForceCalculatorCUDA::pme_reciprocal_spread(MDSystem& system) {
     MPI_Comm_size(PmePpSplit::instance().pp_comm(), &pme_pp_size_);
     pme_sum_via_nccl_ = false;
     pme_sum_via_dmpi_ = false;
-    if (pme_grid_sum_needed() && pme_nccl_ensure()) {
+    pme_sum_via_dist_ = false;
+    if (pme_grid_sum_needed() && pme_dist_ensure()) {
+        // Distributed solve (pme_ranks: 2): the box the charges cover is packed behind the spread; post_sum()
+        // sends its pieces to the slab owners, complete() runs the FFT chain on the slabs.
+        pme_sum_via_dist_ = true;
+        pme_dmpi_queue_pack(grid_size, local_particles, inv_box_x, inv_box_y, inv_box_z);
+        CUDA_CHECK(cudaEventRecord(pme_stage_event_, pme_stream_));
+    } else if (pme_grid_sum_needed() && pme_nccl_ensure()) {
         // The grid is summed on the device, in place, right behind the spread on pme_stream_: the
         // FFT chain that follows is ordered after it by the stream. No staging copy, no MPI
         // request to wait for, nothing for the host to do.
@@ -6631,6 +7680,360 @@ void ForceCalculatorCUDA::pme_dmpi_complete(size_t grid_size) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+// --- distributed reciprocal solve (cuFFTMp) ------------------------------------------------------------------
+// force_calculation.pme_ranks: 2 in a build with cuFFTMp. Per step:
+//   spread      as usual into the rank's grid; the box the charges cover is packed (pme_dmpi_queue_pack)
+//   post        all ranks learn each other's box; the box is cut at the X-slab borders and every piece goes to
+//               the rank that owns that slab (CUDA-aware MPI, only to the slabs the box overlaps)
+//   complete    the pieces are added into the slab, R2C FFT (X-slabs to Y-slabs), the solve on the local
+//               Y-slab, C2R FFT, the potential of every piece goes back to the rank it came from and is
+//               unpacked into the rank's grid, where the interpolation reads it as before
+// cuFFTMp wants NVSHMEM memory for the transform (cufftXtMalloc), so the exchange itself stays in ordinary
+// device buffers and one local kernel moves the data between the two.
+constexpr int PME_DIST_TAG_FWD = 7313;
+constexpr int PME_DIST_TAG_BACK = 7314;
+
+#ifdef DSMD_WITH_CUFFTMP
+struct ForceCalculatorCUDA::PmeDist {
+    // A block of x-planes of a rank's box that lies in the X-slab of one rank.
+    struct OutSeg { int peer, a_begin, rows, gx0; };            // seen from the box owner
+    struct InSeg { int src, a_begin, rows, gx0; int box[6]; size_t offset; };  // seen from the slab owner
+    MPI_Comm comm = MPI_COMM_NULL;
+    int rank = 0, size = 1;
+    int nx = 0, ny = 0, nz = 0, nzh = 0, nzpad = 0;
+    std::vector<int> xs, ys;               // X-slab (real) and Y-slab (complex) borders, size + 1 entries
+    int lx_local = 0, ly_local = 0;
+    cufftHandle plan_r2c = 0, plan_c2r = 0;
+    cudaLibXtDesc* desc = nullptr;         // NVSHMEM memory: real X-slab in, complex Y-slab out, in place
+    float* d_real = nullptr;
+    cufftComplex* d_cplx = nullptr;
+    size_t real_elems = 0;                 // lx_local * ny * nzpad
+    std::vector<int> boxes;                // 6 ints per rank
+    std::vector<OutSeg> out_segs;
+    std::vector<InSeg> in_segs;
+    float* d_recv = nullptr;               // pieces received from the other ranks, one after the other
+    float* d_back = nullptr;               // potential pieces sent back, same layout
+    size_t buffer_capacity = 0;            // elements of each
+    std::vector<MPI_Request> requests;
+    // Host wall time per phase, summed over the steps (printed when the solver is destroyed): post = wait for the
+    // spread chain + box allgather + posting the sends; fwd = wait for the charge pieces; chain = queue the unpack,
+    // FFT, solve, inverse FFT and potential packing and wait for the stream; back = potential pieces exchange.
+    double t_post = 0.0, t_fwd = 0.0, t_chain = 0.0, t_back = 0.0;
+    long steps = 0;
+};
+#endif
+
+// Decides once, collectively, whether the distributed solve is used and builds its plans. Called by every
+// rank at the first spread, so the collectives (communicator, NVSHMEM start-up inside cuFFTMp, the
+// symmetric allocation) are reached together. Any rank that cannot use it makes all fall back to the
+// replicated solve (with a line on rank 0 saying why).
+bool ForceCalculatorCUDA::pme_dist_ensure() {
+    if (pme_dist_tried_) return pme_dist_active_;
+    pme_dist_tried_ = true;
+    if (!pme_distributed_requested_) return false;
+    MPI_Comm pp_comm = PmePpSplit::instance().pp_comm();
+    int pp_rank = 0, pp_size = 1;
+    MPI_Comm_rank(pp_comm, &pp_rank);
+    MPI_Comm_size(pp_comm, &pp_size);
+    const char* reason = nullptr;
+#ifndef DSMD_WITH_CUFFTMP
+    reason = "this build has no cuFFTMp (configure with -DDSMD_ENABLE_CUFFTMP=ON)";
+#else
+    if (!pme_float_) reason = "it needs the float grid (precision: mixed)";
+    else if (!cuda_aware_mpi_) reason = "it needs CUDA-aware MPI";
+    else if (ewald_grid_x_ < pp_size || ewald_grid_y_ < pp_size) reason = "the grid has fewer x or y planes than ranks";
+#endif
+    int usable = reason ? 0 : 1;
+    MPI_Allreduce(MPI_IN_PLACE, &usable, 1, MPI_INT, MPI_MIN, pp_comm);
+    if (!usable) {
+        if (pp_rank == 0) {
+            std::cout << "[PME] distributed reciprocal solve (pme_ranks: 2) not used: "
+                      << (reason ? reason : "another rank cannot use it")
+                      << "; replicated solve instead" << std::endl;
+        }
+        return false;
+    }
+#ifdef DSMD_WITH_CUFFTMP
+    PmeDist* d = new PmeDist();
+    pme_dist_ = d;
+    MPI_Comm_dup(pp_comm, &d->comm);  // must stay valid until the plans are destroyed
+    d->rank = pp_rank;
+    d->size = pp_size;
+    d->nx = ewald_grid_x_;
+    d->ny = ewald_grid_y_;
+    d->nz = ewald_grid_z_;
+    d->nzh = d->nz / 2 + 1;
+    d->nzpad = 2 * d->nzh;
+    d->xs.resize(pp_size + 1);
+    d->ys.resize(pp_size + 1);
+    for (int q = 0; q <= pp_size; ++q) {
+        d->xs[q] = static_cast<int>((static_cast<long long>(d->nx) * q) / pp_size);
+        d->ys[q] = static_cast<int>((static_cast<long long>(d->ny) * q) / pp_size);
+    }
+    d->lx_local = d->xs[pp_rank + 1] - d->xs[pp_rank];
+    d->ly_local = d->ys[pp_rank + 1] - d->ys[pp_rank];
+    d->boxes.assign(static_cast<size_t>(6) * pp_size, 0);
+
+    // Real input: this rank's X-slab, z rows padded to 2 * (nz / 2 + 1) floats (in-place R2C).
+    // Complex output: this rank's Y-slab of the half-spectrum, packed, z fastest. Upper bounds are exclusive.
+    const long long lower_real[3] = {d->xs[pp_rank], 0, 0};
+    const long long upper_real[3] = {d->xs[pp_rank + 1], d->ny, d->nz};
+    const long long stride_real[3] = {static_cast<long long>(d->ny) * d->nzpad, d->nzpad, 1};
+    const long long lower_cplx[3] = {0, d->ys[pp_rank], 0};
+    const long long upper_cplx[3] = {d->nx, d->ys[pp_rank + 1], d->nzh};
+    const long long stride_cplx[3] = {static_cast<long long>(d->ly_local) * d->nzh, d->nzh, 1};
+    int n[3] = {d->nx, d->ny, d->nz};
+    size_t workspace = 0;
+    CUFFT_CHECK(cufftCreate(&d->plan_r2c));
+    CUFFT_CHECK(cufftCreate(&d->plan_c2r));
+    CUFFT_CHECK(cufftSetStream(d->plan_r2c, pme_stream_));
+    CUFFT_CHECK(cufftSetStream(d->plan_c2r, pme_stream_));
+    // Both plans take the real box first, then the complex one (as in the NVIDIA pencil sample).
+    CUFFT_CHECK(cufftMpMakePlanDecomposition(d->plan_r2c, 3, n, lower_real, upper_real, stride_real,
+                                             lower_cplx, upper_cplx, stride_cplx, CUFFT_R2C,
+                                             &d->comm, CUFFT_COMM_MPI, &workspace));
+    CUFFT_CHECK(cufftMpMakePlanDecomposition(d->plan_c2r, 3, n, lower_real, upper_real, stride_real,
+                                             lower_cplx, upper_cplx, stride_cplx, CUFFT_C2R,
+                                             &d->comm, CUFFT_COMM_MPI, &workspace));
+    CUFFT_CHECK(cufftXtMalloc(d->plan_r2c, &d->desc, CUFFT_XT_FORMAT_DISTRIBUTED_INPUT));
+    d->d_real = static_cast<float*>(d->desc->descriptor->data[0]);
+    d->d_cplx = reinterpret_cast<cufftComplex*>(d->d_real);
+    d->real_elems = static_cast<size_t>(d->lx_local) * d->ny * d->nzpad;
+    if (pp_rank == 0) {
+        std::cout << "[PME] " << pp_size << " ranks: distributed reciprocal solve (cuFFTMp, X-slabs to Y-slabs), "
+                  << d->nx << "x" << d->ny << "x" << d->nz << " float grid" << std::endl;
+    }
+    pme_dist_active_ = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+// Starts the exchange of the charge pieces once the spread and the packing of the box are done.
+void ForceCalculatorCUDA::pme_dist_post() {
+#ifdef DSMD_WITH_CUFFTMP
+    PmeDist& d = *pme_dist_;
+    const double time_post_begin = MPI_Wtime();
+    // The host needs the box (pinned copy) and MPI reads the packed box: wait for the spread chain.
+    CUDA_CHECK(cudaEventSynchronize(pme_stage_event_));
+    MPI_Allgather(h_pme_box_, 6, MPI_INT, d.boxes.data(), 6, MPI_INT, d.comm);
+    const int axis_size[3] = {d.nx, d.ny, d.nz};
+    for (int r = 0; r < d.size; ++r) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const int start = d.boxes[static_cast<size_t>(6) * r + 2 * axis];
+            const int length = d.boxes[static_cast<size_t>(6) * r + 2 * axis + 1];
+            if (start < 0 || start >= axis_size[axis] || length < 1 || length > axis_size[axis]) {
+                throw std::runtime_error("PME distributed solve: invalid box from rank " + std::to_string(r));
+            }
+        }
+    }
+    const int* mine = &d.boxes[static_cast<size_t>(6) * d.rank];
+    const size_t my_plane = static_cast<size_t>(mine[3]) * mine[5];  // points of one x-plane of my box
+
+    // Pieces of my box per owner: the x-range of the box (periodic, so also shifted by one box length)
+    // cut at the slab borders. Rows are x-planes of the packed box, which is contiguous per plane.
+    d.out_segs.clear();
+    d.in_segs.clear();
+    for (int q = 0; q < d.size; ++q) {
+        for (int shift = 0; shift <= d.nx; shift += d.nx) {
+            const int lo = std::max(mine[0], d.xs[q] + shift);
+            const int hi = std::min(mine[0] + mine[1], d.xs[q + 1] + shift);
+            if (lo < hi) d.out_segs.push_back({q, lo - mine[0], hi - lo, lo - shift});
+        }
+    }
+    // Pieces of every rank's box in my slab, in rank order (the order the pieces are added in, the same on
+    // every run: the sum is reproducible).
+    size_t recv_elems = 0;
+    for (int r = 0; r < d.size; ++r) {
+        const int* box = &d.boxes[static_cast<size_t>(6) * r];
+        for (int shift = 0; shift <= d.nx; shift += d.nx) {
+            const int lo = std::max(box[0], d.xs[d.rank] + shift);
+            const int hi = std::min(box[0] + box[1], d.xs[d.rank + 1] + shift);
+            if (lo >= hi) continue;
+            PmeDist::InSeg seg;
+            seg.src = r;
+            seg.a_begin = lo - box[0];
+            seg.rows = hi - lo;
+            seg.gx0 = lo - shift;
+            for (int j = 0; j < 6; ++j) seg.box[j] = box[j];
+            seg.offset = 0;
+            if (r != d.rank) {
+                seg.offset = recv_elems;
+                recv_elems += static_cast<size_t>(seg.rows) * box[3] * box[5];
+            }
+            d.in_segs.push_back(seg);
+        }
+    }
+    if (recv_elems > d.buffer_capacity) {
+        // The previous step has finished with these (complete() ends with a stream synchronization).
+        if (d.d_recv) CUDA_CHECK(cudaFree(d.d_recv));
+        if (d.d_back) CUDA_CHECK(cudaFree(d.d_back));
+        CUDA_CHECK(cudaMalloc(&d.d_recv, recv_elems * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d.d_back, recv_elems * sizeof(float)));
+        d.buffer_capacity = recv_elems;
+    }
+
+    d.requests.clear();
+    const float* pack = static_cast<const float*>(d_pme_dmpi_pack_);
+    for (const auto& seg : d.in_segs) {
+        if (seg.src == d.rank) continue;
+        MPI_Request request = MPI_REQUEST_NULL;
+        MPI_Irecv(d.d_recv + seg.offset, static_cast<int>(static_cast<size_t>(seg.rows) * seg.box[3] * seg.box[5]),
+                  MPI_FLOAT, seg.src, PME_DIST_TAG_FWD, d.comm, &request);
+        d.requests.push_back(request);
+    }
+    for (const auto& seg : d.out_segs) {
+        if (seg.peer == d.rank) continue;
+        MPI_Request request = MPI_REQUEST_NULL;
+        MPI_Isend(pack + static_cast<size_t>(seg.a_begin) * my_plane, static_cast<int>(static_cast<size_t>(seg.rows) * my_plane),
+                  MPI_FLOAT, seg.peer, PME_DIST_TAG_FWD, d.comm, &request);
+        d.requests.push_back(request);
+    }
+    d.t_post += MPI_Wtime() - time_post_begin;
+#endif
+}
+
+// Finishes the exchange and runs the whole reciprocal chain on the slabs (see the overview above). It ends with
+// the potential of the rank's own box unpacked into d_pme_charge_grid_f_, queued on pme_stream_. The host waits for
+// the FFT chain here: the potential pieces travel through MPI, which does not follow the stream order.
+void ForceCalculatorCUDA::pme_dist_complete(bool want_energy, Real inv_box_x, Real inv_box_y, Real inv_box_z) {
+#ifdef DSMD_WITH_CUFFTMP
+    PmeDist& d = *pme_dist_;
+    const double time_fwd_begin = MPI_Wtime();
+    if (!d.requests.empty()) {
+        MPI_Waitall(static_cast<int>(d.requests.size()), d.requests.data(), MPI_STATUSES_IGNORE);
+        d.requests.clear();
+    }
+    const double time_chain_begin = MPI_Wtime();
+    d.t_fwd += time_chain_begin - time_fwd_begin;
+    float* pack = static_cast<float*>(d_pme_dmpi_pack_);
+    const int* mine = &d.boxes[static_cast<size_t>(6) * d.rank];
+    const size_t my_plane = static_cast<size_t>(mine[3]) * mine[5];
+    const int x_slab0 = d.xs[d.rank];
+
+    // 1. Add the pieces into the (zeroed) real slab, in rank order.
+    CUDA_CHECK(cudaMemsetAsync(d.d_real, 0, d.real_elems * sizeof(float), pme_stream_));
+    for (const auto& seg : d.in_segs) {
+        const int ly = seg.box[3], lz = seg.box[5];
+        const float* source = seg.src == d.rank ? pack + static_cast<size_t>(seg.a_begin) * ly * lz
+                                                : d.d_recv + seg.offset;
+        const int blocks = static_cast<int>((static_cast<size_t>(seg.rows) * ly + 7) / 8);
+        pme_dist_unpack_add_kernel<float><<<blocks, 256, 0, pme_stream_>>>(
+            d.d_real, source, seg.rows, ly, lz, seg.gx0 - x_slab0, seg.box[2], seg.box[4],
+            d.ny, d.nz, d.nzpad);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // 2. Forward FFT, solve on the local Y-slab, inverse FFT. The k-space energy and virial are partial sums
+    //    over this rank's slab: no 1/P.
+    CUFFT_CHECK(cufftXtExecDescriptor(d.plan_r2c, d.desc, d.desc, CUFFT_FORWARD));
+    const int grid_nzh = d.nzh;
+    dim3 grid_blocks((d.nx + 7) / 8, (d.ly_local + 7) / 8, (grid_nzh + 7) / 8);
+    dim3 threads(8, 8, 8);
+    const int y_begin = d.ys[d.rank];
+    if (want_energy && d_virial) {
+        pme_reciprocal_virial_kernel<float><<<grid_blocks, threads, 0, pme_stream_>>>(
+            d.d_cplx, d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+            d_virial, ewald_prefactor_, ewald_alpha_, d.nx, d.ny, d.nz, grid_nzh,
+            inv_box_x, inv_box_y, inv_box_z, 1.0, virial_tensor_enabled_, y_begin, d.ly_local);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    pme_solve_poisson_kernel<float><<<grid_blocks, threads, 0, pme_stream_>>>(
+        d.d_cplx, d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
+        want_energy ? d_potential_energy : nullptr, ewald_prefactor_, ewald_alpha_,
+        d.nx, d.ny, d.nz, grid_nzh, inv_box_x, inv_box_y, inv_box_z, 1.0, y_begin, d.ly_local);
+    CUDA_CHECK(cudaGetLastError());
+    CUFFT_CHECK(cufftXtExecDescriptor(d.plan_c2r, d.desc, d.desc, CUFFT_INVERSE));
+
+    // 3. Potential pieces back: pack what each source rank's box needs from my slab.
+    for (const auto& seg : d.in_segs) {
+        const int ly = seg.box[3], lz = seg.box[5];
+        float* target = seg.src == d.rank ? pack + static_cast<size_t>(seg.a_begin) * ly * lz
+                                          : d.d_back + seg.offset;
+        const int blocks = static_cast<int>((static_cast<size_t>(seg.rows) * ly + 7) / 8);
+        pme_dist_pack_slab_kernel<float><<<blocks, 256, 0, pme_stream_>>>(
+            d.d_real, target, seg.rows, ly, lz, seg.gx0 - x_slab0, seg.box[2], seg.box[4],
+            d.ny, d.nz, d.nzpad);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    // MPI reads and writes these device buffers outside the stream order: the FFT chain and the packing
+    // must be done first.
+    CUDA_CHECK(cudaStreamSynchronize(pme_stream_));
+    const double time_back_begin = MPI_Wtime();
+    d.t_chain += time_back_begin - time_chain_begin;
+    for (const auto& seg : d.out_segs) {
+        if (seg.peer == d.rank) continue;
+        MPI_Request request = MPI_REQUEST_NULL;
+        MPI_Irecv(pack + static_cast<size_t>(seg.a_begin) * my_plane, static_cast<int>(static_cast<size_t>(seg.rows) * my_plane),
+                  MPI_FLOAT, seg.peer, PME_DIST_TAG_BACK, d.comm, &request);
+        d.requests.push_back(request);
+    }
+    for (const auto& seg : d.in_segs) {
+        if (seg.src == d.rank) continue;
+        MPI_Request request = MPI_REQUEST_NULL;
+        MPI_Isend(d.d_back + seg.offset, static_cast<int>(static_cast<size_t>(seg.rows) * seg.box[3] * seg.box[5]),
+                  MPI_FLOAT, seg.src, PME_DIST_TAG_BACK, d.comm, &request);
+        d.requests.push_back(request);
+    }
+    if (!d.requests.empty()) {
+        MPI_Waitall(static_cast<int>(d.requests.size()), d.requests.data(), MPI_STATUSES_IGNORE);
+        d.requests.clear();
+    }
+
+    d.t_back += MPI_Wtime() - time_back_begin;
+    ++d.steps;
+
+    // 4. The rank's own box of potential back into the grid the interpolation reads.
+    const int unpack_blocks = static_cast<int>((static_cast<size_t>(d.nx) * d.ny + 7) / 8);
+    pme_unpack_box_kernel<float><<<unpack_blocks, 256, 0, pme_stream_>>>(
+        d_pme_charge_grid_f_, pack, d_pme_box_, d.nx, d.ny, d.nz);
+    CUDA_CHECK(cudaGetLastError());
+#else
+    (void)want_energy; (void)inv_box_x; (void)inv_box_y; (void)inv_box_z;
+#endif
+}
+
+void ForceCalculatorCUDA::pme_dist_destroy() {
+#ifdef DSMD_WITH_CUFFTMP
+    if (pme_dist_) {
+        PmeDist& d = *pme_dist_;
+        if (pme_stream_) cudaStreamSynchronize(pme_stream_);
+        int finalized_before = 0;
+        MPI_Finalized(&finalized_before);
+        if (!finalized_before && d.steps > 0) {
+            // Mean and maximum over the ranks of the host time per step in each phase, in ms.
+            double mine[4] = {d.t_post, d.t_fwd, d.t_chain, d.t_back};
+            double sum[4], maximum[4];
+            MPI_Allreduce(mine, sum, 4, MPI_DOUBLE, MPI_SUM, d.comm);
+            MPI_Allreduce(mine, maximum, 4, MPI_DOUBLE, MPI_MAX, d.comm);
+            if (d.rank == 0) {
+                const double scale = 1000.0 / static_cast<double>(d.steps);
+                std::cout << "[PME dist] host ms per solve over " << d.steps << " solves (mean / max over ranks): post "
+                          << sum[0] / d.size * scale << " / " << maximum[0] * scale << ", charge pieces "
+                          << sum[1] / d.size * scale << " / " << maximum[1] * scale << ", FFT chain "
+                          << sum[2] / d.size * scale << " / " << maximum[2] * scale << ", potential pieces "
+                          << sum[3] / d.size * scale << " / " << maximum[3] * scale << std::endl;
+            }
+        }
+        // The NVSHMEM buffer goes before the plans (cuFFTMp keeps NVSHMEM initialized for it).
+        if (d.desc) cufftXtFree(d.desc);
+        if (d.plan_r2c) cufftDestroy(d.plan_r2c);
+        if (d.plan_c2r) cufftDestroy(d.plan_c2r);
+        if (d.d_recv) cudaFree(d.d_recv);
+        if (d.d_back) cudaFree(d.d_back);
+        int finalized = 0;
+        MPI_Finalized(&finalized);
+        if (d.comm != MPI_COMM_NULL && !finalized) MPI_Comm_free(&d.comm);
+        delete pme_dist_;
+        pme_dist_ = nullptr;
+    }
+#endif
+    pme_dist_tried_ = false;
+    pme_dist_active_ = false;
+    pme_sum_via_dist_ = false;
+}
+
 // Queues the in-place sum of the charge grid over the PP ranks on pme_stream_.
 void ForceCalculatorCUDA::pme_nccl_sum_grid(size_t grid_size) {
 #ifdef DSMD_WITH_NCCL
@@ -6654,6 +8057,11 @@ void ForceCalculatorCUDA::pme_nccl_sum_grid(size_t grid_size) {
 
 void ForceCalculatorCUDA::pme_reciprocal_post_sum() {
     if (pme_stage_ != PmeStage::Spread || !pme_grid_sum_needed()) return;
+    if (pme_sum_via_dist_) {
+        pme_dist_post();
+        pme_stage_ = PmeStage::Posted;
+        return;
+    }
     if (pme_sum_via_dmpi_) {
         pme_dmpi_post(pme_grid_size_);
         pme_stage_ = PmeStage::Posted;
@@ -6718,7 +8126,10 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
         // CPU PmeServer::run protocol; MDSimulation::finalize sends the final
         // zero). A fixed server step count cannot match the number of force
         // evaluations (initial evaluation, minimization iterations).
-        int continue_flag = 1;
+        // 1 = one more step; 2 = one more step, and the PME rank also returns the diagonal of the
+        // reciprocal virial (anisotropic pressure coupling): the GPU PME rank (PmeServerCuda) and the CPU
+        // PmeServer (bit 1 of the flag) both answer with {E, W, W_xx, W_yy, W_zz}.
+        int continue_flag = virial_tensor_enabled_ ? 2 : 1;
         MPI_Bcast(&continue_flag, 1, MPI_INT, pp_leader_root, split.inter_comm());
         SimulationBox& box = system.get_box();
         Real box_dims[3] = {box.lx, box.ly, box.lz};
@@ -6740,7 +8151,8 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
         // layout. This replaced an earlier design using MPI_Reduce_scatter/
         // MPI_Allgatherv directly on the intercomm here, which segfaulted
         // inside OpenMPI's coll/basic reduce_scatter_inter in real testing.
-        Real energy_virial[2] = {0.0, 0.0};
+        // {energy, virial trace} and, with the virial tensor, {W_xx, W_yy, W_zz} after them.
+        Real energy_virial[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
         {
             MPI_Request req;
             MPI_Ireduce(pme_split_host_grid_buffer_.data(), nullptr, static_cast<int>(grid_size),
@@ -6750,7 +8162,7 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
 
             MPI_Bcast(pme_split_host_grid_buffer_.data(), static_cast<int>(grid_size), MPI_DOUBLE,
                       0, split.inter_comm());
-            MPI_Bcast(energy_virial, 2, MPI_DOUBLE, 0, split.inter_comm());
+            MPI_Bcast(energy_virial, virial_tensor_enabled_ ? 5 : 2, MPI_DOUBLE, 0, split.inter_comm());
         }
 
         CUDA_CHECK(cudaMemcpyAsync(d_pme_charge_grid_real_, pme_split_host_grid_buffer_.data(),
@@ -6765,8 +8177,15 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
             MPI_Comm_size(split.pp_comm(), &pp_size);
             pme_add_energy_virial_kernel<<<1, 1, 0, pme_stream_>>>(
                 d_potential_energy, d_virial,
-                energy_virial[0] / pp_size, energy_virial[1] / pp_size);
+                energy_virial[0] / pp_size, energy_virial[1] / pp_size,
+                virial_tensor_enabled_,
+                energy_virial[2] / pp_size, energy_virial[3] / pp_size, energy_virial[4] / pp_size);
         }
+    } else if (pme_sum_via_dist_) {
+        // Distributed solve: pieces of the charge grid to the slab owners, FFT chain on the slabs, potential
+        // back (pme_dist_complete). The reciprocal energy and virial are this rank's slab share.
+        if (pme_stage_ == PmeStage::Spread) pme_reciprocal_post_sum();
+        pme_dist_complete(want_energy, inv_box_x, inv_box_y, inv_box_z);
     } else {
         // No PP/PME split. Every rank spread only its OWNED atoms' charges, so with
         // more than one rank the grid is a partial charge density. The ranks' grids
@@ -6811,7 +8230,7 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
                     d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
                     d_virial, ewald_prefactor_, ewald_alpha_,
                     ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
-                    inv_box_x, inv_box_y, inv_box_z, energy_scale
+                    inv_box_x, inv_box_y, inv_box_z, energy_scale, virial_tensor_enabled_
                 );
             }
             pme_solve_poisson_kernel<float><<<grid_blocks, threads, 0, pme_stream_>>>(
@@ -6830,7 +8249,7 @@ void ForceCalculatorCUDA::pme_reciprocal_complete(MDSystem& system) {
                     d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
                     d_virial, ewald_prefactor_, ewald_alpha_,
                     ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
-                    inv_box_x, inv_box_y, inv_box_z, energy_scale
+                    inv_box_x, inv_box_y, inv_box_z, energy_scale, virial_tensor_enabled_
                 );
             }
             pme_solve_poisson_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
@@ -6914,7 +8333,8 @@ PmeServerCuda::PmeServerCuda(PmePpSplit& split) : split_(split) {
     CUDA_CHECK(cudaSetDevice(device_id_));
 
     CUDA_CHECK(cudaMalloc(&d_recip_energy_, sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&d_recip_virial_, sizeof(Real)));
+    // [0] the virial trace, [1..3] its diagonal (filled when a PP rank asks for the tensor)
+    CUDA_CHECK(cudaMalloc(&d_recip_virial_, VIRIAL_SLOTS * sizeof(Real)));
 }
 
 PmeServerCuda::~PmeServerCuda() {
@@ -6994,14 +8414,15 @@ void PmeServerCuda::run(int /*total_steps*/, Real cutoff) {
         int continue_flag = 0;
         // Root is rank 0 of the remote (PP) group: the per-call flag sent by
         // compute_electrostatic_forces_reciprocal and the final zero sent by
-        // MDSimulation::finalize.
+        // MDSimulation::finalize. 1 = one more step, 2 = one more step with the diagonal of
+        // the reciprocal virial in the reply (the PP ranks use the virial tensor).
         MPI_Bcast(&continue_flag, 1, MPI_INT, /*root in remote (PP) group*/ 0, inter);
         if (!continue_flag) break;
-        step();
+        step((continue_flag & 2) != 0);   // bit 1 = the PP ranks want the virial tensor (a CPU PP side sends 3, a CUDA one 2)
     }
 }
 
-void PmeServerCuda::step() {
+void PmeServerCuda::step(bool tensor) {
     MPI_Comm inter = split_.inter_comm();
     const bool leader = split_.is_pme_leader();
     const int leader_root = leader ? MPI_ROOT : MPI_PROC_NULL;
@@ -7033,11 +8454,12 @@ void PmeServerCuda::step() {
     MPI_Wait(&req, MPI_STATUS_IGNORE);
 
     Real recip_energy = 0.0, recip_virial = 0.0;
+    Real recip_virial_diag[3] = {0.0, 0.0, 0.0};
     if (leader) {
         CUDA_CHECK(cudaMemcpyAsync(d_pme_charge_grid_real_, host_grid_buffer_.data(),
                                    grid_size * sizeof(Real), cudaMemcpyHostToDevice, pme_stream_));
         CUDA_CHECK(cudaMemsetAsync(d_recip_energy_, 0, sizeof(Real), pme_stream_));
-        CUDA_CHECK(cudaMemsetAsync(d_recip_virial_, 0, sizeof(Real), pme_stream_));
+        CUDA_CHECK(cudaMemsetAsync(d_recip_virial_, 0, VIRIAL_SLOTS * sizeof(Real), pme_stream_));
 
         CUFFT_CHECK(cufftExecD2Z(pme_fft_plan_forward_, d_pme_charge_grid_real_, d_pme_charge_grid_freq_));
 
@@ -7050,7 +8472,7 @@ void PmeServerCuda::step() {
             d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
             d_recip_virial_, ewald_prefactor_, ewald_alpha_,
             ewald_grid_x_, ewald_grid_y_, ewald_grid_z_, grid_nzh,
-            inv_box_x, inv_box_y, inv_box_z);
+            inv_box_x, inv_box_y, inv_box_z, 1.0, tensor);
         pme_solve_poisson_kernel<double><<<grid_blocks, threads, 0, pme_stream_>>>(
             d_pme_charge_grid_freq_,
             d_pme_b_spline_mod_x_, d_pme_b_spline_mod_y_, d_pme_b_spline_mod_z_,
@@ -7066,13 +8488,19 @@ void PmeServerCuda::step() {
                                    cudaMemcpyDeviceToHost, pme_stream_));
         CUDA_CHECK(cudaMemcpyAsync(&recip_virial, d_recip_virial_, sizeof(Real),
                                    cudaMemcpyDeviceToHost, pme_stream_));
+        if (tensor) {
+            CUDA_CHECK(cudaMemcpyAsync(recip_virial_diag, d_recip_virial_ + 1, 3 * sizeof(Real),
+                                       cudaMemcpyDeviceToHost, pme_stream_));
+        }
         CUDA_CHECK(cudaStreamSynchronize(pme_stream_));
     }
 
     MPI_Bcast(host_grid_buffer_.data(), static_cast<int>(grid_size), MPI_DOUBLE, leader_root, inter);
 
-    Real energy_virial[2] = {recip_energy, recip_virial};
-    MPI_Bcast(energy_virial, 2, MPI_DOUBLE, leader_root, inter);
+    // {energy, virial trace}, and {W_xx, W_yy, W_zz} after them when the PP ranks asked for the tensor.
+    Real energy_virial[5] = {recip_energy, recip_virial, recip_virial_diag[0], recip_virial_diag[1],
+                             recip_virial_diag[2]};
+    MPI_Bcast(energy_virial, tensor ? 5 : 2, MPI_DOUBLE, leader_root, inter);
 }
 
 

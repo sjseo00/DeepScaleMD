@@ -15,7 +15,7 @@ import importlib.util
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-ACCELS = ("e3nn", "cueq", "openeq", "flash")
+ACCELS = ("e3nn", "cueq", "openeq", "flash", "so3lr_fused")
 
 
 class AccelError(RuntimeError):
@@ -71,7 +71,9 @@ def _resolve_cueq() -> AccelInfo:
                                                     "cuequivariance-ops-torch-cu11"),
         "cuequivariance-ops": package_version("cuequivariance-ops-cu12", "cuequivariance-ops-cu13", "cuequivariance-ops-cu11"),
     }
-    return AccelInfo(libs, ["cuequivariance_ops_torch"], versions)
+    # cuequivariance_ops_torch registers only some of its operators when it is imported; uniform_1d (the tensor products and
+    # symmetric contractions of mace) is registered by its submodule, which cuequivariance_torch imports
+    return AccelInfo(libs, ["cuequivariance_ops_torch", "cuequivariance_torch"], versions)
 
 
 def _resolve_openeq() -> AccelInfo:
@@ -107,6 +109,45 @@ def _resolve_flash() -> AccelInfo:
     return AccelInfo(libs, [], {"flashTP_e3nn": package_version("flashTP_e3nn", "flashtp-e3nn", "flashTP-e3nn")})
 
 
+def so3lr_fused_sources() -> List[Path]:
+    """so3lr_ops/so3lr_fused_ops.cpp (the operator) and so3lr_ops/so3lr_fused_kernels.cu (its kernels), inside mlip_convert."""
+    folder = Path(__file__).resolve().parent / "so3lr_ops"
+    return [folder / "so3lr_fused_ops.cpp", folder / "so3lr_fused_kernels.cu"]
+
+
+def _so3lr_fused_headers() -> List[Path]:
+    """Headers the two sources include: part of the source hash (a changed header is a new library), not compiled on their own."""
+    return [Path(__file__).resolve().parent / "so3lr_ops" / "so3lr_pair_params.h"]
+
+
+def _resolve_so3lr_fused() -> AccelInfo:
+    """The SO3LR attention operator (so3lr::attention, mlip_convert/so3lr_ops/): compiled here as a torch extension with the CUDA
+    toolkit (nvcc, ninja) and loaded into this process; dsMD dlopens the same library. The library name carries a hash of the
+    source, so a changed source is a new library: a library that running jobs have open is never rebuilt in place."""
+    import hashlib
+    sources = so3lr_fused_sources()
+    missing = [str(path) for path in sources if not path.is_file()]
+    if missing:
+        raise AccelError(f"--accel so3lr_fused needs the operator sources {', '.join(missing)} (mlip_convert/so3lr_ops/)")
+    digest = hashlib.sha256(b"".join(path.read_bytes() for path in sources + _so3lr_fused_headers())).hexdigest()[:12]
+    name = f"dsmd_so3lr_fused_{digest}"
+    try:
+        import torch
+        from torch.utils import cpp_extension
+        if not torch.cuda.is_available():
+            raise AccelError("--accel so3lr_fused builds and checks a CUDA operator: run the conversion on a machine with a GPU")
+        cpp_extension.load(name=name, sources=[str(path) for path in sources], is_python_module=False, extra_cflags=["-O3"],
+                           extra_cuda_cflags=["-O3"], verbose=False)
+        library = Path(cpp_extension._get_build_directory(name, False)) / f"{name}.so"
+    except AccelError:
+        raise
+    except Exception as error:      # noqa: BLE001  (compiler and loader errors come in many classes)
+        raise AccelError(f"could not build or load the so3lr_fused operator from {sources[0].parent}: {error}") from error
+    if not library.is_file():
+        raise AccelError(f"the so3lr_fused operator was built, but its library is not at {library}")
+    return AccelInfo([str(library.resolve())], [], {"so3lr_fused": digest})
+
+
 def resolve_accel(kind: str) -> AccelInfo:
     if kind not in ACCELS:
         raise AccelError(f"unknown acceleration '{kind}'; supported: {', '.join(ACCELS)}")
@@ -114,4 +155,6 @@ def resolve_accel(kind: str) -> AccelInfo:
         return AccelInfo([], [], {})
     if kind == "flash":
         return _resolve_flash()
+    if kind == "so3lr_fused":
+        return _resolve_so3lr_fused()
     return _resolve_cueq() if kind == "cueq" else _resolve_openeq()

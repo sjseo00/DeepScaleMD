@@ -14,7 +14,7 @@ from torch import Tensor
 
 from .base import MLIPAdapter
 
-KCAL_PER_MOL_TO_EV = 1.0 / 23.0609
+KCAL_PER_MOL_TO_EV = 1.0 / 23.0605
 
 # Lennard-Jones-like parameters per atomic number: (epsilon in eV, sigma in A). Argon is the LJ example of
 # examples/dsMD_input_lj (0.238 kcal/mol, 3.405 A); the others are only plausible-looking values for tests.

@@ -11,11 +11,15 @@ four letters:
   MINImize   NSTEp, TOLGrad
   NBONds     CUTNb, CTONnb, CTOFnb, VSWItch, EWALd, FFTX/FFTY/FFTZ, ORDEr
   CRYStal    DEFIne CUBIc / ORTHorhombic / TETRagonal (the periodic box)
+  SHAKe      BONH or BOND with PARAm (RunSettings.constraints: the PSF reader turns the bonds
+             with hydrogen / every bond into [constraints] of their parameter-file length);
+             TOLerance, MXITer, FAST and NOFAst do not change the constraints and are ignored
 
 What DeepScaleMD cannot reproduce goes into RunSettings.unsupported (an error unless
---allow-lossy): constant-pressure dynamics (CPT), Nose-Hoover and temperature-coupling
-dynamics, SHAKE, shifted / force-switched van der Waals, electrostatics without Ewald,
-and a PME spline order other than 4.
+--allow-lossy): constant-pressure dynamics (CPT; there is no anisotropic option to map),
+Nose-Hoover and temperature-coupling dynamics, any other SHAKe form (ANGLe, no PARAm, a
+selection, ...), shifted / force-switched van der Waals, electrostatics without Ewald, and a
+PME spline order other than 4.
 """
 
 from __future__ import annotations
@@ -62,6 +66,28 @@ def _after(tokens: List[str], prefix: str) -> Optional[float]:
 
 def _has(tokens: List[str], prefix: str) -> bool:
     return any(token.startswith(prefix) for token in tokens)
+
+
+_SHAKE_KEYWORDS = ("BONH", "BOND", "PARA", "TOL", "MXIT", "FAST", "NOFA")
+
+
+def _shake(s: RunSettings, tokens: List[str]) -> None:
+    """SHAKe BONH | BOND PARAm: the bonds with hydrogen / all bonds at their parameter-file length.
+    Without PARAm CHARMM takes the lengths from the coordinates, which is not converted."""
+    other = []
+    for token in tokens[1:]:
+        try:
+            float(token)
+        except ValueError:
+            if not token.startswith(_SHAKE_KEYWORDS):
+                other.append(token)
+    bonh, bond = _has(tokens[1:], "BONH"), _has(tokens[1:], "BOND")
+    if other or bonh == bond or not _has(tokens[1:], "PARA"):
+        s.unsupported.append("SHAKe " + " ".join(tokens[1:]) + " (only SHAKe BONH or BOND with PARAm is converted)")
+    else:
+        s.constraints = "hydrogen" if bonh else "all"
+        s.notes.append(f"SHAKe {'BONH' if bonh else 'BOND'}: the rigid bonds are the [constraints] section "
+                       f"of topology.dsMDtop")
 
 
 def charmm_run_settings(path: str, box: Optional[Tuple[float, float, float]]) -> RunSettings:
@@ -133,7 +159,7 @@ def charmm_run_settings(path: str, box: Optional[Tuple[float, float, float]]) ->
             else:
                 s.unsupported.append("CRYStal type other than CUBIc / ORTHorhombic / TETRagonal")
         elif head == "SHAK":
-            s.unsupported.append("SHAKe (bond constraints)")
+            _shake(s, tokens)
 
     if not seen_dynamics:
         raise ConversionError(f"{path}: no DYNAmics command found")

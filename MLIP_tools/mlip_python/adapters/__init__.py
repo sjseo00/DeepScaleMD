@@ -1,4 +1,4 @@
-"""Adapters of the Python MLIP mode, one file per MLIP. ADAPTER_REGISTRY maps the `model_type` of mlip_config to its adapter.
+"""Adapters of the ASE mode, one file per MLIP. ADAPTER_REGISTRY maps the `model_type` of mlip_config to its adapter.
 
 A new MLIP: add its file here and one line to ADAPTER_REGISTRY. The packages of a MLIP are imported inside its initialize(),
 so importing all adapters needs none of them installed.
@@ -9,12 +9,14 @@ from .base import MLIPAdapter, _atom_types_to_symbols       # noqa: F401
 from .bam import BAMAdapter
 from .chgnet import CHGNetAdapter
 from .deepmd import DeePMDAdapter
+from .esen import ESENAdapter
 from .gap import GAPAdapter
 from .mace import MACEAdapter
 from .matgl import MatGLAdapter
 from .mattersim import MatterSimAdapter
 from .nequip import NequIPAdapter
 from .orb import ORBAdapter
+from .painn import PaiNNAdapter
 from .sevennet import SevenNetAdapter
 from .uma import UMAAdapter
 
@@ -35,6 +37,7 @@ ADAPTER_REGISTRY: dict[str, type[MLIPAdapter]] = {
     "uma_s":       UMAAdapter,
     "uma_m":       UMAAdapter,
     "fairchem":    UMAAdapter,
+    "esen":        ESENAdapter,      # fairchem 2.x eSEN checkpoints: loaded like UMA, one task
     # new adapters
     "mattersim":   MatterSimAdapter,
     "matgl":       MatGLAdapter,
@@ -45,5 +48,7 @@ ADAPTER_REGISTRY: dict[str, type[MLIPAdapter]] = {
     "gap":         GAPAdapter,
     "bam":         BAMAdapter,
     "bam_torch":   BAMAdapter,
+    "painn":       PaiNNAdapter,
+    "schnetpack":  PaiNNAdapter,
     "quip":        GAPAdapter,
 }

@@ -1,5 +1,5 @@
 #include "MLIPBackend.h"
-#include "PythonBackend.h"
+#include "AseBackend.h"
 #ifdef DSMD_WITH_LIBTORCH
 #include "LibTorchBackend.h"
 #endif
@@ -10,14 +10,14 @@
 namespace {
 
 std::string effective_backend(const MLIPConfig& cfg) {
-    return cfg.backend.empty() ? std::string("python") : cfg.backend;
+    return cfg.backend.empty() ? std::string("ase") : cfg.backend;
 }
 
 }  // namespace
 
 void validate_mlip_config(const MLIPConfig& cfg) {
     const std::string backend = effective_backend(cfg);
-    if (backend == "python") {
+    if (backend == "ase") {
         // optional here (Python guesses the elements of the types without it), but an entry that is given has to be an element
         for (int z : cfg.type_to_z) {
             if (z < 1 || z > 118) {
@@ -27,23 +27,23 @@ void validate_mlip_config(const MLIPConfig& cfg) {
         }
         return;
     }
-    if (backend != "libtorch") {
+    if (backend != "libtorch" && backend != "pytorch") {
         throw std::runtime_error(
-            "Invalid mlip_backend: '" + backend + "'. Supported values are: python, libtorch");
+            "Invalid mlip_backend: '" + backend + "'. Supported values are: ase, libtorch, pytorch");
     }
 
 #if !defined(USE_CUDA)
     throw std::runtime_error(
-        "mlip_backend 'libtorch' is only supported in CUDA builds, not in CPU/SYCL builds. "
-        "Use 'python'.");
+        "mlip_backend '" + backend + "' is only supported in CUDA builds, not in CPU/SYCL builds. "
+        "Use 'ase'.");
 #elif !defined(DSMD_WITH_LIBTORCH)
     throw std::runtime_error(
-        "mlip_backend 'libtorch' needs a build with LibTorch support "
-        "(configure with -DBACKEND=CUDA -DENABLE_LIBTORCH=ON). Use 'python' or rebuild.");
+        "mlip_backend '" + backend + "' needs a build with LibTorch support "
+        "(configure with -DBACKEND=CUDA -DENABLE_LIBTORCH=ON). Use 'ase' or rebuild.");
 #else
     if (cfg.model_path.empty()) {
         throw std::runtime_error(
-            "mlip_backend 'libtorch' requires mlip_model: <converted model folder>");
+            "mlip_backend '" + backend + "' requires mlip_model: <converted model folder>");
     }
     // mlip_type_to_z may be empty here: the MD reads it from the atom type names of the topology before it creates the backend
     for (int z : cfg.type_to_z) {
@@ -57,13 +57,14 @@ void validate_mlip_config(const MLIPConfig& cfg) {
 
 std::unique_ptr<MLIPBackend> create_mlip_backend(const MLIPConfig& cfg) {
     validate_mlip_config(cfg);
-    if (effective_backend(cfg) == "python") {
-        return std::make_unique<PythonBackend>(cfg);
+    if (effective_backend(cfg) == "ase") {
+        return std::make_unique<AseBackend>(cfg);
     }
-    // validate_mlip_config accepts 'libtorch' only in a build with LibTorch support.
+    // validate_mlip_config accepts 'libtorch' and 'pytorch' only in a build with LibTorch support. One class serves both: they
+    // differ in the runner (TorchScript / AOTI file, or the Python wrapper) that the model folder's metadata chooses.
 #ifdef DSMD_WITH_LIBTORCH
     return std::make_unique<LibTorchBackend>(cfg);
 #else
-    throw std::runtime_error("mlip_backend 'libtorch' needs a build with LibTorch support");
+    throw std::runtime_error("mlip_backend '" + effective_backend(cfg) + "' needs a build with LibTorch support");
 #endif
 }

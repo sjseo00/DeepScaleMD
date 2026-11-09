@@ -77,9 +77,10 @@ inline LangevinCoeffs compute_langevin_coeffs(Real gamma, Real dt, Real T) {
 
 inline Real nose_hoover_scale(Real kinetic_energy, size_t particle_count,
                               Real target_temperature, Real tau,
-                              Real dt, Real& xi) {
+                              Real dt, Real& xi, Real dof_fraction) {
     if (particle_count == 0 || target_temperature <= 0.0 || tau <= 0.0) return 1.0;
-    const Real dof = 3.0 * static_cast<Real>(particle_count);
+    // 3N degrees of freedom, fewer by the constraints (dof_fraction = (3N - constraints) / 3N, 1 without any)
+    const Real dof = 3.0 * static_cast<Real>(particle_count) * dof_fraction;
     const Real target_twice_ke = dof * kB * target_temperature;
     const Real thermostat_mass = target_twice_ke * tau * tau;
     if (!(thermostat_mass > 0.0)) return 1.0;
@@ -91,24 +92,39 @@ inline Real nose_hoover_scale(Real kinetic_energy, size_t particle_count,
     return scale;
 }
 
-NoseHooverThermostat::NoseHooverThermostat(Real temp, Real mass) 
+void Thermostat::set_communicator(MPI_Comm comm) {
+    comm_ = comm;
+    MPI_Comm_size(comm_, &comm_size_);
+}
+
+void Thermostat::sum_over_ranks(Real& kinetic_energy, size_t& particle_count) const {
+    if (comm_size_ <= 1) return;
+    double sums[2] = {static_cast<double>(kinetic_energy), static_cast<double>(particle_count)};
+    MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_DOUBLE, MPI_SUM, comm_);
+    kinetic_energy = static_cast<Real>(sums[0]);
+    particle_count = static_cast<size_t>(sums[1] + 0.5);
+}
+
+NoseHooverThermostat::NoseHooverThermostat(Real temp, Real mass)
     : Thermostat(temp), Q(mass), xi(0.0) {}
 
 void NoseHooverThermostat::apply(ParticleData& particles, Real dt, size_t local_particles) {
     const size_t num_particles = local_particles;
-    if (num_particles == 0) return;
-    
-    Real local_ke = 0.0;
+
+    Real kinetic_energy = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
-        Real v2 = particles.vx[i] * particles.vx[i] + 
-                  particles.vy[i] * particles.vy[i] + 
+        Real v2 = particles.vx[i] * particles.vx[i] +
+                  particles.vy[i] * particles.vy[i] +
                   particles.vz[i] * particles.vz[i];
-        local_ke += 0.5 * particles.mass[i] * v2 * mvv2e;  // [kcal/mol]
+        kinetic_energy += 0.5 * particles.mass[i] * v2 * mvv2e;  // [kcal/mol]
     }
-    
-    Real lambda = nose_hoover_scale(local_ke, num_particles,
-                                     target_temperature, Q, dt, xi);
-    
+    // The whole system's kinetic energy and atom count (also on a rank with no atoms: the sum is collective)
+    size_t particle_count = num_particles;
+    sum_over_ranks(kinetic_energy, particle_count);
+
+    Real lambda = nose_hoover_scale(kinetic_energy, particle_count,
+                                     target_temperature, Q, dt, xi, dof_fraction_);
+
     for (size_t i = 0; i < num_particles; i++) {
         particles.vx[i] *= lambda;
         particles.vy[i] *= lambda;
@@ -412,20 +428,21 @@ void NoseHooverThermostatCUDA::copy_from_device(ParticleData& particles, size_t 
 
 void NoseHooverThermostatCUDA::apply(ParticleData& particles, Real dt, size_t local_particles) {
     const size_t num_particles = local_particles;
-    if (num_particles == 0) return;
-    
-    allocate_gpu_memory(num_particles);
-    copy_to_device(particles, num_particles);
-    
+
     Real kinetic_energy = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
         kinetic_energy += 0.5 * particles.mass[i] * v2 * mvv2e;
     }
-    
-    Real scaling_factor = nose_hoover_scale(kinetic_energy, num_particles,
-                                             target_temperature, Q, dt, xi);
-    
+    size_t particle_count = num_particles;
+    sum_over_ranks(kinetic_energy, particle_count);
+
+    Real scaling_factor = nose_hoover_scale(kinetic_energy, particle_count,
+                                             target_temperature, Q, dt, xi, dof_fraction_);
+    if (num_particles == 0) return;
+
+    allocate_gpu_memory(num_particles);
+    copy_to_device(particles, num_particles);
     launch_nose_hoover_thermostat_kernel(d_vx, d_vy, d_vz, scaling_factor, num_particles);
     
     cudaDeviceSynchronize();
@@ -434,21 +451,24 @@ void NoseHooverThermostatCUDA::apply(ParticleData& particles, Real dt, size_t lo
 
 void NoseHooverThermostatCUDA::apply_device(Real* dev_vx, Real* dev_vy, Real* dev_vz, Real* dev_mass,
                                            size_t num_particles, Real dt, cudaStream_t stream) {
-    if (num_particles == 0) return;
-    allocate_gpu_memory(num_particles);
-    
-    launch_compute_kinetic_energy_kernel(dev_vx, dev_vy, dev_vz, dev_mass, d_ke, num_particles, stream);
-    
-    Real local_ke;
-    cudaMemcpyAsync(&local_ke, d_ke, sizeof(Real), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream); // Wait for KE computation + copy
-    
-    local_ke *= mvv2e;
-    
-    Real lambda = nose_hoover_scale(local_ke, num_particles,
-                                     target_temperature, Q, dt, xi);
-    
-    launch_nose_hoover_thermostat_kernel(dev_vx, dev_vy, dev_vz, lambda, num_particles);
+    Real kinetic_energy = 0.0;
+    if (num_particles > 0) {
+        allocate_gpu_memory(num_particles);
+        launch_compute_kinetic_energy_kernel(dev_vx, dev_vy, dev_vz, dev_mass, d_ke, num_particles, stream);
+        cudaMemcpyAsync(&kinetic_energy, d_ke, sizeof(Real), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream); // Wait for KE computation + copy
+        kinetic_energy *= mvv2e;
+    }
+    // The whole system's kinetic energy and atom count (also on a rank with no atoms: the sum is collective)
+    size_t particle_count = num_particles;
+    sum_over_ranks(kinetic_energy, particle_count);
+
+    Real lambda = nose_hoover_scale(kinetic_energy, particle_count,
+                                     target_temperature, Q, dt, xi, dof_fraction_);
+
+    if (num_particles > 0) {
+        launch_nose_hoover_thermostat_kernel(dev_vx, dev_vy, dev_vz, lambda, num_particles);
+    }
     
 }
 
@@ -558,16 +578,18 @@ NoseHooverThermostatSYCL::NoseHooverThermostatSYCL(Real temp, Real mass)
 
 void NoseHooverThermostatSYCL::apply(ParticleData& particles, Real dt, size_t local_particles) {
     const size_t num_particles = local_particles;
-    if (num_particles == 0) return;
-    
+
     Real kinetic_energy = 0.0;
     for (size_t i = 0; i < num_particles; i++) {
         Real v2 = particles.vx[i]*particles.vx[i] + particles.vy[i]*particles.vy[i] + particles.vz[i]*particles.vz[i];
         kinetic_energy += 0.5 * particles.mass[i] * v2 * mvv2e;
     }
-    
-    Real scaling_factor = nose_hoover_scale(kinetic_energy, num_particles,
-                                             target_temperature, Q, dt, xi);
+    size_t particle_count = num_particles;
+    sum_over_ranks(kinetic_energy, particle_count);
+
+    Real scaling_factor = nose_hoover_scale(kinetic_energy, particle_count,
+                                             target_temperature, Q, dt, xi, dof_fraction_);
+    if (num_particles == 0) return;
     
     try {
         sycl::buffer<Real, 1> vx_buf(particles.vx.data(), sycl::range<1>(num_particles));

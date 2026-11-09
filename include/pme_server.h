@@ -69,6 +69,9 @@ private:
 
     PmePpSplit& split_;
     PmeReciprocalEngine engine_;
+    // Set from the per-step flag the PP group's leader broadcasts (bit 1): the PP group wants the diagonal of the
+    // reciprocal virial tensor back with the energy/virial (see run()).
+    bool virial_tensor_ = false;
     Real cutoff_ = 0.0;
     SimulationBox box_{};
 };

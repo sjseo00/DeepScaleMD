@@ -1,4 +1,4 @@
-"""MatterSim: an adapter of the Python MLIP mode (registered in adapters/__init__.py)."""
+"""MatterSim: an adapter of the ASE mode (registered in adapters/__init__.py)."""
 from __future__ import annotations
 
 import os

@@ -17,10 +17,13 @@ in, so the default (`manifest.yaml`) is meant for starting it inside OUT_DIR:
     cd OUT_DIR && dsMD input_dsmd.yaml
 Use --input-system to write a different path (e.g. OUT_DIR/manifest.yaml).
 
-A NAMD setting DeepScaleMD cannot reproduce (rigid bonds, multiple time stepping, a
-thermostat it does not have, ...) is an error unless --allow-lossy is given, which turns
-it into a warning. --box and --e14fac override the config. To give the files one by one
-instead, use convert_charmm.py.
+rigidBonds water / all become the package's [constraints] (lengths from the parameter files)
+and useFlexibleCell yes the anisotropic barostat on x, y and z.
+
+A NAMD setting DeepScaleMD cannot reproduce (multiple time stepping, a thermostat it does
+not have, useConstantArea / useConstantRatio, ...) is an error unless --allow-lossy is given,
+which turns it into a warning. --box and --e14fac override the config. To give the files one
+by one instead, use convert_charmm.py.
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ import dsmd_input
 from progress import stage
 from canonical_model import ConversionError
 from charmm_reader import convert
-from namd_config import namd_run_settings, parse_namd_config
+from namd_config import namd_run_settings, parse_namd_config, read_namd_bin_coordinates
 from writer import write_package
 
 
@@ -73,10 +76,17 @@ def main(argv=None) -> int:
         e14fac = args.e14fac if args.e14fac is not None else config.scale14
         system = convert(config.structure, config.parameters, config.coordinates,
                           box_angstrom=box, forcefield_variant=args.ff_name,
-                          dihedral_terms=args.dihedral_terms, e14fac=e14fac)
-        write_package(system, args.out_dir, source_engine="namd",
-                      source_files=[args.namd, config.structure] + config.parameters
-                                   + [config.coordinates])
+                          dihedral_terms=args.dihedral_terms, e14fac=e14fac,
+                          constraints=settings.constraints)
+        source_files = [args.namd, config.structure] + config.parameters + [config.coordinates]
+        if config.bin_coordinates:
+            # the PDB is only the structure NAMD was built from: its positions come from the binary file
+            stage(f"positions from {os.path.basename(config.bin_coordinates)}")
+            for atom, (x, y, z) in zip(system.atoms, read_namd_bin_coordinates(config.bin_coordinates,
+                                                                                  len(system.atoms))):
+                atom.x, atom.y, atom.z = x, y, z
+            source_files.append(config.bin_coordinates)
+        write_package(system, args.out_dir, source_engine="namd", source_files=source_files)
         stage("writing input_dsmd.yaml")
         yaml_path = os.path.join(args.out_dir, "input_dsmd.yaml")
         dsmd_input.write_dsmd_input(settings, yaml_path, **yaml_args)
@@ -89,7 +99,7 @@ def main(argv=None) -> int:
     print(f"Wrote {args.out_dir}/manifest.yaml and {yaml_path} "
           f"({len(system.atoms)} atoms, {len(system.bonds)} bonds, "
           f"{len(system.angles)} angles, {len(system.torsions)} dihedrals, "
-          f"{len(system.special_pairs)} special pairs; "
+          f"{len(system.special_pairs)} special pairs, {len(system.constraints)} constraints; "
           f"box {box[0]:g} x {box[1]:g} x {box[2]:g} A, 1-4scaling {e14fac:g})")
     return 0
 

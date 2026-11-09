@@ -1,7 +1,7 @@
 #ifndef MLIP_RANK_COMM_H
 #define MLIP_RANK_COMM_H
 
-// How an MLIP backend reaches the other MPI ranks of the run. No MPI types here: PythonBackend (which unit tests build
+// How an MLIP backend reaches the other MPI ranks of the run. No MPI types here: AseBackend (which unit tests build
 // without MPI) and the replicated libtorch step use only this interface; the MPI version is make_mlip_rank_comm()
 // (src/MLIPRankComm.cpp, in the MD target). A backend without a comm (nullptr) behaves as a single process.
 //

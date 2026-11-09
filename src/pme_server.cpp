@@ -19,6 +19,11 @@ void PmeServer::run(int /*total_steps*/, Real cutoff) {
         // the PP leader on this same intercommunicator.
         MPI_Bcast(&continue_flag, 1, MPI_INT, /*root in remote (PP) group*/ 0, inter);
         if (!continue_flag) break;
+        // Bit 0 = "one more step follows"; bit 1 (value 2) = the PP group also wants the diagonal of the
+        // virial tensor (anisotropic barostat): the energy/virial payload below then has 5 numbers
+        // {E, W, W_xx, W_yy, W_zz} instead of 2. A plain 1 keeps the old protocol.
+        virial_tensor_ = (continue_flag & 2) != 0;
+        engine_.set_virial_tensor_enabled(virial_tensor_);
 #ifdef DEEPSCALEMD_HAVE_FFTW_MPI
         if (split_.pme_size() > 1) {
             step_distributed();
@@ -56,15 +61,22 @@ void PmeServer::step() {
     MPI_Wait(&req, MPI_STATUS_IGNORE);
 
     Real recip_energy = 0.0, recip_virial = 0.0;
+    Real recip_diag[3] = {0.0, 0.0, 0.0};
     if (leader) {
-        recip_energy = engine_.solve(recip_virial);
+        recip_energy = virial_tensor_ ? engine_.solve(recip_virial, recip_diag)
+                                      : engine_.solve(recip_virial);
     }
 
     MPI_Bcast(engine_.grid_data(), static_cast<int>(engine_.real_grid_size()), MPI_DOUBLE,
               leader_root, inter);
 
-    Real energy_virial[2] = {recip_energy, recip_virial};
-    MPI_Bcast(energy_virial, 2, MPI_DOUBLE, leader_root, inter);
+    if (virial_tensor_) {
+        Real energy_virial[5] = {recip_energy, recip_virial, recip_diag[0], recip_diag[1], recip_diag[2]};
+        MPI_Bcast(energy_virial, 5, MPI_DOUBLE, leader_root, inter);
+    } else {
+        Real energy_virial[2] = {recip_energy, recip_virial};
+        MPI_Bcast(energy_virial, 2, MPI_DOUBLE, leader_root, inter);
+    }
 }
 
 #ifdef DEEPSCALEMD_HAVE_FFTW_MPI
@@ -128,11 +140,15 @@ void PmeServer::step_distributed() {
     // Collective across pme_comm -- every PME rank participates, each gets
     // back its own local partial energy/virial sum.
     Real local_energy = 0.0, local_virial = 0.0;
-    local_energy = engine_.solve(local_virial);
+    Real local_diag[3] = {0.0, 0.0, 0.0};
+    local_energy = virial_tensor_ ? engine_.solve(local_virial, local_diag)
+                                  : engine_.solve(local_virial);
 
-    Real local_sums[2] = {local_energy, local_virial};
-    Real total_sums[2] = {0.0, 0.0};
-    MPI_Allreduce(local_sums, total_sums, 2, MPI_DOUBLE, MPI_SUM, pme_comm);
+    // {E, W} and, with the virial tensor, {W_xx, W_yy, W_zz} behind them.
+    const int num_sums = virial_tensor_ ? 5 : 2;
+    Real local_sums[5] = {local_energy, local_virial, local_diag[0], local_diag[1], local_diag[2]};
+    Real total_sums[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    MPI_Allreduce(local_sums, total_sums, num_sums, MPI_DOUBLE, MPI_SUM, pme_comm);
 
     // Step 3: gather solved slabs back onto the leader -- intracommunicator
     // Gatherv.
@@ -144,7 +160,7 @@ void PmeServer::step_distributed() {
     // back to the PP group -- same intercomm MPI_Bcast mechanism as the
     // group-size==1 path.
     MPI_Bcast(leader ? full_grid_buffer_.data() : nullptr, global_count, MPI_DOUBLE, leader_root, inter);
-    MPI_Bcast(total_sums, 2, MPI_DOUBLE, leader_root, inter);
+    MPI_Bcast(total_sums, num_sums, MPI_DOUBLE, leader_root, inter);
 }
 
 #endif  // DEEPSCALEMD_HAVE_FFTW_MPI

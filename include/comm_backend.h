@@ -22,6 +22,10 @@ public:
 
     virtual Real max_reduce(Real local_value) const = 0;
     virtual Real sum_reduce(Real local_value) const = 0;
+    // The diagonal of a tensor (the virial of the anisotropic barostat): v[0..2] are replaced by their sums over the ranks.
+    virtual void sum_reduce3(Real v[3]) const {
+        for (int a = 0; a < 3; ++a) v[a] = sum_reduce(v[a]);
+    }
     virtual int sum_int(int local_value) const = 0;
     virtual bool all_true(bool local_value) const = 0;
     virtual void reduce_max_force_particle(Real local_force,

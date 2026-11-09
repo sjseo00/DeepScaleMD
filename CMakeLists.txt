@@ -19,7 +19,7 @@ set(BACKEND "CPU" CACHE STRING
 set_property(CACHE BACKEND PROPERTY STRINGS CPU CUDA SYCL)
 string(TOUPPER "${BACKEND}" BACKEND)
 
-option(ENABLE_PYTHON "Enable the embedded Python MLIP interface (mlip_backend: python)" ON)
+option(ENABLE_PYTHON "Enable the embedded Python interface (mlip_backend: ase and pytorch)" ON)
 option(ENABLE_LIBTORCH
        "Build the LibTorch MLIP backend (mlip_backend: libtorch); BACKEND=CUDA only" OFF)
 set(LIBTORCH_PYTHON "" CACHE FILEPATH
@@ -43,7 +43,7 @@ endif()
 if(ENABLE_LIBTORCH AND NOT BACKEND STREQUAL "CUDA")
     message(FATAL_ERROR
         "ENABLE_LIBTORCH requires -DBACKEND=CUDA: the LibTorch MLIP backend is not available in "
-        "${BACKEND} builds. Use mlip_backend: python there.")
+        "${BACKEND} builds. Use mlip_backend: ase there.")
 endif()
 
 set(_deepscalemd_uses_cuda OFF)
@@ -191,7 +191,8 @@ set(DEEPSCALEMD_COMMON_SOURCES
     src/halo_backend.cpp
     src/comm_backend.cpp
     src/md_simulation.cpp
-    src/PythonBackend.cpp
+    src/md_restart.cpp
+    src/AseBackend.cpp
     src/MLIPRankComm.cpp
     src/PythonModules.cpp
     src/MLIPBackendFactory.cpp
@@ -344,21 +345,29 @@ else()
         add_library(dsmd_libtorch STATIC
             src/LibTorchBackend.cpp
             src/HaloExchangeOp.cpp
+            src/MLIPKspaceOp.cpp
             src/TorchScriptRunner.cpp
             src/AOTIRunner.cpp
-            src/OpLibLoader.cpp)
-        target_compile_features(dsmd_libtorch PRIVATE cxx_std_17)
+            src/OpLibLoader.cpp
+            src/PyTorchModelRunner.cpp)
+        # torch >= 2.10 headers require C++20 (the library is separate from the MD sources, which stay C++17)
+        target_compile_features(dsmd_libtorch PRIVATE cxx_std_20)
         target_include_directories(dsmd_libtorch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_compile_definitions(dsmd_libtorch PRIVATE USE_CUDA)
         separate_arguments(_torch_cxx_flags UNIX_COMMAND "${TORCH_CXX_FLAGS}")
         target_compile_options(dsmd_libtorch PRIVATE ${_torch_cxx_flags})
         target_link_libraries(dsmd_libtorch PRIVATE ${TORCH_LIBRARIES} CUDA::cudart ${CMAKE_DL_LIBS})
+        if(ENABLE_PYTHON)
+            # a model folder converted with --backend pytorch is run by the embedded Python (src/PyTorchModelRunner.cpp)
+            target_compile_definitions(dsmd_libtorch PRIVATE ENABLE_PYTHON_INTERFACE)
+            target_link_libraries(dsmd_libtorch PRIVATE Python3::Python)
+        endif()
         target_link_libraries(deepscalemd PRIVATE dsmd_libtorch)
         # dsMD finds the LibTorch (and its bundled libraries) it was linked with without LD_LIBRARY_PATH
         set_property(TARGET deepscalemd APPEND PROPERTY BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib")
         set_property(TARGET deepscalemd APPEND PROPERTY INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib")
         # MD-side GPU work around the model (periodic images, edge list, force folding); only built with LibTorch.
-        target_sources(deepscalemd PRIVATE src/EdgeBuilder.cu src/MLIPStep.cu src/MLIPReplica.cpp)
+        target_sources(deepscalemd PRIVATE src/EdgeBuilder.cu src/MLIPStep.cu src/MLIPReplica.cpp src/MLIPKspaceHost.cpp)
         message(STATUS "DeepScaleMD: LibTorch MLIP backend enabled (Torch ${Torch_VERSION}, ${Torch_DIR})")
     endif()
 
@@ -372,6 +381,35 @@ else()
         message(STATUS "DeepScaleMD: NCCL PME grid sum enabled")
     else()
         message(STATUS "DeepScaleMD: NCCL PME grid sum not built (MPI grid sum only)")
+    endif()
+
+    # Distributed PME for many GPUs / several nodes: force_calculation.pme_ranks: 2 runs the reciprocal
+    # solve as a cuFFTMp FFT over all ranks (NVIDIA HPC SDK: math_libs/<cuda>/include/cufftmp and
+    # lib64/libcufftMp.so, plus NVSHMEM). libcufftMp contains the single-process cuFFT, so it replaces
+    # CUDA::cufft in the link (both together fail at run time): not for the LibTorch (MLIP) build.
+    option(DSMD_ENABLE_CUFFTMP "Distributed PME FFT with cuFFTMp (force_calculation.pme_ranks: 2)" OFF)
+    if(DSMD_ENABLE_CUFFTMP)
+        if(ENABLE_LIBTORCH)
+            message(FATAL_ERROR "DSMD_ENABLE_CUFFTMP cannot be combined with ENABLE_LIBTORCH (torch links its own libcufft)")
+        endif()
+        set(CUFFTMP_ROOT "" CACHE PATH "math_libs/<cuda version> directory of the HPC SDK (include/cufftmp, lib64/libcufftMp.so)")
+        set(CUFFTMP_NVSHMEM_ROOT "" CACHE PATH "NVSHMEM prefix (lib/libnvshmem_host.so); default: env NVSHMEM_HOME")
+        find_path(CUFFTMP_INCLUDE_DIR cufftMp.h HINTS ${CUFFTMP_ROOT} ENV CUFFTMP_ROOT PATH_SUFFIXES include/cufftmp)
+        find_library(CUFFTMP_LIBRARY cufftMp HINTS ${CUFFTMP_ROOT} ENV CUFFTMP_ROOT PATH_SUFFIXES lib64 lib)
+        find_library(CUFFTMP_NVSHMEM_HOST NAMES nvshmem_host libnvshmem_host.so.3
+                     HINTS ${CUFFTMP_NVSHMEM_ROOT} ENV NVSHMEM_HOME PATH_SUFFIXES lib lib64)
+        if(NOT CUFFTMP_INCLUDE_DIR OR NOT CUFFTMP_LIBRARY OR NOT CUFFTMP_NVSHMEM_HOST)
+            message(FATAL_ERROR "DSMD_ENABLE_CUFFTMP: cufftMp.h (${CUFFTMP_INCLUDE_DIR}), libcufftMp (${CUFFTMP_LIBRARY}) or "
+                                "libnvshmem_host (${CUFFTMP_NVSHMEM_HOST}) not found: set -DCUFFTMP_ROOT=<math_libs/x.y> and -DCUFFTMP_NVSHMEM_ROOT=<nvshmem prefix>")
+        endif()
+        get_target_property(_dsmd_link_libs deepscalemd LINK_LIBRARIES)
+        list(REMOVE_ITEM _dsmd_link_libs CUDA::cufft)
+        set_property(TARGET deepscalemd PROPERTY LINK_LIBRARIES "${_dsmd_link_libs}")
+        # The cufftmp header directory first: its cufft.h must win over the toolkit one (version check in cufftMp.h).
+        target_include_directories(deepscalemd BEFORE PRIVATE ${CUFFTMP_INCLUDE_DIR})
+        target_link_libraries(deepscalemd PRIVATE ${CUFFTMP_LIBRARY} ${CUFFTMP_NVSHMEM_HOST})
+        target_compile_definitions(deepscalemd PRIVATE DSMD_WITH_CUFFTMP=1)
+        message(STATUS "DeepScaleMD: cuFFTMp distributed PME enabled (${CUFFTMP_LIBRARY}, ${CUFFTMP_NVSHMEM_HOST})")
     endif()
     set_target_properties(deepscalemd PROPERTIES
         CUDA_STANDARD 17

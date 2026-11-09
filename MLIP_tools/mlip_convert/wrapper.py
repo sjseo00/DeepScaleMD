@@ -29,9 +29,12 @@ def make_z_to_index(elements: Sequence[int]) -> Tensor:
 
 
 class MDWrapper(torch.nn.Module):
+    __constants__ = ["whole_system"]
+
     def __init__(self, adapter: MLIPAdapter):
         super().__init__()
         self.adapter = adapter
+        self.whole_system = bool(adapter.whole_system)
         # Atomic numbers outside the table are rejected by the C++ side at startup (type -> Z check against
         # metadata `elements`); they would index -1 here.
         self.register_buffer("z_to_index", make_z_to_index(adapter.elements))
@@ -45,7 +48,11 @@ class MDWrapper(torch.nn.Module):
         torch.set_grad_enabled(True)
         pos = pos.detach().requires_grad_(True)
         species = self.z_to_index[atomic_numbers]
-        atom_energy = self.adapter(pos, species, edge_index)
+        if self.whole_system:
+            no_shift = torch.zeros((edge_index.shape[1], 3), dtype=pos.dtype, device=pos.device)
+            atom_energy = self.adapter.forward_whole_system(pos, species, edge_index, no_shift, int(n_owned))
+        else:
+            atom_energy = self.adapter(pos, species, edge_index)
         # Owned-atom sum as a mask instead of atom_energy[:n_owned]: no data-dependent slice, no host
         # synchronization, and it traces/exports with a dynamic N.
         owned = torch.arange(pos.shape[0], device=pos.device) < n_owned
@@ -83,7 +90,8 @@ class MDLayerShiftWrapper(torch.nn.Module):
         previous_grad_mode = torch.is_grad_enabled()
         torch.set_grad_enabled(True)
         pos = pos.detach().requires_grad_(True)
-        strain = torch.zeros((), dtype=pos.dtype, device=pos.device).requires_grad_(True)
+        # one strain per axis: scaling x, y, z of the positions and shifts by (1 + strain_a) gives W_aa = -dE/dstrain_a
+        strain = torch.zeros(3, dtype=pos.dtype, device=pos.device).requires_grad_(True)
         scale = 1.0 + strain
         species = self.z_to_index[atomic_numbers]
         owned_count = int(n_owned)
@@ -98,9 +106,9 @@ class MDLayerShiftWrapper(torch.nn.Module):
         else:
             force = -grad
         if grad_strain is None:
-            virial = torch.zeros(1, dtype=pos.dtype, device=pos.device)
+            virial = torch.zeros(3, dtype=pos.dtype, device=pos.device)
         else:
-            virial = -grad_strain.reshape(1)
+            virial = -grad_strain
         torch.set_grad_enabled(previous_grad_mode)
         return energy.reshape(1), atom_energy.detach(), force, virial
 
@@ -111,18 +119,23 @@ class MDShiftWrapper(torch.nn.Module):
     inputs   pos [N, 3] (the atoms themselves: no periodic images), atomic_numbers [N] int64, edge_index [2, E] int64,
              edge_shift [E, 3] (the vector of edge (i, j) is pos[j] - pos[i] + edge_shift; zero for an edge to an atom
              that is really there, a lattice vector for one across a periodic boundary), n_owned [] int64
-    outputs  energy [1], atom_energy [N], forces [N, 3], virial [1]
+    outputs  energy [1], atom_energy [N], forces [N, 3], virial [3]
 
-    The virial is W = sum_i r_i . F_i over the atoms the model saw, plus the shift term, which is what the sum over the
-    atoms of the extended system (images included) would give: -dE/de with the positions and the shifts scaled by (1 + e).
-    It has the same meaning as the MD side's sum of r.F over atoms and ghosts for a model without shifts, so the pressure
-    follows from it the same way.
+    The virial is the diagonal of the virial tensor, W_aa = sum_i r_ia F_ia over the atoms the model saw plus the shift term,
+    which is what the sum over the atoms of the extended system (images included) would give: -dE/de_a with the a components
+    of the positions and the shifts scaled by (1 + e_a). It has the same meaning as the MD side's sum of r.F over atoms and
+    ghosts for a model without shifts, so the pressure (the trace) and the pressures along the axes (anisotropic and
+    semi-isotropic barostats) follow from it the same way. metadata.json says so with "virial_diagonal": true; folders
+    converted before return the trace only, as virial [1].
     """
+    __constants__ = ["whole_system"]
+
     def __init__(self, adapter: MLIPAdapter):
         super().__init__()
         if not adapter.supports_shifts:
             raise ValueError(f"the {adapter.model_family} adapter does not take edge shifts")
         self.adapter = adapter
+        self.whole_system = bool(adapter.whole_system)
         self.register_buffer("z_to_index", make_z_to_index(adapter.elements))
 
     def forward(self, pos: Tensor, atomic_numbers: Tensor, edge_index: Tensor, edge_shift: Tensor,
@@ -131,10 +144,14 @@ class MDShiftWrapper(torch.nn.Module):
         previous_grad_mode = torch.is_grad_enabled()
         torch.set_grad_enabled(True)
         pos = pos.detach().requires_grad_(True)
-        strain = torch.zeros((), dtype=pos.dtype, device=pos.device).requires_grad_(True)
+        # one strain per axis: scaling x, y, z of the positions and shifts by (1 + strain_a) gives W_aa = -dE/dstrain_a
+        strain = torch.zeros(3, dtype=pos.dtype, device=pos.device).requires_grad_(True)
         scale = 1.0 + strain
         species = self.z_to_index[atomic_numbers]
-        atom_energy = self.adapter.forward_with_shifts(pos * scale, species, edge_index, edge_shift * scale)
+        if self.whole_system:
+            atom_energy = self.adapter.forward_whole_system(pos * scale, species, edge_index, edge_shift * scale, int(n_owned))
+        else:
+            atom_energy = self.adapter.forward_with_shifts(pos * scale, species, edge_index, edge_shift * scale)
         owned = torch.arange(pos.shape[0], device=pos.device) < n_owned
         energy = torch.where(owned, atom_energy, torch.zeros_like(atom_energy)).sum()
         grads = torch.autograd.grad([energy], [pos, strain], allow_unused=True)
@@ -145,8 +162,8 @@ class MDShiftWrapper(torch.nn.Module):
         else:
             force = -grad
         if grad_strain is None:
-            virial = torch.zeros(1, dtype=pos.dtype, device=pos.device)
+            virial = torch.zeros(3, dtype=pos.dtype, device=pos.device)
         else:
-            virial = -grad_strain.reshape(1)
+            virial = -grad_strain
         torch.set_grad_enabled(previous_grad_mode)
         return energy.reshape(1), atom_energy.detach(), force, virial

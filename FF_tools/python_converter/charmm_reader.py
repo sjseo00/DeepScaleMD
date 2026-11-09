@@ -18,6 +18,11 @@ its parameter terms apply (PSF writers list a multi-term dihedral once per term)
 reproduces NAMD's dihedral energy exactly for the ApoA1 system; pass
 dihedral_terms="all" to apply every parameter term to every distinct dihedral instead.
 
+Rigid bonds (NAMD rigidBonds, CHARMM SHAKe BONH / BOND) are asked for through the `constraints`
+argument of convert(): the chosen bonds become distance constraints of their parameter-file
+equilibrium length and lose their bond term, as in the LAMMPS fix shake path. Exclusions still
+come from the whole bond graph.
+
 Not implemented at all: CMAP cross-terms, lonepairs/Drude polarizable
 models, NBFIX pair overrides, wildcard-only ('X' at both outer positions on
 BOTH ends) dihedral parameter matches beyond the standard `X a b X` form.
@@ -25,6 +30,7 @@ BOTH ends) dihedral parameter matches beyond the standard `X a b X` form.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import sys
@@ -496,6 +502,76 @@ def read_pdb(path: str) -> List[Tuple[float, float, float]]:
     return positions
 
 
+# ── rigid bonds -> constraints ───────────────────────────────────────────
+
+def _is_hydrogen(atom: PsfAtom) -> bool:
+    """NAMD's rule (Molecule::load_one_inputatom): a mass from 1.0 to 3.5 is a hydrogen; lighter atoms are lone
+    pairs and Drude particles. CHARMM SHAKe BONH uses the same rule here, which was not checked against CHARMM."""
+    return 1.0 <= atom.mass <= 3.5
+
+
+def _is_oxygen(atom: PsfAtom) -> bool:
+    """NAMD's rule (the same function): the atom name starts with an O and the mass is 14 to 18."""
+    return atom.atomname[:1] == "O" and 14.0 <= atom.mass <= 18.0
+
+
+def _rigid_waters(psf: PsfSystem) -> List[Tuple[int, int, int]]:
+    """(O, H1, H2) of every water NAMD holds rigid: an oxygen bonded to exactly two hydrogens that have no
+    other neighbour than the oxygen and, as in CHARMM's TIP3P, each other. The oxygen and hydrogen rules are
+    NAMD's; that a water must have exactly this bond structure is how NAMD's hydrogen groups look, not checked
+    in the NAMD source."""
+    neighbours: Dict[int, set] = {i: set() for i in range(len(psf.atoms))}
+    for i, j in psf.bonds:
+        neighbours[i].add(j)
+        neighbours[j].add(i)
+    waters = []
+    for o, atom in enumerate(psf.atoms):
+        if not _is_oxygen(atom) or len(neighbours[o]) != 2:
+            continue
+        h1, h2 = sorted(neighbours[o])
+        if (_is_hydrogen(psf.atoms[h1]) and _is_hydrogen(psf.atoms[h2])
+                and neighbours[h1] <= {o, h2} and neighbours[h2] <= {o, h1}):
+            waters.append((o, h1, h2))
+    return waters
+
+
+def _constraints_from_psf(psf: PsfSystem, params: CharmmParams, mode: str) -> Dict[Tuple[int, int], float]:
+    """{(i, j): distance} of the bonds a rigid-bond setting holds fixed, from the parameter files.
+
+    mode `water`: the rigid waters. `hydrogen`: every bond with a hydrogen, the waters included.
+    `all`: every bond. A water's H-H distance is the PSF's H-H bond (CHARMM's TIP3P lists one for
+    SHAKE) or, without that bond, follows from the two O-H lengths and the H-O-H angle."""
+    atoms = psf.atoms
+    wanted: Dict[Tuple[int, int], float] = {}
+
+    def add(i: int, j: int, distance: float) -> None:
+        wanted.setdefault((min(i, j), max(i, j)), distance)
+
+    def bond_length(i: int, j: int) -> float:
+        return _lookup_bond(params, atoms[i].atomtype, atoms[j].atomtype)[1]
+
+    for i, j in psf.bonds:
+        if mode == "all" or (mode == "hydrogen" and (_is_hydrogen(atoms[i]) or _is_hydrogen(atoms[j]))):
+            add(i, j, bond_length(i, j))
+    if mode in ("water", "hydrogen"):
+        listed = {(min(i, j), max(i, j)) for i, j in psf.bonds}
+        derived = 0
+        for o, h1, h2 in _rigid_waters(psf):
+            r1, r2 = bond_length(o, h1), bond_length(o, h2)
+            add(o, h1, r1)
+            add(o, h2, r2)
+            if (h1, h2) in listed:
+                add(h1, h2, bond_length(h1, h2))
+            else:
+                theta0 = _lookup_angle(params, atoms[h1].atomtype, atoms[o].atomtype, atoms[h2].atomtype)[1]
+                add(h1, h2, math.sqrt(r1 * r1 + r2 * r2 - 2.0 * r1 * r2 * math.cos(math.radians(theta0))))
+                derived += 1
+        if derived:
+            _warn(f"{derived} rigid waters have no H-H bond in the PSF; their H-H distance follows from the "
+                  f"H-O-H angle parameter")
+    return wanted
+
+
 # ── graph distance -> exclusions / 1-4 pairs ────────────────────────────
 
 def _bond_graph_distances(n_atoms: int, bonds: List[Tuple[int, int]]) -> Dict[int, Dict[int, int]]:
@@ -528,16 +604,21 @@ def convert(psf_path: str, prm_paths: List[str], pdb_path: str,
             forcefield_variant: str = "unknown",
             allow_lossy: bool = False,
             dihedral_terms: str = "namd",
-            e14fac: Optional[float] = None) -> CanonicalSystem:
+            e14fac: Optional[float] = None,
+            constraints: str = "none") -> CanonicalSystem:
     """allow_lossy is accepted for CLI compatibility only: Urey-Bradley terms, harmonic
     impropers and explicit 1-4 parameters are converted exactly, so there is nothing to drop.
 
     dihedral_terms: "namd" (default) applies as many parameter terms as the PSF lists the
     dihedral; "all" applies every term of every distinct dihedral.
     e14fac: overrides the 1-4 electrostatic scale (NAMD's 1-4scaling); by default it is
-    taken from an E14FAC entry in the parameter files, else 1.0."""
+    taken from an E14FAC entry in the parameter files, else 1.0.
+    constraints: the bonds held rigid, "none", "water", "hydrogen" or "all" (RunSettings.constraints);
+    they become distance constraints and lose their bond term."""
     if dihedral_terms not in ("namd", "all"):
         raise ConversionError(f"dihedral_terms must be 'namd' or 'all', got {dihedral_terms!r}")
+    if constraints not in ("none", "water", "hydrogen", "all"):
+        raise ConversionError(f"constraints must be none, water, hydrogen or all, got {constraints!r}")
     stage(f"reading PSF {os.path.basename(psf_path)}")
     psf = parse_psf(psf_path)
     stage(f"PSF: {len(psf.atoms)} atoms, {len(psf.bonds)} bonds, {len(psf.angles)} angles, {len(psf.dihedrals)} dihedrals")
@@ -613,7 +694,12 @@ def convert(psf_path: str, prm_paths: List[str], pdb_path: str,
         system.atoms[aid].x, system.atoms[aid].y, system.atoms[aid].z = x, y, z
 
     stage("building bonds, angles, dihedrals, impropers")
+    rigid = _constraints_from_psf(psf, params, constraints) if constraints != "none" else {}
+    for (i, j), distance in rigid.items():
+        system.constraints.append(Constraint(i, j, distance))
     for i, j in psf.bonds:
+        if (min(i, j), max(i, j)) in rigid:
+            continue       # a constrained bond has no bond term (as with LAMMPS fix shake)
         kb, b0 = _lookup_bond(params, psf.atoms[i].atomtype, psf.atoms[j].atomtype)
         system.bonds.append(Bond(i, j, 2.0 * kb, b0))  # CHARMM V=Kb*dr^2 -> DeepScaleMD V=0.5*k*dr^2
 

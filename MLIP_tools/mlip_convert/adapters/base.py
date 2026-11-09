@@ -16,7 +16,7 @@ from .. import halo_op as _halo_op   # noqa: F401  (registers the op dsmd::halo_
 
 class MLIPAdapter(torch.nn.Module):
     # The property below is plain Python for the converter; TorchScript must not try to compile it.
-    __jit_unused_properties__ = ["ghost_cutoff", "reference_elements"]
+    __jit_unused_properties__ = ["ghost_cutoff", "reference_elements", "reference_ghost_depth"]
 
     # Filled in by the subclass; the converter copies them into metadata.json.
     model_family: str = ""
@@ -41,6 +41,12 @@ class MLIPAdapter(torch.nn.Module):
     # supports_shifts. `layer_exchange` is switched on by the converter (--layer-exchange) for the adapter instance.
     supports_layer_exchange = False
     layer_exchange = False
+    # True for a model whose energy is not a sum of local terms but reads the whole system at once (ORB's energy head averages the
+    # node features of all atoms before its MLP). The wrapper then calls forward_whole_system with n_owned; the owned atoms have to be
+    # the whole system, so metadata.json says whole_system and dsMD never splits the model over ranks.
+    whole_system = False
+    # False when the model's code cannot become a TorchScript or AOTI file: it is converted with --backend pytorch only.
+    scriptable = True
 
     def __init__(self, elements: List[int]):
         super().__init__()
@@ -68,6 +74,12 @@ class MLIPAdapter(torch.nn.Module):
         """Ghost depth (A) that makes owned-atom results exact: num_layers * cutoff (design 5.1); with layer exchange one cutoff."""
         return self.cutoff if self.layer_exchange else self.num_layers * self.cutoff
 
+    @property
+    def reference_ghost_depth(self) -> float:
+        """Ghost depth of the reference structure (reference.json): ghost_cutoff, unless the owned-atom results of a model are already
+        exact with a thinner layer (so3lr: its edges are long-range, but only its short-range edges pass messages)."""
+        return self.ghost_cutoff
+
     def forward(self, pos: Tensor, species: Tensor, edge_index: Tensor) -> Tensor:
         """pos [N, 3], species [N] int64 (model species index), edge_index [2, E] int64 (design 4)
         -> atom_energy [N], same dtype and device as pos."""
@@ -80,6 +92,11 @@ class MLIPAdapter(torch.nn.Module):
             torch.ops.dsmd.halo_exchange(h_owned, n_ghost)
         and only the owned rows are ever computed. Returns the per-atom energies [N], zero for the ghost atoms. Only adapters
         with supports_layer_exchange = True implement it."""
+        raise NotImplementedError
+
+    def forward_whole_system(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor, n_owned: int) -> Tensor:
+        """forward_with_shifts of a model with whole_system = True: the first n_owned atoms are the whole system, the others their
+        periodic images. Per-atom energies [N] whose sum over the owned atoms is the energy, zero for the images."""
         raise NotImplementedError
 
     def forward_with_shifts(self, pos: Tensor, species: Tensor, edge_index: Tensor, edge_shift: Tensor) -> Tensor:

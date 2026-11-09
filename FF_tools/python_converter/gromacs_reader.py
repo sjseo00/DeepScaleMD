@@ -10,7 +10,8 @@ Nonbonded parameters follow GROMACS semantics: [ atomtypes ] combined by the com
 give every ordinary pair, [ nonbond_params ] override individual ordinary pairs, and
 [ pairtypes ] apply ONLY to the 1-4 [ pairs ] (used as written, without fudgeLJ; pairs
 without a pairtype are generated from the atom types with fudgeLJ). [ settles ] becomes three
-distance constraints.
+distance constraints. The .mdp option `constraints = h-bonds | all-bonds` (build's `constrain`)
+turns the bonds into more of them; their bond terms are dropped.
 
 Explicitly NOT supported -- raises ConversionError rather than silently
 mis-converting:
@@ -114,6 +115,7 @@ class TemplateAtom:
     mass: Optional[float]
     element: str
     residue_id: int
+    name: str = ""          # the atom name; grompp finds hydrogens by its first letter
 
 
 @dataclass
@@ -303,7 +305,7 @@ class GromacsReader:
             charge = float(tokens[6])
             mass = float(tokens[7]) if len(tokens) > 7 else None
             tpl.atoms.append(TemplateAtom(type_name, charge, mass,
-                                           _guess_element(type_name), resnr))
+                                           _guess_element(type_name), resnr, tokens[4]))
         elif section == "bonds":
             if len(tokens) < 5:
                 raise ConversionError(
@@ -461,11 +463,38 @@ class GromacsReader:
                     excluded.add((min(start, other), max(start, other)))
         return excluded
 
+    # ── .mdp `constraints`: bonds -> distance constraints ───────────────
+
+    @staticmethod
+    def _constrain_bonds(tpl: MoleculeTemplate, mode: str):
+        """(bonds, constraints) of a template after the .mdp option `constraints` is applied: `h-bonds`
+        turns every bond with a hydrogen into a distance constraint of its b0, `all-bonds` every bond.
+        As in grompp, an atom whose name starts with H is a hydrogen. A bond whose pair [ constraints ]
+        or [ settles ] already holds is not constrained a second time."""
+        if mode == "none":
+            return tpl.bonds, tpl.constraints
+        held = {frozenset(c[:2]) for c in tpl.constraints}
+        bonds, constraints = [], list(tpl.constraints)
+        for i, j, k, r0 in tpl.bonds:
+            if max(i, j) >= len(tpl.atoms):
+                raise ConversionError(f"moleculetype '{tpl.name}': [ bonds ] references atom {max(i, j) + 1} "
+                                      f"but the molecule has {len(tpl.atoms)} atoms")
+            if mode == "h-bonds" and "H" not in (tpl.atoms[i].name[:1].upper(), tpl.atoms[j].name[:1].upper()):
+                bonds.append((i, j, k, r0))
+            elif frozenset((i, j)) not in held:
+                held.add(frozenset((i, j)))
+                constraints.append((i, j, r0))
+        return bonds, constraints
+
     # ── build the flattened CanonicalSystem ─────────────────────────────
 
     def build(self, box_angstrom: Tuple[float, float, float],
-              positions_angstrom: Optional[List[Tuple[float, float, float]]] = None
-              ) -> CanonicalSystem:
+              positions_angstrom: Optional[List[Tuple[float, float, float]]] = None,
+              constrain: str = "none") -> CanonicalSystem:
+        """constrain is the .mdp option `constraints` as gromacs_mdp.constraint_mode gives it: none,
+        h-bonds or all-bonds. The bond term of a constrained bond is dropped, as in grompp."""
+        if constrain not in ("none", "h-bonds", "all-bonds"):
+            raise ConversionError(f"constrain must be none, h-bonds or all-bonds, got {constrain!r}")
         if not self._molecule_order:
             raise ConversionError("[molecules] section is empty or missing")
 
@@ -509,8 +538,9 @@ class GromacsReader:
         atom_cursor = 0
         for tpl_name, count in self._molecule_order:
             tpl = self._templates[tpl_name]
-            bonded_pairs_for_exclusion = [(b[0], b[1]) for b in tpl.bonds] + \
-                                          [(c[0], c[1]) for c in tpl.constraints]
+            tpl_bonds, tpl_constraints = self._constrain_bonds(tpl, constrain)
+            bonded_pairs_for_exclusion = [(b[0], b[1]) for b in tpl_bonds] + \
+                                          [(c[0], c[1]) for c in tpl_constraints]
             nrexcl_pairs = self._generate_nrexcl_pairs(
                 len(tpl.atoms), bonded_pairs_for_exclusion, tpl.nrexcl)
 
@@ -543,7 +573,7 @@ class GromacsReader:
                                      molecule_id=molecule_id, residue_id=a.residue_id)
                     atom_cursor += 1
 
-                for i, j, k, r0 in tpl.bonds:
+                for i, j, k, r0 in tpl_bonds:
                     system.bonds.append(Bond(offset + i, offset + j, k, r0))
                 for i, j, k, k_ang, th0 in tpl.angles:
                     system.angles.append(Angle(offset + i, offset + j, offset + k, k_ang, th0))
@@ -553,7 +583,7 @@ class GromacsReader:
                 for i, j, k, l, kd, phase, mult in tpl.impropers:
                     system.impropers.append(Torsion(offset + i, offset + j, offset + k, offset + l,
                                                       kd, phase, mult))
-                for i, j, dist in tpl.constraints:
+                for i, j, dist in tpl_constraints:
                     system.constraints.append(Constraint(offset + i, offset + j, dist))
 
                 for i, j in nrexcl_pairs:
@@ -583,10 +613,10 @@ class GromacsReader:
 # ── .gro coordinate reader ──────────────────────────────────────────────
 
 def read_gro(path: str) -> Tuple[List[Tuple[float, float, float]], Tuple[float, float, float]]:
-    """Whitespace-tokenized .gro reader (works for the overwhelming majority
-    of real files; GROMACS only relies on fixed-width columns when residue/atom
-    counts overflow their field widths, which this raises on instead of
-    silently misreading)."""
+    """Whitespace-tokenized .gro reader. When fields touch (atom numbers of 5
+    digits abut the atom name, as in any system above 9999 atoms) it falls
+    back to the fixed-width columns GROMACS writes: the coordinate field width
+    is the distance between the first two decimal points."""
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         lines = f.readlines()
     if len(lines) < 3:
@@ -603,10 +633,17 @@ def read_gro(path: str) -> Tuple[List[Tuple[float, float, float]], Tuple[float, 
         line = lines[2 + i]
         tokens = line.split()
         if len(tokens) < 6:
-            raise ConversionError(
-                f"{path}:{3 + i}: cannot parse .gro atom line (residue/atom name may be "
-                f"touching an adjacent field -- this reader requires whitespace-separated "
-                f"columns): {line!r}")
+            point1 = line.find(".", 20)
+            point2 = line.find(".", point1 + 1) if point1 >= 0 else -1
+            width = point2 - point1
+            try:
+                x_nm, y_nm, z_nm = (float(line[20 + k * width:20 + (k + 1) * width]) for k in range(3))
+            except ValueError:
+                raise ConversionError(f"{path}:{3 + i}: cannot parse .gro atom line: {line!r}")
+            positions.append((units.gmx_length_to_angstrom(x_nm),
+                               units.gmx_length_to_angstrom(y_nm),
+                               units.gmx_length_to_angstrom(z_nm)))
+            continue
         # 9+ tokens => velocities present (vx,vy,vz trail x,y,z); otherwise
         # x,y,z are the last 3 tokens. (resnum+resname often abut as one
         # token with no separating space, so anchor from the right, not left.)
@@ -630,16 +667,18 @@ def read_gro(path: str) -> Tuple[List[Tuple[float, float, float]], Tuple[float, 
 
 def convert(top_path: str, gro_path: str, out_dir: str,
             forcefield_variant: str = "unknown",
-            include_dirs: Optional[List[str]] = None) -> CanonicalSystem:
+            include_dirs: Optional[List[str]] = None,
+            constrain: str = "none") -> CanonicalSystem:
     """End-to-end: parse .top (+ #includes) and .gro, build and validate a
-    CanonicalSystem, and return it (caller writes the package via writer.py)."""
+    CanonicalSystem, and return it (caller writes the package via writer.py).
+    constrain: the .mdp `constraints` option, see GromacsReader.build."""
     reader = GromacsReader(forcefield_variant=forcefield_variant)
     stage(f"reading topology {os.path.basename(top_path)} (and its #includes)")
     reader.parse_top(top_path, include_dirs or [])
     stage(f"reading coordinates {os.path.basename(gro_path)}")
     positions, box = read_gro(gro_path)
     stage("building atoms, bonded terms, exclusions")
-    system = reader.build(box_angstrom=box, positions_angstrom=positions)
+    system = reader.build(box_angstrom=box, positions_angstrom=positions, constrain=constrain)
     stage("checking the system")
     system.finalize()
     return system

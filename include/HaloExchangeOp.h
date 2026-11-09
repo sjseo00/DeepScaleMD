@@ -5,6 +5,9 @@
 // `layer_exchange`) calls between its message-passing layers: [n_owned, F] -> [n_owned + n_ghost, F], the owned rows followed
 // by the ghost rows, which the MLIPHaloTransport fills with the owners' rows; its autograd backward is the transport's
 // reverse(). The Python side of the op (the same schema, for building and checking the model) is MLIP_tools/mlip_convert/halo_op.py.
+// The same file registers dsmd::allreduce_sum(Tensor x) -> Tensor: the element-wise sum of x over the ranks (the transport's
+// sum_over_ranks; a copy without a transport), whose backward is the same sum. A model that sums a few numbers over the whole
+// system calls it (so3lr with --layer-exchange: the charge sum).
 //
 // The operator is registered when this library is loaded; call ensure_halo_exchange_op_registered() once (from LibTorchBackend) so
 // that a static link keeps this file. The transport the op uses is the one of the innermost HaloTransportScope: set it around

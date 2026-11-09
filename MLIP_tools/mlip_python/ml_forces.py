@@ -1,8 +1,8 @@
 """
-ml_forces.py  –  the module the C++ PythonBackend imports  (mlip_backend: python)
+ml_forces.py  –  the module the C++ AseBackend imports  (mlip_backend: ase)
 =================================================================================
 
-PythonBackend (src/PythonBackend.cpp) imports this module by name and calls three functions:
+AseBackend (src/AseBackend.cpp) imports this module by name and calls three functions:
 
     initialize_ml_forcefield_generic(model_path, model_type, model_size, device, dtype, **kwargs) -> bool
     compute_force(positions, atom_types, cell, pbc)  -> forces [N, 3] float64, kcal/mol/A (added to the MD forces)
@@ -14,7 +14,7 @@ file's `mlip_type_to_z`).
 """
 import numpy as np
 
-import mlip_interface as _mlip     # an ImportError here is reported by PythonBackend with the module path searched
+import mlip_interface as _mlip     # an ImportError here is reported by AseBackend with the module path searched
 
 
 def initialize_ml_forcefield_generic(model_path=None, model_type="mace", model_size="small", device="cpu",

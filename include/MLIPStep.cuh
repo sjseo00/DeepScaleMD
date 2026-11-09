@@ -70,8 +70,19 @@ public:
     // With edge shifts it is the virial the model returned (set_model_virial), which includes the shift term.
     double virial(cudaStream_t stream);
 
-    // The backend's virial of the last compute() (MLIPOutputs::virial), needed by virial() when edge_shifts_active().
+    // The diagonal of the same, out[a] = sum_i r_ia F_ia (anisotropic and semi-isotropic barostats). With edge shifts it is the
+    // model's (set_model_virial with a diagonal); a model that returned only the trace makes this throw. Synchronizes.
+    void virial_diag(cudaStream_t stream, double out[3]);
+
+    // The backend's virial of the last compute() (MLIPOutputs::virial, and virial_diag when has_diag), needed by virial() and
+    // virial_diag() when edge_shifts_active().
     void set_model_virial(bool has_virial, double virial) { model_virial_valid_ = has_virial; model_virial_ = virial; }
+    void set_model_virial(const MLIPOutputs& out) {
+        model_virial_valid_ = out.has_virial;
+        model_virial_ = out.virial;
+        model_virial_diag_valid_ = out.has_virial_diag;
+        for (int a = 0; a < 3; ++a) model_virial_diag_[a] = out.virial_diag[a];
+    }
 
 private:
     template <class T>
@@ -85,6 +96,8 @@ private:
     bool shift_active_ = false;         // images are edge shifts this step
     bool model_virial_valid_ = false;
     double model_virial_ = 0.0;
+    bool model_virial_diag_valid_ = false;
+    double model_virial_diag_[3] = {0.0, 0.0, 0.0};
     const double* md_x_ = nullptr;
     const double* md_y_ = nullptr;
     const double* md_z_ = nullptr;
@@ -111,8 +124,8 @@ private:
     unsigned char* d_ok_ = nullptr;    size_t cap_ok_ = 0;      // per node: may be the receiver of an edge that matters
     long long* d_total_ = nullptr;      // image count (device)
     long long* h_total_ = nullptr;      // pinned
-    double* d_sum_ = nullptr;           // virial (device)
-    double* h_sum_ = nullptr;           // pinned
+    double* d_sum_ = nullptr;           // virial (device; 3 values: the diagonal)
+    double* h_sum_ = nullptr;           // pinned, 3 values
 };
 
 #endif // MLIP_STEP_CUH

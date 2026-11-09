@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -209,6 +210,43 @@ Real pme_apply_green(
         fft_grid[idx][1] = g * im;
     }
     virial_out = virial;
+    return energy;
+}
+
+// Same solve as pme_apply_green, plus the diagonal of the reciprocal virial tensor. The scalar virial is still
+// taken from green_virial so that it is exactly what pme_apply_green returns; the three components come from the
+// per-axis tables and add up to it to rounding.
+Real pme_apply_green_tensor(
+    fftw_complex* fft_grid,
+    const Real* __restrict__ green,
+    const Real* __restrict__ green_energy,
+    const Real* __restrict__ green_virial,
+    const Real* __restrict__ green_virial_x,
+    const Real* __restrict__ green_virial_y,
+    const Real* __restrict__ green_virial_z,
+    size_t num_k, Real& virial_out, Real virial_diag_out[3])
+{
+    Real energy = 0.0;
+    Real virial = 0.0;
+    Real virial_x = 0.0, virial_y = 0.0, virial_z = 0.0;
+    #pragma omp parallel for reduction(+:energy, virial, virial_x, virial_y, virial_z) schedule(static)
+    for (long idx = 0; idx < static_cast<long>(num_k); ++idx) {
+        const Real re = fft_grid[idx][0];
+        const Real im = fft_grid[idx][1];
+        const Real rho_sq = re * re + im * im;
+        energy += green_energy[idx] * rho_sq;
+        virial += green_virial[idx] * rho_sq;
+        virial_x += green_virial_x[idx] * rho_sq;
+        virial_y += green_virial_y[idx] * rho_sq;
+        virial_z += green_virial_z[idx] * rho_sq;
+        const Real g = green[idx];
+        fft_grid[idx][0] = g * re;
+        fft_grid[idx][1] = g * im;
+    }
+    virial_out = virial;
+    virial_diag_out[0] = virial_x;
+    virial_diag_out[1] = virial_y;
+    virial_diag_out[2] = virial_z;
     return energy;
 }
 
@@ -430,6 +468,7 @@ void PmeReciprocalEngine::free_resources() {
     pme_green_.clear();
     pme_green_energy_.clear();
     pme_green_virial_.clear();
+    for (int a = 0; a < 3; ++a) pme_green_virial_axis_[a].clear();
     pme_green_cached_lx_ = pme_green_cached_ly_ = pme_green_cached_lz_ = 0.0;
     initialized_ = false;
 #ifdef DEEPSCALEMD_HAVE_FFTW_MPI
@@ -441,11 +480,26 @@ void PmeReciprocalEngine::free_resources() {
 #endif
 }
 
+void PmeReciprocalEngine::set_virial_tensor_enabled(bool enabled) {
+    if (enabled == virial_tensor_enabled_) return;
+    virial_tensor_enabled_ = enabled;
+    if (enabled) {
+        // The cached tables lack the per-axis ones: force ensure_green_cached() to rebuild them.
+        pme_green_.clear();
+    } else {
+        for (int a = 0; a < 3; ++a) {
+            pme_green_virial_axis_[a].clear();
+            pme_green_virial_axis_[a].shrink_to_fit();
+        }
+    }
+}
+
 void PmeReciprocalEngine::ensure_green_cached(const SimulationBox& box) {
     if (!pme_green_.empty() &&
         pme_green_cached_lx_ == box.lx &&
         pme_green_cached_ly_ == box.ly &&
-        pme_green_cached_lz_ == box.lz) {
+        pme_green_cached_lz_ == box.lz &&
+        (!virial_tensor_enabled_ || !pme_green_virial_axis_[0].empty())) {
         return;
     }
 
@@ -462,6 +516,10 @@ void PmeReciprocalEngine::ensure_green_cached(const SimulationBox& box) {
     pme_green_.assign(num_k_local, 0.0);
     pme_green_energy_.assign(num_k_local, 0.0);
     pme_green_virial_.assign(num_k_local, 0.0);
+    const bool tensor = virial_tensor_enabled_;
+    if (tensor) {
+        for (int a = 0; a < 3; ++a) pme_green_virial_axis_[a].assign(num_k_local, 0.0);
+    }
 
     const Real inv_box_x = 1.0 / box.lx, inv_box_y = 1.0 / box.ly, inv_box_z = 1.0 / box.lz;
     const Real alpha_sq = ewald_alpha_ * ewald_alpha_;
@@ -497,6 +555,18 @@ void PmeReciprocalEngine::ensure_green_cached(const SimulationBox& box) {
                 pme_green_energy_[idx] = 0.5 * w * green;
                 // trace of the virial = sum E_k (1 - k^2/(2 alpha^2)), E_k = 1/2 w G |rho|^2
                 pme_green_virial_[idx] = 0.5 * w * green * (1.0 - k_sq * inv_2alpha_sq);
+                if (tensor) {
+                    // W_aa = sum_k E_k (1 - 2 k_a^2/k^2 - k_a^2/(2 alpha^2)): the strain derivative of
+                    // E_k ~ exp(-k^2/4a^2)/k^2 |S|^2 / V. The three factors add up to 1 - k^2/(2 alpha^2).
+                    const Real half_w_green = 0.5 * w * green;
+                    const Real inv_k_sq = 1.0 / k_sq;
+                    pme_green_virial_axis_[0][idx] = half_w_green *
+                        (1.0 - kxw * kxw * (2.0 * inv_k_sq + inv_2alpha_sq));
+                    pme_green_virial_axis_[1][idx] = half_w_green *
+                        (1.0 - kyw * kyw * (2.0 * inv_k_sq + inv_2alpha_sq));
+                    pme_green_virial_axis_[2][idx] = half_w_green *
+                        (1.0 - kzw * kzw * (2.0 * inv_k_sq + inv_2alpha_sq));
+                }
             }
         }
     }
@@ -553,6 +623,37 @@ Real PmeReciprocalEngine::solve(Real& virial_out) {
     Real energy = pme_apply_green(
         pme_complex_grid_, pme_green_.data(), pme_green_energy_.data(),
         pme_green_virial_.data(), num_k(), virial);
+    fftw_execute(pme_fft_plan_bwd_);   // Phi(k) -> Phi(r), C2R
+    virial_out = virial;
+    return energy;
+}
+
+Real PmeReciprocalEngine::solve(Real& virial_out, Real virial_diag_out[3]) {
+    if (!virial_tensor_enabled_ || pme_green_virial_axis_[0].size() != pme_green_.size()) {
+        throw std::runtime_error(
+            "PmeReciprocalEngine::solve with the virial tensor needs set_virial_tensor_enabled(true) "
+            "followed by ensure_green_cached()");
+    }
+#ifdef DEEPSCALEMD_HAVE_FFTW_MPI
+    if (distributed_) {
+        // Collective: every rank in pme_comm_ must call this together.
+        fftw_mpi_execute_dft_r2c(pme_fft_plan_fwd_, pme_real_grid_, pme_complex_grid_);
+        Real d_virial = 0.0;
+        Real d_energy = pme_apply_green_tensor(
+            pme_complex_grid_, pme_green_.data(), pme_green_energy_.data(), pme_green_virial_.data(),
+            pme_green_virial_axis_[0].data(), pme_green_virial_axis_[1].data(),
+            pme_green_virial_axis_[2].data(), num_k(), d_virial, virial_diag_out);
+        fftw_mpi_execute_dft_c2r(pme_fft_plan_bwd_, pme_complex_grid_, pme_real_grid_);
+        virial_out = d_virial;
+        return d_energy;  // LOCAL partial sums -- caller must MPI_Allreduce over pme_comm_
+    }
+#endif
+    fftw_execute(pme_fft_plan_fwd_);   // rho(r) -> rho(k), R2C
+    Real virial = 0.0;
+    Real energy = pme_apply_green_tensor(
+        pme_complex_grid_, pme_green_.data(), pme_green_energy_.data(), pme_green_virial_.data(),
+        pme_green_virial_axis_[0].data(), pme_green_virial_axis_[1].data(),
+        pme_green_virial_axis_[2].data(), num_k(), virial, virial_diag_out);
     fftw_execute(pme_fft_plan_bwd_);   // Phi(k) -> Phi(r), C2R
     virial_out = virial;
     return energy;

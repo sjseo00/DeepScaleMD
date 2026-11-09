@@ -68,11 +68,11 @@ An implementation selected for a job is often called a **backend**. The code use
 | Job | Choices | Meaning |
 |---|---|---|
 | Run MD calculations | CPU, CUDA, SYCL | Where supported force and movement calculations run |
-| Call a learned model | Python, LibTorch | How MD passes data to the model |
+| Call a learned model | ASE (Python), LibTorch, PyTorch (Python) | How MD passes data to the model: the model package's own calculator, a saved model run in C++, or the converter's wrapper run in Python |
 | Store a converted model | TorchScript, AOTI | Which saved model format the C++ runner loads |
 | Transfer data between processes | MPI, NCCL, NVSHMEM | Which communication implementation moves the data |
 
-For example, CUDA can move atoms, LibTorch can call a TorchScript model, and MPI can exchange boundary atoms in the same run. Each choice controls a different job.
+For example, CUDA can move atoms, LibTorch mode can call a TorchScript model, and MPI can exchange boundary atoms in the same run. Each choice controls a different job.
 
 Code: [simulation control](../src/md_simulation.cpp), [implementation selection](../src/simulation_backend_factory.cpp), [model interface selection](../src/MLIPBackendFactory.cpp).
 
@@ -139,9 +139,15 @@ If a simulation requests a fixed bond length, an ordinary movement step may stre
 
 A second correction removes the relative motion that would immediately stretch the bond again (**RATTLE**). The program checks the remaining error and stops if repeated corrections cannot meet the tolerance. CUDA also has device-side corrections and stores the pre-movement positions they need.
 
-**Current limit:** both atoms must be owned by the same process. Constraints crossing a process boundary are skipped. Several processes do not provide a complete distributed constraint solver.
+**GPU solver.** The constraints are grouped by cluster (see below). On the GPU a cluster of at most 8 constraints (a water, an X-H group of a topology that constrains the hydrogen bonds) is solved by one thread that sweeps its constraints in registers (Gauss-Seidel) until all hold, and then writes its atoms once; there are no atomic operations, no launch per sweep and no wait for the host between sweeps. SHAKE and RATTLE are one kernel launch each per step. A cluster of more than 8 constraints (a chain with all bonds constrained) falls back to the Jacobi iteration over the whole list, one kernel launch and one host check per sweep, which is much slower. The tolerances are unchanged: a constraint holds when its squared length is within 1e-8 (relative) of the target, and `r.v` is below 1e-8 for the velocities. The program starts from velocities that satisfy the constraints: one RATTLE runs after the first force evaluation, before step 0 is printed.
 
-Code: [CPU constraints](../src/constraint_solver.cpp), [CUDA constraints](../src/force_calculator_cuda.cu), [correction timing](../src/md_simulation.cpp).
+**Several processes.** Atoms that are bonded by a constraint form a **cluster** (a water molecule, a CH3 group with its three C-H constraints). A process takes every constraint of every cluster that has an atom it owns; the cluster's other atoms are its ghost atoms. Before SHAKE the positions of the ghost atoms are refreshed from their owners (one extra halo exchange of three numbers per ghost), before RATTLE positions and velocities (one full-record exchange). Each of the two processes that share a cluster then solves all of it by itself, moves the ghost copies too (so coupled constraints converge) and keeps the result for the atoms it owns; the next halo exchange overwrites the ghost copies. Both ranks agree up to the solver tolerance. A cluster whose atoms are not all inside the halo stops the run with a message. The extra exchanges are only made with several processes and constraints.
+
+**Pressure.** The constraint forces carry virial, `W = sum r.G` over the constrained pairs. RATTLE obtains it from its own corrections: a velocity correction `-k r / m` of the first atom of a pair is made by the force `G = -2 k r / (FORCE_TO_ACCEL dt)` over the last half step, so the pair adds `r_a G_a = -2 k r_a^2 / (FORCE_TO_ACCEL dt)` to `W_aa`, with `r` the bond vector at the end of the step and `k` summed over the iterations; a pair counts on the process that owns its atom of the lower global id. This force belongs to the end of the step, the time of the force virial and the kinetic energy that the pressure of the step is made of. (The SHAKE correction gives the force at the start of the step; pairing it with the end-of-step force and kinetic energy was a lag of one step, which only added noise to the instantaneous pressure.) The value is added to the force virial for the barostat and for the pressure in the output. Before the first step there is no velocity correction that carries a force, so the start measures one on a virtual half step: the velocities (projected onto the constraints) are kicked by half a step of the first forces, RATTLE finds the constraint forces of that time, and the velocities are put back. The force that keeps a pair at its length satisfies `r.a = -|v|^2`, so in that virtual step the pair's `r.v` is made `-dt/2 |v|^2` instead of 0 (in a normal step the position correction leaves the velocities with exactly that radial part). The pressure of step 0 then agrees with the steps that follow.
+
+**Box scaling keeps clusters rigid.** The barostat scales every atom position by the box factor, which would stretch every constrained bond by the same factor. SHAKE of the next step then pushes the bond back, and that displacement is indistinguishable from a constraint force: a spurious virial and a velocity kick, a bias of first order in `mu - 1` that does not average out because it follows the sign of the pressure error. After the scaling every cluster therefore keeps its scaled centre of mass and gets its old offsets from it back (the atoms of a cluster move rigidly with the scaled box; only the distances between clusters scale). On the GPU a cluster of at most 8 constraints is handled by one thread in registers, a larger one by one thread that walks the whole cluster (every atom is put next to the atom it is bonded to by the minimum image before the centre of mass is taken, so a cluster that is longer than half the box works).
+
+Code: [CPU constraints](../src/constraint_solver.cpp), [CUDA constraints](../src/force_calculator_cuda.cu), [constraint clusters](../src/md_system.cpp), [correction timing](../src/md_simulation.cpp).
 
 ### 3.4 Keep temperature near a target (thermostats)
 
@@ -151,6 +157,8 @@ Temperature is related to atomic kinetic energy: faster-moving atoms generally m
 - **Add friction and random kicks (Langevin).** Friction removes motion while random kicks add thermal motion. Their size depends on temperature, mass, friction, and time step.
 - **Occasionally replace a velocity (Andersen).** Each atom has a chance of colliding with an imaginary heat bath. A collision gives it a new velocity from the temperature-dependent distribution.
 
+With constraints (3.3) the number of degrees of freedom is `3N - constraints`: the Nosé–Hoover controller holds the kinetic energy at half that number times `kT`, and the printed temperature divides by the same number. The Nosé–Hoover variable belongs to the whole system: every step the processes add up their kinetic energy and atom counts, so they all hold the same value. Langevin and Andersen change each velocity on its own, also along constrained bonds, so the constraints are applied to the velocities once more after them. The pressure keeps the constraint forces of the step's first velocity correction.
+
 The CPU uses standard C++ random-number generators. CUDA generates random values with NVIDIA's **cuRAND** library and updates velocities in parallel. Random starting seeds mean separate runs can follow different trajectories even with the same settings.
 
 Code: [temperature controllers](../src/thermostat.cpp), [CUDA velocity updates](../src/thermostat_kernels.cu).
@@ -159,13 +167,13 @@ Code: [temperature controllers](../src/thermostat.cpp), [CUDA velocity updates](
 
 Pressure depends on atomic motion and forces across the system. The code combines kinetic energy with a force-related pressure contribution (the **virial**).
 
-A pressure controller (a **barostat**) changes the box size. Coordinates change with the box. Current implementations scale all three directions together (isotropic scaling).
+A pressure controller (a **barostat**) changes the box size. Coordinates change with the box. By default all three directions are scaled together (isotropic scaling, from the trace of the pressure tensor). With `barostat_coupling: anisotropic` each axis named in `barostat_axes` is scaled on its own from its own diagonal pressure `P_aa = (2 KE_a + W_aa) / V`, where `KE_a` is the kinetic energy of the motion along the axis and `W_aa` the diagonal of the virial; the other axes keep their length (for example `z` for a membrane normal to z). The angle, dihedral and improper terms have zero trace but not zero diagonal components, so they are included in `W_aa`, and so are the constraint forces.
 
-- **Parrinello–Rahman:** this path uses a moving-piston-like variable. Optional friction and random noise provide a **Langevin piston** extension. The implementation here is isotropic.
+- **Parrinello–Rahman:** this path uses a moving-piston-like variable. Optional friction and random noise provide a **Langevin piston** extension. Anisotropic: one piston per coupled axis, each with the mass `W/3`, so that the drift is `3 V (P_aa - P0) / W` (the isotropic drift when the three pressures are equal) and the thermal piston velocity matches the isotropic one; the axes draw their noise in a fixed order, the same on every process.
 - **Andersen:** this path currently adjusts the box gradually from the pressure difference (weak coupling). The class name does not establish a full implementation of every Andersen pressure algorithm.
-- **Berendsen:** relaxes the box toward the target pressure, using compressibility and a relaxation time to set the response.
+- **Berendsen:** relaxes the box toward the target pressure, using compressibility and a relaxation time to set the response. Anisotropic: the length factor of an axis is `1 - (dt beta / 3 tau)(P0 - P_aa)`, the linear form of the isotropic `cbrt(1 - dt beta / tau (P0 - P))`.
 
-Per-step scale changes are limited to avoid sudden expansion or collapse. Processes combine pressure-related measurements before control. A box change updates their region boundaries; enough deformation also triggers a neighbor-list rebuild.
+Per-step scale changes are limited to avoid sudden expansion or collapse (per axis when anisotropic). Processes combine pressure-related measurements before control (three more numbers for the anisotropic virial). A box change updates their region boundaries; enough deformation also triggers a neighbor-list rebuild. The virial tensor is accumulated only when an anisotropic barostat is on; the isotropic path and its results are unchanged. An MLIP returns the trace only, so an anisotropic barostat cannot be combined with one.
 
 Code: [pressure controllers](../src/barostat.cpp), [CUDA scaling](../src/barostat_kernels.cu), [box changes](../src/md_simulation.cpp).
 
@@ -464,7 +472,24 @@ With `pme_ranks > 1`, the reserved group uses **CPU FFTW-MPI**, even in a CUDA b
 
 The current server still collects the full grid at a group leader before distributing slices, then collects solved slices before returning results. Those transfers remain a possible bottleneck.
 
-### 9.3 Use nearby-force work to cover some waiting time
+### 9.3 Solve the grid across all GPUs (cuFFTMp)
+
+The two paths above both leave one full transform per process. With 16 or more GPUs the cost of summing the whole grid (the CUDA-aware exchange stops at 8 ranks and the fallback goes through host memory) and of repeating the transform on every rank is the same however many GPUs are used, so the speed stops rising. `pme_ranks: 2` in a build with `-DDSMD_ENABLE_CUFFTMP=ON` replaces both with a distributed transform:
+
+1. Each rank spreads its own charges, as before. The box its charges cover is packed.
+2. The ranks exchange their boxes (six integers each). Every box is cut at the borders of the X-slabs, and each piece goes to the rank that owns that slab (CUDA-aware MPI, only to the slabs the box overlaps). The owner adds the pieces in rank order, so the sum is the same on every run.
+3. cuFFTMp does the real-to-complex transform from X-slabs to Y-slabs. The solve runs on the local Y-slab. The reciprocal energy and virial are the sum over that slab only; the callers add them over the ranks, so there is no 1/P factor.
+4. The inverse transform returns X-slabs. Each owner sends back, for every piece it received, the potential of that piece. The rank puts the pieces into its grid and the interpolation reads it as before.
+
+No rank holds the summed grid and no rank repeats the transform. The traffic per rank is about its own box in each direction, which falls as ranks are added. cuFFTMp needs NVSHMEM memory for the transform, so the exchange itself uses ordinary device buffers and a copy kernel moves the data. The host waits for the transform chain before sending the potential back (MPI does not follow the stream order), so this step does not overlap the boundary pair kernels.
+
+Selection: `pme_ranks: 2` in a cuFFTMp build turns it on. No rank is reserved and the number 2 is only the switch; the normal PP/PME split stays off. Without cuFFTMp, `pme_ranks: 2` keeps its old meaning (the CPU FFTW-MPI group of 9.2). If a condition below is not met, every rank falls back to the replicated solve of 9.1 and rank 0 prints `[PME] distributed reciprocal solve (pme_ranks: 2) not used: <reason>`. When it is used, rank 0 prints `[PME] N ranks: distributed reciprocal solve (cuFFTMp, X-slabs to Y-slabs)`.
+
+The solve and virial kernels take `y_begin` and `y_count`, the rows of the half-spectrum the array holds (default: all rows), so the same kernels serve the whole spectrum and the local Y-slab. The spread, the interpolation and the self energy are unchanged. The plans are real-to-complex and complex-to-real in single precision; the real box is the X-slab with z rows padded to `2 * (nz / 2 + 1)`, the complex box the Y-slab of the half-spectrum.
+
+Limits: float grid only (`precision: mixed`; NVIDIA documents custom boxes for single precision only), CUDA-aware MPI, a build that has cuFFTMp, and not in the LibTorch build (libcufftMp replaces libcufft). The number of x and y planes must be at least the number of ranks (a slab decomposition). Run time needs `NVSHMEM_BOOTSTRAP=MPI`, and `NVSHMEM_REMOTE_TRANSPORT=libfabric NVSHMEM_LIBFABRIC_PROVIDER=cxi` across nodes on Slingshot. First measurement (Hangang, GH200, 4 GPUs per node, 786,432 atoms of rigid water, 200x200x200 float grid, one run each, same job and nodes for both settings, ms per step with `pme_ranks: 0` / `pme_ranks: 2`): 4 GPUs 2.89 / 2.75 (one node), 8 GPUs 2.81 / 3.47, 16 GPUs 18.4 / 2.81. The potential energy at step 0 agrees with the `pme_ranks: 0` value to 2e-4 kcal/mol out of 2.5e6 (the `pme_ranks: 0` value itself changes by 1e-2 between 4 and 16 GPUs). The distributed solve removes the plateau at 16 GPUs; at 8 GPUs it is slower than the CUDA-aware replicated sum, which is why the replicated path stays the default. With 6,291,456 atoms (W64, 400x400x400 grid, 500 steps, same job and nodes, ms per step with `pme_ranks: 0` / `pme_ranks: 2`): 16 GPUs 122.8 / 10.1, 64 GPUs 128.4 / 5.3, 128 GPUs 131.0 / 4.8, that is 12, 24 and 27 times faster (17.2, 32.5 and 35.9 ns/day with `pme_ranks: 2`). The step-0 potential energy differs from the `pme_ranks: 0` value by 2.4e-3, 1.1e-3 and 6.6e-4 kcal/mol out of 2.0e7. The mean pressure over steps 100 to 500 is 445, 450 and 452 bar against 452, 455 and 447 bar, within the spread of the five samples (8 to 17 bar), and the energy drift is not larger. Going from 16 to 128 GPUs the distributed solve speeds up 2.1 times; the rest of the step (neighbor list, integration, halo exchange) no longer scales.
+
+### 9.4 Use nearby-force work to cover some waiting time
 
 PME has start and finish stages so independent nearby-force work can proceed while a transfer or grid operation is in progress.
 
@@ -504,9 +529,9 @@ The result includes forces, requested energy, and a pressure contribution when s
 
 Code: [common interface](../include/MLIPBackend.h), [element mapping](../src/Elements.cpp), [adapters](../mlip_convert/adapters).
 
-### 11.3 Call through Python
+### 11.3 ASE mode: call through Python
 
-The Python path starts an embedded interpreter and calls `ml_forces.py`. NumPy arrays carry atom data to the package-specific adapter. Returned force sizes are checked, and Python errors are reported.
+The ASE mode (`mlip_backend: ase`) starts an embedded interpreter and calls `ml_forces.py`. NumPy arrays carry atom data to the package-specific adapter. Returned force sizes are checked, and Python errors are reported.
 
 This route uses model packages through their Python interfaces. With CUDA MD, positions cross into CPU memory for this interface and forces return to the GPU. Pinned buffers improve transfer conditions but do not eliminate copies, even when the model itself runs on a GPU.
 
@@ -514,7 +539,7 @@ With several MPI processes, each Python model call gathers all owned atoms and e
 
 CPU and SYCL builds use this route for MLIPs.
 
-Code: [Python backend](../src/PythonBackend.cpp), [gathering](../src/MLIPRankComm.cpp), [entry point](../mlip_python/ml_forces.py), [Python adapters](../mlip_python/adapters).
+Code: [ASE backend](../src/AseBackend.cpp), [gathering](../src/MLIPRankComm.cpp), [entry point](../mlip_python/ml_forces.py), [Python adapters](../mlip_python/adapters).
 
 ## 12. Running a model directly from C++
 
@@ -535,13 +560,15 @@ The converter wraps the model in a shared input/output format and writes a packa
 
 The converter compares the saved model with reference results. This checks conversion; it does not prove every later simulation is correct.
 
+With `--backend pytorch` the converter writes no model file. `metadata.json` then keeps what the converter built the wrapper from (model file, precision, kernels, layer exchange), and the interpreter inside dsMD builds the same wrapper again when MD starts and calls it every step as Python (`mlip_backend: pytorch`, [PyTorch runner](../src/PyTorchModelRunner.cpp), [Python side](../mlip_convert/pytorch_runner.py)). Tensors are shared with that interpreter as DLPack capsules, so the GPU data is not copied. `mlip_backend` has to match the folder: `libtorch` for `model.pt` and `model.pt2`, `pytorch` for a folder converted with `--backend pytorch`.
+
 ### 12.2 Read existing GPU arrays
 
 The backend can create PyTorch views of existing GPU memory (`torch::from_blob`). Coordinates need not pass through CPU NumPy arrays every step.
 
 GPU preparation still occurs: separate x/y/z arrays become the model's position array, labels are translated, and number types may be converted. These operations can allocate or copy GPU data. The main advantage is avoiding the CPU round trip.
 
-A queue guard (`CUDAStreamGuard`) puts PyTorch work on the MD force queue. Outputs are converted and added to MD arrays. For models using eV and Å, the backend uses its `23.0609` factor to obtain kcal/mol and corresponding force units.
+A queue guard (`CUDAStreamGuard`) puts PyTorch work on the MD force queue. Outputs are converted and added to MD arrays. For models using eV and Å, the backend uses its `23.0605` factor to obtain kcal/mol and corresponding force units.
 
 ### 12.3 Differentiate the energy assigned to this process
 
@@ -665,6 +692,8 @@ Position-related ghost forces also need their final return. Exchanging forward f
 
 This operation connects PyTorch differentiation to dsDecompX's transfer layout. It accepts continuous two-dimensional arrays of float32 or float64 features.
 
+A model may also need a few numbers summed over the whole system (SO3LR: the sum of its partial charges, which fixes the total charge). The operation `dsmd::allreduce_sum` adds them over all ranks; every rank gets the same sum, added in rank order. Its derivative is the same sum of the incoming derivatives, because every rank's energy depends on the shared sum. The values are copied to the host and summed through the MLIP rank communicator: a few numbers per call, two calls per step forward and backward for SO3LR.
+
 ### 14.5 When it helps
 
 Layer exchange reduces deep ghost duplication. It helps when those savings exceed extra per-layer communication.
@@ -689,17 +718,18 @@ Several families use internal quantities that change consistently when the syste
 | NequIP | Atom labels, connection direction, and supported saved model forms | Layer exchange expects the supported `ConvNetLayer` structure; original model may fix number type |
 | Allegro | NequIP loading route for a model whose information stays local | Already local; layer-exchange conversion rejected |
 | SevenNet | Interaction layers and selected model variant | Layer exchange and supported multi-modal models; several acceleration choices |
-| BAM/RACE | Saved interaction blocks and energy outputs | Layer exchange excludes DeNS heads; OpenEquivariance requires fast blocks; cuEquivariance needs a compatible trained checkpoint |
+| BAM/RACE | Saved interaction blocks and energy outputs | DeNS heads are skipped (they need `dens_forces`); OpenEquivariance requires fast blocks and its fused convolution runs in the layered path; cuEquivariance needs a compatible trained checkpoint |
 | PaiNN | Single-value and directional features and interactions | Layer exchange supported; model and element information must meet adapter requirements |
 | TensorNet | Directional-array representations and interaction blocks | Reach is `(blocks + 1) × cutoff`; layered conversion has energy-scaling and bias restrictions |
 | MatterSim | Builds angle-related combinations of connections | Layer exchange supported; angle combinations add work beyond edge construction |
 | CHGNet | Required atom, bond, and angle information | Atom-feature exchange alone cannot resolve shared bond/angle state; layer exchange rejected |
 | DeePMD with PyTorch | Local environment description and checkpoint type mapping | Strictly local descriptors; layered option needs no intermediate feature transfers in this local path |
+| SO3LR Tauri | The JAX network rebuilt in PyTorch from the released weights: attention layers on the short-range edges, heads for energy, partial charges and dispersion ratios, pair terms on the long-range edges | Edge list built with the long-range cutoff; charges summed over the whole system, so `whole_system` (never split over ranks) unless converted with `--layer-exchange` (then the sums are `dsmd::allreduce_sum` over the ranks); no k-space electrostatics |
 | Toy pair and message-passing models | Small models for checking interfaces | Conversion, periodic-boundary, differentiation, and distributed tests |
 
 An angle-based model may need every relevant pair of neighbors around a center atom (three-body triplets). The combinations can grow roughly as the square of neighbor count. Equal atom and edge counts therefore do not imply equal costs across models.
 
-Python adapters also exist for UMA, ORB, GAP, and MatGL families. A Python adapter does not establish that a LibTorch converter or layer-exchange implementation exists.
+ASE-mode adapters also exist for GAP and the MatGL families, which have no converter. UMA, eSEN and ORB have converters for the PyTorch mode only: their code does not become a TorchScript file. eSEN (fairchem 2.x) is UMA's network without the mixture of experts and uses the same adapter code. ORB's energy head averages over all atoms of the system, so its folder is marked `whole_system` and is never split over ranks (every rank computes all atoms). An ASE adapter does not establish that a LibTorch converter or layer-exchange implementation exists.
 
 The default converter label `e3nn` also means “no extra acceleration package” for some adapters. It does not mean all these models use the same e3nn mathematics. Actual model-testing coverage is recorded in the [MLIP support table](06_MLIP.md#4-supported-models).
 
@@ -726,7 +756,7 @@ The choice is normally made during conversion with `--accel`. NequIP and Allegro
 
 A library can contain a fast energy operation without registering how PyTorch differentiates it. That is insufficient for MD forces.
 
-cuEquivariance may need `cuequivariance_ops_torch` imported to register operations. OpenEquivariance can compile an extension on first import and registers backward rules through Python. The model package records these startup requirements.
+cuEquivariance needs `cuequivariance_ops_torch` and `cuequivariance_torch` imported to register operations (`uniform_1d`, used by MACE, is registered by a submodule that only `cuequivariance_torch` imports). cuEquivariance times many `uniform_1d` kernels for every new problem size. On several GPUs the ghost count changes at every neighbor rebuild, so it kept tuning: water with 24,000 atoms on 4 GPUs ran at 154 ms per step instead of 66 ms. dsMD therefore sets `CUEQUIVARIANCE_OPS_U1D_ALGOS=0` before the import, unless the user already set it. The energies do not change. OpenEquivariance can compile an extension on first import and registers backward rules through Python. The model package records these startup requirements.
 
 DeepScaleMD checks Python torch against linked LibTorch and checks required OpenEquivariance setup. Some accelerated LibTorch models therefore need Python support at startup, even though ordinary per-step calls use C++.
 
@@ -802,10 +832,12 @@ Code: [CMakeLists.txt](../CMakeLists.txt).
 |---|---|
 | Different force-update intervals (r-RESPA) | Classes remain, but current input rejects the option |
 | Fast Multipole Method electrical calculation (FMM) | CPU entry point reports it is unimplemented |
-| Fixed bonds across MPI boundaries | Current SHAKE/RATTLE skips these constraints |
-| Tilted boxes and general directional box motion | Current representation uses perpendicular sides and isotropic pressure control |
+| Fixed bonds across MPI boundaries | Solved on every process that owns an atom of the constraint cluster (ghost atoms refreshed before SHAKE and RATTLE, two extra halo exchanges per step); the whole cluster must lie inside the halo |
+| Tilted boxes and shear pressure | The box is orthorhombic: the axes can be scaled independently (`barostat_coupling: anisotropic`), shear components of the pressure tensor are not used |
+| Several MPI ranks with constraints on the CPU backend | Needs a dsDecompX that refreshes the ghosts' velocities on a host halo exchange (`DSDECOMPX_HOST_HALO_REFRESHES_VELOCITY`); the program stops with a message otherwise |
+| Anisotropic pressure with an MLIP or SYCL | Not available: needs the virial tensor, which an MLIP (trace only) and the SYCL calculator (no virial) do not give |
 | SYCL long-range PME | No reciprocal-grid implementation |
-| CPU/SYCL LibTorch | Not supported; use Python MLIP |
+| CPU/SYCL LibTorch or PyTorch mode | Not supported; use the ASE mode |
 | Python model MPI acceleration | Every process evaluates the whole system |
 | One FFT divided across CUDA GPUs | Not provided by default GPU PME |
 | Capturing/replaying a CUDA work sequence (CUDA Graphs) | No explicit MD `cudaGraph*`/stream-capture path; external runtimes may have their own behavior |

@@ -95,7 +95,10 @@ often it happens.
   single-threaded no matter how many threads you set.
 - On GPU with several ranks, an NCCL-enabled dsDecompX makes the mesh sum cheaper
   ([Installation](01_Installation.md)).
-- `pme_ranks`.
+- `pme_ranks`: `1` reserves one rank (one GPU in a CUDA build) for the mesh. With 16 or more GPUs the
+  replicated solve stops speeding up (the whole mesh is summed and transformed on every rank).
+  `pme_ranks: 2` in a cuFFTMp build (`-DDSMD_ENABLE_CUFFTMP=ON`) solves the mesh across all GPUs instead
+  ([Technical note](08_Technical_Note.md) 9.3). Compare it with `pme_ranks: 0` on your system; on one node keep `0`.
 
 ### Many ranks
 

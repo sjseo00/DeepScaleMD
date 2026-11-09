@@ -9,9 +9,9 @@ It is for researchers who want to run MLIP simulations on one GPU or on many, an
 ## Highlights
 
 - Spatial domain decomposition, particle migration and halo exchange from `dsDecompX`, on CPU (MPI + OpenMP) and on GPU (CUDA)
-- MLIP simulations through two backends: a **Python MLIP** backend that calls the model package, and a **LibTorch MLIP** backend
-  (CUDA builds) that runs a converted model on the GPU, including several GPUs with per-layer feature exchange
-- A model converter and a menu for it (`mlip_convert`, `mlip_cli_ui`) for ten MLIP families
+- MLIP simulations in three modes: an **ASE mode** that calls the model package, a **LibTorch mode** (CUDA builds) that runs a converted
+  model on the GPU, and a **PyTorch mode** (CUDA builds) that runs the converter's wrapper as Python; the last two work on several GPUs with per-layer feature exchange
+- A model converter and a menu for it (`mlip_convert`, `mlip_cli_ui`) for twelve MLIP families
 - Built-in classical force field (Lennard-Jones, bonded terms, PME) and converters from NAMD, GROMACS, LAMMPS and CHARMM inputs
 - Neighbor lists, thermostats and barostats for both MLIP and classical runs
 - Trajectories in XYZ, LAMMPS dump and DCD, plus parallel ADIOS2 BP and H5MD writers in which every rank writes its own particles
@@ -21,8 +21,9 @@ It is for researchers who want to run MLIP simulations on one GPU or on many, an
 | Force calculation | CPU build | CUDA build |
 |---|---|---|
 | Built-in classical force field | yes | yes |
-| Python MLIP (`mlip_backend: python`) | yes | yes |
-| LibTorch MLIP (`mlip_backend: libtorch`) | no | yes |
+| ASE mode (`mlip_backend: ase`) | yes | yes |
+| LibTorch mode (`mlip_backend: libtorch`) | no | yes |
+| PyTorch mode (`mlip_backend: pytorch`) | no | yes |
 
 Both builds use MPI. A SYCL build is under development. The MLIP models and what was verified for each are listed in
 [docs/06_MLIP.md](docs/06_MLIP.md#4-supported-models).
@@ -33,8 +34,8 @@ Both builds use MPI. A SYCL build is under development. The MLIP models and what
 - An installed `dsDecompX` 1.0 package. It is a separate CMake package, built and installed before DeepScaleMD; CPU and CUDA
   builds need matching CPU and CUDA installations
 - CUDA builds: the NVIDIA CUDA Toolkit and a CUDA-enabled `dsDecompX`
-- Python MLIP: Python 3 development headers and NumPy, plus the model's own packages
-- LibTorch MLIP: a CUDA build, GCC 9 or newer, and a Python environment whose `torch` provides LibTorch
+- ASE mode: Python 3 development headers and NumPy, plus the model's own packages
+- LibTorch and PyTorch modes: a CUDA build, GCC 9 or newer, and a Python environment whose `torch` provides LibTorch (the PyTorch mode also needs the Python 3 development headers)
 
 ## Build
 
@@ -52,7 +53,7 @@ cmake -S . -B build/deepscalemd-cpu -DCMAKE_BUILD_TYPE=Release -DBACKEND=CPU -DD
 cmake --build build/deepscalemd-cpu -j
 ```
 
-For an MLIP with the LibTorch backend, build for CUDA and add the LibTorch options (the `torch` of the Python you point to supplies LibTorch):
+For an MLIP in the LibTorch or PyTorch mode, build for CUDA and add the LibTorch options (the `torch` of the Python you point to supplies LibTorch):
 
 ```bash
 cmake -S . -B build_mlip -DCMAKE_BUILD_TYPE=Release -DBACKEND=CUDA -DDSDECOMPX_DIR=<dsDecompX CUDA install> \
@@ -83,7 +84,7 @@ and [docs/03_Input_Reference.md](docs/03_Input_Reference.md).
 | [03 Input Reference](docs/03_Input_Reference.md) | every YAML key |
 | [04 Preparing a System](docs/04_Preparing_a_System.md) | initial structures, topology files, converting other formats |
 | [05 Classical MD](docs/05_Classical_MD.md) | built-in force field, PME, constraints |
-| [06 MLIP](docs/06_MLIP.md) | Python and LibTorch MLIP, converter, supported models, several GPUs, water tutorial |
+| [06 MLIP](docs/06_MLIP.md) | ASE, LibTorch and PyTorch modes, converter, supported models, several GPUs, water tutorial |
 | [07 Performance Tuning](docs/07_Performance_Tuning.md) | timing, neighbor lists, what to check when it is slow |
 | [08 Technical Note](docs/08_Technical_Note.md) | algorithms, CPU/GPU parallel work, learned-model acceleration |
 

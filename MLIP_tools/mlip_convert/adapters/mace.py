@@ -58,11 +58,15 @@ def _rebuild_without_scripted_code(model: torch.nn.Module) -> torch.nn.Module:
 
 def _to_cueq(model: torch.nn.Module, device: str) -> torch.nn.Module:
     """The model with cuEquivariance tensor products (mace's own e3nn -> cueq conversion, cli/convert_e3nn_cueq.py). `device`
-    matters: the fused convolution is only used for "cuda"."""
+    matters: mace turns the fused convolution on only for device == "cuda", so "cuda:N" (the PyTorch mode inside dsMD) is
+    passed as "cuda" (the current GPU) and the caller moves the model to its GPU afterwards. Without the fusion the convolution
+    gathers and scatters every edge itself (water, 24000 atoms, one GPU: 387 instead of 112 ms/step)."""
     try:
         from mace.cli.convert_e3nn_cueq import run as convert
     except ImportError as error:
         raise ValueError(f"--accel cueq needs the cuequivariance packages: {error}") from error
+    if str(device).startswith("cuda"):
+        device = "cuda"
     previous_default = torch.get_default_dtype()
     try:
         return convert(model, device=device, return_model=True)      # it sets the default dtype to the model's
@@ -111,6 +115,36 @@ def _make_patched_forwards_scriptable(model: torch.nn.Module) -> int:
     return changed
 
 
+class _CueqFlags:
+    """The fields of mace's CuEquivarianceConfig that mace's forward methods read (EquivariantProductBasisBlock, reshape_irreps),
+    as a TorchScript class."""
+
+    def __init__(self, enabled: bool, optimize_all: bool, optimize_symmetric: bool, layout_str: str):
+        self.enabled = enabled
+        self.optimize_all = optimize_all
+        self.optimize_symmetric = optimize_symmetric
+        self.layout_str = layout_str
+
+
+def _make_cueq_config_scriptable(model: torch.nn.Module) -> int:
+    """mace's blocks choose the cuEquivariance path in forward with `hasattr(self, "cueq_config")` and the config's fields. The
+    config is a dataclass that TorchScript cannot hold (its layout and group are cuequivariance objects), so scripting drops the
+    attribute and hasattr is False in the scripted model: it takes the e3nn branch with cuEquivariance modules (reshape_irreps
+    cuts the features in the mul_ir layout, the symmetric contraction gets the one-hot node attributes as its index, and the
+    kernel stops with "unexpected index buffer dtype"). The config is replaced by a TorchScript class with the fields those
+    forwards read; eager runs are unchanged. Returns how many modules were changed."""
+    flags = torch.jit.script(_CueqFlags)
+    changed = 0
+    for module in model.modules():
+        config = module.__dict__.get("cueq_config")
+        if config is None or isinstance(config, flags):
+            continue
+        module.cueq_config = flags(bool(config.enabled), bool(config.optimize_all), bool(config.optimize_symmetric),
+                                   str(config.layout_str))
+        changed += 1
+    return changed
+
+
 def load_mace_model(path, dtype: torch.dtype = torch.float64, accel: str = "e3nn", device: str = "cpu") -> torch.nn.Module:
     """A saved MACE model (torch.save of the whole model, as mace's tools write it) in eval mode, without gradients.
     accel "cueq" / "openeq" converts it to cuEquivariance / OpenEquivariance tensor products (on `device`). While e3nn's
@@ -131,6 +165,8 @@ def load_mace_model(path, dtype: torch.dtype = torch.float64, accel: str = "e3nn
         parameter.requires_grad_(False)
     if accel != "e3nn":
         _make_patched_forwards_scriptable(model)
+    if accel == "cueq":
+        _make_cueq_config_scriptable(model)
     return model
 
 

@@ -206,15 +206,19 @@ void MDSystem::initialize_velocities(Real temperature) {
     // (g/mol)*(Å/fs)^2 -> kcal/mol
 
     if (rank == 0) {
-        // 1) Generate Gaussian random velocities
+        // 1) Generate Maxwell-Boltzmann velocities: every component is Gaussian with variance kT/m, so a light atom
+        //    moves faster than a heavy one (equipartition). Equal variance for every atom, which this used to do, puts
+        //    far more kinetic energy on the heavy atoms than on the hydrogens and takes some tens of steps to relax;
+        //    with rigid bonds it also leaves the temperature too high after the constraints take their share.
         std::random_device rd;
         std::mt19937 gen(rd());
         std::normal_distribution<Real> dist(0.0, 1.0);
-        
+
         for (size_t i = 0; i < particles.num_particles; i++) {
-            particles.vx[i] = dist(gen);
-            particles.vy[i] = dist(gen);
-            particles.vz[i] = dist(gen);
+            const Real sigma = std::sqrt(kB * std::max<Real>(temperature, 0.0) / (particles.mass[i] * mvv2e));
+            particles.vx[i] = sigma * dist(gen);
+            particles.vy[i] = sigma * dist(gen);
+            particles.vz[i] = sigma * dist(gen);
         }
         
         // 2) Remove center-of-mass velocity
@@ -255,8 +259,8 @@ void MDSystem::initialize_velocities(Real temperature) {
         // = (dof/2) k_B T   (units: kcal/mol)
 
         // 5) Compute scale factor (both are in kcal/mol, so the units match)
-        Real scale_factor = std::sqrt(target_ke / current_ke);
-        
+        Real scale_factor = (current_ke > 0.0) ? std::sqrt(target_ke / current_ke) : 0.0;
+
         for (size_t i = 0; i < particles.num_particles; i++) {
             particles.vx[i] *= scale_factor;
             particles.vy[i] *= scale_factor;
@@ -297,10 +301,12 @@ void MDSystem::initialize_distributed_velocities(Real temperature) {
     std::mt19937 gen(seed);
     std::normal_distribution<Real> normal(0.0, 1.0);
 
+    // Maxwell-Boltzmann (variance kT/m per component), see initialize_velocities().
     for (size_t i = 0; i < local_count; ++i) {
-        particles.vx[i] = normal(gen);
-        particles.vy[i] = normal(gen);
-        particles.vz[i] = normal(gen);
+        const Real sigma = std::sqrt(kB * std::max<Real>(temperature, 0.0) / (particles.mass[i] * mvv2e));
+        particles.vx[i] = sigma * normal(gen);
+        particles.vy[i] = sigma * normal(gen);
+        particles.vz[i] = sigma * normal(gen);
     }
 
     Real local_moments[4] = {0.0, 0.0, 0.0, 0.0};
@@ -1069,8 +1075,12 @@ void MDSystem::sync_decomposition_domain() {
     if (mlip_ghost_depth_ > 0.0) {
         // Judged with the full ghost depth; a collective, so every rank takes the same path (subdomain widths can differ).
         mlip_replicated_ = false;
-        const bool replicated = decomp_runtime_->any_rank_true(!mlip_halo_fits(get_halo_width()));
-        if (replicated && !mlip_replicated_reported_ && rank == 0) {
+        const bool replicated = mlip_whole_system_ || decomp_runtime_->any_rank_true(!mlip_halo_fits(get_halo_width()));
+        if (replicated && mlip_whole_system_ && !mlip_replicated_reported_ && rank == 0) {
+            std::cerr << "[MLIP] The model reads the whole system at once (metadata whole_system), so it is not split over the ranks: "
+                         "every rank takes the atoms of all ranks and computes the whole system (correct, but the extra ranks give no "
+                         "speed-up for the model)." << std::endl;
+        } else if (replicated && !mlip_replicated_reported_ && rank == 0) {
             std::cerr << "[MLIP] A subdomain is narrower than the ghost layer of the model (ghost depth "
                       << mlip_ghost_depth_ << " A + skin + margin = " << get_halo_width()
                       << " A): one halo exchange reaches only the neighboring ranks, so it cannot give the model its ghost atoms. "
@@ -1090,6 +1100,23 @@ void MDSystem::sync_decomposition_domain() {
     box.zlo = local.lower[2]; box.zhi = local.upper[2];
     // NOTE: redistribute_particles_after_scale() is NOT called here.
     // It is called explicitly by md_simulation.cpp after each NPT box change.
+}
+
+void MDSystem::rescale_decomposition_domain() {
+    if (size == 1 || !decomp_runtime_) return;
+#ifdef DSDECOMPX_RESCALE_DOMAIN
+    // The subdomain cuts scale with the box like the atoms the barostat scaled, so the plan's ghost membership stays
+    // valid (MDSimulation::kBoxSyncBudget bounds the drift until the next rebuild); only the image shifts change.
+    dsdecompx::GlobalDomain domain;
+    domain.lower = {0.0, 0.0, 0.0};
+    domain.upper = {box.lx, box.ly, box.lz};
+    domain.periodic = {true, true, true};
+    decomp_runtime_->rescale_domain(domain);
+    const auto& local = decomp_runtime_->topology().local_domain();
+    box.xlo = local.lower[0]; box.xhi = local.upper[0];
+    box.ylo = local.lower[1]; box.yhi = local.upper[1];
+    box.zlo = local.lower[2]; box.zhi = local.upper[2];
+#endif
 }
 
 bool MDSystem::migrate_particles_check() {
@@ -1156,27 +1183,67 @@ void MDSystem::ensure_bonded_parameter_cache() {
     };
     const auto& bonds = topology->get_bonds();
     bond_k_all_.assign(bonds.size(), 0.0); bond_r0_all_.assign(bonds.size(), 0.0);
-    fill(bonds, [&](const std::string& n) -> const BondType& { return topology->get_bond_type(n); },
+    fill(bonds, [&](int n) -> const BondType& { return topology->get_bond_type(n); },
          [&](size_t t, const BondType& p) { bond_k_all_[t] = p.k; bond_r0_all_[t] = p.r0; }, bond_ok_all_);
     const auto& angles = topology->get_angles();
     angle_k_all_.assign(angles.size(), 0.0); angle_theta0_all_.assign(angles.size(), 0.0);
-    fill(angles, [&](const std::string& n) -> const AngleType& { return topology->get_angle_type(n); },
+    fill(angles, [&](int n) -> const AngleType& { return topology->get_angle_type(n); },
          [&](size_t t, const AngleType& p) { angle_k_all_[t] = p.k; angle_theta0_all_[t] = p.theta0; }, angle_ok_all_);
     const auto& dihedrals = topology->get_dihedrals();
     dihedral_k_all_.assign(dihedrals.size(), 0.0); dihedral_phi0_all_.assign(dihedrals.size(), 0.0);
     dihedral_n_all_.assign(dihedrals.size(), 0);
-    fill(dihedrals, [&](const std::string& n) -> const DihedralType& { return topology->get_dihedral_type(n); },
+    fill(dihedrals, [&](int n) -> const DihedralType& { return topology->get_dihedral_type(n); },
          [&](size_t t, const DihedralType& p) {
              dihedral_k_all_[t] = p.k; dihedral_phi0_all_[t] = p.phi0; dihedral_n_all_[t] = p.n; },
          dihedral_ok_all_);
     const auto& impropers = topology->get_impropers();
     improper_k_all_.assign(impropers.size(), 0.0); improper_phi0_all_.assign(impropers.size(), 0.0);
     improper_n_all_.assign(impropers.size(), 0);
-    fill(impropers, [&](const std::string& n) -> const DihedralType& { return topology->get_dihedral_type(n); },
+    fill(impropers, [&](int n) -> const DihedralType& { return topology->get_dihedral_type(n); },
          [&](size_t t, const DihedralType& p) {
              improper_k_all_[t] = p.k; improper_phi0_all_[t] = p.phi0; improper_n_all_[t] = p.n; },
          improper_ok_all_);
     bonded_param_cache_ready_ = true;
+}
+
+void MDSystem::ensure_constraint_clusters() {
+    if (constraint_clusters_ready_) return;
+    constraint_clusters_ready_ = true;
+    constraint_cluster_count_ = 0;
+    constraint_cluster_of_atom_.clear();
+    constraint_cluster_of_term_.clear();
+    if (!topology) return;
+    const auto& constraints = topology->get_constraints();
+    if (constraints.empty()) return;
+
+    int max_atom = -1;
+    for (const Constraint& c : constraints) max_atom = std::max({max_atom, c.atom1, c.atom2});
+    std::vector<int> parent(static_cast<size_t>(max_atom + 1));
+    for (size_t a = 0; a < parent.size(); ++a) parent[a] = static_cast<int>(a);
+    auto find = [&](int a) {
+        while (parent[a] != a) {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        return a;
+    };
+    for (const Constraint& c : constraints) {
+        const int ra = find(c.atom1), rb = find(c.atom2);
+        if (ra != rb) parent[std::max(ra, rb)] = std::min(ra, rb);
+    }
+
+    // Cluster ids in the order of their first constraint, so the numbering does not depend on the rank.
+    std::vector<int> cluster_of_root(parent.size(), -1);
+    constraint_cluster_of_atom_.assign(parent.size(), -1);
+    constraint_cluster_of_term_.assign(constraints.size(), -1);
+    for (size_t t = 0; t < constraints.size(); ++t) {
+        const int root = find(constraints[t].atom1);
+        if (cluster_of_root[root] < 0) cluster_of_root[root] = static_cast<int>(constraint_cluster_count_++);
+        const int id = cluster_of_root[root];
+        constraint_cluster_of_term_[t] = id;
+        constraint_cluster_of_atom_[constraints[t].atom1] = id;
+        constraint_cluster_of_atom_[constraints[t].atom2] = id;
+    }
 }
 
 void MDSystem::refresh_local_bonded_topology() {
@@ -1235,7 +1302,7 @@ void MDSystem::refresh_local_bonded_topology() {
                 if (!strict) return false;
                 topology->get_bond_type(bond.type);  // throws the original error
             }
-            out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), &bond.type,
+            out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), bond.type,
                            bond_k_all_[t], bond_r0_all_[t]});
         }
         return true;
@@ -1256,7 +1323,7 @@ void MDSystem::refresh_local_bonded_topology() {
                 topology->get_angle_type(angle.type);
             }
             out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), static_cast<size_t>(k),
-                           &angle.type, angle_k_all_[t], angle_theta0_all_[t]});
+                           angle.type, angle_k_all_[t], angle_theta0_all_[t]});
         }
         return true;
     });
@@ -1279,7 +1346,7 @@ void MDSystem::refresh_local_bonded_topology() {
                 topology->get_dihedral_type(dihedral.type);
             }
             out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), static_cast<size_t>(k),
-                           static_cast<size_t>(l), &dihedral.type,
+                           static_cast<size_t>(l), dihedral.type,
                            dihedral_k_all_[t], dihedral_phi0_all_[t], dihedral_n_all_[t]});
         }
         return true;
@@ -1303,7 +1370,7 @@ void MDSystem::refresh_local_bonded_topology() {
                 topology->get_dihedral_type(improper.type);
             }
             out.push_back({static_cast<size_t>(i), static_cast<size_t>(j), static_cast<size_t>(k),
-                           static_cast<size_t>(l), &improper.type,
+                           static_cast<size_t>(l), improper.type,
                            improper_k_all_[t], improper_phi0_all_[t], improper_n_all_[t]});
         }
         return true;
@@ -1321,14 +1388,38 @@ void MDSystem::refresh_local_bonded_topology() {
              pair.sigma, pair.epsilon});
     }
 
+    // Every constraint of every cluster that has an owned atom, whatever rank owns its other atoms: such a rank
+    // also holds them as ghosts, and the constraint solvers update the owned atoms only for the pair they see as
+    // theirs (see ConstraintSolver). A cluster whose atoms are not all in the halo cannot be solved here.
     const auto& constraints = topology->get_constraints();
-    local_constraints_.reserve(constraints.size() / ranks + 1);
-    for (const Constraint& c : constraints) {
-        const int owner = std::min(c.atom1, c.atom2);
-        if (!owned_slot(owner)) continue;
-        const int i = slot_of(c.atom1), j = slot_of(c.atom2);
-        if (i < 0 || j < 0) continue;
-        local_constraints_.push_back({static_cast<size_t>(i), static_cast<size_t>(j), c.distance});
+    if (!constraints.empty()) {
+        ensure_constraint_clusters();
+        std::vector<char> active(constraint_cluster_count_, 0);
+        for (size_t s = 0; s < local_count && s < particles.global_id.size(); ++s) {
+            const int gid = particles.global_id[s];
+            if (gid >= 0 && static_cast<size_t>(gid) < constraint_cluster_of_atom_.size()) {
+                const int cluster = constraint_cluster_of_atom_[gid];
+                if (cluster >= 0) active[cluster] = 1;
+            }
+        }
+        local_constraints_.reserve(constraints.size() / ranks + 1);
+        for (size_t t = 0; t < constraints.size(); ++t) {
+            if (!active[constraint_cluster_of_term_[t]]) continue;
+            const Constraint& c = constraints[t];
+            const int i = slot_of(c.atom1), j = slot_of(c.atom2);
+            if (i < 0 || j < 0) {
+                // Before the first halo exchange (domain setup, the initial upload) a rank has no ghost atoms at
+                // all, so a cluster that straddles a subdomain boundary is incomplete by construction; the list
+                // is rebuilt after the halo exists, and only then can a missing atom be an error.
+                if (particles.ghost_count() == 0 && size > 1) continue;
+                throw std::runtime_error(
+                    "[Constraints] the constraint " + std::to_string(c.atom1) + "-" + std::to_string(c.atom2) +
+                    " belongs to a cluster that has an atom on this rank, but " +
+                    std::to_string(i < 0 ? c.atom1 : c.atom2) + " is neither owned nor in the halo: the halo "
+                    "(cutoff + skin + margin) must reach the whole constrained cluster");
+            }
+            local_constraints_.push_back({static_cast<size_t>(i), static_cast<size_t>(j), c.distance});
+        }
     }
 
     bonded_layout_global_ids_ = particles.global_id;
@@ -1355,14 +1446,14 @@ static dsdecompx::HaloExchangeOptions make_halo_options(bool rebuild, cudaStream
 }
 
 bool MDSystem::exchange_halo_on_device(ForceCalculatorCUDA& calculator,
-                                       bool rebuild_halo) {
+                                       bool rebuild_halo, bool positions_only) {
     if (size == 1) return false;
     const size_t owned = get_local_particles();
     cudaStream_t stream = calculator.get_force_stream();
     dsdecompx::ParticleInfo storage(
         owned, particles.ghost_count(), calculator);
     const auto result = decomp_runtime_->exchange_halo(
-        storage, make_halo_options(rebuild_halo, stream, !rebuild_halo));
+        storage, make_halo_options(rebuild_halo, stream, positions_only && !rebuild_halo));
     resize_particle_storage(owned + result.ghost_count);
     particles.reset_counts(owned, result.ghost_count);
     last_device_halo_plan_reused_ = result.plan_reused;

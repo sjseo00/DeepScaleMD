@@ -7,9 +7,13 @@ force-constant unit conversion is needed. LAMMPS's bond/angle harmonic
 styles omit the 1/2 DeepScaleMD's V = 0.5*k*(x-x0)^2 expects (LAMMPS writes
 E = K(x-x0)^2), same as CHARMM, so K is still doubled on the way in.
 
-Supported styles (chosen for AMBER/OPLS/GAFF-via-LAMMPS and SPICA/Mie(n,m)
-coverage -- the two things a LAMMPS reader adds over the GROMACS one):
+Supported styles (chosen for AMBER/OPLS/GAFF-via-LAMMPS, CHARMM-via-LAMMPS and
+SPICA/Mie(n,m) coverage -- what a LAMMPS reader adds over the GROMACS one):
   pair_style   lj/cut, lj/cut/coul/cut, lj/cut/coul/long  (Mie 12-6)
+               lj/charmm/coul/long                         (CHARMM LJ with the
+                                                             inner/outer switch;
+                                                             eps14/sigma14 give
+                                                             the 1-4 pairs)
                mie/cut                                     (generic Mie n,m;
                                                              one n,m for the
                                                              whole system --
@@ -18,11 +22,21 @@ coverage -- the two things a LAMMPS reader adds over the GROMACS one):
                                                              per-pair n,m)
   bond_style   harmonic
   angle_style  harmonic
+               charmm   (E=K(theta-theta0)^2 + Kub(r13-rub)^2: the Urey-Bradley
+                         term becomes one extra harmonic bond, as in charmm_reader)
   dihedral_style harmonic (E=K[1+d*cos(n*phi)], d=+-1 -> phase 0/180)
                  opls     (4-term Fourier series, decomposed into up to 4
                            periodic torsion_parameters entries -- see
                            _opls_to_periodic_terms for the exact algebra)
+                 charmm   (E=K[1+cos(n*phi-d)]; the weight factor scales the 1-4
+                           LJ/Coulomb pair of its end atoms, see
+                           _add_charmm_14_pairs)
   improper_style cvff     (same periodic form as dihedral_style harmonic)
+                 harmonic (E=K(chi-chi0)^2 with chi0 = 0 or 180, written as the
+                           harmonic improper charmm_reader writes)
+  fix shake / rattle      (bond and angle clusters selected with b / a / t / m
+                           become the topology's [constraints]; the bond and angle
+                           terms LAMMPS switches off for them are not written)
 
 special_bonds lj/coul 1-2 and 1-3 weights must both be 0 (full exclusion,
 the overwhelmingly common case for AMBER/OPLS/GAFF force fields); the 1-4
@@ -30,22 +44,28 @@ weights become every special_pair's lj_scale/coulomb_scale. The keywords lj, cou
 lj/coul, amber, charmm, dreiding, angle and dihedral are understood ("angle yes" /
 "dihedral yes" restrict the 1-3 / 1-4 treatment to atoms that share an angle / dihedral).
 
-Unlike-pair mixing follows `pair_modify mix` (LAMMPS default: geometric; arithmetic and
-sixthpower are supported). Charges are ignored by pair styles without a coul part, exactly
-as LAMMPS does, so they are zeroed (with a warning) for those styles.
+Unlike-pair mixing follows `pair_modify mix` (LAMMPS default: geometric, arithmetic for the
+lj/charmm styles; arithmetic and sixthpower are supported). Charges are ignored by pair
+styles without a coul part, exactly as LAMMPS does, so they are zeroed (with a warning) for
+those styles.
+
+With `dihedral_style charmm` the pair style sees no 1-4 interaction (special_bonds charmm):
+every dihedral adds weight * [4*eps14*((sigma14/r)^12-(sigma14/r)^6) + qq/r] for its end
+atoms instead. The weights of all dihedrals sharing the same end atoms are summed, and the
+pair becomes one special_pair with that lj_scale/coulomb_scale and the mixed eps14/sigma14.
 
 Explicitly NOT supported -- raises ConversionError rather than silently
 mis-converting: any unit style other than `real`; any pair/bond/angle/
-dihedral/improper style other than the ones listed above (in particular
-`improper harmonic`, which -- like CHARMM impropers -- is a harmonic, not
-periodic, functional form: pass allow_lossy=True / --allow-lossy to drop
-it instead, exactly as charmm_reader.py does); nonzero 1-2 or 1-3
-special_bonds weights (a partial 1-2/1-3 inclusion DeepScaleMD's binary
-exclusion model cannot represent); triclinic (tilted) boxes.
+dihedral/improper style other than the ones listed above (an improper harmonic with
+chi0 other than 0 or 180 differs from DeepScaleMD's signed angle, so it needs
+allow_lossy=True / --allow-lossy); nonzero 1-2 or 1-3 special_bonds weights (a partial
+1-2/1-3 inclusion DeepScaleMD's binary exclusion model cannot represent); fix shake on a
+group other than `all` or with a molecule template; triclinic (tilted) boxes.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import sys
@@ -57,7 +77,8 @@ from canonical_model import (
     CanonicalSystem, ConversionError, Bond, Angle, Torsion, Constraint, SpecialPair,
 )
 
-_SUPPORTED_PAIR_STYLES = ("lj/cut", "lj/cut/coul/cut", "lj/cut/coul/long")
+_CHARMM_PAIR_STYLES = ("lj/charmm/coul/long",)
+_SUPPORTED_PAIR_STYLES = ("lj/cut", "lj/cut/coul/cut", "lj/cut/coul/long") + _CHARMM_PAIR_STYLES
 _MIE_PAIR_STYLES = ("mie/cut",)
 _ACCELERATOR_SUFFIXES = ("/omp", "/gpu", "/kk", "/opt", "/intel")
 
@@ -98,9 +119,9 @@ class LammpsData:
     counts: Dict[str, int] = field(default_factory=dict)
     box: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     masses: Dict[int, float] = field(default_factory=dict)              # type -> mass
-    pair_coeffs: Dict[int, Tuple[float, ...]] = field(default_factory=dict)   # type -> (eps, sigma[, n, m])
+    pair_coeffs: Dict[int, Tuple[float, ...]] = field(default_factory=dict)   # type -> (eps, sigma[, n, m | eps14, sigma14])
     bond_coeffs: Dict[int, Tuple[float, float]] = field(default_factory=dict)      # type -> (K, r0)
-    angle_coeffs: Dict[int, Tuple[float, float]] = field(default_factory=dict)     # type -> (K, theta0_deg)
+    angle_coeffs: Dict[int, Tuple[float, ...]] = field(default_factory=dict)       # type -> (K, theta0_deg[, Kub, rub])
     dihedral_coeffs: Dict[int, Tuple] = field(default_factory=dict)      # type -> raw tokens (style-dependent)
     improper_coeffs: Dict[int, Tuple] = field(default_factory=dict)
     # atom_id (1-based, as in file) -> (mol_id, type, charge, x, y, z)
@@ -209,7 +230,7 @@ def _consume_section(data: LammpsData, section: str, body: List[str], path: str)
     elif section == "Angle Coeffs":
         for line in body:
             t = line.split()
-            data.angle_coeffs[int(t[0])] = (float(t[1]), float(t[2]))
+            data.angle_coeffs[int(t[0])] = tuple(float(x) for x in t[1:])
     elif section == "Dihedral Coeffs":
         for line in body:
             t = line.split()
@@ -264,6 +285,19 @@ def _consume_section(data: LammpsData, section: str, body: List[str], path: str)
 # ── input script ─────────────────────────────────────────────────────────
 
 @dataclass
+class ShakeFix:
+    """What one `fix shake|rattle ... b ... a ... t ... m ...` constrains."""
+    bond_types: set = field(default_factory=set)
+    angle_types: set = field(default_factory=set)
+    atom_types: set = field(default_factory=set)
+    masses: List[float] = field(default_factory=list)
+
+
+# LAMMPS selects the bonds of the `m` keyword by mass within this distance (fix_shake.cpp)
+_SHAKE_MASS_DELTA = 0.1
+
+
+@dataclass
 class LammpsScript:
     units: str = "real"
     atom_style: str = "full"
@@ -276,13 +310,59 @@ class LammpsScript:
     special_bonds_coul: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     special_angle: bool = False
     special_dihedral: bool = False
-    mix: str = "geometric"            # pair_modify mix (LAMMPS default)
+    mix: Optional[str] = None         # pair_modify mix; None = the pair style's own default
     pair_coeffs: Dict[int, Tuple[float, ...]] = field(default_factory=dict)
     bond_coeffs: Dict[int, Tuple[float, float]] = field(default_factory=dict)
-    angle_coeffs: Dict[int, Tuple[float, float]] = field(default_factory=dict)
+    angle_coeffs: Dict[int, Tuple[float, ...]] = field(default_factory=dict)
     dihedral_coeffs: Dict[int, Tuple] = field(default_factory=dict)
     improper_coeffs: Dict[int, Tuple] = field(default_factory=dict)
+    shake_fixes: List[ShakeFix] = field(default_factory=list)
     data_file: Optional[str] = None
+
+
+def _parse_shake(tokens: List[str]) -> ShakeFix:
+    """fix ID group shake|rattle tol iter N keyword values ... (b a t m; mol and kbond)."""
+    text = " ".join(tokens)
+    if tokens[2] != "all":
+        raise ConversionError(
+            f"'{text}': only fix {tokens[3]} on the group 'all' can be converted")
+    if len(tokens) < 8:
+        raise ConversionError(f"'{text}': fix {tokens[3]} needs tol, iter, N and a b/a/t/m selection")
+    fix = ShakeFix()
+    mode: Optional[str] = None
+    for token in tokens[7:]:
+        if mode == "kbond":
+            mode = None            # the value of kbond only matters for minimization
+        elif token in ("b", "a", "t", "m", "kbond"):
+            mode = token
+        elif token == "mol":
+            raise ConversionError(f"'{text}': fix {tokens[3]} with a molecule template cannot be converted")
+        elif mode is None:
+            raise ConversionError(f"'{text}': unexpected '{token}' in fix {tokens[3]}")
+        else:
+            try:
+                value = float(token)
+            except ValueError:
+                raise ConversionError(f"'{text}': fix {tokens[3]} needs numbers after '{mode}', got {token!r}")
+            if mode == "b":
+                fix.bond_types.add(int(value))
+            elif mode == "a":
+                fix.angle_types.add(int(value))
+            elif mode == "t":
+                fix.atom_types.add(int(value))
+            else:
+                fix.masses.append(value)
+    if not (fix.bond_types or fix.angle_types or fix.atom_types or fix.masses):
+        raise ConversionError(f"'{text}': fix {tokens[3]} selects nothing (no b, a, t or m values)")
+    return fix
+
+
+def _coefficients(tokens: List[str], first: int) -> Tuple[float, ...]:
+    """The numbers of a bond_coeff/angle_coeff command, from tokens[first:]."""
+    try:
+        return tuple(float(x) for x in tokens[first:])
+    except ValueError:
+        raise ConversionError(f"cannot read the coefficients of: {' '.join(tokens)}")
 
 
 def parse_special_bonds(tokens: List[str], lj, coul, angle: bool, dihedral: bool):
@@ -378,8 +458,9 @@ def parse_input_script(path: str) -> LammpsScript:
             t = int(tokens[1])
             script.bond_coeffs[t] = (float(tokens[2]), float(tokens[3]))
         elif cmd == "angle_coeff":
-            t = int(tokens[1])
-            script.angle_coeffs[t] = (float(tokens[2]), float(tokens[3]))
+            script.angle_coeffs[int(tokens[1])] = _coefficients(tokens, 2)
+        elif cmd == "fix" and len(tokens) >= 4 and tokens[3].startswith(("shake", "rattle")):
+            script.shake_fixes.append(_parse_shake(tokens))
         elif cmd == "dihedral_coeff":
             script.dihedral_coeffs[int(tokens[1])] = tuple(tokens[2:])
         elif cmd == "improper_coeff":
@@ -450,6 +531,107 @@ def _cvff_improper_to_periodic(coeffs: Tuple[str, ...]) -> Tuple[float, float, i
         raise ConversionError(f"improper_style cvff 'd' must be +1 or -1, got {d}")
     phase = 0.0 if d == 1 else 180.0
     return (k, phase, n)
+
+
+def _charmm_dihedral_to_periodic(coeffs: Tuple[str, ...]) -> Tuple[float, float, int, float]:
+    """dihedral_style charmm: E = K[1 + cos(n*phi - d)] (K, n, d in degrees, weight) --
+    exactly DeepScaleMD's periodic form. Returns (K, d, n, weight)."""
+    if len(coeffs) < 4:
+        raise ConversionError(f"dihedral_style charmm needs 'K n d weight', got: {' '.join(coeffs)}")
+    k, d, weight = float(coeffs[0]), float(coeffs[2]), float(coeffs[3])
+    n = int(float(coeffs[1]))
+    if n <= 0:
+        raise ConversionError(
+            f"dihedral_style charmm multiplicity n={n} is not supported (DeepScaleMD needs n >= 1)")
+    if weight < 0.0:
+        raise ConversionError(f"dihedral_style charmm weight must not be negative, got {weight:g}")
+    return k, d, n, weight
+
+
+def _harmonic_improper(coeffs: Tuple[str, ...]) -> Tuple[float, float]:
+    """improper_style harmonic: E = K(chi - chi0)^2. DeepScaleMD's harmonic improper is the same
+    expression with a signed chi (no 1/2), so K is used as written."""
+    if len(coeffs) < 2:
+        raise ConversionError(f"improper_style harmonic needs 'K chi0', got: {' '.join(coeffs)}")
+    return float(coeffs[0]), float(coeffs[1])
+
+
+def _chi0_matches_signed_angle(chi0: float) -> bool:
+    """LAMMPS takes chi as the unsigned angle acos(c) in [0, 180]; DeepScaleMD's is signed. The two
+    expressions agree only when chi0 is 0 or 180 (both are symmetric under chi -> -chi)."""
+    return abs(chi0 - 180.0 * round(chi0 / 180.0)) < 1e-9
+
+
+def _shake_constraints(fixes: List[ShakeFix], data: LammpsData,
+                       bond_coeffs: Dict[int, Tuple[float, ...]],
+                       angle_coeffs: Dict[int, Tuple[float, ...]]):
+    """Bond and angle clusters of fix shake/rattle as distance constraints.
+
+    Returns (constraints, skipped_bonds, skipped_angles): constraints are (lammps_i, lammps_j,
+    distance) from the equilibrium bond lengths (and, for an `a` angle cluster, the 1-3 distance
+    by the law of cosines, as fix_shake.cpp computes it); the two sets hold the indexes into
+    data.bonds / data.angles that LAMMPS switches off, so their harmonic terms are not written."""
+    def selected(fix: ShakeFix, btype: int, i: int, j: int) -> bool:
+        ti, tj = data.atoms[i][1], data.atoms[j][1]
+        if btype in fix.bond_types or ti in fix.atom_types or tj in fix.atom_types:
+            return True
+        return any(abs(data.masses[t] - m) <= _SHAKE_MASS_DELTA for t in (ti, tj) for m in fix.masses)
+
+    bond_length: Dict[Tuple[int, int], float] = {}
+    partners: Dict[int, List[int]] = {}
+    skipped_bonds: set = set()
+    for n, (btype, i, j) in enumerate(data.bonds):
+        if not any(selected(fix, btype, i, j) for fix in fixes):
+            continue
+        if btype not in bond_coeffs:
+            raise ConversionError(f"no bond_coeff for bond type {btype}")
+        key = (min(i, j), max(i, j))
+        if key in bond_length:
+            continue
+        bond_length[key] = bond_coeffs[btype][1]
+        partners.setdefault(i, []).append(j)
+        partners.setdefault(j, []).append(i)
+        skipped_bonds.add(n)
+
+    constraints = [(i, j, r0) for (i, j), r0 in bond_length.items()]
+    skipped_angles: set = set()
+    angle_types = set().union(*(fix.angle_types for fix in fixes))
+    for n, (atype, a, b, c) in enumerate(data.angles):
+        if atype not in angle_types:
+            continue
+        r_ab = bond_length.get((min(a, b), max(a, b)))
+        r_bc = bond_length.get((min(b, c), max(b, c)))
+        if r_ab is None or r_bc is None or len(partners[b]) != 2:
+            continue               # not a three-atom cluster: LAMMPS leaves the angle alone
+        if atype not in angle_coeffs:
+            raise ConversionError(f"no angle_coeff for angle type {atype}")
+        theta0 = math.radians(angle_coeffs[atype][1])
+        distance = math.sqrt(r_ab * r_ab + r_bc * r_bc - 2.0 * r_ab * r_bc * math.cos(theta0))
+        constraints.append((a, c, distance))
+        skipped_angles.add(n)
+    return constraints, skipped_bonds, skipped_angles
+
+
+def _add_charmm_14_pairs(system: CanonicalSystem, weights: Dict[Tuple[int, int], float],
+                         type14_of_atom: List[Tuple[float, float]], mix: str,
+                         lj14: float, coul14: float) -> None:
+    """One special_pair per 1-4 end-atom pair whose summed dihedral weight is not zero (see the
+    module docstring); sigma/epsilon are the 1-4 coefficients mixed like the ordinary pair."""
+    if any(weights.values()) and (lj14 != 0.0 or coul14 != 0.0):
+        raise ConversionError(
+            f"dihedral_style charmm applies its own 1-4 weight, so special_bonds must give the "
+            f"1-4 pair a zero weight (special_bonds charmm); got lj={lj14:g}, coul={coul14:g}")
+    for (i, l), weight in weights.items():
+        if weight == 0.0:
+            continue
+        sigma_i, eps_i = type14_of_atom[i]
+        sigma_l, eps_l = type14_of_atom[l]
+        sigma, epsilon = mix_pair(sigma_i, eps_i, sigma_l, eps_l, mix)
+        if not system.is_excluded(i, l):
+            raise ConversionError(
+                f"atoms {i + 1} and {l + 1} are the ends of a dihedral but are not within three "
+                f"bonds of each other in the Bonds section")
+        system.special_pairs.append(SpecialPair(i, l, weight, weight, sigma, epsilon))
 
 
 # ── graph distance (shared logic with gromacs_reader's nrexcl generation) ─
@@ -551,29 +733,29 @@ def convert(input_script_path: str, data_file_path: Optional[str] = None,
     pair_style = base_pair_style(script.pair_style)
     use_mie = pair_style in _MIE_PAIR_STYLES
     use_lj = pair_style in _SUPPORTED_PAIR_STYLES
+    use_charmm = pair_style in _CHARMM_PAIR_STYLES
     if not (use_mie or use_lj):
         raise ConversionError(
             f"pair_style '{pair_style}' is not supported "
             f"(supported: {', '.join(_SUPPORTED_PAIR_STYLES + _MIE_PAIR_STYLES)})")
+    mix = script.mix or ("arithmetic" if use_charmm else "geometric")   # the pair style's default
 
     if script.bond_style not in ("harmonic", ""):
         raise ConversionError(f"bond_style '{script.bond_style}' is not supported (only 'harmonic')")
-    if script.angle_style not in ("harmonic", ""):
-        raise ConversionError(f"angle_style '{script.angle_style}' is not supported (only 'harmonic')")
-    if script.dihedral_style not in ("harmonic", "opls", ""):
+    if script.angle_style not in ("harmonic", "charmm", ""):
         raise ConversionError(
-            f"dihedral_style '{script.dihedral_style}' is not supported (only 'harmonic', 'opls')")
+            f"angle_style '{script.angle_style}' is not supported (only 'harmonic', 'charmm')")
+    if script.dihedral_style not in ("harmonic", "opls", "charmm", ""):
+        raise ConversionError(
+            f"dihedral_style '{script.dihedral_style}' is not supported "
+            f"(only 'harmonic', 'opls', 'charmm')")
     if script.improper_style not in ("cvff", "harmonic", ""):
         raise ConversionError(
-            f"improper_style '{script.improper_style}' is not supported (only 'cvff'; "
-            f"'harmonic' is a genuinely different, non-periodic functional form -- "
-            f"see the improper handling below)")
-    if script.improper_style == "harmonic" and not allow_lossy:
+            f"improper_style '{script.improper_style}' is not supported (only 'cvff', 'harmonic')")
+    if script.dihedral_style == "charmm" and not use_charmm:
         raise ConversionError(
-            "improper_style harmonic (E=K(chi-chi0)^2) is a harmonic, not periodic, "
-            "functional form -- DeepScaleMD's improper_parameters only implements "
-            "the periodic form. Pass allow_lossy=True (--allow-lossy) to drop these "
-            "impropers entirely.")
+            f"dihedral_style charmm takes its 1-4 LJ parameters from a lj/charmm pair style, "
+            f"not '{pair_style}'")
 
     has_coulomb = "coul" in pair_style
     if not has_coulomb and any(atom[2] != 0.0 for atom in data.atoms.values()):
@@ -602,6 +784,7 @@ def convert(input_script_path: str, data_file_path: Optional[str] = None,
 
     mie_ns: set = set()
     type_sigma_eps: Dict[int, Tuple[float, float]] = {}
+    type_sigma_eps_14: Dict[int, Tuple[float, float]] = {}
     for t in range(1, n_atom_types + 1):
         if t not in pair_coeffs:
             raise ConversionError(f"no pair_coeff for atom type {t}")
@@ -616,6 +799,13 @@ def convert(input_script_path: str, data_file_path: Optional[str] = None,
                 raise ConversionError(f"pair_coeff for type {t}: needs 'epsilon sigma'")
             eps, sigma = c[0], c[1]
         type_sigma_eps[t] = (sigma, eps)
+        if use_charmm:
+            # lj/charmm: 'epsilon sigma [eps14 sigma14]'; the 1-4 values default to the ordinary ones
+            if len(c) not in (2, 4):
+                raise ConversionError(
+                    f"pair_coeff for type {t}: lj/charmm needs 'epsilon sigma' or "
+                    f"'epsilon sigma eps14 sigma14', got {len(c)} numbers")
+            type_sigma_eps_14[t] = (c[3], c[2]) if len(c) == 4 else (sigma, eps)
     if use_mie:
         if len(mie_ns) > 1:
             raise ConversionError(
@@ -634,7 +824,7 @@ def convert(input_script_path: str, data_file_path: Optional[str] = None,
         for j in range(i, n_atom_types + 1):
             sigma_i, eps_i = type_sigma_eps[i]
             sigma_j, eps_j = type_sigma_eps[j]
-            sigma, epsilon = mix_pair(sigma_i, eps_i, sigma_j, eps_j, script.mix)
+            sigma, epsilon = mix_pair(sigma_i, eps_i, sigma_j, eps_j, mix)
             system.set_pair(type_id_by_lammps_type[i], type_id_by_lammps_type[j], sigma, epsilon)
 
     n_atoms = data.counts.get("atoms", 0)
@@ -645,6 +835,7 @@ def convert(input_script_path: str, data_file_path: Optional[str] = None,
         raise ConversionError("atom IDs in the data file must be 1..N with no gaps")
 
     lammps_id_to_dsmd_id: Dict[int, int] = {}
+    type14_of_atom: List[Tuple[float, float]] = []      # (sigma14, eps14) per DeepScaleMD atom id
     for lammps_id in range(1, n_atoms + 1):
         mol, atype, q, x, y, z = data.atoms[lammps_id]
         if data.masses:
@@ -658,44 +849,88 @@ def convert(input_script_path: str, data_file_path: Optional[str] = None,
                                molecule_id=mol, residue_id=mol)
         system.atoms[aid].x, system.atoms[aid].y, system.atoms[aid].z = x, y, z
         lammps_id_to_dsmd_id[lammps_id] = aid
+        if use_charmm:
+            type14_of_atom.append(type_sigma_eps_14[atype])
 
     def dsmd(lammps_atom_id: int) -> int:
         return lammps_id_to_dsmd_id[lammps_atom_id]
 
-    for btype, i, j in data.bonds:
+    shake_bonds: set = set()
+    shake_angles: set = set()
+    if script.shake_fixes:
+        constraints, shake_bonds, shake_angles = _shake_constraints(
+            script.shake_fixes, data, bond_coeffs, angle_coeffs)
+        for i, j, distance in constraints:
+            system.constraints.append(Constraint(dsmd(i), dsmd(j), distance))
+
+    # LAMMPS switches the bond (and angle) terms off for the clusters fix shake holds rigid.
+    for n, (btype, i, j) in enumerate(data.bonds):
+        if n in shake_bonds:
+            continue
         if btype not in bond_coeffs:
             raise ConversionError(f"no bond_coeff for bond type {btype}")
         k, r0 = bond_coeffs[btype]
         system.bonds.append(Bond(dsmd(i), dsmd(j), 2.0 * k, r0))  # E=K*dr^2 -> 0.5*k*dr^2
 
-    for atype, i, j, k_atom in data.angles:
+    charmm_angle = script.angle_style == "charmm"
+    for n, (atype, i, j, k_atom) in enumerate(data.angles):
+        if n in shake_angles:
+            continue
         if atype not in angle_coeffs:
             raise ConversionError(f"no angle_coeff for angle type {atype}")
-        k, theta0 = angle_coeffs[atype]
+        coeffs = angle_coeffs[atype]
+        if len(coeffs) != (4 if charmm_angle else 2):
+            raise ConversionError(
+                f"angle_coeff for type {atype}: angle_style "
+                f"{'charmm needs K theta0 Kub rub' if charmm_angle else 'harmonic needs K theta0'}, "
+                f"got {len(coeffs)} numbers")
+        k, theta0 = coeffs[0], coeffs[1]
+        if charmm_angle and coeffs[2] != 0.0:
+            # Urey-Bradley Kub*(r13-rub)^2 is a harmonic distance term between the angle's
+            # end atoms (as in charmm_reader); a zero constant contributes nothing
+            system.bonds.append(Bond(dsmd(i), dsmd(k_atom), 2.0 * coeffs[2], coeffs[3]))
         system.angles.append(Angle(dsmd(i), dsmd(j), dsmd(k_atom), 2.0 * k, theta0))
 
+    charmm_weights: Dict[Tuple[int, int], float] = {}
     for dtype, i, j, k_atom, l in data.dihedrals:
         if dtype not in dihedral_coeffs:
             raise ConversionError(f"no dihedral_coeff for dihedral type {dtype}")
         coeffs = dihedral_coeffs[dtype]
         if script.dihedral_style == "opls":
             terms = _opls_to_periodic_terms(coeffs)
+        elif script.dihedral_style == "charmm":
+            k_val, phase, mult, weight = _charmm_dihedral_to_periodic(coeffs)
+            terms = [(k_val, phase, mult)]
+            ends = (min(dsmd(i), dsmd(l)), max(dsmd(i), dsmd(l)))
+            charmm_weights[ends] = charmm_weights.get(ends, 0.0) + weight
         else:
             terms = _harmonic_dihedral_to_periodic(coeffs)
         for k_val, phase, mult in terms:
             system.torsions.append(Torsion(dsmd(i), dsmd(j), dsmd(k_atom), dsmd(l), k_val, phase, mult))
 
-    dropped_impropers = 0
+    signed_angle_mismatch = 0
     for itype, i, j, k_atom, l in data.impropers:
         if itype not in improper_coeffs:
             raise ConversionError(f"no improper_coeff for improper type {itype}")
         if script.improper_style == "harmonic":
-            dropped_impropers += 1
+            k_val, chi0 = _harmonic_improper(improper_coeffs[itype])
+            if not _chi0_matches_signed_angle(chi0):
+                if not allow_lossy:
+                    raise ConversionError(
+                        f"improper_coeff for type {itype}: chi0 = {chi0:g}. LAMMPS measures chi as an "
+                        f"unsigned angle, DeepScaleMD as a signed one, so only chi0 = 0 or 180 gives "
+                        f"the same energy. Pass allow_lossy=True (--allow-lossy) to convert it as "
+                        f"written.")
+                signed_angle_mismatch += 1
+            system.impropers.append(
+                Torsion(dsmd(i), dsmd(j), dsmd(k_atom), dsmd(l), k_val, chi0, 0, style="harmonic"))
             continue
         k_val, phase, mult = _cvff_improper_to_periodic(improper_coeffs[itype])
         system.impropers.append(Torsion(dsmd(i), dsmd(j), dsmd(k_atom), dsmd(l), k_val, phase, mult))
-    if dropped_impropers:
-        _warn(f"dropped {dropped_impropers} improper_style harmonic improper(s) entirely (--allow-lossy)")
+    if signed_angle_mismatch:
+        _warn(f"{signed_angle_mismatch} improper_style harmonic improper(s) with chi0 other than 0 or "
+              f"180 are converted as written; their energy differs from LAMMPS for negative chi "
+              f"(--allow-lossy)")
 
     bond_pairs = [(dsmd(i), dsmd(j)) for _, i, j in data.bonds]
     angle_triples = [(dsmd(i), dsmd(j), dsmd(k)) for _, i, j, k in data.angles]
@@ -703,6 +938,9 @@ def convert(input_script_path: str, data_file_path: Optional[str] = None,
     apply_special_bonds(system, bond_pairs, angle_triples, dihedral_quads,
                         script.special_bonds_lj, script.special_bonds_coul,
                         script.special_angle, script.special_dihedral)
+    if charmm_weights:
+        _add_charmm_14_pairs(system, charmm_weights, type14_of_atom, mix,
+                             script.special_bonds_lj[2], script.special_bonds_coul[2])
 
     stage("checking the system")
     system.finalize()

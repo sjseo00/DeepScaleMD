@@ -6,15 +6,21 @@ Keys are case-insensitive and `-` / `_` are interchangeable, as in grompp.
 
 Anything that changes the physics and that DeepScaleMD cannot reproduce goes into
 RunSettings.unsupported (an error unless --allow-lossy): thermostats it lacks (berendsen,
-v-rescale), the c-rescale / MTTK barostats, anisotropic pressure coupling, a Coulomb
-treatment other than PME, different van der Waals and Coulomb cutoffs, force-switch,
-dispersion correction, constraints, a non-3D periodic box and a PME order other than 4.
+v-rescale), the c-rescale / MTTK barostats, pressure coupling that ties axes together
+(semiisotropic, surface-tension) or gives them different compressibilities or pressures, a
+Coulomb treatment other than PME, different van der Waals and Coulomb cutoffs, force-switch,
+dispersion correction, the angle constraints of `constraints = h-angles | all-angles`, a
+non-3D periodic box and a PME order other than 4.
+
+`constraints = h-bonds | all-bonds` is converted by gromacs_reader (constraint_mode below gives
+it the mode). `pcoupltype = anisotropic` with a diagonal compressibility is the anisotropic
+barostat on the axes whose compressibility is not zero.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from canonical_model import ConversionError
 from dsmd_input import RunSettings
@@ -56,6 +62,50 @@ def _float(mdp: Dict[str, str], key: str, default: Optional[float] = None) -> Op
         return float(text)
     except ValueError:
         raise ConversionError(f".mdp: {key} needs a number, got {text!r}")
+
+
+def _numbers(mdp: Dict[str, str], key: str) -> List[float]:
+    try:
+        return [float(token) for token in mdp.get(key, "").split()]
+    except ValueError:
+        raise ConversionError(f".mdp: {key} needs numbers, got {mdp[key]!r}")
+
+
+def _anisotropic(mdp: Dict[str, str], s: RunSettings) -> Optional[Tuple[str, float]]:
+    """pcoupltype = anisotropic -> (axes, pressure in bar), or None after adding the reason to s.unsupported.
+
+    Compressibility is `xx yy zz xy xz yz`: a 0 on the diagonal leaves that axis out, a non-zero
+    off-diagonal value is shear coupling. DeepScaleMD has one compressibility and one target
+    pressure, so the coupled axes must agree on both (ref-p is one number or six)."""
+    compressibility, ref_p = _numbers(mdp, "compressibility"), _numbers(mdp, "ref-p") or [1.0]
+    if len(compressibility) != 6 or len(ref_p) not in (1, 6):
+        s.unsupported.append("pcoupltype = anisotropic needs compressibility with 6 numbers (xx yy zz xy xz yz) "
+                             "and ref-p with 1 or 6")
+        return None
+    coupled = [n for n in range(3) if compressibility[n] != 0.0]
+    axes = "".join("xyz"[n] for n in coupled)
+    pressures = {ref_p[n] if len(ref_p) == 6 else ref_p[0] for n in coupled}
+    if any(compressibility[3:]):
+        problem = "a non-zero off-diagonal compressibility (shear coupling)"
+    elif not coupled:
+        problem = "compressibility 0 on every axis"
+    elif len({compressibility[n] for n in coupled}) > 1:
+        problem = "different compressibilities on the coupled axes (DeepScaleMD has one)"
+    elif len(pressures) > 1:
+        problem = "different ref-p on the coupled axes (DeepScaleMD has one target pressure)"
+    else:
+        return axes, pressures.pop()
+    s.unsupported.append(f"pcoupltype = anisotropic with {problem}")
+    return None
+
+
+def constraint_mode(mdp: Dict[str, str]) -> str:
+    """The .mdp option `constraints` as gromacs_reader.build takes it: none, h-bonds or all-bonds.
+    h-angles and all-angles also convert every bond (grompp does), so they give all-bonds; their
+    angle constraints are what mdp_run_settings reports as unsupported."""
+    value = (_first(mdp, "constraints") or "none").lower()
+    return {"h-bonds": "h-bonds", "all-bonds": "all-bonds",
+            "h-angles": "all-bonds", "all-angles": "all-bonds"}.get(value, "none")
 
 
 def mdp_run_settings(mdp: Dict[str, str],
@@ -109,15 +159,22 @@ def mdp_run_settings(mdp: Dict[str, str],
     # barostat
     pcoupl = (_first(mdp, "pcoupl") or "no").lower()
     if pcoupl not in ("no", ""):
-        if (_first(mdp, "pcoupltype") or "isotropic").lower() != "isotropic":
-            s.unsupported.append(f"pcoupltype = {_first(mdp, 'pcoupltype')} (only isotropic)")
+        pcoupltype = (_first(mdp, "pcoupltype") or "isotropic").lower()
+        s.target_pressure_bar = _float(mdp, "ref-p", 1.0)
+        if pcoupltype == "anisotropic":
+            found = _anisotropic(mdp, s)
+            if found is not None:
+                s.barostat_coupling = "anisotropic"
+                s.barostat_axes, s.target_pressure_bar = found
+        elif pcoupltype != "isotropic":
+            s.unsupported.append(f"pcoupltype = {pcoupltype} (only isotropic and anisotropic are converted; "
+                                 f"semiisotropic and surface-tension couple x and y)")
         if pcoupl == "berendsen":
             s.barostat = "berendsen"
         elif pcoupl == "parrinello-rahman":
             s.barostat = "parrinello_rahman"
         else:
             s.unsupported.append(f"pcoupl = {pcoupl} (DeepScaleMD has berendsen, parrinello_rahman)")
-        s.target_pressure_bar = _float(mdp, "ref-p", 1.0)
         s.tau_p_ps = _float(mdp, "tau-p", 1.0)
         if s.barostat == "parrinello_rahman":
             s.piston_temperature = s.temperature
@@ -159,8 +216,14 @@ def mdp_run_settings(mdp: Dict[str, str],
             s.pme_spacing = spacing * NM_TO_A
 
     constraints = (_first(mdp, "constraints") or "none").lower()
-    if constraints not in ("none",):
-        s.unsupported.append(f"constraints = {constraints} (bonds would be rigid in GROMACS)")
+    if constraints in ("h-bonds", "all-bonds"):
+        s.notes.append(f"constraints = {constraints}: the constrained bonds are the [constraints] section "
+                       f"of topology.dsMDtop")
+    elif constraints in ("h-angles", "all-angles"):
+        s.unsupported.append(f"constraints = {constraints} (the angle constraints are not converted; "
+                             f"with --allow-lossy only the bond constraints are)")
+    elif constraints != "none":
+        s.unsupported.append(f"constraints = {constraints}")
 
     # neighbour list
     nstlist = _float(mdp, "nstlist")

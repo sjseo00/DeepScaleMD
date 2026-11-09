@@ -8,6 +8,9 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #ifdef USE_MPI
 #include <mpi.h>
 #endif
@@ -54,6 +57,78 @@ void broadcast_string(std::string& value, MPI_Comm comm, int root, int rank) {
     }
 }
 
+// One broadcast of a large buffer. MPI counts are int, so a buffer of more than 1 GiB goes in pieces.
+void broadcast_bytes(void* data, std::uint64_t bytes, MPI_Comm comm, int root) {
+    char* cursor = static_cast<char*>(data);
+    const std::uint64_t piece_limit = std::uint64_t(1) << 30;
+    while (bytes != 0) {
+        const int piece = static_cast<int>(std::min(bytes, piece_limit));
+        MPI_Bcast(cursor, piece, MPI_BYTE, root, comm);
+        cursor += piece;
+        bytes -= static_cast<std::uint64_t>(piece);
+    }
+}
+
+std::uint64_t broadcast_size(size_t local_size, MPI_Comm comm, int root, int rank) {
+    std::uint64_t count = (rank == root) ? static_cast<std::uint64_t>(local_size) : 0;
+    MPI_Bcast(&count, 1, MPI_UINT64_T, root, comm);
+    return count;
+}
+
+// All strings of a list in one buffer (each ends with '\0'); the list already has its final length on every rank.
+void broadcast_strings(std::vector<std::string>& values, MPI_Comm comm, int root, int rank) {
+    std::string joined;
+    if (rank == root) {
+        for (const auto& value : values) { joined += value; joined += '\0'; }
+    }
+    std::uint64_t size = broadcast_size(joined.size(), comm, root, rank);
+    if (rank != root) joined.resize(static_cast<size_t>(size));
+    broadcast_bytes(&joined[0], size, comm, root);
+    if (rank != root) {
+        size_t begin = 0;
+        for (auto& value : values) {
+            const size_t end = joined.find('\0', begin);
+            value.assign(joined, begin, end - begin);
+            begin = end + 1;
+        }
+    }
+}
+
+// A table of names: the count, then all names in one buffer.
+void broadcast_table(StringTable& table, MPI_Comm comm, int root, int rank) {
+    std::vector<std::string> names = table.names;
+    names.resize(static_cast<size_t>(broadcast_size(names.size(), comm, root, rank)));
+    broadcast_strings(names, comm, root, rank);
+    if (rank != root) table.assign(std::move(names));
+}
+
+// Bonds, angles, dihedrals and impropers: the atom indices of every record and the id of its type go in one int array
+// (a record is `atom_fields` indices followed by the type id). A call per record took about 10 us each, i.e. minutes
+// for a system of millions of atoms.
+template <class Record>
+void broadcast_records(std::vector<Record>& records, std::initializer_list<int Record::*> atom_fields,
+                       MPI_Comm comm, int root, int rank) {
+    const size_t count = static_cast<size_t>(broadcast_size(records.size(), comm, root, rank));
+    if (rank != root) records.resize(count);
+    const size_t stride = atom_fields.size() + 1;
+    std::vector<int> packed(count * stride);
+    if (rank == root) {
+        for (size_t i = 0; i < count; ++i) {
+            size_t k = i * stride;
+            for (auto field : atom_fields) packed[k++] = records[i].*field;
+            packed[k] = records[i].type;
+        }
+    }
+    broadcast_bytes(packed.data(), static_cast<std::uint64_t>(packed.size()) * sizeof(int), comm, root);
+    if (rank != root) {
+        for (size_t i = 0; i < count; ++i) {
+            size_t k = i * stride;
+            for (auto field : atom_fields) records[i].*field = packed[k++];
+            records[i].type = packed[k];
+        }
+    }
+}
+
 } // namespace
 
 void Topology::broadcast(MPI_Comm comm, int root) {
@@ -85,176 +160,151 @@ void Topology::broadcast(MPI_Comm comm, int root) {
         }
     }
 
-    const size_t bond_type_count = broadcast_count(bond_types.size());
-    if (rank != root) bond_types.clear();
-    if (rank == root) {
-        for (auto& entry : bond_types) {
-            std::string name = entry.first;
-            broadcast_string(name, comm, root, rank);
-            Real values[2] = {entry.second.k, entry.second.r0};
-            MPI_Bcast(values, 2, MPI_DOUBLE, root, comm);
+    // Bond, angle and dihedral parameters: a package has one entry per interaction, so the names go in one string
+    // buffer and the values in one array each (a call per entry took minutes for a system of millions of atoms).
+    {
+        std::vector<std::string> names;
+        std::vector<Real> values;
+        if (rank == root) {
+            for (const auto& entry : bond_types) {
+                names.push_back(entry.first);
+                values.push_back(entry.second.k);
+                values.push_back(entry.second.r0);
+            }
         }
-    } else {
-        for (size_t i = 0; i < bond_type_count; ++i) {
-            std::string name;
-            broadcast_string(name, comm, root, rank);
-            Real values[2]{};
-            MPI_Bcast(values, 2, MPI_DOUBLE, root, comm);
-            bond_types[name] = BondType{name, values[0], values[1]};
-        }
-    }
-
-    const size_t angle_type_count = broadcast_count(angle_types.size());
-    if (rank != root) angle_types.clear();
-    if (rank == root) {
-        for (auto& entry : angle_types) {
-            std::string name = entry.first;
-            broadcast_string(name, comm, root, rank);
-            Real values[2] = {entry.second.k, entry.second.theta0};
-            MPI_Bcast(values, 2, MPI_DOUBLE, root, comm);
-        }
-    } else {
-        for (size_t i = 0; i < angle_type_count; ++i) {
-            std::string name;
-            broadcast_string(name, comm, root, rank);
-            Real values[2]{};
-            MPI_Bcast(values, 2, MPI_DOUBLE, root, comm);
-            angle_types[name] = AngleType{name, values[0], values[1]};
+        names.resize(static_cast<size_t>(broadcast_size(names.size(), comm, root, rank)));
+        values.resize(names.size() * 2);
+        broadcast_strings(names, comm, root, rank);
+        broadcast_bytes(values.data(), values.size() * sizeof(Real), comm, root);
+        if (rank != root) {
+            bond_types.clear();
+            for (size_t i = 0; i < names.size(); ++i) {
+                bond_types[names[i]] = BondType{names[i], values[2 * i], values[2 * i + 1]};
+            }
         }
     }
 
-    const size_t dihedral_type_count = broadcast_count(dihedral_types.size());
-    if (rank != root) dihedral_types.clear();
-    if (rank == root) {
-        for (auto& entry : dihedral_types) {
-            std::string name = entry.first;
-            broadcast_string(name, comm, root, rank);
-            Real values[2] = {entry.second.k, entry.second.phi0};
-            int multiplicity = entry.second.n;
-            MPI_Bcast(values, 2, MPI_DOUBLE, root, comm);
-            MPI_Bcast(&multiplicity, 1, MPI_INT, root, comm);
+    {
+        std::vector<std::string> names;
+        std::vector<Real> values;
+        if (rank == root) {
+            for (const auto& entry : angle_types) {
+                names.push_back(entry.first);
+                values.push_back(entry.second.k);
+                values.push_back(entry.second.theta0);
+            }
         }
-    } else {
-        for (size_t i = 0; i < dihedral_type_count; ++i) {
-            std::string name;
-            broadcast_string(name, comm, root, rank);
-            Real values[2]{};
-            int multiplicity = 0;
-            MPI_Bcast(values, 2, MPI_DOUBLE, root, comm);
-            MPI_Bcast(&multiplicity, 1, MPI_INT, root, comm);
-            dihedral_types[name] = DihedralType{name, values[0], values[1], multiplicity};
+        names.resize(static_cast<size_t>(broadcast_size(names.size(), comm, root, rank)));
+        values.resize(names.size() * 2);
+        broadcast_strings(names, comm, root, rank);
+        broadcast_bytes(values.data(), values.size() * sizeof(Real), comm, root);
+        if (rank != root) {
+            angle_types.clear();
+            for (size_t i = 0; i < names.size(); ++i) {
+                angle_types[names[i]] = AngleType{names[i], values[2 * i], values[2 * i + 1]};
+            }
         }
     }
 
-    const size_t atom_count = broadcast_count(atom_type_names.size());
+    {
+        std::vector<std::string> names;
+        std::vector<Real> values;
+        std::vector<int> multiplicities;
+        if (rank == root) {
+            for (const auto& entry : dihedral_types) {
+                names.push_back(entry.first);
+                values.push_back(entry.second.k);
+                values.push_back(entry.second.phi0);
+                multiplicities.push_back(entry.second.n);
+            }
+        }
+        names.resize(static_cast<size_t>(broadcast_size(names.size(), comm, root, rank)));
+        values.resize(names.size() * 2);
+        multiplicities.resize(names.size());
+        broadcast_strings(names, comm, root, rank);
+        broadcast_bytes(values.data(), values.size() * sizeof(Real), comm, root);
+        broadcast_bytes(multiplicities.data(), multiplicities.size() * sizeof(int), comm, root);
+        if (rank != root) {
+            dihedral_types.clear();
+            for (size_t i = 0; i < names.size(); ++i) {
+                dihedral_types[names[i]] = DihedralType{names[i], values[2 * i], values[2 * i + 1], multiplicities[i]};
+            }
+        }
+    }
+
+    const size_t atom_count = broadcast_count(atom_name_ids.size());
     if (rank != root) {
-        atom_type_names.resize(atom_count);
-        atom_elements.resize(atom_count);
+        atom_name_ids.resize(atom_count);
+        atom_element_ids.resize(atom_count);
         atom_type_ids.resize(atom_count);
         atom_masses.resize(atom_count);
         atom_charges.resize(atom_count);
     }
-    for (size_t i = 0; i < atom_count; ++i) {
-        broadcast_string(atom_type_names[i], comm, root, rank);
-        broadcast_string(atom_elements[i], comm, root, rank);
-    }
+    broadcast_table(atom_name_table, comm, root, rank);
+    broadcast_table(atom_element_table, comm, root, rank);
+    broadcast_bytes(atom_name_ids.data(), static_cast<std::uint64_t>(atom_count) * sizeof(int), comm, root);
+    broadcast_bytes(atom_element_ids.data(), static_cast<std::uint64_t>(atom_count) * sizeof(int), comm, root);
     if (atom_count != 0) {
         MPI_Bcast(atom_type_ids.data(), static_cast<int>(atom_count), MPI_INT, root, comm);
         MPI_Bcast(atom_masses.data(), static_cast<int>(atom_count), MPI_DOUBLE, root, comm);
         MPI_Bcast(atom_charges.data(), static_cast<int>(atom_count), MPI_DOUBLE, root, comm);
     }
 
-    const size_t bond_count = broadcast_count(bonds.size());
-    if (rank != root) bonds.resize(bond_count);
-    for (size_t i = 0; i < bond_count; ++i) {
-        int atoms[2]{};
-        if (rank == root) { atoms[0] = bonds[i].atom1; atoms[1] = bonds[i].atom2; }
-        MPI_Bcast(atoms, 2, MPI_INT, root, comm);
-        if (rank != root) { bonds[i].atom1 = atoms[0]; bonds[i].atom2 = atoms[1]; }
-        broadcast_string(bonds[i].type, comm, root, rank);
-    }
+    broadcast_table(bond_type_table, comm, root, rank);
+    broadcast_table(angle_type_table, comm, root, rank);
+    broadcast_table(dihedral_type_table, comm, root, rank);
+    broadcast_records(bonds, {&Bond::atom1, &Bond::atom2}, comm, root, rank);
+    broadcast_records(angles, {&Angle::atom1, &Angle::atom2, &Angle::atom3}, comm, root, rank);
+    broadcast_records(dihedrals, {&Dihedral::atom1, &Dihedral::atom2, &Dihedral::atom3, &Dihedral::atom4}, comm, root, rank);
+    broadcast_records(impropers, {&Dihedral::atom1, &Dihedral::atom2, &Dihedral::atom3, &Dihedral::atom4}, comm, root, rank);
 
-    const size_t angle_count = broadcast_count(angles.size());
-    if (rank != root) angles.resize(angle_count);
-    for (size_t i = 0; i < angle_count; ++i) {
-        int atoms[3]{};
+    {
+        const size_t special_pair_count = broadcast_count(special_pairs.size());
+        if (rank != root) special_pairs.resize(special_pair_count);
+        std::vector<int> atoms(special_pair_count * 2);
+        std::vector<Real> scales(special_pair_count * 4);
         if (rank == root) {
-            atoms[0] = angles[i].atom1; atoms[1] = angles[i].atom2; atoms[2] = angles[i].atom3;
+            for (size_t i = 0; i < special_pair_count; ++i) {
+                const SpecialPair& pair = special_pairs[i];
+                atoms[2 * i] = pair.atom1; atoms[2 * i + 1] = pair.atom2;
+                scales[4 * i] = pair.lj_scale; scales[4 * i + 1] = pair.coulomb_scale;
+                scales[4 * i + 2] = pair.sigma; scales[4 * i + 3] = pair.epsilon;
+            }
         }
-        MPI_Bcast(atoms, 3, MPI_INT, root, comm);
+        broadcast_bytes(atoms.data(), atoms.size() * sizeof(int), comm, root);
+        broadcast_bytes(scales.data(), scales.size() * sizeof(Real), comm, root);
         if (rank != root) {
-            angles[i].atom1 = atoms[0]; angles[i].atom2 = atoms[1]; angles[i].atom3 = atoms[2];
-        }
-        broadcast_string(angles[i].type, comm, root, rank);
-    }
-
-    const size_t dihedral_count = broadcast_count(dihedrals.size());
-    if (rank != root) dihedrals.resize(dihedral_count);
-    for (size_t i = 0; i < dihedral_count; ++i) {
-        int atoms[4]{};
-        if (rank == root) {
-            atoms[0] = dihedrals[i].atom1; atoms[1] = dihedrals[i].atom2;
-            atoms[2] = dihedrals[i].atom3; atoms[3] = dihedrals[i].atom4;
-        }
-        MPI_Bcast(atoms, 4, MPI_INT, root, comm);
-        if (rank != root) {
-            dihedrals[i].atom1 = atoms[0]; dihedrals[i].atom2 = atoms[1];
-            dihedrals[i].atom3 = atoms[2]; dihedrals[i].atom4 = atoms[3];
-        }
-        broadcast_string(dihedrals[i].type, comm, root, rank);
-    }
-
-    const size_t improper_count = broadcast_count(impropers.size());
-    if (rank != root) impropers.resize(improper_count);
-    for (size_t i = 0; i < improper_count; ++i) {
-        int atoms[4]{};
-        if (rank == root) {
-            atoms[0] = impropers[i].atom1; atoms[1] = impropers[i].atom2;
-            atoms[2] = impropers[i].atom3; atoms[3] = impropers[i].atom4;
-        }
-        MPI_Bcast(atoms, 4, MPI_INT, root, comm);
-        if (rank != root) {
-            impropers[i].atom1 = atoms[0]; impropers[i].atom2 = atoms[1];
-            impropers[i].atom3 = atoms[2]; impropers[i].atom4 = atoms[3];
-        }
-        broadcast_string(impropers[i].type, comm, root, rank);
-    }
-
-    const size_t special_pair_count = broadcast_count(special_pairs.size());
-    if (rank != root) special_pairs.resize(special_pair_count);
-    for (size_t i = 0; i < special_pair_count; ++i) {
-        int atoms[2]{};
-        Real scales[4]{};
-        if (rank == root) {
-            atoms[0] = special_pairs[i].atom1; atoms[1] = special_pairs[i].atom2;
-            scales[0] = special_pairs[i].lj_scale; scales[1] = special_pairs[i].coulomb_scale;
-            scales[2] = special_pairs[i].sigma; scales[3] = special_pairs[i].epsilon;
-        }
-        MPI_Bcast(atoms, 2, MPI_INT, root, comm);
-        MPI_Bcast(scales, 4, MPI_DOUBLE, root, comm);
-        if (rank != root) {
-            special_pairs[i].atom1 = atoms[0]; special_pairs[i].atom2 = atoms[1];
-            special_pairs[i].lj_scale = scales[0]; special_pairs[i].coulomb_scale = scales[1];
-            special_pairs[i].sigma = scales[2]; special_pairs[i].epsilon = scales[3];
+            for (size_t i = 0; i < special_pair_count; ++i) {
+                SpecialPair& pair = special_pairs[i];
+                pair.atom1 = atoms[2 * i]; pair.atom2 = atoms[2 * i + 1];
+                pair.lj_scale = scales[4 * i]; pair.coulomb_scale = scales[4 * i + 1];
+                pair.sigma = scales[4 * i + 2]; pair.epsilon = scales[4 * i + 3];
+            }
         }
     }
 
-    const size_t constraint_count = broadcast_count(constraints.size());
-    if (rank != root) constraints.resize(constraint_count);
-    for (size_t i = 0; i < constraint_count; ++i) {
-        int atoms[2]{};
-        Real distance = 0.0;
+    {
+        const size_t constraint_count = broadcast_count(constraints.size());
+        if (rank != root) constraints.resize(constraint_count);
+        std::vector<int> atoms(constraint_count * 2);
+        std::vector<Real> distances(constraint_count);
         if (rank == root) {
-            atoms[0] = constraints[i].atom1; atoms[1] = constraints[i].atom2;
-            distance = constraints[i].distance;
+            for (size_t i = 0; i < constraint_count; ++i) {
+                atoms[2 * i] = constraints[i].atom1; atoms[2 * i + 1] = constraints[i].atom2;
+                distances[i] = constraints[i].distance;
+            }
         }
-        MPI_Bcast(atoms, 2, MPI_INT, root, comm);
-        MPI_Bcast(&distance, 1, MPI_DOUBLE, root, comm);
+        broadcast_bytes(atoms.data(), atoms.size() * sizeof(int), comm, root);
+        broadcast_bytes(distances.data(), distances.size() * sizeof(Real), comm, root);
         if (rank != root) {
-            constraints[i].atom1 = atoms[0]; constraints[i].atom2 = atoms[1];
-            constraints[i].distance = distance;
+            for (size_t i = 0; i < constraint_count; ++i) {
+                constraints[i].atom1 = atoms[2 * i]; constraints[i].atom2 = atoms[2 * i + 1];
+                constraints[i].distance = distances[i];
+            }
         }
     }
+
+    resolve_type_ids();
 
     int canonical = canonical_format ? 1 : 0;
     MPI_Bcast(&canonical, 1, MPI_INT, root, comm);
@@ -285,7 +335,10 @@ void Topology::broadcast(MPI_Comm comm, int root) {
 bool Topology::load_topology(const std::string& filename, int mpi_rank) {
     rank = mpi_rank;  // Store the rank for use throughout the class
     atom_types.clear(); bond_types.clear(); angle_types.clear(); dihedral_types.clear();
-    atom_type_names.clear(); atom_elements.clear(); atom_type_ids.clear(); atom_masses.clear(); atom_charges.clear();
+    atom_name_ids.clear(); atom_element_ids.clear(); atom_name_table.clear(); atom_element_table.clear();
+    bond_type_table.clear(); angle_type_table.clear(); dihedral_type_table.clear();
+    bond_by_id.clear(); angle_by_id.clear(); dihedral_by_id.clear();
+    atom_type_ids.clear(); atom_masses.clear(); atom_charges.clear();
     bonds.clear(); angles.clear(); dihedrals.clear(); impropers.clear(); special_pairs.clear();
     constraints.clear();
     pair_sigma.clear(); pair_epsilon.clear(); exclusion_keys.clear();
@@ -390,10 +443,10 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
                 int atom_id = std::stoi(tokens[0]) - 1;  // Convert to 0-based indexing
                 std::string type_name = tokens[1];
                 
-                if (static_cast<size_t>(atom_id) >= atom_type_names.size()) {
-                    atom_type_names.resize(atom_id + 1);
+                if (static_cast<size_t>(atom_id) >= atom_name_ids.size()) {
+                    atom_name_ids.resize(atom_id + 1, atom_name_table.intern(""));
                 }
-                atom_type_names[atom_id] = type_name;
+                atom_name_ids[atom_id] = atom_name_table.intern(type_name);
             }
         }
         else if (current_section == "bonds") {
@@ -401,7 +454,7 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
                 Bond bond;
                 bond.atom1 = std::stoi(tokens[0]) - 1;  // Convert to 0-based indexing
                 bond.atom2 = std::stoi(tokens[1]) - 1;
-                bond.type = tokens[2];
+                bond.type = bond_type_table.intern(tokens[2]);
                 bonds.push_back(bond);
             }
         }
@@ -411,7 +464,7 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
                 angle.atom1 = std::stoi(tokens[0]) - 1;  // Convert to 0-based indexing
                 angle.atom2 = std::stoi(tokens[1]) - 1;
                 angle.atom3 = std::stoi(tokens[2]) - 1;
-                angle.type = tokens[3];
+                angle.type = angle_type_table.intern(tokens[3]);
                 angles.push_back(angle);
             }
         }
@@ -422,18 +475,18 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
                 dihedral.atom2 = std::stoi(tokens[1]) - 1;
                 dihedral.atom3 = std::stoi(tokens[2]) - 1;
                 dihedral.atom4 = std::stoi(tokens[3]) - 1;
-                dihedral.type = tokens[4];
+                dihedral.type = dihedral_type_table.intern(tokens[4]);
                 dihedrals.push_back(dihedral);
             }
         }
     }
 
     std::map<std::string, int> legacy_type_ids;
-    for (size_t i = 0; i < atom_type_names.size(); ++i) {
-        const std::string& name = atom_type_names[i];
+    for (size_t i = 0; i < atom_name_ids.size(); ++i) {
+        const std::string& name = atom_name_table.name(atom_name_ids[i]);
         auto inserted = legacy_type_ids.emplace(name, static_cast<int>(legacy_type_ids.size()));
         atom_type_ids.push_back(inserted.first->second);
-        atom_elements.push_back("");
+        atom_element_ids.push_back(atom_element_table.intern(""));
         const AtomType& type = get_atom_type(name);
         atom_masses.push_back(type.mass);
         atom_charges.push_back(type.charge);
@@ -442,7 +495,7 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
     if (rank == 0) {
         std::cout << "Topology loaded successfully:" << std::endl;
         std::cout << "  Atom types: " << atom_types.size() << std::endl;
-        std::cout << "  Atoms: " << atom_type_names.size() << std::endl;
+        std::cout << "  Atoms: " << atom_name_ids.size() << std::endl;
         std::cout << "  Bond types: " << bond_types.size() << std::endl;
         std::cout << "  Bonds: " << bonds.size() << std::endl;
         std::cout << "  Angle types: " << angle_types.size() << std::endl;
@@ -450,6 +503,7 @@ bool Topology::load_topology(const std::string& filename, int mpi_rank) {
         std::cout << "  Dihedral types: " << dihedral_types.size() << std::endl;
         std::cout << "  Dihedrals: " << dihedrals.size() << std::endl;
     }
+    resolve_type_ids();
         
     return true;
 }
@@ -459,7 +513,10 @@ bool Topology::load_canonical(const std::string& topology_filename,
                               int mpi_rank) {
     rank = mpi_rank;
     atom_types.clear(); bond_types.clear(); angle_types.clear(); dihedral_types.clear();
-    atom_type_names.clear(); atom_elements.clear(); atom_type_ids.clear(); atom_masses.clear(); atom_charges.clear();
+    atom_name_ids.clear(); atom_element_ids.clear(); atom_name_table.clear(); atom_element_table.clear();
+    bond_type_table.clear(); angle_type_table.clear(); dihedral_type_table.clear();
+    bond_by_id.clear(); angle_by_id.clear(); dihedral_by_id.clear();
+    atom_type_ids.clear(); atom_masses.clear(); atom_charges.clear();
     bonds.clear(); angles.clear(); dihedrals.clear(); impropers.clear(); special_pairs.clear();
     constraints.clear();
     pair_sigma.clear(); pair_epsilon.clear(); exclusion_keys.clear();
@@ -684,14 +741,14 @@ bool Topology::load_canonical(const std::string& topology_filename,
             } else if (section == "atoms") {
                 if (tokens.size() < 5) fail("atom requires: atom_id element type_id mass charge [molecule_id residue_id]");
                 const int id = std::stoi(tokens[0]);
-                if (id != static_cast<int>(atom_type_names.size())) {
+                if (id != static_cast<int>(atom_name_ids.size())) {
                     fail("atom IDs must be contiguous and start at zero");
                 }
                 const int type_id = std::stoi(tokens[2]);
                 auto type_it = type_names_by_id.find(type_id);
                 if (type_it == type_names_by_id.end()) fail("atom references an invalid type ID");
-                atom_type_names.push_back(type_it->second);
-                atom_elements.push_back(tokens[1]);
+                atom_name_ids.push_back(atom_name_table.intern(type_it->second));
+                atom_element_ids.push_back(atom_element_table.intern(tokens[1]));
                 atom_type_ids.push_back(type_id);
                 const Real mass = std::stod(tokens[3]);
                 const Real charge = std::stod(tokens[4]);
@@ -704,19 +761,19 @@ bool Topology::load_canonical(const std::string& topology_filename,
                 if (tokens.size() < 3) fail("bond requires: atom_i atom_j bond_param_id");
                 const std::string name = "p" + tokens[2];
                 if (!has_bond_type(name)) fail("bond references an invalid parameter ID");
-                bonds.push_back({std::stoi(tokens[0]), std::stoi(tokens[1]), name});
+                bonds.push_back({std::stoi(tokens[0]), std::stoi(tokens[1]), bond_type_table.intern(name)});
             } else if (section == "angles") {
                 if (tokens.size() < 4) fail("angle requires: atom_i atom_j atom_k angle_param_id");
                 const std::string name = "p" + tokens[3];
                 if (!has_angle_type(name)) fail("angle references an invalid parameter ID");
                 angles.push_back({std::stoi(tokens[0]), std::stoi(tokens[1]),
-                                  std::stoi(tokens[2]), name});
+                                  std::stoi(tokens[2]), angle_type_table.intern(name)});
             } else if (section == "dihedrals") {
                 if (tokens.size() < 5) fail("dihedral requires: atom_i atom_j atom_k atom_l torsion_param_id");
                 const std::string name = "p" + tokens[4];
                 if (!has_dihedral_type(name)) fail("dihedral references an invalid parameter ID");
                 dihedrals.push_back({std::stoi(tokens[0]), std::stoi(tokens[1]),
-                    std::stoi(tokens[2]), std::stoi(tokens[3]), name});
+                    std::stoi(tokens[2]), std::stoi(tokens[3]), dihedral_type_table.intern(name)});
             } else if (section == "exclusions") {
                 if (tokens.size() < 2) fail("exclusion requires: atom_i atom_j");
                 exclusion_keys.push_back(pair_key(std::stoi(tokens[0]), std::stoi(tokens[1])));
@@ -725,7 +782,7 @@ bool Topology::load_canonical(const std::string& topology_filename,
                 const std::string name = "ip" + tokens[4];
                 if (!has_dihedral_type(name)) fail("improper references an invalid parameter ID");
                 impropers.push_back({std::stoi(tokens[0]), std::stoi(tokens[1]),
-                    std::stoi(tokens[2]), std::stoi(tokens[3]), name});
+                    std::stoi(tokens[2]), std::stoi(tokens[3]), dihedral_type_table.intern(name)});
             } else if (section == "special_pairs") {
                 if (tokens.size() < 5) fail("special_pair requires: atom_i atom_j pair_param_id lj_scale coulomb_scale");
                 const int param_id = std::stoi(tokens[2]);
@@ -747,15 +804,15 @@ bool Topology::load_canonical(const std::string& topology_filename,
             }
         }
 
-        if (atom_type_names.empty()) throw std::runtime_error("topology file has no [atoms]");
+        if (atom_name_ids.empty()) throw std::runtime_error("topology file has no [atoms]");
         if (expected_atom_count < 0) throw std::runtime_error("topology [meta] has no atom_count");
-        if (expected_atom_count != static_cast<int>(atom_type_names.size())) {
+        if (expected_atom_count != static_cast<int>(atom_name_ids.size())) {
             throw std::runtime_error("topology atom_count is " + std::to_string(expected_atom_count) +
                                      " but [atoms] contains " +
-                                     std::to_string(atom_type_names.size()) + " entries");
+                                     std::to_string(atom_name_ids.size()) + " entries");
         }
         auto validate_atom = [&](int id, const char* kind) {
-            if (id < 0 || id >= static_cast<int>(atom_type_names.size())) {
+            if (id < 0 || id >= static_cast<int>(atom_name_ids.size())) {
                 throw std::runtime_error(std::string(kind) + " references invalid atom ID " + std::to_string(id));
             }
         };
@@ -807,7 +864,7 @@ bool Topology::load_canonical(const std::string& topology_filename,
         }
 
         if (rank == 0) {
-            std::cout << "dsMD_input topology loaded: " << atom_type_names.size()
+            std::cout << "dsMD_input topology loaded: " << atom_name_ids.size()
                       << " atoms, " << type_count << " types, " << bonds.size()
                       << " bonds, " << angles.size() << " angles, "
                       << dihedrals.size() << " dihedrals, " << impropers.size() << " impropers, "
@@ -815,6 +872,7 @@ bool Topology::load_canonical(const std::string& topology_filename,
                       << constraints.size() << " constraints, "
                       << exclusion_keys.size() << " exclusions" << std::endl;
         }
+        resolve_type_ids();
         return true;
     } catch (const std::exception& error) {
         if (rank == 0) std::cerr << "dsMD_input topology error: " << error.what() << std::endl;
@@ -831,17 +889,17 @@ const AtomType& Topology::get_atom_type(const std::string& type_name) const {
 }
 
 const std::string& Topology::get_atom_type_name(int atom_id) const {
-    if (atom_id < 0 || static_cast<size_t>(atom_id) >= atom_type_names.size()) {
+    if (atom_id < 0 || static_cast<size_t>(atom_id) >= atom_name_ids.size()) {
         throw std::runtime_error("Invalid atom ID: " + std::to_string(atom_id));
     }
-    return atom_type_names[atom_id];
+    return atom_name_table.name(atom_name_ids[atom_id]);
 }
 
 const std::string& Topology::get_atom_element(int atom_id) const {
-    if (atom_id < 0 || static_cast<size_t>(atom_id) >= atom_elements.size()) {
+    if (atom_id < 0 || static_cast<size_t>(atom_id) >= atom_element_ids.size()) {
         throw std::runtime_error("Invalid atom ID: " + std::to_string(atom_id));
     }
-    return atom_elements[atom_id];
+    return atom_element_table.name(atom_element_ids[atom_id]);
 }
 
 const BondType& Topology::get_bond_type(const std::string& type_name) const {
@@ -923,4 +981,37 @@ bool Topology::has_angle_type(const std::string& type_name) const {
 
 bool Topology::has_dihedral_type(const std::string& type_name) const {
     return dihedral_types.find(type_name) != dihedral_types.end();
+}
+
+void Topology::resolve_type_ids() {
+    atom_name_table.release_index();
+    atom_element_table.release_index();
+    bond_type_table.release_index();
+    angle_type_table.release_index();
+    dihedral_type_table.release_index();
+    auto resolve = [](const StringTable& table, const auto& parameters, auto& by_id) {
+        by_id.assign(table.size(), nullptr);
+        for (size_t id = 0; id < table.size(); ++id) {
+            const auto found = parameters.find(table.names[id]);
+            if (found != parameters.end()) by_id[id] = &found->second;
+        }
+    };
+    resolve(bond_type_table, bond_types, bond_by_id);
+    resolve(angle_type_table, angle_types, angle_by_id);
+    resolve(dihedral_type_table, dihedral_types, dihedral_by_id);
+}
+
+const BondType& Topology::get_bond_type(int type_id) const {
+    if (type_id >= 0 && static_cast<size_t>(type_id) < bond_by_id.size() && bond_by_id[type_id]) return *bond_by_id[type_id];
+    return get_bond_type(bond_type_table.name(type_id));   // throws the error of the unknown name
+}
+
+const AngleType& Topology::get_angle_type(int type_id) const {
+    if (type_id >= 0 && static_cast<size_t>(type_id) < angle_by_id.size() && angle_by_id[type_id]) return *angle_by_id[type_id];
+    return get_angle_type(angle_type_table.name(type_id));
+}
+
+const DihedralType& Topology::get_dihedral_type(int type_id) const {
+    if (type_id >= 0 && static_cast<size_t>(type_id) < dihedral_by_id.size() && dihedral_by_id[type_id]) return *dihedral_by_id[type_id];
+    return get_dihedral_type(dihedral_type_table.name(type_id));
 }

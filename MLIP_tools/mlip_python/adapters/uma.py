@@ -1,4 +1,4 @@
-"""UMA (fairchem): an adapter of the Python MLIP mode (registered in adapters/__init__.py)."""
+"""UMA (fairchem): an adapter of the ASE mode (registered in adapters/__init__.py)."""
 from __future__ import annotations
 
 import os
@@ -50,9 +50,10 @@ class UMAAdapter(MLIPAdapter):
         print(f"[UMA] Loading model: {model_path}  device={self.device}  task={task}")
         try:
             from fairchem.core.units.mlip_unit.predict import InferenceSettings
-            # external_graph_gen=True -> FAIRChemCalculator builds the radius graph itself
-            # (if False, r_edges=False -> AtomicData has no edges and "No edges found" is raised)
-            inf_settings = InferenceSettings(external_graph_gen=True)
+            # external_graph_gen=False (fairchem's default setting): the model builds its graph itself, with its own cutoff
+            # (otf_graph on, so a checkpoint saved with it off does not end in "No edges found"). True would need pymatgen and a
+            # fixed 6 A radius in FAIRChemCalculator.
+            inf_settings = InferenceSettings(external_graph_gen=False)
             predict_unit = MLIPPredictUnit(
                 model_path, device=self.device, inference_settings=inf_settings
             )

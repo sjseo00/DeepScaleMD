@@ -1,4 +1,4 @@
-"""Base class of the adapters of the Python MLIP mode, and the helper that turns MD atom types into elements.
+"""Base class of the adapters of the ASE mode, and the helper that turns MD atom types into elements.
 
 Every MLIP has its own file in this folder (mace.py, sevennet.py, ...) with one MLIPAdapter subclass; ADAPTER_REGISTRY in
 __init__.py maps the `model_type` of mlip_config to it. To add a MLIP: a new file and one line there. The C++ side needs no change.

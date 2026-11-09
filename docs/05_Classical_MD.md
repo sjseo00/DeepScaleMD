@@ -74,6 +74,10 @@ interpolation, and sets the mesh from the box:
 - The CPU backend does the FFT with FFTW. It is multi-threaded only when `libfftw3_omp` was found
   at build time ([Installation](01_Installation.md)). The GPU backend uses cuFFT.
 - `pme_ranks: N` dedicates N MPI ranks to the reciprocal-space part.
+- `pme_ranks: 2` in a CUDA build configured with `-DDSMD_ENABLE_CUFFTMP=ON` is different: no rank is reserved and the
+  reciprocal solve is split across all GPUs with a cuFFTMp FFT. It is meant for several nodes and needs
+  `precision: mixed` and CUDA-aware MPI. See [Technical note](08_Technical_Note.md) 9.3 and
+  [Input reference](03_Input_Reference.md).
 
 ## Precision and kernels
 
@@ -198,12 +202,37 @@ tau_p_decay: 100.0
 
 With a barostat the box changes. The `box_*` values you give are the starting box.
 
+By default the three box lengths change together. To let only some axes follow the pressure, for
+example the z axis of a membrane or a slab, use the anisotropic barostat: each coupled axis follows
+its own pressure and the other axes keep their length.
+
+```yaml
+barostat: parrinello_rahman
+barostat_coupling: anisotropic
+barostat_axes: z           # x, y, z, or any combination; xyz scales the three independently
+target_pressure: 1.0       # bar, for every coupled axis
+tau_p: 1000.0
+```
+
+It needs the virial tensor, so it runs with the CUDA and CPU backends and not with an MLIP. The
+pressure of a system with constraints includes the constraint forces, and every barostat keeps the
+constraint clusters rigid when it scales the box (only the distances between clusters scale).
+
+Converters write it for NAMD `useFlexibleCell yes`, GROMACS `pcoupltype = anisotropic` (with a
+diagonal compressibility; the axes with a non-zero value are coupled) and the LAMMPS `aniso` or
+single-axis forms of `fix npt`. Coupling that ties x and y together (NAMD `useConstantArea` /
+`useConstantRatio`, GROMACS `semiisotropic`) is reported as unsupported.
+
 ## Choosing a timestep
 
 1 fs is the safe choice with flexible bonds. A longer step needs constraints on the fastest
 bonds (a `[constraints]` section in the topology, with the `velocity_verlet` integrator).
 Converters write constraints they find in GROMACS `[constraints]` and `[settles]` topology
-sections. Watch `Etot` in an NVE run: a steady drift means the step is too large.
+sections, and the ones the run input asks for: the GROMACS `.mdp` option `constraints = h-bonds`
+or `all-bonds`, NAMD `rigidBonds all` or `water`, CHARMM `SHAKe BONH` or `BOND` with `PARAm`, and
+the bonds and angle clusters a LAMMPS `fix shake` or `fix rattle` selects. The angle constraints
+of GROMACS `h-angles` / `all-angles` and CHARMM `SHAKe ANGLe` are not converted; those settings
+are reported as unsupported. Watch `Etot` in an NVE run: a steady drift means the step is too large.
 
 ## Checking a run
 
@@ -223,11 +252,29 @@ sections. Watch `Etot` in an NVE run: a steady drift means the step is too large
   GPU backend.
 - Electrostatics are PME only. `electrostatics_solver: fmm` is a placeholder and stops.
 - Not supported: CMAP, polarizable (Drude) models, NBFIX overrides, virtual sites, tabulated
-  potentials, anisotropic pressure coupling, tilted boxes.
-- SHAKE/RATTLE needs the `velocity_verlet` integrator and does not support constraints that join
-  atoms owned by different MPI ranks.
+  potentials, tilted boxes and shear pressure coupling (the anisotropic barostat scales the axes
+  of an orthorhombic box independently).
+- SHAKE/RATTLE needs the `velocity_verlet` integrator. With several MPI ranks a constrained cluster
+  is solved by every rank that owns one of its atoms, which costs two extra halo exchanges per
+  step; the whole cluster must lie inside the halo.
+- Several MPI ranks reproduce the one-rank result: on the 32000-atom rhodopsin system with rigid bonds 1, 2
+  and 4 GPUs agree to about 1e-5 in the energy and the pressure tensor, and 1, 2 and 4 CPU ranks give the same
+  energies, pressure and forces digit for digit over the first steps (constraints across the subdomain faces
+  included). The CPU backend with constraints on several ranks needs a dsDecompX whose host halo refresh also
+  updates the ghosts' velocities (`DSDECOMPX_HOST_HALO_REFRESHES_VELOCITY` in `dsdecompx.hpp`); with an older
+  installation the run stops with a message that says so.
+- The GPU solves a constraint cluster of up to 8 constraints in one thread, which makes a constrained step cost
+  little more than a flexible one; a larger cluster (all bonds of a chain constrained) uses a slower iterative
+  path.
+- With constraints the printed `T` is `2 KE / ((3N - constraints) kB)` and the Nose-Hoover thermostat
+  holds the same number of degrees of freedom (the centre-of-mass motion is not subtracted).
+  Langevin and Andersen act on every particle separately and need no count. Their random kicks
+  also move atoms along the constrained bonds, so RATTLE runs once more after them. The constraint
+  virial stays that of the step's own RATTLE.
+- Nose-Hoover has one friction variable for the whole system. On several GPUs it sums the kinetic
+  energy and the atom count over all ranks every step (one small `MPI_Allreduce`).
 - There is no Berendsen thermostat (`thermostat: berendsen` gives no thermostat at all).
 - `precision: mixed` is only checked by energy conservation tests; confirm it for your own
   observable before production.
-- There are no restart files, so a long run cannot be continued. Plan the run length, and write
-  trajectory frames often enough to restart a new run from a frame yourself.
+- A run can be continued from a restart file (`restart_output_freq`, `restart_file`; see
+  [Input Reference, Restart](03_Input_Reference.md#restart)).

@@ -2,7 +2,9 @@
 
 #include "AOTIRunner.h"
 #include "HaloExchangeOp.h"
+#include "MLIPKspaceOp.h"
 #include "OpLibLoader.h"
+#include "PyTorchModelRunner.h"
 #include "PythonModules.h"
 #include "TorchModelRunner.h"
 #include "TorchScriptRunner.h"
@@ -15,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -25,7 +28,7 @@ namespace {
 
 // 1 eV in kcal/mol; the same value as EV_TO_KCAL_PER_MOL in MLIP_tools/mlip_python/mlip_interface.py, so results of the
 // python and libtorch backends compare directly (design A.6).
-constexpr double kEvToKcalPerMol = 23.0609;
+constexpr double kEvToKcalPerMol = 23.0605;
 
 constexpr int kWarmupCalls = 3;   // TorchScript profiles the first calls and optimizes the later ones
 
@@ -39,6 +42,19 @@ std::string join_strings(const std::vector<std::string>& values) {
     std::string text;
     for (const std::string& v : values) text += (text.empty() ? "" : ", ") + v;
     return text;
+}
+
+// cuEquivariance (cuequivariance_ops 0.13) times dozens of uniform_1d kernel variants for every new problem size and keeps
+// the fastest. Under domain decomposition the ghost count of a rank changes at every neighbor rebuild, so it tunes again and
+// again: water 24000 atoms on 4 GPUs ran at 154 ms/step instead of 66 ms/step (benchmarks/mlip/mace/modes/u1d_algos.sh).
+// CUEQUIVARIANCE_OPS_U1D_ALGOS (read by libcue_ops.so, not documented) fixes the choice; 0 was the fastest on 1 and 4 GPUs and
+// the energies are unchanged. A value already set in the environment is kept. Must run before the library is loaded.
+// Returns the value in effect.
+std::string fix_cueq_kernel_choice() {
+    static const char* const name = "CUEQUIVARIANCE_OPS_U1D_ALGOS";
+    if (const char* value = std::getenv(name)) return value;
+    setenv(name, "0", 0);
+    return "0";
 }
 
 // An AOTI package holds kernels compiled for one GPU architecture (metadata target_gpu): refuse one built for the CPU or for
@@ -89,6 +105,13 @@ struct LibTorchBackend::Impl {
         torch::Tensor edges = torch::tensor(std::vector<int64_t>{0, 1, 1, 0}, torch::kInt64).reshape({2, 2}).to(device);
         torch::Tensor shift = torch::zeros({2, 3}, real);
         torch::NoGradGuard no_grad;
+        // A model with k-space terms needs a box and grid for dsmd::kspace: a periodic box around the two atoms, the model's grid.
+        MLIPKspaceContext warm_kspace;
+        for (int a = 0; a < 3; ++a) warm_kspace.box[a] = 2.0 * metadata.cutoff + 10.0;
+        warm_kspace.grid_spacing = metadata.kspace.grid_spacing;
+        warm_kspace.dispersion_grid_spacing = metadata.kspace.dispersion_grid_spacing;
+        warm_kspace.order = metadata.kspace.order;
+        KspaceScope kspace_scope(metadata.kspace.enabled ? &warm_kspace : nullptr);
         for (int call = 0; call < kWarmupCalls; ++call) {
             std::vector<torch::Tensor> out = run(pos, z, edges, shift, n_owned);
             if (out.size() != (metadata.edge_shifts ? 4u : 3u) || out[2].sizes() != torch::IntArrayRef({2, 3})) {
@@ -108,8 +131,20 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
     // 1. metadata.json
     s.metadata = load_mlip_metadata(cfg.model_path);
     const MLIPMetadata& meta = s.metadata;
+    // mlip_backend says how the model is run, and the folder has to be one for it (the yaml alone then tells the way).
+    if (cfg.backend == "pytorch" && meta.backend != "pytorch") {
+        throw std::runtime_error("LibTorchBackend: mlip_backend: pytorch needs a model folder converted with --backend pytorch, but '" +
+                                 cfg.model_path + "' was converted with --backend " + meta.backend +
+                                 ". Use mlip_backend: libtorch for it, or convert the model again with --backend pytorch");
+    }
+    if (cfg.backend == "libtorch" && meta.backend == "pytorch") {
+        throw std::runtime_error("LibTorchBackend: mlip_backend: libtorch runs a TorchScript or AOTI file, but '" + cfg.model_path +
+                                 "' was converted with --backend pytorch (no model file). Use mlip_backend: pytorch for it, or "
+                                 "convert the model again with --backend torchscript");
+    }
     s.dtype = meta.dtype == "float32" ? torch::kFloat32 : torch::kFloat64;
     s.energy_to_md = meta.energy_unit == "eV" ? kEvToKcalPerMol : 1.0;   // "kcal/mol": already MD units
+    s.metadata.kspace.energy_to_md = s.energy_to_md;                      // the k-space virial correction is in model units
 
     // 6. Every MD type must map to an element the model knows. Checked before loading anything heavy.
     if (cfg.type_to_z.empty()) {
@@ -165,15 +200,27 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
     }
 
     // 3. operators the model calls, before it is loaded. cuEquivariance registers its operators from Python (design 11.3,
-    // A.11-9): importing its module in the embedded interpreter is all the Python this backend runs; the model itself is
-    // executed by LibTorch. The libraries (OpenEquivariance: a plain operator library) are dlopened after that.
-    if (!meta.required_python_modules.empty()) {
+    // A.11-9): importing its module in the embedded interpreter is all the Python this backend runs for a TorchScript or AOTI
+    // model; the model itself is executed by LibTorch. The libraries (OpenEquivariance: a plain operator library) are dlopened
+    // after that. A "pytorch" folder is run by the embedded Python itself: the interpreter is started here too, and its torch
+    // checked against the LibTorch of this program.
+    if (meta.accel == "cueq") {
+        const bool user_set = std::getenv("CUEQUIVARIANCE_OPS_U1D_ALGOS") != nullptr;
+        const std::string algos = fix_cueq_kernel_choice();
+        // on stderr: std::cout is silenced during start-up
+        if (cfg.verbose) {
+            std::cerr << "LibTorchBackend: cuEquivariance kernel choice CUEQUIVARIANCE_OPS_U1D_ALGOS=" << algos
+                      << (user_set ? " (set in the environment)" : " (dsMD default)") << std::endl;
+        }
+    }
+    if (!meta.required_python_modules.empty() || meta.backend == "pytorch") {
         std::string python_torch;
         try {
             python_torch = import_python_modules(meta.required_python_modules);
         } catch (const std::exception& e) {
-            throw std::runtime_error("LibTorchBackend: model '" + meta.model_name + "' needs the Python modules " +
-                                     join_strings(meta.required_python_modules) + " imported before it can be loaded: " + e.what());
+            throw std::runtime_error("LibTorchBackend: model '" + meta.model_name + "' needs the Python modules torch" +
+                                     (meta.required_python_modules.empty() ? "" : ", " + join_strings(meta.required_python_modules)) +
+                                     " imported before it can be loaded: " + e.what());
         }
         // "2.7.1+cu118" against TORCH_VERSION "2.7.1": two torch builds in one process would crash later, so stop here.
         if (python_torch.substr(0, python_torch.find('+')) != TORCH_VERSION) {
@@ -184,6 +231,7 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
     }
     load_op_libs(meta.required_op_libs);
     ensure_halo_exchange_op_registered();   // dsmd::halo_exchange, called by a layer-exchange model
+    ensure_kspace_op_registered();          // dsmd::kspace, called by a model converted with --kspace pme
 
     // 4. the runner for this file format
     if (meta.backend == "torchscript") {
@@ -193,6 +241,9 @@ LibTorchBackend::LibTorchBackend(const MLIPConfig& cfg) : impl_(std::make_unique
         check_aoti_target(meta, s.device);
         s.runner = std::make_unique<AOTIRunner>(
             (std::filesystem::path(cfg.model_path) / "model.pt2").string(), s.device);
+    } else if (meta.backend == "pytorch") {
+        // no model file: the converter's wrapper is built again and run by the embedded Python (mlip_convert/pytorch_runner.py)
+        s.runner = std::make_unique<PyTorchModelRunner>(cfg.model_path, meta.python_path, s.device);
     } else {
         throw std::runtime_error("LibTorchBackend: backend '" + meta.backend + "' is not implemented");
     }
@@ -212,8 +263,11 @@ LibTorchBackend::~LibTorchBackend() = default;
 double LibTorchBackend::cutoff() const { return impl_->metadata.cutoff; }
 double LibTorchBackend::ghost_cutoff() const { return impl_->metadata.ghost_cutoff; }
 bool LibTorchBackend::uses_edge_shifts() const { return impl_->metadata.edge_shifts; }
+bool LibTorchBackend::gives_virial_diagonal() const { return impl_->metadata.virial_diagonal; }
 int LibTorchBackend::edge_receiver_row() const { return impl_->metadata.edge_receiver_row; }
 bool LibTorchBackend::exchanges_layers() const { return impl_->metadata.layer_exchange; }
+bool LibTorchBackend::needs_whole_system() const { return impl_->metadata.whole_system; }
+const MLIPKspaceSettings* LibTorchBackend::kspace_settings() const { return &impl_->metadata.kspace; }
 const MLIPMetadata& LibTorchBackend::metadata() const { return impl_->metadata; }
 
 void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
@@ -239,6 +293,8 @@ void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
     torch::NoGradGuard no_grad;
     // The transport the model's dsmd::halo_exchange calls (forward pass and the backward pass of the force) use; none on a single rank.
     HaloTransportScope halo_scope(in.halo);
+    // The context of dsmd::kspace (box, grid, grid sum) for a model with k-space terms; nullptr for every other model.
+    KspaceScope kspace_scope(in.kspace);
 
     const auto real64 = torch::TensorOptions().device(s.device).dtype(torch::kFloat64);
     const auto int32 = torch::TensorOptions().device(s.device).dtype(torch::kInt32);
@@ -289,7 +345,21 @@ void LibTorchBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
     if (out.need_energy) {
         out.energy = energy.item<double>() * s.energy_to_md;
         if (s.metadata.edge_shifts) {
-            out.virial = result[3].item<double>() * s.energy_to_md;
+            // [1] the trace, or with metadata virial_diagonal [3] the diagonal W_xx, W_yy, W_zz (one copy to the host)
+            const torch::Tensor virial = result[3].reshape(-1).to(torch::kCPU, torch::kFloat64);
+            const int64_t expected = s.metadata.virial_diagonal ? 3 : 1;
+            if (virial.numel() != expected) {
+                throw std::runtime_error("LibTorchBackend: the model returned a virial of " + std::to_string(virial.numel()) +
+                                         " values, metadata.json says " + std::to_string(expected) + " (virial_diagonal)");
+            }
+            const double* w = virial.data_ptr<double>();
+            if (expected == 3) {
+                for (int a = 0; a < 3; ++a) out.virial_diag[a] = w[a] * s.energy_to_md;
+                out.virial = out.virial_diag[0] + out.virial_diag[1] + out.virial_diag[2];
+                out.has_virial_diag = true;
+            } else {
+                out.virial = w[0] * s.energy_to_md;
+            }
             out.has_virial = true;
         }
     }

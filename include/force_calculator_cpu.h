@@ -36,6 +36,11 @@ public:
     void set_mixed_precision(bool enabled) override;
     void set_pme_grid_spacing(Real spacing_angstrom) override { pme_engine_.set_grid_spacing_override(spacing_angstrom); }
 
+    // Diagonal virial and kinetic energy tensors (anisotropic barostat). Off by default: nothing extra is
+    // computed and every result is unchanged. Enable before the first compute_forces() of the run.
+    bool supports_virial_tensor() const override { return true; }
+    void set_virial_tensor_enabled(bool enabled) override;
+
 private:
     void compute_bond_forces(MDSystem& system);
     void compute_angle_forces(MDSystem& system);

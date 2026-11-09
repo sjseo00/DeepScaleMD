@@ -370,6 +370,10 @@ void MDSimulation::rebuild_output_info_items_cache() {
         else if (token == "PE") output_fields_cache.push_back(OutputField::PE);
         else if (token == "ETOTAL") output_fields_cache.push_back(OutputField::ETOTAL);
         else if (token == "P" || token == "PRESS") output_fields_cache.push_back(OutputField::PRESS);
+        else if (token == "PXX") output_fields_cache.push_back(OutputField::PRESS_XX);
+        else if (token == "PYY") output_fields_cache.push_back(OutputField::PRESS_YY);
+        else if (token == "PZZ") output_fields_cache.push_back(OutputField::PRESS_ZZ);
+        else if (token == "BOX") output_fields_cache.push_back(OutputField::BOX);
         else if (token == "MAX_SPEED") output_fields_cache.push_back(OutputField::MAX_SPEED);
         else if (token == "AVG_SPEED") output_fields_cache.push_back(OutputField::AVG_SPEED);
         else if (token == "FMAX") output_fields_cache.push_back(OutputField::FMAX);
@@ -433,7 +437,7 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
 
     std::string force_mode;
     if (enable_builtin_forces_) force_mode = "Built-in";
-    if (enable_python_mlip_) force_mode += (force_mode.empty() ? "MLIP" : " + MLIP");
+    if (enable_mlip_) force_mode += (force_mode.empty() ? "MLIP" : " + MLIP");
     if (force_mode.empty()) force_mode = display_name(force_calculation_mode);
 
     const SimulationBox& box = system->get_box();
@@ -514,7 +518,7 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
     item("Compute backend", backend);
     item("Configuration", config_file);
     item("Force calculation", force_mode);
-    const bool mlip_only = enable_python_mlip_ && !enable_builtin_forces_;   // no builtin force field is evaluated
+    const bool mlip_only = enable_mlip_ && !enable_builtin_forces_;   // no builtin force field is evaluated
     if (!mlip_only) {
         item("Nonbonded kernel", display_name(nonbonded_kernel_) + ", " + display_name(force_precision_) + " precision");
     }
@@ -524,6 +528,12 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
     item("Integrator", display_name(integrator_type));
     item("Timestep", format_real(dt) + " fs");
     item("Total steps", total_steps);
+    if (restarted_) {
+        item("Restart from", restart_file_ + " (step " + std::to_string(start_step_) + ")");
+    }
+    if (restart_output_freq_ > 0) {
+        item("Restart output", restart_output_ + " every " + std::to_string(restart_output_freq_) + " steps");
+    }
     item("Target temperature", format_real(target_temperature) + " K");
     item("Thermostat", display_name(thermostat_type));
     item("Barostat", display_name(barostat_type));
@@ -558,7 +568,7 @@ void MDSimulation::print_initialization_summary(const std::string& config_file) 
     section(mlip_only ? "Machine-Learned Potential" : "Force Field");
     if (mlip_only) {
         item("MLIP backend", mlip_backend_name_);
-        if (mlip_backend_name_ == "libtorch") {
+        if (mlip_backend_name_ != "ase") {
             item("MLIP model", mlip_model_folder_);
         } else {
             item("MLIP model", (!mlip_model_type.empty() ? mlip_model_type : force_calculation_type) +
@@ -667,8 +677,14 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
             std::cout << "Topology and force field parameters loaded" << std::endl;
         }
     }
-    
-    system->initialize_velocities(target_temperature);
+
+    if (!restart_file_.empty()) {
+        // Positions, velocities, box and step from the restart file (the coordinate file still gives the atom order
+        // and the element names).
+        read_restart_file();
+    } else {
+        system->initialize_velocities(target_temperature);
+    }
     
     system->setup_domain_decomposition();
 
@@ -702,7 +718,15 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
     if (cuda_calc_cached_) {
         cuda_calc_cached_->set_builtin_forces_enabled(enable_builtin_forces_);
         cuda_calc_cached_->set_mixed_precision(force_precision_ == "mixed");
-        cuda_calc_cached_->set_cuda_aware_mpi(system->mpi_takes_device_pointers());
+        // The PME charge grid is exchanged over MPI whatever carries the halo (MPI, NCCL or NVSHMEM): dsDecompX only
+        // says "device pointers" when its own backend is MPI, so with another backend the variable that tells it the
+        // MPI library is CUDA-aware is read here as well (the NVSHMEM build fell back to a host-staged grid sum).
+        bool mpi_device_pointers = system->mpi_takes_device_pointers();
+        if (!mpi_device_pointers) {
+            const char* aware = std::getenv("CUDA_AWARE_MPI");
+            mpi_device_pointers = aware && (std::string(aware) == "1" || std::string(aware) == "true");
+        }
+        cuda_calc_cached_->set_cuda_aware_mpi(mpi_device_pointers);
         if (force_precision_ == "mixed" && system->get_rank() == 0) {
             std::cout << "[Force precision] mixed precision enabled: LJ/Ewald "
                       << "real-space pair math runs in float, forces/energy/"
@@ -710,6 +734,7 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         }
         cuda_calc_cached_->set_pme_cluster_spread_enabled(pme_cluster_spread_);
         cuda_calc_cached_->set_pme_grid_spacing(pme_grid_spacing_);
+        cuda_calc_cached_->set_pme_distributed_enabled(pme_distributed_);
         if (pme_cluster_spread_ && system->get_rank() == 0) {
             std::cout << "[PME] thread-block-cluster spread kernel requested -- "
                       << "unverified on real Hopper hardware; only takes "
@@ -726,7 +751,7 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         force_calc->set_pme_grid_spacing(pme_grid_spacing_);
     }
 
-    if (enable_python_mlip_) {
+    if (enable_mlip_) {
         if (is_using_cuda_backend() && mlip_device != "cpu") {
             mlip_device = "cuda";
         }
@@ -745,16 +770,16 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         mlip_cfg.type_to_z = mlip_type_to_z_;
         mlip_cfg.verbose = (system->get_rank() == 0);
         mlip_cfg.allow_tf32 = tf32_;
-        if (tf32_ && mlip_backend_name_ != "libtorch" && system->get_rank() == 0) {
-            std::cerr << "[MLIP] advanced.tf32 only applies to mlip_backend: libtorch; ignored" << std::endl;
+        if (tf32_ && mlip_backend_name_ == "ase" && system->get_rank() == 0) {
+            std::cerr << "[MLIP] advanced.tf32 only applies to mlip_backend: libtorch and pytorch; ignored" << std::endl;
         }
-        mlip_cfg.python.module_path = python_mlip_path;
-        mlip_cfg.python.model_path = mlip_model_path;
-        mlip_cfg.python.model_type = !mlip_model_type.empty() ? mlip_model_type : force_calculation_type;
-        mlip_cfg.python.model_size = mlip_model_size;
-        mlip_cfg.python.device = mlip_device;
-        mlip_cfg.python.dtype = mlip_dtype;
-        mlip_cfg.python.extra_kwargs = mlip_extra_kwargs;
+        mlip_cfg.ase.module_path = python_mlip_path;
+        mlip_cfg.ase.model_path = mlip_model_path;
+        mlip_cfg.ase.model_type = !mlip_model_type.empty() ? mlip_model_type : force_calculation_type;
+        mlip_cfg.ase.model_size = mlip_model_size;
+        mlip_cfg.ase.device = mlip_device;
+        mlip_cfg.ase.dtype = mlip_dtype;
+        mlip_cfg.ase.extra_kwargs = mlip_extra_kwargs;
         if (system->get_rank() == 0) {
             // On stderr: the start-up std::cout is silenced. Tells which dsMD a log came from (this line exists only in a build that
             // reads metadata.json "layer_exchange").
@@ -763,12 +788,19 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         mlip_backend_ = create_mlip_backend(mlip_cfg);
 
 #if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
-        // A backend with a cutoff wants an edge list (libtorch). Nothing below runs for the python backend or for runs
+        // k-space sums of a model converted with --kspace pme (nullptr for every other model and for the ase backend); throws when
+        // the model and the input file (mlip_kspace) disagree
+        {
+            const SimulationBox& kbox = system->get_box();
+            mlip_kspace_ = MLIPKspaceHost::create(mlip_backend_->kspace_settings(), mlip_kspace_input_,
+                                                  kbox.periodic_x && kbox.periodic_y && kbox.periodic_z, system->get_rank() == 0);
+        }
+        // A backend with a cutoff wants an edge list (libtorch, pytorch). Nothing below runs for the ase backend or for runs
         // without an MLIP.
         if (mlip_backend_->cutoff() > 0.0) {
             if (!cuda_calc_cached_) {
                 throw std::runtime_error(
-                    "mlip_backend 'libtorch' needs the CUDA force calculator, but this run fell back to the CPU one");
+                    "mlip_backend '" + mlip_backend_name_ + "' needs the CUDA force calculator, but this run fell back to the CPU one");
             }
             const int md_types = system->get_ff_params().num_atom_types;
             if (md_types > static_cast<int>(mlip_type_to_z_.size())) {
@@ -777,11 +809,16 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
                     std::to_string(md_types) + " atom types: give the atomic number of every type");
             }
             mlip_step_ = std::make_unique<MLIPStep>();
+            system->set_mlip_whole_system(mlip_backend_->needs_whole_system());
             system->set_mlip_ghost_depth(mlip_backend_->ghost_cutoff());   // ghosts as deep as the model reaches
             if (system->get_rank() == 0) {
                 std::cout << "[MLIP] ghost depth " << mlip_backend_->ghost_cutoff() << " A, halo width "
                           << system->get_halo_width() << " A, edge cutoff " << mlip_backend_->cutoff() << " A" << std::endl;
             }
+        }
+#else
+        if (!mlip_kspace_input_.mode.empty() && mlip_kspace_input_.mode != "none") {
+            throw std::runtime_error("mlip_kspace needs a dsMD built with LibTorch (-DENABLE_LIBTORCH=ON)");
         }
 #endif
     }
@@ -801,6 +838,19 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
     initialize_integrator();
     initialize_thermostat();
     initialize_barostat();
+    apply_restart_dynamics_state();
+
+    // Pxx, Pyy, Pzz in output_info need the virial tensor even without an anisotropic barostat.
+    for (const OutputField field : output_fields_cache) {
+        if (field != OutputField::PRESS_XX && field != OutputField::PRESS_YY && field != OutputField::PRESS_ZZ) continue;
+        if (!force_calc || !force_calc->supports_virial_tensor() || (enable_mlip_ && !mlip_gives_virial_tensor())) {
+            throw std::runtime_error(
+                "output_info PXX/PYY/PZZ needs the virial tensor, which this force calculator does not provide (" +
+                mlip_virial_tensor_problem() + ")");
+        }
+        force_calc->set_virial_tensor_enabled(true);
+        break;
+    }
 
     if (!system->get_topology().get_constraints().empty()) {
         bool is_velocity_verlet = dynamic_cast<VelocityVerletIntegrator*>(integrator.get()) != nullptr;
@@ -816,16 +866,25 @@ void MDSimulation::initialize_impl(const std::string& config_file) {
         if (!cuda_calc_cached_) {
             constraint_solver_ = std::make_unique<ConstraintSolver>();
         }
+        // Degrees of freedom: the constraints remove one each. The printed temperature and the Nose-Hoover thermostat
+        // count them (the other thermostats act on every particle separately and need no count).
+        {
+            const int local_count = static_cast<int>(system->get_local_particles());
+            const double coordinates = 3.0 * static_cast<double>(comm_backend_->sum_int(local_count));
+            const double constraints = static_cast<double>(system->get_topology().get_constraints().size());
+            dof_fraction_ = (coordinates > constraints && coordinates > 0.0) ? (coordinates - constraints) / coordinates : 1.0;
+            if (thermostat) thermostat->set_dof_fraction(dof_fraction_);
+        }
+        thermostat_needs_projection_ = thermostat && thermostat_type != "nose_hoover";
         if (system->get_rank() == 0) {
             std::cout << "[Constraints] SHAKE/RATTLE enabled ("
                       << (cuda_calc_cached_ ? "CUDA" : "CPU") << ") for "
                       << system->get_topology().get_constraints().size()
-                      << " constraint(s)" << std::endl;
+                      << " constraint(s); degrees of freedom " << dof_fraction_ << " x 3N" << std::endl;
             if (system->get_size() > 1) {
-                std::cout << "[Constraints] MPI mode: cross-rank constraints "
-                          << "(one endpoint on a ghost slot) are skipped by "
-                          << "the CPU solver to avoid inconsistent owner/ghost "
-                          << "state updates." << std::endl;
+                std::cout << "[Constraints] MPI mode: every rank solves the constraint clusters it owns an atom of "
+                          << "(ghost atoms refreshed before SHAKE and RATTLE: two extra halo exchanges per step)"
+                          << std::endl;
             }
         }
     }
@@ -891,7 +950,7 @@ void MDSimulation::prepare_first_step() {
         box_synced_valid_ = true;
     }
 
-    if (integrator_type == "leap_frog" || integrator_type == "leapfrog") {
+    if ((integrator_type == "leap_frog" || integrator_type == "leapfrog") && !restarted_) {
         integrator->initialize_velocities(system->get_particles(), dt, system->get_local_particles());
     }
 
@@ -908,7 +967,14 @@ void MDSimulation::prepare_first_step() {
 
     double force_time = 0.0;
     handle_force_phase(cuda_calc, force_time);
-    
+
+    // The first step starts from velocities that satisfy the constraints, and the constraint virial of step 0 is
+    // measured on a virtual half step: the kinetic energy and the pressure of step 0 are then those of the
+    // constrained system (before, step 0 printed the temperature and the pressure of the unprojected start with no
+    // constraint forces in it, and was only right from step 1 on).
+    apply_velocity_constraints(cuda_calc);
+    measure_constraint_virial_at_start(cuda_calc);
+
     if (force_calc) {
         force_calc->calculate_kinetic_energy(*system);
     }
@@ -924,6 +990,7 @@ void MDSimulation::handle_integrate1_phase(ForceCalculatorCUDA* cuda_calc, doubl
             }
             cuda_calc->integrate_on_device(*system, dt, integrator_type);
             if (constraints_enabled_) {
+                refresh_ghosts_for_constraints(cuda_calc, false);
                 if (!cuda_calc->apply_shake_on_device(*system, dt)) {
                     throw std::runtime_error(
                         "[Constraints] CUDA SHAKE did not converge; reduce the timestep or check the constraint geometry.");
@@ -945,6 +1012,7 @@ void MDSimulation::handle_integrate1_phase(ForceCalculatorCUDA* cuda_calc, doubl
         }
         integrator->integrate(system->get_particles(), system->get_box(), dt, system->get_local_particles());
         if (constraints_enabled_) {
+            refresh_ghosts_for_constraints(nullptr, false);
             if (!constraint_solver_->apply_shake(*system, dt,
                     constraint_pre_step_x_, constraint_pre_step_y_, constraint_pre_step_z_)) {
                 throw std::runtime_error(
@@ -952,6 +1020,142 @@ void MDSimulation::handle_integrate1_phase(ForceCalculatorCUDA* cuda_calc, doubl
             }
         }
     });
+}
+
+void MDSimulation::refresh_ghosts_for_constraints(ForceCalculatorCUDA* cuda_calc, bool with_velocities) {
+    if (!constraints_enabled_ || system->get_size() <= 1) return;
+    // The ghost atoms of a constraint cluster still hold the positions of the last halo exchange (before this step's
+    // position update) and the velocities of the last full one: bring them to the owners' current values on the
+    // plan of the last neighbor rebuild. SHAKE needs the positions, RATTLE positions and velocities.
+#ifdef USE_CUDA
+    if (cuda_calc) {
+        system->exchange_halo_on_device(*cuda_calc, false, !with_velocities);
+        return;
+    }
+#else
+    (void)cuda_calc;
+#endif
+#ifndef DSDECOMPX_HOST_HALO_REFRESHES_VELOCITY
+    // Before that dsDecompX a host halo refresh moved the ghosts' positions only: their velocities stayed at the values
+    // of the last plan build and RATTLE would solve the clusters on the subdomain faces with stale ones.
+    if (with_velocities) {
+        throw std::runtime_error(
+            "[Constraints] several ranks on the CPU backend need a dsDecompX whose host halo refresh also updates the "
+            "ghost velocities (DSDECOMPX_HOST_HALO_REFRESHES_VELOCITY): rebuild and install dsDecompX, then rebuild dsMD");
+    }
+#endif
+    (void)with_velocities;
+    system->perform_halo_exchange(false);
+}
+
+void MDSimulation::apply_velocity_constraints(ForceCalculatorCUDA* cuda_calc) {
+    if (!constraints_enabled_) return;
+#ifdef USE_CUDA
+    if (cuda_calc) {
+        refresh_ghosts_for_constraints(cuda_calc, true);
+        if (!cuda_calc->apply_rattle_on_device(*system, dt)) {
+            throw std::runtime_error(
+                "[Constraints] CUDA RATTLE did not converge; reduce the timestep or check the constraint geometry.");
+        }
+        return;
+    }
+#else
+    (void)cuda_calc;
+#endif
+    refresh_ghosts_for_constraints(nullptr, true);
+    if (!constraint_solver_->apply_rattle(*system, dt)) {
+        throw std::runtime_error(
+            "[Constraints] CPU RATTLE did not converge; reduce the timestep or check the constraint geometry.");
+    }
+}
+
+void MDSimulation::measure_constraint_virial_at_start(ForceCalculatorCUDA* cuda_calc) {
+    if (!constraints_enabled_) return;
+#ifdef USE_CUDA
+    if (cuda_calc) {
+        cuda_calc->save_constraint_velocities(*system);
+        cuda_calc->complete_velocity_update_on_device(*system, dt, integrator_type);
+        refresh_ghosts_for_constraints(cuda_calc, true);
+        const bool converged = cuda_calc->apply_rattle_on_device(*system, dt, 500, 1e-8, true);
+        cuda_calc->restore_constraint_velocities(*system);
+        if (!converged) {
+            throw std::runtime_error(
+                "[Constraints] CUDA RATTLE did not converge; reduce the timestep or check the constraint geometry.");
+        }
+        return;
+    }
+#else
+    (void)cuda_calc;
+#endif
+    ParticleData& particles = system->get_particles();
+    const std::vector<Real> saved_vx = particles.vx, saved_vy = particles.vy, saved_vz = particles.vz;
+    integrator->complete_velocity_update(particles, dt, system->get_local_particles());
+    refresh_ghosts_for_constraints(nullptr, true);
+    const bool converged = constraint_solver_->apply_rattle(*system, dt, saved_vx.data(), saved_vy.data(),
+                                                            saved_vz.data());
+    particles.vx = saved_vx;
+    particles.vy = saved_vy;
+    particles.vz = saved_vz;
+    if (!converged) {
+        throw std::runtime_error(
+            "[Constraints] CPU RATTLE did not converge; reduce the timestep or check the constraint geometry.");
+    }
+}
+
+void MDSimulation::restore_rigid_constraint_clusters(ForceCalculatorCUDA* cuda_calc, const Real mu[3]) {
+    if (!constraints_enabled_) return;
+#ifdef USE_CUDA
+    if (cuda_calc) {
+        cuda_calc->restore_constraint_clusters_rigid(system->get_box(), mu, system->get_num_particles());
+        return;
+    }
+#else
+    (void)cuda_calc;
+#endif
+    constraint_solver_->restore_rigid_clusters(*system, mu);
+}
+
+bool MDSimulation::mlip_gives_virial_tensor() const {
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+    // MLIPStep sums r_a F_a over the atoms the model saw, or, for a model with edge shifts, takes the model's own diagonal
+    return mlip_step_ && mlip_backend_ && (!mlip_backend_->uses_edge_shifts() || mlip_backend_->gives_virial_diagonal());
+#else
+    return false;
+#endif
+}
+
+std::string MDSimulation::mlip_virial_tensor_problem() const {
+    if (!enable_mlip_) return "the SYCL backend";
+#if defined(USE_CUDA) && defined(DSMD_WITH_LIBTORCH)
+    if (mlip_step_ && mlip_backend_ && mlip_backend_->uses_edge_shifts() && !mlip_backend_->gives_virial_diagonal()) {
+        return "this model folder returns only the trace of the virial (converted before metadata virial_diagonal); convert it "
+               "again with mlip_convert";
+    }
+#endif
+    return "mlip_backend '" + mlip_backend_name_ + "' gives the trace of the virial only; use mlip_backend libtorch or pytorch";
+}
+
+void MDSimulation::constraint_virial_local(Real out[3]) const {
+    out[0] = out[1] = out[2] = 0.0;
+    if (!constraints_enabled_) return;
+#ifdef USE_CUDA
+    if (cuda_calc_cached_) {
+        cuda_calc_cached_->get_constraint_virial(out);
+        return;
+    }
+#endif
+    if (constraint_solver_) constraint_solver_->get_virial_diag(out);
+}
+
+void MDSimulation::set_constraint_virial_local(const Real virial[3]) {
+    if (!constraints_enabled_) return;
+#ifdef USE_CUDA
+    if (cuda_calc_cached_) {
+        cuda_calc_cached_->set_constraint_virial(virial);
+        return;
+    }
+#endif
+    if (constraint_solver_) constraint_solver_->set_virial_diag(virial);
 }
 
 void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_time, double& migrate_time) {
@@ -1125,7 +1329,7 @@ void MDSimulation::handle_neighbor_phase(double& nlist_build_time, double& comm_
         bool overlap_halo = false;
 #ifdef USE_CUDA
         overlap_halo = cuda_calc && !should_rebuild &&
-            !enable_python_mlip_ &&
+            !enable_mlip_ &&
             cuda_calc->supports_overlapped_forces(*system) &&
             system->can_overlap_halo_on_device(*cuda_calc);
         if (overlap_halo) {
@@ -1369,11 +1573,26 @@ void report_mlip_load(MLIPRankComm& comm, const MLIPStep& step, int64_t owned, c
 }
 
 // The transport of a layer-exchange model (MLIPHaloTransport): the node features go through dsDecompX along the halo plan of this step.
+// The few numbers a model sums over the whole system (dsmd::allreduce_sum) go through the MLIP rank communicator: every rank gets
+// all ranks' values in rank order and adds them in that order, so the sum is the same number on every rank.
 class MDHaloTransport : public MLIPHaloTransport {
 public:
-    MDHaloTransport(MDSystem& system, ForceCalculatorCUDA& calculator) : system_(system), calculator_(calculator) {}
+    MDHaloTransport(MDSystem& system, ForceCalculatorCUDA& calculator, MLIPRankComm& comm)
+        : system_(system), calculator_(calculator), comm_(comm) {}
     void forward(const MLIPHaloBuffer& b) override { run(b, false); }
     void reverse(const MLIPHaloBuffer& b) override { run(b, true); }
+    void sum_over_ranks(double* data, int64_t count) override {
+        std::vector<double> all;
+        std::vector<int64_t> counts;
+        comm_.allgatherv(data, count, all, counts);
+        for (int64_t k = 0; k < count; ++k) data[k] = 0.0;
+        int64_t offset = 0;
+        for (const int64_t c : counts) {
+            if (c != count) throw std::runtime_error("MDHaloTransport: the ranks sum different numbers of values (dsmd::allreduce_sum)");
+            for (int64_t k = 0; k < count; ++k) data[k] += all[static_cast<size_t>(offset + k)];
+            offset += c;
+        }
+    }
 
 private:
     void run(const MLIPHaloBuffer& b, bool reverse) {
@@ -1382,9 +1601,23 @@ private:
     }
     MDSystem& system_;
     ForceCalculatorCUDA& calculator_;
+    MLIPRankComm& comm_;
 };
 
 }  // namespace
+
+// The k-space operator's virial correction (MLIPKspace.h): the explicit box dependence of the reciprocal energy, which the model's
+// strain derivative does not have. `factor`: 1 / ranks when every rank computed the whole system.
+void MDSimulation::add_mlip_kspace_virial(ForceCalculatorCUDA& calc, double factor) {
+    const double* c = mlip_kspace_->virial_correction();
+    factor *= mlip_kspace_->energy_to_md();   // model energy unit (eV) -> kcal/mol
+    if (calc.virial_tensor_enabled()) {
+        const Real wr[3] = {static_cast<Real>(c[0] * factor), static_cast<Real>(c[1] * factor), static_cast<Real>(c[2] * factor)};
+        calc.add_external_virial_diag(wr);
+    } else {
+        calc.add_external_virial(static_cast<Real>((c[0] + c[1] + c[2]) * factor));
+    }
+}
 
 void MDSimulation::compute_mlip_step_forces(bool need_energy, Real& energy) {
     if (system->mlip_replicated()) {
@@ -1428,17 +1661,30 @@ void MDSimulation::compute_mlip_step_forces(bool need_energy, Real& energy) {
     }
 
     MLIPInputs in = mlip_step_->inputs();
-    MDHaloTransport halo(*system, calc);
+    MDHaloTransport halo(*system, calc, *mlip_comm_);
     if (layered) in.halo = &halo;
+    if (mlip_kspace_) {   // each rank holds its own atoms: the k-space grid is summed over the ranks
+        const double kbox[3] = {box.lx, box.ly, box.lz};
+        in.kspace = mlip_kspace_->prepare(kbox, mlip_comm_->size() > 1, mlip_comm_->size());
+    }
     MLIPOutputs out = mlip_step_->outputs(need_energy);
     mlip_backend_->compute(in, out);
-    mlip_step_->set_model_virial(out.has_virial, out.virial);
+    mlip_step_->set_model_virial(out);
     mlip_step_->add_forces(calc.get_device_fx(), calc.get_device_fy(), calc.get_device_fz(), stream);
 
     if (need_energy) {
         // sum over atoms of r.F, with the model's forces on owned, ghost and image atoms (design 5.3); the MD adds the
-        // per-rank values up (comm_backend_->sum_reduce) where it uses the virial.
-        calc.add_external_virial(static_cast<Real>(mlip_step_->virial(stream)));
+        // per-rank values up (comm_backend_->sum_reduce) where it uses the virial. With the virial tensor on (anisotropic or
+        // semi-isotropic barostat, Pxx/Pyy/Pzz output) its diagonal, which adds up to the same trace.
+        if (calc.virial_tensor_enabled()) {
+            double w[3];
+            mlip_step_->virial_diag(stream, w);
+            const Real wr[3] = {static_cast<Real>(w[0]), static_cast<Real>(w[1]), static_cast<Real>(w[2])};
+            calc.add_external_virial_diag(wr);
+        } else {
+            calc.add_external_virial(static_cast<Real>(mlip_step_->virial(stream)));
+        }
+        if (mlip_kspace_) add_mlip_kspace_virial(calc, 1.0);
         // The model's energy is the sum over this rank's owned atoms; the builtin energy is already global.
         energy = comm_backend_->sum_reduce(static_cast<Real>(out.energy));
     }
@@ -1494,13 +1740,26 @@ void MDSimulation::compute_mlip_replicated_forces(bool need_energy, Real& energy
     }
 
     MLIPInputs in = mlip_step_->inputs();
+    if (mlip_kspace_) {   // every rank holds all atoms: no grid sum
+        const double kbox[3] = {box.lx, box.ly, box.lz};
+        in.kspace = mlip_kspace_->prepare(kbox, false, 1);
+    }
     MLIPOutputs out = mlip_step_->outputs(need_energy);
     mlip_backend_->compute(in, out);
-    mlip_step_->set_model_virial(out.has_virial, out.virial);
+    mlip_step_->set_model_virial(out);
     mlip_step_->add_forces(calc.get_device_fx(), calc.get_device_fy(), calc.get_device_fz(), stream, n_owned);
 
     if (need_energy) {
-        calc.add_external_virial(static_cast<Real>(mlip_step_->virial(stream)) / mlip_comm_->size());
+        if (calc.virial_tensor_enabled()) {
+            double w[3];
+            mlip_step_->virial_diag(stream, w);
+            const Real wr[3] = {static_cast<Real>(w[0] / mlip_comm_->size()), static_cast<Real>(w[1] / mlip_comm_->size()),
+                                static_cast<Real>(w[2] / mlip_comm_->size())};
+            calc.add_external_virial_diag(wr);
+        } else {
+            calc.add_external_virial(static_cast<Real>(mlip_step_->virial(stream)) / mlip_comm_->size());
+        }
+        if (mlip_kspace_) add_mlip_kspace_virial(calc, 1.0 / mlip_comm_->size());
         energy = static_cast<Real>(out.energy);   // already the whole system's
     }
     cudaStreamSynchronize(stream);
@@ -1514,7 +1773,10 @@ void MDSimulation::refresh_cuda_bonded_topology_if_needed() {
         return;
     }
     const auto& cfg = system->get_force_manager().get_config();
-    if (cfg.enable_bonds || cfg.enable_angles || cfg.enable_dihedrals) {
+    // The constraint list is part of the bonded topology: a run with constraints needs it rebuilt after every halo
+    // rebuild even when no bonded force is evaluated (a rigid-water box with only nonbonded forces).
+    if (cfg.enable_bonds || cfg.enable_angles || cfg.enable_dihedrals ||
+        !system->get_topology().get_constraints().empty()) {
         cuda_calc->refresh_bonded_topology_on_device(*system);
     }
 #endif
@@ -1584,23 +1846,13 @@ void MDSimulation::handle_integrate2_phase(ForceCalculatorCUDA* cuda_calc, doubl
         if (cuda_calc) {
 #ifdef USE_CUDA
             cuda_calc->complete_velocity_update_on_device(*system, dt, integrator_type);
-            if (constraints_enabled_) {
-                if (!cuda_calc->apply_rattle_on_device(*system)) {
-                    throw std::runtime_error(
-                        "[Constraints] CUDA RATTLE did not converge; reduce the timestep or check the constraint geometry.");
-                }
-            }
+            apply_velocity_constraints(cuda_calc);
             return;
 #else
 #endif
         }
         integrator->complete_velocity_update(system->get_particles(), dt, system->get_local_particles());
-        if (constraints_enabled_) {
-            if (!constraint_solver_->apply_rattle(*system)) {
-                throw std::runtime_error(
-                    "[Constraints] CPU RATTLE did not converge; reduce the timestep or check the constraint geometry.");
-            }
-        }
+        apply_velocity_constraints(nullptr);
     });
 }
 
@@ -1668,8 +1920,21 @@ void MDSimulation::handle_thermostat_phase(ForceCalculatorCUDA* cuda_calc,
             } else {
                 thermostat->apply(system->get_particles(), dt, system->get_local_particles());
             }
+            project_thermostat_kicks(cuda_calc);
         }
     });
+}
+
+void MDSimulation::project_thermostat_kicks(ForceCalculatorCUDA* cuda_calc) {
+    if (!constraints_enabled_ || !thermostat_needs_projection_) return;
+    // Langevin and Andersen change every velocity on its own, also along the constrained bonds. Without this the
+    // printed and saved velocities break the constraints (the kinetic energy then counts motion along the bonds, and a
+    // restart's start-up RATTLE removes it). GROMACS also constrains again after its stochastic step. The constraint
+    // virial stays that of the step's RATTLE (the force of the dynamics): this one only takes out the random part.
+    Real virial[3];
+    constraint_virial_local(virial);
+    apply_velocity_constraints(cuda_calc);
+    set_constraint_virial_local(virial);
 }
 
 void MDSimulation::handle_ke_output_phase(double& ke_time) {
@@ -1695,32 +1960,63 @@ void MDSimulation::handle_barostat_phase(ForceCalculatorCUDA* cuda_calc,
                 Real global_kinetic_energy = force_calc->get_kinetic_energy() * mvv2e;
                 barostat->set_kinetic_energy(global_kinetic_energy);
 
-                Real local_virial = force_calc->get_virial();
+                // The rigid bonds' constraint forces carry virial too (the pressure of a water box with SHAKE is
+                // wrong without it); this rank's share of the last RATTLE (the constraint force of the end of the
+                // step, the time of the force virial and the kinetic energy) is added to the force virial.
+                Real constraint_virial[3];
+                constraint_virial_local(constraint_virial);
+                Real local_virial = force_calc->get_virial()
+                                    + constraint_virial[0] + constraint_virial[1] + constraint_virial[2];
                 Real global_virial = comm_backend_->sum_reduce(local_virial);
                 barostat->set_virial(global_virial);
+
+                if (barostat->anisotropic()) {
+                    // P_aa = (2 KE_a + W_aa) / V: the diagonal of the kinetic and of the virial tensor, all ranks
+                    Real virial_diag[3];
+                    force_calc->get_virial_diag(virial_diag);
+                    for (int a = 0; a < 3; ++a) virial_diag[a] += constraint_virial[a];
+                    comm_backend_->sum_reduce3(virial_diag);
+                    Real kinetic_diag[3];
+                    force_calc->get_kinetic_energy_diag(kinetic_diag);
+                    for (int a = 0; a < 3; ++a) kinetic_diag[a] *= mvv2e;
+                    barostat->set_pressure_tensor(virial_diag, kinetic_diag);
+                }
             }
 
             Real old_lx = system->get_box().lx;
             Real old_ly = system->get_box().ly;
             Real old_lz = system->get_box().lz;
 
+            // The positions of the owned atoms are scaled. With constraints on several ranks the ghost atoms are scaled
+            // too: SHAKE takes the bond vectors of the next step from the owned AND the ghost positions, and a ghost
+            // that the scaling skipped would put the two ranks of a cluster on different reference vectors (the next
+            // halo exchange refreshes the ghosts anyway; a ghost image scales consistently with the box).
+            const size_t scaled_count = (constraints_enabled_ && system->get_size() > 1)
+                                            ? system->get_num_particles() : system->get_local_particles();
             if (cuda_calc) {
 #ifdef USE_CUDA
                 barostat->apply_device(cuda_calc->get_device_x(), cuda_calc->get_device_y(),
                                        cuda_calc->get_device_z(),
                                        cuda_calc->get_device_vx(), cuda_calc->get_device_vy(),
                                        cuda_calc->get_device_vz(), cuda_calc->get_device_mass(),
-                                       system->get_box(), dt, system->get_local_particles(), 0);
+                                       system->get_box(), dt, scaled_count, 0);
 #else
-                barostat->apply(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+                barostat->apply(system->get_particles(), system->get_box(), dt, scaled_count);
 #endif
             } else {
-                barostat->apply(system->get_particles(), system->get_box(), dt, system->get_local_particles());
+                barostat->apply(system->get_particles(), system->get_box(), dt, scaled_count);
             }
 
             Real new_lx = system->get_box().lx;
             Real new_ly = system->get_box().ly;
             Real new_lz = system->get_box().lz;
+            if (constraints_enabled_) {
+                // The barostat scaled every atom, which stretches every constrained bond by the same factor as the
+                // box. Put the clusters back to their rigid shape around their scaled centre of mass: otherwise the
+                // next SHAKE restores the bonds with a displacement that it takes for a constraint force.
+                const Real mu[3] = {new_lx / old_lx, new_ly / old_ly, new_lz / old_lz};
+                if (mu[0] != 1.0 || mu[1] != 1.0 || mu[2] != 1.0) restore_rigid_constraint_clusters(cuda_calc, mu);
+            }
             // Several ranks: the box change of one step is tiny, the drift since the last domain
             // synchronisation is what matters (see kBoxSyncBudget). Every rank must take the same
             // branch, the rebuild is collective.
@@ -1737,6 +2033,10 @@ void MDSimulation::handle_barostat_phase(ForceCalculatorCUDA* cuda_calc,
 
             if (box_changed) {
                 handle_box_change_rebuild();
+            } else if (several_ranks && (new_lx != old_lx || new_ly != old_ly || new_lz != old_lz)) {
+                // No new halo plan yet: the decomposition takes the new box, so the next halo refresh puts the ghosts
+                // of a periodic face at this box's image shift (they kept the shift of the last rebuild's box).
+                system->rescale_decomposition_domain();
             }
         }
     });
@@ -1788,7 +2088,8 @@ void MDSimulation::handle_box_change_rebuild() {
         } else
 #endif
         {
-            system->perform_halo_exchange(true);
+            // also rebuilds the local bonded and constraint lists: the ghost slots may have moved
+            system->sync_halo_particles(true);
         }
         // The halo was rebuilt for the new box, so ghost slots may have moved;
         // forces are computed right below, before the next neighbor phase.
@@ -1813,6 +2114,12 @@ void MDSimulation::handle_box_change_rebuild() {
         zero_forces();
     }
     compute_forces_with_mode();
+    if (!cuda_calc && force_calc) {
+        // The CPU force evaluation resets the kinetic energy it reports, and this runs inside the barostat phase,
+        // after the step's kinetic energy was computed: without it the output line of a step whose box changed
+        // printed T = 0 and KE = 0. (Collective: calculate_kinetic_energy reduces over the ranks.)
+        force_calc->calculate_kinetic_energy(*system);
+    }
 }
 
 void MDSimulation::sync_domain_to_box() {
@@ -2036,7 +2343,11 @@ void MDSimulation::run() {
         force_calc->set_timing_breakdown_enabled(timing_trace_force_);
     }
     if (system->get_rank() == 0) {
-        std::cout << "Starting MD simulation for " << total_steps << " steps" << std::endl;
+        std::cout << "Starting MD simulation for " << total_steps << " steps";
+        if (restarted_) {
+            std::cout << " (restart: steps " << start_step_ + 1 << " to " << start_step_ + total_steps << ")";
+        }
+        std::cout << std::endl;
         if (timing_trace_mode_ != TimingTraceMode::Off) {
             std::cout << "Per-step timing trace enabled (advanced.timing_trace="
                       << (timing_trace_mode_ == TimingTraceMode::Every ? "every" : "step") << ")"
@@ -2047,7 +2358,7 @@ void MDSimulation::run() {
         }
     }
 
-    current_step = 0;
+    current_step = start_step_;
     neighbor_rebuild_forced = false;
     adaptive_rebuild_armed_ = true;
     rebuild_reason_periodic_ = 0;
@@ -2057,16 +2368,20 @@ void MDSimulation::run() {
     rebuild_reason_box_change_ = 0;
     rebuild_reason_other_ = 0;
 
+    if (restarted_ && minimizer_type_ != "none" && !minimizer_type_.empty() && system->get_rank() == 0) {
+        std::cout << "Restart: energy minimization skipped" << std::endl;
+    }
     const double minimize_time = measure_seconds([&]() {
-        run_energy_minimization();
+        if (!restarted_) run_energy_minimization();
     });
     cumulative_timing.minimize_time += minimize_time;
 
     prepare_first_step();
 
-    output_results(0);
+    output_results(start_step_);
 
-    for (int step = 1; step <= total_steps; step++) {
+    const int last_step = start_step_ + total_steps;
+    for (int step = start_step_ + 1; step <= last_step; step++) {
         single_step();
 
         if (timing_trace_mode_ == TimingTraceMode::Every && should_print_timing_for_step(step)) {
@@ -2074,6 +2389,10 @@ void MDSimulation::run() {
         }
 
         handle_step_output(step);
+
+        if (should_write_restart_step(step)) {
+            write_restart_file(step);
+        }
     }
 
     if (system->get_rank() == 0) {
@@ -2126,7 +2445,7 @@ bool MDSimulation::should_output_step(int step) const {
 
 bool MDSimulation::needs_ke_update_for_step(int step) const {
     return should_output_step(step) || should_write_trajectory_step(step) ||
-           (step == total_steps);
+           (step == start_step_ + total_steps);
 }
 
 bool MDSimulation::energy_needed_for_step(int step) const {
@@ -2226,17 +2545,38 @@ void MDSimulation::compute_output_thermodynamics(const ParticleData& particles, 
         metrics.max_force, metrics.max_force_particle_id);
 
     Real global_virial_for_press = 0.0;
+    Real global_virial_diag[3] = {0.0, 0.0, 0.0};
+    Real kinetic_diag[3] = {0.0, 0.0, 0.0};
+    const bool tensor = force_calc && force_calc->virial_tensor_enabled();
+    metrics.box[0] = system->get_box().lx;
+    metrics.box[1] = system->get_box().ly;
+    metrics.box[2] = system->get_box().lz;
     if (force_calc) {
-        Real local_virial = force_calc->get_virial();
+        Real constraint_virial[3];
+        constraint_virial_local(constraint_virial);
+        Real local_virial = force_calc->get_virial()
+                            + constraint_virial[0] + constraint_virial[1] + constraint_virial[2];
         global_virial_for_press = comm_backend_->sum_reduce(local_virial);
+        if (tensor) {
+            force_calc->get_virial_diag(global_virial_diag);
+            for (int a = 0; a < 3; ++a) global_virial_diag[a] += constraint_virial[a];
+            comm_backend_->sum_reduce3(global_virial_diag);
+            force_calc->get_kinetic_energy_diag(kinetic_diag);
+        }
     }
 
     if (particles.num_particles > 0 && system->get_rank() == 0) {
-        metrics.temperature = (2.0 * metrics.total_ke) / (3.0 * global_particles * kB);
+        metrics.temperature = (2.0 * metrics.total_ke) / (3.0 * global_particles * dof_fraction_ * kB);
 
         Real volume = system->get_box().lx * system->get_box().ly * system->get_box().lz;
         if (volume > 0.0) {
             metrics.pressure = (2.0 * metrics.total_ke + global_virial_for_press) / (3.0 * volume) * nktv2p;
+            if (tensor) {
+                for (int a = 0; a < 3; ++a) {
+                    metrics.pressure_diag[a] =
+                        (2.0 * kinetic_diag[a] * mvv2e + global_virial_diag[a]) / volume * nktv2p;
+                }
+            }
         }
     }
 }
@@ -2287,6 +2627,18 @@ std::string MDSimulation::format_output_line(int step, const OutputMetrics& metr
             break;
         case OutputField::PRESS:
             output_line << ", P: " << metrics.pressure;
+            break;
+        case OutputField::PRESS_XX:
+            output_line << ", Pxx: " << metrics.pressure_diag[0];
+            break;
+        case OutputField::PRESS_YY:
+            output_line << ", Pyy: " << metrics.pressure_diag[1];
+            break;
+        case OutputField::PRESS_ZZ:
+            output_line << ", Pzz: " << metrics.pressure_diag[2];
+            break;
+        case OutputField::BOX:
+            output_line << ", Box: " << metrics.box[0] << " " << metrics.box[1] << " " << metrics.box[2];
             break;
         case OutputField::MAX_SPEED:
             output_line << ", MaxSpd: " << metrics.max_speed;
@@ -2525,6 +2877,14 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                 electrostatics_solver_ = trim_copy(value);
             } else if (key == "pme_ranks") {
                 pme_ranks_ = std::stoi(trim_copy(value));
+#if defined(USE_CUDA) && defined(DSMD_WITH_CUFFTMP)
+                // A cuFFTMp build: 2 selects the distributed GPU solve over all ranks (no dedicated PME
+                // ranks, no CPU FFTW-MPI group); the ordinary PP/PME split stays off.
+                if (pme_ranks_ == 2) {
+                    pme_distributed_ = true;
+                    pme_ranks_ = 0;
+                }
+#endif
             }
         } else if (current_section == "advanced") {
             const bool in_subsection = !current_subsection.empty() && indent_width > subsection_indent;
@@ -2612,6 +2972,12 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             found_total_steps = true;
         } else if (key == "output_prefix") {
             output_prefix = value;
+        } else if (key == "restart_file") {
+            restart_file_ = trim_copy(value);
+        } else if (key == "restart_output") {
+            restart_output_ = trim_copy(value);
+        } else if (key == "restart_output_freq") {
+            restart_output_freq_ = std::stoi(value);
         } else if (key == "trajectory_output_freq") {
             trajectory_output_freq = std::stoi(value);
         } else if (key == "trajectory_format") {
@@ -2665,12 +3031,25 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
             tau_p_decay_ = std::stod(value);
         } else if (key == "langevin_piston_temp") {
             langevin_piston_temp_ = std::stod(value);
+        } else if (key == "barostat_coupling") {
+            barostat_coupling_ = trim_copy(value);
+        } else if (key == "barostat_axes") {
+            barostat_axes_ = trim_copy(value);
         } else if (key == "python_mlip_path") {
             python_mlip_path = value;
         } else if (key == "mlip_backend") {
             mlip_backend_name_ = trim_copy(value);
+            if (mlip_backend_name_.empty()) mlip_backend_name_ = "ase";
         } else if (key == "mlip_model") {
             mlip_model_folder_ = trim_copy(value);
+        } else if (key == "mlip_kspace") {
+            mlip_kspace_input_.mode = trim_copy(value);
+        } else if (key == "mlip_kspace_grid_spacing") {
+            mlip_kspace_input_.grid_spacing = std::stod(value);
+        } else if (key == "mlip_kspace_dispersion_grid_spacing") {
+            mlip_kspace_input_.dispersion_grid_spacing = std::stod(value);
+        } else if (key == "mlip_kspace_order") {
+            mlip_kspace_input_.order = std::stoi(value);
         } else if (key == "mlip_type_to_z") {
             throw std::runtime_error(
                 "mlip_type_to_z is no longer used. Leave it out (dsMD finds the element of every atom type from the coordinate file and the "
@@ -2726,30 +3105,24 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     force_calculation_mode = trim_copy(force_calculation_mode);
     const auto force_components = parse_force_components(force_calculation_mode);
     for (const auto& component : force_components) {
-        if (component == "libtorch") {
-#ifdef USE_CUDA
+        if (component == "ase" || component == "libtorch" || component == "pytorch") {
             throw std::runtime_error(
-                "force_calculation.mode 'libtorch' is not available yet: the LibTorch MLIP backend is "
-                "being rebuilt (docs/mlip_integration_design.md). Use 'python'.");
-#else
-            throw std::runtime_error(
-                "force_calculation.mode 'libtorch' is only supported in CUDA builds, not in CPU/SYCL "
-                "builds. Use 'python'.");
-#endif
+                "force_calculation.mode '" + component + "' is not a mode: write mode: mlip, and say how the model is run with "
+                "mlip_backend: " + component);
         }
-        if (component != "builtin" && component != "python") {
+        if (component != "builtin" && component != "mlip") {
             throw std::runtime_error(
                 "Invalid force_calculation.mode component: '" + component
-                + "'. Supported components are: builtin, python");
+                + "'. Supported components are: builtin, mlip");
         }
     }
     if (force_components.empty()) {
         throw std::runtime_error(
             "Invalid force_calculation.mode: '" + force_calculation_mode
-            + "'. Specify one or more of: builtin, python");
+            + "'. Specify one or more of: builtin, mlip");
     }
     enable_builtin_forces_  = force_components.count("builtin") != 0;
-    enable_python_mlip_   = force_components.count("python") != 0;
+    enable_mlip_            = force_components.count("mlip") != 0;
 
     {
         MLIPConfig mlip_check;
@@ -2867,6 +3240,20 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
     if (total_steps <= 0) {
         throw std::runtime_error("Invalid total_steps: must be positive");
     }
+    if (restart_output_freq_ < 0) {
+        throw std::runtime_error("Invalid restart_output_freq: must be 0 (no restart files) or positive");
+    }
+    if (restart_output_.empty()) {
+        restart_output_ = output_prefix + ".restart";
+    }
+    if (restart_output_freq_ > 0 && !restart_file_.empty() &&
+        std::filesystem::path(restart_output_).lexically_normal() == std::filesystem::path(restart_file_).lexically_normal()) {
+        // Allowed (the file is read once at start-up and replaced atomically), but the starting state is then lost.
+        if (system->get_rank() == 0) {
+            std::cerr << "[restart] note: restart_output is the restart_file this run starts from; it will be overwritten"
+                      << std::endl;
+        }
+    }
     if (target_temperature < 0) {
         throw std::runtime_error("Invalid target_temperature: must be non-negative");
     }
@@ -2933,6 +3320,7 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
         std::cout << "  Target temperature: " << target_temperature << " K" << std::endl;
         std::cout << "  Timestep: " << dt << " fs" << std::endl;
         std::cout << "  Total steps: " << total_steps << std::endl;
+        if (!restart_file_.empty()) std::cout << "  Restart file: " << restart_file_ << std::endl;
         std::cout << "  Integrator: " << integrator_type << std::endl;
         std::cout << "  Thermostat: " << thermostat_type << std::endl;
         std::cout << "  Barostat: " << barostat_type << std::endl;
@@ -2972,10 +3360,10 @@ void MDSimulation::parse_simulation_config(const std::string& config_file) {
                       << std::endl;
         }
         std::cout << "  Force calculation mode: " << force_calculation_mode << std::endl;
-        if (enable_python_mlip_) {
-            std::cout << "  MLIP backend: " << (mlip_backend_name_.empty() ? "python" : mlip_backend_name_) << std::endl;
-            if (mlip_backend_name_.empty() || mlip_backend_name_ == "python") {
-                std::cout << "  Python MLIP module path: " << python_mlip_path << std::endl;
+        if (enable_mlip_) {
+            std::cout << "  MLIP backend: " << mlip_backend_name_ << std::endl;
+            if (mlip_backend_name_ == "ase") {
+                std::cout << "  ASE MLIP module path: " << python_mlip_path << std::endl;
             } else {
                 std::cout << "  MLIP model: " << mlip_model_folder_ << std::endl;
             }
@@ -3053,10 +3441,12 @@ void MDSimulation::initialize_thermostat() {
         }
     } else {
         if (system->get_rank() == 0) {
-            std::cout << "Unknown thermostat type '" << thermostat_type 
+            std::cout << "Unknown thermostat type '" << thermostat_type
                       << "', no thermostat initialized" << std::endl;
         }
     }
+    // The particle-particle ranks share the system: Nose-Hoover sums the kinetic energy and the atom count over them.
+    if (thermostat) thermostat->set_communicator(PmePpSplit::instance().pp_comm());
 }
 
 void MDSimulation::initialize_barostat() {
@@ -3082,7 +3472,79 @@ void MDSimulation::initialize_barostat() {
         barostat.reset();
         return;
     }
-    
+
+    // barostat_coupling / barostat_axes -> barostat_anisotropic_, barostat_axis_
+    barostat_anisotropic_ = false;
+    barostat_semiisotropic_ = false;
+    {
+        std::string coupling;
+        for (const char c : barostat_coupling_) coupling += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (coupling == "anisotropic" || coupling == "aniso") {
+            barostat_anisotropic_ = true;
+        } else if (coupling == "semiisotropic" || coupling == "semi-isotropic" || coupling == "semiiso") {
+            barostat_anisotropic_ = true;       // from the diagonal of the pressure tensor, like anisotropic
+            barostat_semiisotropic_ = true;
+        } else if (coupling != "isotropic" && coupling != "iso" && !coupling.empty()) {
+            throw std::runtime_error("barostat_coupling must be isotropic, anisotropic or semiisotropic, got '" + barostat_coupling_ +
+                                     "'");
+        }
+        bool axes[3] = {false, false, false};
+        for (const char c : barostat_axes_) {
+            const char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower == 'x') axes[0] = true;
+            else if (lower == 'y') axes[1] = true;
+            else if (lower == 'z') axes[2] = true;
+            else if (lower != ' ' && lower != ',') {
+                throw std::runtime_error("barostat_axes lists the coupled axes, for example 'z' or 'x y z'; got '" +
+                                         barostat_axes_ + "'");
+            }
+        }
+        if (!(axes[0] || axes[1] || axes[2])) {
+            throw std::runtime_error("barostat_axes names no axis (use x, y and/or z)");
+        }
+        if (!barostat_anisotropic_ && !(axes[0] && axes[1] && axes[2])) {
+            throw std::runtime_error("barostat_axes '" + barostat_axes_ + "' needs barostat_coupling: anisotropic "
+                                     "(an isotropic barostat scales all three axes together)");
+        }
+        if (barostat_semiisotropic_) {
+            // barostat_axes names the two in-plane axes (the default xyz: x and y); the third is the normal. All three are scaled.
+            bool plane[3] = {axes[0], axes[1], axes[2]};
+            if (plane[0] && plane[1] && plane[2]) plane[2] = false;
+            if (static_cast<int>(plane[0]) + static_cast<int>(plane[1]) + static_cast<int>(plane[2]) != 2) {
+                throw std::runtime_error("barostat_coupling: semiisotropic needs barostat_axes to name the two in-plane axes, for "
+                                         "example 'x y' for a membrane normal to z; got '" + barostat_axes_ + "'");
+            }
+            for (int a = 0; a < 3; ++a) {
+                axes[a] = true;
+                barostat_group_[a] = plane[a] ? 0 : 1;
+            }
+        } else {
+            for (int a = 0; a < 3; ++a) barostat_group_[a] = a;
+        }
+        for (int a = 0; a < 3; ++a) barostat_axis_[a] = axes[a];
+    }
+    if (barostat_anisotropic_) {
+        const SimulationBox& box = system->get_box();
+        const bool periodic[3] = {box.periodic_x, box.periodic_y, box.periodic_z};
+        for (int a = 0; a < 3; ++a) {
+            if (barostat_axis_[a] && !periodic[a]) {
+                throw std::runtime_error(std::string(barostat_semiisotropic_ ? "semi-isotropic" : "anisotropic") + " barostat: axis " + "xyz"[a] +
+                                         " is coupled but not periodic");
+            }
+        }
+        if (enable_mlip_ && !mlip_gives_virial_tensor()) {
+            throw std::runtime_error("barostat_coupling: " + barostat_coupling_ + " needs the diagonal of the virial tensor: " +
+                                     mlip_virial_tensor_problem());
+        }
+        if (!force_calc || !force_calc->supports_virial_tensor()) {
+            throw std::runtime_error(
+                "barostat_coupling: anisotropic needs the virial tensor, which this force calculator backend does not "
+                "provide (the CUDA and CPU backends do)");
+        }
+        // every force phase from here on also accumulates W_xx, W_yy, W_zz
+        force_calc->set_virial_tensor_enabled(true);
+    }
+
     if (barostat_type == "parrinello_rahman") {
         int local_particles = static_cast<int>(system->get_local_particles());
         int global_particles = comm_backend_->sum_int(local_particles);
@@ -3113,7 +3575,8 @@ void MDSimulation::initialize_barostat() {
             ? langevin_piston_temp_ : target_temperature;
 
         if (system->get_rank() == 0) {
-            std::cout << "[DEBUG] Isotropic Parrinello-Rahman: tau_p=" << tau_p
+            std::cout << "[DEBUG] " << (barostat_anisotropic_ ? "Anisotropic" : "Isotropic")
+                      << " Parrinello-Rahman: tau_p=" << tau_p
                       << " W=" << W << " tau_p_decay=" << tau_p_decay
                       << " piston_temp=" << piston_temp << std::endl;
         }
@@ -3151,9 +3614,31 @@ void MDSimulation::initialize_barostat() {
         }
     } else {
         if (system->get_rank() == 0) {
-            std::cout << "Unknown barostat type '" << barostat_type 
+            std::cout << "Unknown barostat type '" << barostat_type
                       << "', no barostat initialized" << std::endl;
         }
+    }
+
+    if (barostat && barostat_semiisotropic_) {
+        barostat->set_coupling(barostat_axis_, barostat_group_);
+        if (system->get_rank() == 0) {
+            std::string plane, normal;
+            for (int a = 0; a < 3; ++a) (barostat_group_[a] == 0 ? plane : normal) += "xyz"[a];
+            std::cout << "  Semi-isotropic pressure coupling: " << plane << " together from (P_" << plane[0] << plane[0] << " + P_"
+                      << plane[1] << plane[1] << ") / 2, " << normal << " on its own from P_" << normal << normal << std::endl;
+        }
+    } else if (barostat && barostat_anisotropic_) {
+        barostat->set_coupling(barostat_axis_);
+        if (system->get_rank() == 0) {
+            std::string axes;
+            for (int a = 0; a < 3; ++a) {
+                if (barostat_axis_[a]) axes += "xyz"[a];
+            }
+            std::cout << "  Anisotropic pressure coupling of the axes " << axes
+                      << " (each follows its own P_aa, the other axes keep their length)" << std::endl;
+        }
+    } else if (!barostat) {
+        barostat_anisotropic_ = false;
     }
 }
 
@@ -3204,13 +3689,11 @@ void MDSimulation::check_energy_stability() {
     last_total_energy = total_energy;
 }
 
-void MDSimulation::gather_particles_for_serial_output(SerialTrajectoryFrame& frame) const {
+void MDSimulation::gather_particles_for_serial_output(SerialTrajectoryFrame& frame, bool need_v, bool need_f) const {
     const int rank = system->get_rank();
     const int size = system->get_size();
     const size_t local_n = system->get_local_particles();
     ParticleData& particles = system->get_particles();
-    const bool need_v = trajectory_include_velocities;
-    const bool need_f = trajectory_include_forces;
 
     if (size == 1) {
         frame.x.resize(local_n); frame.y.resize(local_n); frame.z.resize(local_n);
@@ -3312,7 +3795,7 @@ void MDSimulation::write_trajectory(int step) {
 
     if (need_serial) {
         SerialTrajectoryFrame frame;
-        gather_particles_for_serial_output(frame);
+        gather_particles_for_serial_output(frame, trajectory_include_velocities, trajectory_include_forces);
 
         if (system->get_rank() == 0) {
             if (trajectory_formats_.count("xyz"))  write_xyz_trajectory(step, frame);

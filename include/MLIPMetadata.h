@@ -4,13 +4,16 @@
 // metadata.json of a converted model folder (docs/mlip_integration_design.md 3.5).
 // No LibTorch dependency: the file is read with a small JSON parser inside MLIPMetadata.cpp.
 
+#include "MLIPKspace.h"
+
 #include <map>
 #include <string>
 #include <vector>
 
 struct MLIPMetadata {
     int format_version = 0;                   // only 1 is understood
-    std::string backend;                      // "torchscript" | "aoti"
+    std::string backend;                      // "torchscript" | "aoti" | "pytorch" (no model file: the embedded Python builds the
+                                              // converter's wrapper from python_model and runs it, PyTorchModelRunner.h)
     std::string model_family;                 // e.g. "mace"
     std::string model_name;
     double cutoff = 0.0;                      // neighbor cutoff (A)
@@ -24,17 +27,24 @@ struct MLIPMetadata {
     std::vector<std::string> required_op_libs;  // absolute .so paths to dlopen before loading the model
     std::vector<std::string> required_python_modules;  // modules to import first (operators registered from Python, e.g.
                                                        // cuequivariance_ops_torch; optional field, empty when absent)
-    std::string accel;                        // "e3nn" | "cueq" | "openeq" | "flash"
+    std::string accel;                        // "e3nn" | "cueq" | "openeq" | "flash" | "so3lr_fused"
     std::map<std::string, std::string> versions;  // package versions the model was converted with
     std::string target_gpu;                   // "sm_90" (or "cpu": a test package); required for aoti
     bool edge_shifts = false;                 // optional field: the model takes periodic images as per-edge shift vectors (a fifth
                                               // input) and returns the virial (a fourth output); torchscript only
+    bool virial_diagonal = false;             // optional field (needs edge_shifts): that virial is the diagonal W_xx, W_yy, W_zz [3]
+                                              // instead of the trace [1] (folders converted before return the trace)
     int edge_receiver_row = -1;               // optional field edge_receiver_row (0 or 1): the row of edge_index the model sums its
                                               // messages onto; -1 = not given (every edge is kept, see EdgeBuilder::Prune)
     bool layer_exchange = false;              // optional field: the model exchanges its node features between the message-passing
                                               // layers (the operator dsmd::halo_exchange, HaloExchangeOp.h), so it needs ghost atoms
                                               // only one cutoff deep, and edges only onto owned atoms; torchscript only, needs
                                               // edge_shifts and edge_receiver_row
+    std::string python_path;                  // backend "pytorch": the folder that holds the mlip_convert package (absolute)
+    bool whole_system = false;                // optional field: the energy reads the whole system at once (ORB's mean readout), so the
+                                              // model is never split over ranks; with several ranks every rank computes all atoms
+    MLIPKspaceSettings kspace;                // optional object "kspace" (so3lr --kspace pme): the model calls dsmd::kspace, the input
+                                              // file must say mlip_kspace: pme (MLIPKspace.h)
 };
 
 // Parses and validates the JSON text. Throws std::runtime_error whose message starts with `source` and names

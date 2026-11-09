@@ -52,14 +52,29 @@ inline Real weak_coupling_mu(Real target_pressure, Real p_inst, Real dt, Real be
     return clamp_scale_factor(std::cbrt(x));
 }
 
-void scale_box_and_local_positions(SimulationBox& box, ParticleData& particles,
-                                    Real mu, size_t local_particles) {
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
+// Weak-coupling scale factor of ONE axis of an anisotropic cell: the isotropic factor above is
+// cbrt(1 - x) ~ 1 - x/3 with x = dt*beta/tau*(P0 - P), so a single axis answers to its own
+// P_aa with a third of the change.
+inline Real weak_coupling_mu_axis(Real target_pressure, Real p_axis, Real dt, Real beta_over_tau) {
+    Real x = 1.0 - dt * beta_over_tau * (target_pressure - p_axis) / 3.0;
+    x = std::max(x, 1e-6);
+    return clamp_scale_factor(x);
+}
+
+inline bool same_factor(const Real mu[3]) { return mu[0] == mu[1] && mu[1] == mu[2]; }
+
+void scale_box(SimulationBox& box, const Real mu[3]) {
+    box.lx *= mu[0]; box.ly *= mu[1]; box.lz *= mu[2];
     box.update_box_length();
+}
+
+void scale_box_and_local_positions(SimulationBox& box, ParticleData& particles,
+                                    const Real mu[3], size_t local_particles) {
+    scale_box(box, mu);
     for (size_t i = 0; i < local_particles; ++i) {
-        particles.x[i] *= mu;
-        particles.y[i] *= mu;
-        particles.z[i] *= mu;
+        particles.x[i] *= mu[0];
+        particles.y[i] *= mu[1];
+        particles.z[i] *= mu[2];
     }
 }
 
@@ -91,48 +106,96 @@ inline Real langevin_piston_hdot_update(Real h_dot, Real drift, Real gamma,
 } // namespace
 
 // =============================================================================
+// Scale factors shared by every backend
+// =============================================================================
+
+void Barostat::weak_coupling_scale(const SimulationBox& box, Real dt, Real beta_over_tau, Real mu[3]) const {
+    const Real volume = box.lx * box.ly * box.lz;
+    if (!anisotropic_) {
+        const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
+        mu[0] = mu[1] = mu[2] = weak_coupling_mu(target_pressure, p_inst, dt, beta_over_tau);
+        return;
+    }
+    // each coupled axis answers to the mean P_aa of its group (its own P_aa when it is alone in the group)
+    Real group_p[3];
+    int group_n[3];
+    group_pressure_bar(volume, group_p, group_n);
+    for (int a = 0; a < 3; ++a) {
+        mu[a] = couple_[a]
+            ? weak_coupling_mu_axis(target_pressure, group_p[group_[a]], dt, beta_over_tau)
+            : 1.0;
+    }
+}
+
+void Barostat::piston_scale(PistonState& s, const SimulationBox& box, Real dt, Real mu[3]) const {
+    const Real volume = box.lx * box.ly * box.lz;
+    if (!anisotropic_) {
+        if (s.W > 0.0 && volume > 0.0) {
+            const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume) / nktv2p;
+            const Real p_target = target_pressure / nktv2p;
+            const Real drift = 3.0 * volume * (p_inst - p_target) / s.W;
+            s.h_dot[0][0] = langevin_piston_hdot_update(s.h_dot[0][0], drift, s.gamma, s.piston_temp, s.W, dt,
+                                                         s.rng, s.normal_dist);
+        }
+        mu[0] = mu[1] = mu[2] = clamp_scale_factor(std::exp(s.h_dot[0][0] * dt));
+        s.h[0][0] *= mu[0]; s.h[1][1] *= mu[1]; s.h[2][2] *= mu[2];
+        return;
+    }
+    // One piston per group of axes g (one per axis when anisotropic): d(ln L_a)/dt = h_dot_g for its n_g axes, and
+    // d(h_dot_g)/dt = V (P_g - P0) / (W/3) - gamma h_dot_g + noise, P_g the mean P_aa of the group. Every axis carries W/3:
+    // the group's mass n_g W/3 against its force n_g V (P_g - P0) gives that drift, three axes in one group are the
+    // isotropic piston (3 V (P - P0) / W, noise of mass W), and one per axis is the anisotropic one, as before. The groups
+    // are visited in a fixed order so that every rank draws the same noise.
+    const Real w_axis = s.W / 3.0;
+    Real group_p[3];
+    int group_n[3];
+    group_pressure_bar(volume, group_p, group_n);
+    for (int g = 0; g < 3; ++g) {
+        if (group_n[g] == 0) continue;
+        if (w_axis > 0.0 && volume > 0.0) {
+            const Real p_group = group_p[g] / nktv2p;
+            const Real p_target = target_pressure / nktv2p;
+            const Real drift = volume * (p_group - p_target) / w_axis;
+            s.h_dot[g][g] = langevin_piston_hdot_update(s.h_dot[g][g], drift, s.gamma, s.piston_temp, group_n[g] * w_axis,
+                                                         dt, s.rng, s.normal_dist);
+        }
+    }
+    for (int a = 0; a < 3; ++a) {
+        if (!couple_[a]) {
+            mu[a] = 1.0;
+            continue;
+        }
+        mu[a] = clamp_scale_factor(std::exp(s.h_dot[group_[a]][group_[a]] * dt));
+        s.h[a][a] *= mu[a];
+    }
+}
+
+// =============================================================================
 // CPU barostats
 // =============================================================================
 
 ParrinelloRahmanBarostat::ParrinelloRahmanBarostat(Real press, Real mass, Real gamma_, Real piston_temp_)
-    : Barostat(press), W(mass), gamma(gamma_), piston_temp(piston_temp_),
-      rng(std::random_device{}()), normal_dist(0.0, 1.0) {
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            h[i][j] = (i == j) ? 1.0 : 0.0;
-            h_dot[i][j] = 0.0;
-        }
-    }
-}
+    : Barostat(press), piston_(mass, gamma_, piston_temp_) {}
 
 void ParrinelloRahmanBarostat::apply(ParticleData& particles, SimulationBox& box,
                                       Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    if (W > 0.0 && volume > 0.0) {
-        const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume) / nktv2p;
-        const Real p_target = target_pressure / nktv2p;
-        const Real drift = 3.0 * volume * (p_inst - p_target) / W;
-        h_dot[0][0] = langevin_piston_hdot_update(h_dot[0][0], drift, gamma, piston_temp, W, dt, rng, normal_dist);
-    }
-    const Real mu = clamp_scale_factor(std::exp(h_dot[0][0] * dt));
-    h[0][0] *= mu; h[1][1] *= mu; h[2][2] *= mu;
+    Real mu[3];
+    piston_scale(piston_, box, dt, mu);
     scale_box_and_local_positions(box, particles, mu, local_particles);
 }
 
 void AndersenBarostat::apply(ParticleData& particles, SimulationBox& box,
                               Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, compressibility);
+    Real mu[3];
+    weak_coupling_scale(box, dt, compressibility, mu);
     scale_box_and_local_positions(box, particles, mu, local_particles);
 }
 
 void BerendsenBarostat::apply(ParticleData& particles, SimulationBox& box,
                                Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
     const Real beta_over_tau = (tau_p > 0.0) ? (kBerendsenDefaultCompressibility / tau_p) : 0.0;
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, beta_over_tau);
+    Real mu[3];
+    weak_coupling_scale(box, dt, beta_over_tau, mu);
     scale_box_and_local_positions(box, particles, mu, local_particles);
 }
 
@@ -155,16 +218,20 @@ inline void free_device_xyz(Real*& d_x, Real*& d_y, Real*& d_z) {
 // ---- ParrinelloRahmanBarostatCUDA ----
 
 ParrinelloRahmanBarostatCUDA::ParrinelloRahmanBarostatCUDA(Real press, Real mass, Real gamma_, Real piston_temp_)
-    : Barostat(press), W(mass), gamma(gamma_), piston_temp(piston_temp_),
-      rng(std::random_device{}()), normal_dist(0.0, 1.0),
-      d_x(nullptr), d_y(nullptr), d_z(nullptr), allocated_size(0) {
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            h[i][j] = (i == j) ? 1.0 : 0.0;
-            h_dot[i][j] = 0.0;
-        }
+    : Barostat(press), piston_(mass, gamma_, piston_temp_),
+      d_x(nullptr), d_y(nullptr), d_z(nullptr), allocated_size(0) {}
+
+namespace {
+// Positions of the device arrays scaled by mu[3]: the isotropic kernel when the three factors are the same
+// (the bit-identical old path), the anisotropic one otherwise.
+inline void scale_device_positions(Real* x, Real* y, Real* z, const Real mu[3], size_t n, cudaStream_t stream) {
+    if (same_factor(mu)) {
+        launch_scale_positions_kernel(x, y, z, mu[0], n, stream);
+    } else {
+        launch_scale_positions_anisotropic_kernel(x, y, z, mu[0], mu[1], mu[2], n, stream);
     }
 }
+} // namespace
 
 ParrinelloRahmanBarostatCUDA::~ParrinelloRahmanBarostatCUDA() {
     free_device_xyz(d_x, d_y, d_z);
@@ -196,22 +263,14 @@ void ParrinelloRahmanBarostatCUDA::apply(ParticleData& particles, SimulationBox&
                                           Real dt, size_t local_particles) {
     // Box/piston state must be updated identically on every rank regardless
     // of whether this rank currently owns any particles.
-    const Real volume = box.lx * box.ly * box.lz;
-    if (W > 0.0 && volume > 0.0) {
-        const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume) / nktv2p;
-        const Real p_target = target_pressure / nktv2p;
-        const Real drift = 3.0 * volume * (p_inst - p_target) / W;
-        h_dot[0][0] = langevin_piston_hdot_update(h_dot[0][0], drift, gamma, piston_temp, W, dt, rng, normal_dist);
-    }
-    const Real mu = clamp_scale_factor(std::exp(h_dot[0][0] * dt));
-    h[0][0] *= mu; h[1][1] *= mu; h[2][2] *= mu;
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    piston_scale(piston_, box, dt, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
     allocate_gpu_memory(local_particles);
     copy_to_device(particles, local_particles);
-    launch_scale_positions_kernel(d_x, d_y, d_z, mu, local_particles, 0);
+    scale_device_positions(d_x, d_y, d_z, mu, local_particles, 0);
     cudaDeviceSynchronize();
     copy_from_device(particles, local_particles);
 }
@@ -220,20 +279,12 @@ void ParrinelloRahmanBarostatCUDA::apply_device(Real* dx, Real* dy, Real* dz,
                                                  Real*, Real*, Real*, Real*,
                                                  SimulationBox& box, Real dt,
                                                  size_t local_particles, cudaStream_t stream) {
-    const Real volume = box.lx * box.ly * box.lz;
-    if (W > 0.0 && volume > 0.0) {
-        const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume) / nktv2p;
-        const Real p_target = target_pressure / nktv2p;
-        const Real drift = 3.0 * volume * (p_inst - p_target) / W;
-        h_dot[0][0] = langevin_piston_hdot_update(h_dot[0][0], drift, gamma, piston_temp, W, dt, rng, normal_dist);
-    }
-    const Real mu = clamp_scale_factor(std::exp(h_dot[0][0] * dt));
-    h[0][0] *= mu; h[1][1] *= mu; h[2][2] *= mu;
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    piston_scale(piston_, box, dt, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
-    launch_scale_positions_kernel(dx, dy, dz, mu, local_particles, stream);
+    scale_device_positions(dx, dy, dz, mu, local_particles, stream);
 }
 
 // ---- AndersenBarostatCUDA ----
@@ -270,16 +321,14 @@ void AndersenBarostatCUDA::copy_from_device(ParticleData& particles, size_t loca
 
 void AndersenBarostatCUDA::apply(ParticleData& particles, SimulationBox& box,
                                   Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, compressibility);
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    weak_coupling_scale(box, dt, compressibility, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
     allocate_gpu_memory(local_particles);
     copy_to_device(particles, local_particles);
-    launch_scale_positions_kernel(d_x, d_y, d_z, mu, local_particles, 0);
+    scale_device_positions(d_x, d_y, d_z, mu, local_particles, 0);
     cudaDeviceSynchronize();
     copy_from_device(particles, local_particles);
 }
@@ -288,14 +337,12 @@ void AndersenBarostatCUDA::apply_device(Real* dx, Real* dy, Real* dz,
                                          Real*, Real*, Real*, Real*,
                                          SimulationBox& box, Real dt,
                                          size_t local_particles, cudaStream_t stream) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, compressibility);
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    weak_coupling_scale(box, dt, compressibility, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
-    launch_scale_positions_kernel(dx, dy, dz, mu, local_particles, stream);
+    scale_device_positions(dx, dy, dz, mu, local_particles, stream);
 }
 
 // ---- BerendsenBarostatCUDA ----
@@ -332,17 +379,15 @@ void BerendsenBarostatCUDA::copy_from_device(ParticleData& particles, size_t loc
 
 void BerendsenBarostatCUDA::apply(ParticleData& particles, SimulationBox& box,
                                    Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
     const Real beta_over_tau = (tau_p > 0.0) ? (kBerendsenDefaultCompressibility / tau_p) : 0.0;
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, beta_over_tau);
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    weak_coupling_scale(box, dt, beta_over_tau, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
     allocate_gpu_memory(local_particles);
     copy_to_device(particles, local_particles);
-    launch_scale_positions_kernel(d_x, d_y, d_z, mu, local_particles, 0);
+    scale_device_positions(d_x, d_y, d_z, mu, local_particles, 0);
     cudaDeviceSynchronize();
     copy_from_device(particles, local_particles);
 }
@@ -351,15 +396,13 @@ void BerendsenBarostatCUDA::apply_device(Real* dx, Real* dy, Real* dz,
                                           Real*, Real*, Real*, Real*,
                                           SimulationBox& box, Real dt,
                                           size_t local_particles, cudaStream_t stream) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
     const Real beta_over_tau = (tau_p > 0.0) ? (kBerendsenDefaultCompressibility / tau_p) : 0.0;
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, beta_over_tau);
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    weak_coupling_scale(box, dt, beta_over_tau, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
-    launch_scale_positions_kernel(dx, dy, dz, mu, local_particles, stream);
+    scale_device_positions(dx, dy, dz, mu, local_particles, stream);
 }
 
 #endif // USE_CUDA
@@ -383,16 +426,8 @@ inline void free_device_xyz_sycl(Real*& d_x, Real*& d_y, Real*& d_z, sycl::queue
 // ---- ParrinelloRahmanBarostatSYCL ----
 
 ParrinelloRahmanBarostatSYCL::ParrinelloRahmanBarostatSYCL(Real press, Real mass, Real gamma_, Real piston_temp_)
-    : Barostat(press), W(mass), gamma(gamma_), piston_temp(piston_temp_),
-      rng(std::random_device{}()), normal_dist(0.0, 1.0), queue(sycl::default_selector{}),
-      d_x(nullptr), d_y(nullptr), d_z(nullptr), allocated_size(0) {
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            h[i][j] = (i == j) ? 1.0 : 0.0;
-            h_dot[i][j] = 0.0;
-        }
-    }
-}
+    : Barostat(press), piston_(mass, gamma_, piston_temp_), queue(sycl::default_selector{}),
+      d_x(nullptr), d_y(nullptr), d_z(nullptr), allocated_size(0) {}
 
 ParrinelloRahmanBarostatSYCL::~ParrinelloRahmanBarostatSYCL() {
     free_device_xyz_sycl(d_x, d_y, d_z, queue);
@@ -424,17 +459,9 @@ void ParrinelloRahmanBarostatSYCL::copy_from_device(ParticleData& particles, siz
 
 void ParrinelloRahmanBarostatSYCL::apply(ParticleData& particles, SimulationBox& box,
                                           Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    if (W > 0.0 && volume > 0.0) {
-        const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume) / nktv2p;
-        const Real p_target = target_pressure / nktv2p;
-        const Real drift = 3.0 * volume * (p_inst - p_target) / W;
-        h_dot[0][0] = langevin_piston_hdot_update(h_dot[0][0], drift, gamma, piston_temp, W, dt, rng, normal_dist);
-    }
-    const Real mu = clamp_scale_factor(std::exp(h_dot[0][0] * dt));
-    h[0][0] *= mu; h[1][1] *= mu; h[2][2] *= mu;
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    piston_scale(piston_, box, dt, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
     allocate_device_memory(local_particles);
@@ -443,11 +470,12 @@ void ParrinelloRahmanBarostatSYCL::apply(ParticleData& particles, SimulationBox&
     Real* dev_x = d_x;
     Real* dev_y = d_y;
     Real* dev_z = d_z;
+    const Real mu_x = mu[0], mu_y = mu[1], mu_z = mu[2];
     queue.parallel_for(sycl::range<1>(local_particles), [=](sycl::id<1> idx) {
         int i = idx[0];
-        dev_x[i] *= mu;
-        dev_y[i] *= mu;
-        dev_z[i] *= mu;
+        dev_x[i] *= mu_x;
+        dev_y[i] *= mu_y;
+        dev_z[i] *= mu_z;
     });
     queue.wait();
 
@@ -490,11 +518,9 @@ void AndersenBarostatSYCL::copy_from_device(ParticleData& particles, size_t loca
 
 void AndersenBarostatSYCL::apply(ParticleData& particles, SimulationBox& box,
                                   Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, compressibility);
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    weak_coupling_scale(box, dt, compressibility, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
     allocate_device_memory(local_particles);
@@ -503,11 +529,12 @@ void AndersenBarostatSYCL::apply(ParticleData& particles, SimulationBox& box,
     Real* dev_x = d_x;
     Real* dev_y = d_y;
     Real* dev_z = d_z;
+    const Real mu_x = mu[0], mu_y = mu[1], mu_z = mu[2];
     queue.parallel_for(sycl::range<1>(local_particles), [=](sycl::id<1> idx) {
         int i = idx[0];
-        dev_x[i] *= mu;
-        dev_y[i] *= mu;
-        dev_z[i] *= mu;
+        dev_x[i] *= mu_x;
+        dev_y[i] *= mu_y;
+        dev_z[i] *= mu_z;
     });
     queue.wait();
 
@@ -550,12 +577,10 @@ void BerendsenBarostatSYCL::copy_from_device(ParticleData& particles, size_t loc
 
 void BerendsenBarostatSYCL::apply(ParticleData& particles, SimulationBox& box,
                                    Real dt, size_t local_particles) {
-    const Real volume = box.lx * box.ly * box.lz;
-    const Real p_inst = compute_instant_pressure_bar(last_kinetic_energy, last_virial, volume);
     const Real beta_over_tau = (tau_p > 0.0) ? (kBerendsenDefaultCompressibility / tau_p) : 0.0;
-    const Real mu = weak_coupling_mu(target_pressure, p_inst, dt, beta_over_tau);
-    box.lx *= mu; box.ly *= mu; box.lz *= mu;
-    box.update_box_length();
+    Real mu[3];
+    weak_coupling_scale(box, dt, beta_over_tau, mu);
+    scale_box(box, mu);
 
     if (local_particles == 0) return;
     allocate_device_memory(local_particles);
@@ -564,11 +589,12 @@ void BerendsenBarostatSYCL::apply(ParticleData& particles, SimulationBox& box,
     Real* dev_x = d_x;
     Real* dev_y = d_y;
     Real* dev_z = d_z;
+    const Real mu_x = mu[0], mu_y = mu[1], mu_z = mu[2];
     queue.parallel_for(sycl::range<1>(local_particles), [=](sycl::id<1> idx) {
         int i = idx[0];
-        dev_x[i] *= mu;
-        dev_y[i] *= mu;
-        dev_z[i] *= mu;
+        dev_x[i] *= mu_x;
+        dev_y[i] *= mu_y;
+        dev_z[i] *= mu_z;
     });
     queue.wait();
 

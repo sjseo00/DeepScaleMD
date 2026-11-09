@@ -36,19 +36,21 @@ struct DihedralType {
     int n;         // Multiplicity
 };
 
+// The type of a bond, angle or dihedral is the id of its parameter name in the matching StringTable of the Topology
+// (an int instead of a std::string: 12 instead of 40 bytes per bond, and no string copies to broadcast).
 struct Bond {
     int atom1, atom2;
-    std::string type;
+    int type;
 };
 
 struct Angle {
     int atom1, atom2, atom3;  // atom2 is the center
-    std::string type;
+    int type;
 };
 
 struct Dihedral {
     int atom1, atom2, atom3, atom4;
-    std::string type;
+    int type;
 };
 
 struct SpecialPair {
@@ -62,6 +64,32 @@ struct Constraint {
     Real distance;
 };
 
+// Distinct strings with a stable id each: the names the atoms and interactions refer to are stored once.
+struct StringTable {
+    std::vector<std::string> names;
+    std::unordered_map<std::string, int> index;
+    int intern(const std::string& value) {
+        const auto found = index.find(value);
+        if (found != index.end()) return found->second;
+        const int id = static_cast<int>(names.size());
+        names.push_back(value);
+        index.emplace(value, id);
+        return id;
+    }
+    const std::string& name(int id) const { return names[static_cast<size_t>(id)]; }
+    size_t size() const { return names.size(); }
+    void clear() { names.clear(); index.clear(); }
+    // The names of a table that arrived over MPI (no index: nothing is added to it any more).
+    void assign(std::vector<std::string> values) {
+        names = std::move(values);
+        index.clear();
+    }
+    // The index is only needed while a file is read; afterwards the names alone are kept.
+    void release_index() {
+        std::unordered_map<std::string, int>().swap(index);
+    }
+};
+
 class Topology {
 private:
     std::map<std::string, AtomType> atom_types;
@@ -69,8 +97,19 @@ private:
     std::map<std::string, AngleType> angle_types;
     std::map<std::string, DihedralType> dihedral_types;
     
-    std::vector<std::string> atom_type_names;  // atom_type_names[i] = type of atom i
-    std::vector<std::string> atom_elements;
+    // Per atom: the id of its type name and of its element symbol in the two tables (not one std::string per atom).
+    std::vector<int> atom_name_ids;
+    std::vector<int> atom_element_ids;
+    StringTable atom_name_table;
+    StringTable atom_element_table;
+    // Parameter names that bonds, angles and dihedrals (impropers too) refer to by id.
+    StringTable bond_type_table;
+    StringTable angle_type_table;
+    StringTable dihedral_type_table;
+    // The parameters of every id, found once after loading (nullptr: the name has no parameters, the lookup by name throws).
+    std::vector<const BondType*> bond_by_id;
+    std::vector<const AngleType*> angle_by_id;
+    std::vector<const DihedralType*> dihedral_by_id;
     std::vector<int> atom_type_ids;
     std::vector<Real> atom_masses;
     std::vector<Real> atom_charges;
@@ -89,6 +128,8 @@ private:
     bool canonical_format = false;
     
     int rank;
+
+    void resolve_type_ids();
     
 public:
     Topology();
@@ -109,6 +150,13 @@ public:
     const AngleType& get_angle_type(const std::string& type_name) const;
     
     const DihedralType& get_dihedral_type(const std::string& type_name) const;
+    // The same by the id a Bond, Angle or Dihedral carries as its type.
+    const BondType& get_bond_type(int type_id) const;
+    const AngleType& get_angle_type(int type_id) const;
+    const DihedralType& get_dihedral_type(int type_id) const;
+    const std::string& bond_type_name(int type_id) const { return bond_type_table.name(type_id); }
+    const std::string& angle_type_name(int type_id) const { return angle_type_table.name(type_id); }
+    const std::string& dihedral_type_name(int type_id) const { return dihedral_type_table.name(type_id); }
     
     const std::vector<Bond>& get_bonds() const { return bonds; }
     const std::vector<Angle>& get_angles() const { return angles; }
@@ -132,7 +180,7 @@ public:
     int get_mie_attractive_exponent() const { return mie_attractive_exponent; }
     bool is_nonbonded_excluded(int atom1, int atom2) const;
     
-    int get_num_atoms() const { return atom_type_names.size(); }
+    int get_num_atoms() const { return static_cast<int>(atom_name_ids.size()); }
     bool has_atom_type(const std::string& type_name) const;
     bool has_bond_type(const std::string& type_name) const;
     bool has_angle_type(const std::string& type_name) const;

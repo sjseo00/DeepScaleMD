@@ -4,6 +4,7 @@
 #include "md_system.h"
 #include "force_calculator.h"
 #include "MLIPBackend.h"
+#include "MLIPKspaceHost.h"
 #include "integrator.h"
 #include "thermostat.h"
 #include "barostat.h"
@@ -48,6 +49,10 @@ private:
         PE,
         ETOTAL,
         PRESS,
+        PRESS_XX,   // diagonal of the pressure tensor, P_aa = (2 KE_a + W_aa) / V; needs the virial tensor
+        PRESS_YY,
+        PRESS_ZZ,
+        BOX,        // the box lengths Lx, Ly, Lz in A (they change under a barostat)
         MAX_SPEED,
         AVG_SPEED,
         FMAX
@@ -76,6 +81,12 @@ private:
 
     std::unique_ptr<ConstraintSolver> constraint_solver_;
     bool constraints_enabled_ = false;
+    // (3N - number of constraints) / (3N): the share of the 3N coordinates that are degrees of freedom. The printed
+    // temperature is 2 KE / (3N kB dof_fraction) and the Nose-Hoover thermostat counts the same degrees of freedom.
+    Real dof_fraction_ = 1.0;
+    // Langevin and Andersen with constraints: the velocities are projected onto the constraints again after the
+    // thermostat (see project_thermostat_kicks). Nose-Hoover scales all velocities alike and keeps them on.
+    bool thermostat_needs_projection_ = false;
     std::vector<Real> constraint_pre_step_x_, constraint_pre_step_y_, constraint_pre_step_z_;
 
     std::string coordinate_file;
@@ -104,7 +115,7 @@ private:
     int rebuild_reason_other_ = 0;
     std::string force_calculation_mode;
     bool enable_builtin_forces_ = true;
-    bool enable_python_mlip_ = false;     // force_calculation.mode contains 'python': the MLIP path is on
+    bool enable_mlip_ = false;            // force_calculation.mode contains 'mlip': the MLIP path is on
     std::string force_calculation_type;
     std::string force_precision_ = "double";
 
@@ -115,6 +126,7 @@ private:
 
     std::string electrostatics_solver_ = "pme";
     int pme_ranks_ = 0;  // 0 = no PP/PME rank split (default, legacy rank-0-serial behavior)
+    bool pme_distributed_ = false;  // pme_ranks: 2 in a cuFFTMp build: distributed PME over all ranks, no PME group
 
     // decomposition: (advanced, optional) dsDecompX process-grid policy, nested as
     // advanced.decomposition.* in YAML. Empty/sentinel values mean "unset" -- falls
@@ -126,8 +138,10 @@ private:
     double decomposition_dynamic_imbalance_threshold_ = -1.0;
     double decomposition_dynamic_relaxation_ = -1.0;
 
-    std::string mlip_backend_name_ = "python";  // mlip_backend: python | libtorch
+    std::string mlip_backend_name_ = "ase";  // mlip_backend: ase | libtorch | pytorch
     std::string mlip_model_folder_;             // mlip_model: converted model folder (libtorch)
+    MLIPKspaceInput mlip_kspace_input_;         // mlip_kspace, mlip_kspace_grid_spacing, ...: k-space sums of a --kspace pme model
+    std::unique_ptr<MLIPKspaceHost> mlip_kspace_;   // set only for such a model (MLIPKspaceHost::create checks model and input agree)
     std::vector<int> mlip_type_to_z_;           // MD type id -> atomic number: found by dsMD (resolve_mlip_type_to_z), what the backends get
     std::map<std::string, std::string> mlip_elements_by_type_name_;   // mlip_elements: section, atom type name -> element
     std::string mlip_elements_description_;     // the same for the start-up summary
@@ -151,6 +165,17 @@ private:
     // 0.0 = unset; initialize_barostat() then defaults to target_temperature,
     // matching NAMD's langevinPistonTemp (usually equal to langevinTemp).
     Real langevin_piston_temp_ = 0.0;
+    // barostat_coupling: isotropic (the default: one scale factor from the trace of the pressure tensor) or
+    // anisotropic (each axis named in barostat_axes follows its own P_aa and the others keep their length, e.g. "z"
+    // for a membrane normal to z). The flags are parsed from barostat_axes_ by initialize_barostat().
+    std::string barostat_coupling_ = "isotropic";
+    std::string barostat_axes_ = "xyz";
+    bool barostat_anisotropic_ = false;
+    bool barostat_axis_[3] = {true, true, true};
+    // barostat_coupling: semiisotropic (barostat_anisotropic_ is then true as well): the two in-plane axes (barostat_axes) share one
+    // factor from (P_aa + P_bb) / 2, the normal axis follows its own P_cc; barostat_group_ is the group of each axis.
+    bool barostat_semiisotropic_ = false;
+    int barostat_group_[3] = {0, 1, 2};
 
     std::string minimizer_type_ = "none";     // none | fire
     int minimizer_max_steps_ = 1000;
@@ -210,9 +235,20 @@ private:
     };
 
     int current_step;
-    int total_steps;
+    int total_steps;        // steps this run makes; a restarted run continues from start_step_ to start_step_ + total_steps
+    int start_step_ = 0;    // step number of the first state: 0, or the step stored in restart_file
     Real dt;
-    std::string python_mlip_path;         // python_mlip_path: directory with ml_forces.py (mlip_backend: python)
+
+    // Restart files (md_restart.cpp). restart_file: the run starts from the positions, velocities, box, step and
+    // thermostat/barostat state stored there instead of coordinate_file positions and new velocities.
+    // restart_output_freq > 0: a restart file is written every that many steps and after the last step.
+    std::string restart_file_;
+    std::string restart_output_;          // restart_output: path of the written file; default <output_prefix>.restart
+    int restart_output_freq_ = 0;
+    bool restarted_ = false;
+    std::string restart_thermostat_name_, restart_barostat_name_;
+    std::vector<Real> restart_thermostat_state_, restart_barostat_state_;
+    std::string python_mlip_path;         // python_mlip_path: directory with ml_forces.py (mlip_backend: ase)
     
     Real cached_potential_energy;       // Store PE from force calculation
     
@@ -224,9 +260,9 @@ private:
     Real box_synced_lx_ = 0.0, box_synced_ly_ = 0.0, box_synced_lz_ = 0.0;
     bool box_synced_valid_ = false;
     // Largest box change (A, any axis) tolerated since the last domain synchronisation before the
-    // barostat forces a rebuild with a new halo plan: between rebuilds the ghost atoms of a periodic
-    // face are placed with the image shift of the last synchronisation, so this is also the error
-    // of those ghost positions.
+    // barostat forces a rebuild with a new halo plan. Between rebuilds the plan keeps its ghost atoms
+    // (the halo slabs of the synchronised box), while their periodic image shift follows the box
+    // every step (MDSystem::rescale_decomposition_domain).
     static constexpr Real kBoxSyncBudget = 0.005;
     // Lagged displacement check (several GPU ranks): the previous reading, to extrapolate one check ahead.
     Real lagged_disp_previous_ = 0.0;
@@ -280,6 +316,8 @@ private:
         Real avg_speed = 0.0;
         Real temperature = 0.0;
         Real pressure = 0.0;
+        Real pressure_diag[3] = {0.0, 0.0, 0.0};   // only filled while the virial tensor is enabled
+        Real box[3] = {0.0, 0.0, 0.0};
     };
     
     void print_step_timing(int step);
@@ -324,6 +362,30 @@ private:
     void initialize_barostat();
     bool is_using_cuda_backend() const;
     void handle_integrate1_phase(ForceCalculatorCUDA* cuda_calc, double& integrate1_time);
+    // Several ranks with constraints: the ghost atoms of a constraint cluster must be current when SHAKE (positions) and
+    // RATTLE (positions and velocities) solve it. Collective; does nothing on one rank or without constraints.
+    void refresh_ghosts_for_constraints(ForceCalculatorCUDA* cuda_calc, bool with_velocities);
+    // RATTLE on the current positions and velocities (ghosts refreshed first): after the second velocity half-step, and
+    // once at the start so that the first step starts from velocities that satisfy the constraints. Throws when it does
+    // not converge.
+    void apply_velocity_constraints(ForceCalculatorCUDA* cuda_calc);
+    // The constraint virial at the start of the run, where no step has produced one: the forces of the first
+    // evaluation kick the velocities by half a step, RATTLE then finds the constraint forces of that time (with the
+    // centripetal term, see ForceCalculatorCUDA::apply_rattle_on_device), and the velocities are put back.
+    void measure_constraint_virial_at_start(ForceCalculatorCUDA* cuda_calc);
+    // After the barostat scaled the positions (the box has changed from old to new): the atoms of every constraint
+    // cluster get their rigid shape back around the scaled centre of mass.
+    void restore_rigid_constraint_clusters(ForceCalculatorCUDA* cuda_calc, const Real mu[3]);
+    // This rank's virial diagonal of the constraint forces of the last RATTLE (kcal/mol), zeros without constraints.
+    void constraint_virial_local(Real out[3]) const;
+    void set_constraint_virial_local(const Real virial[3]);
+    // After a Langevin or Andersen step with constraints: RATTLE once more, keeping the constraint virial of the
+    // step's RATTLE (see thermostat_needs_projection_).
+    void project_thermostat_kicks(ForceCalculatorCUDA* cuda_calc);
+    // The MLIP gives the diagonal of the virial tensor (anisotropic and semi-isotropic barostats, Pxx/Pyy/Pzz output): it runs
+    // through MLIPStep, and a model with edge shifts returns the diagonal (metadata virial_diagonal). If not, why not.
+    bool mlip_gives_virial_tensor() const;
+    std::string mlip_virial_tensor_problem() const;
     void handle_neighbor_phase(double& nlist_build_time, double& comm_time, double& migrate_time);
     void handle_neighbor_rebuild_if_needed(bool should_rebuild);
     // need_energy=false lets the CUDA force path skip the energy/virial readback
@@ -361,6 +423,8 @@ private:
     void compute_mlip_step_forces(bool need_energy, Real& energy);
     // The same when a subdomain is narrower than the model's ghost layer: all atoms of all ranks on every rank.
     void compute_mlip_replicated_forces(bool need_energy, Real& energy);
+    // Adds the k-space virial correction of a --kspace pme model (times factor).
+    void add_mlip_kspace_virial(ForceCalculatorCUDA& calc, double factor);
 #endif
     void reverse_halo_for_bonded_if_needed();
     // CUDA multi-rank: re-derive the device bonded topology if the owned/ghost
@@ -376,7 +440,17 @@ private:
     void apply_fire_update_cpu(const FireMinimizer::StepParams& params);
 
     void write_trajectory(int step);
-    void gather_particles_for_serial_output(SerialTrajectoryFrame& frame) const;
+    // Gathers the owned atoms of all PP ranks onto rank 0, in global id order. Velocities and forces only when asked.
+    void gather_particles_for_serial_output(SerialTrajectoryFrame& frame, bool need_v, bool need_f) const;
+
+    // Restart (md_restart.cpp). read_restart_file(): after load_coordinates/load_topology and before the domain
+    // decomposition; rank 0 puts the stored positions and velocities into its global arrays and every PP rank takes the
+    // stored box and step. apply_restart_dynamics_state(): after the thermostat and barostat exist. write_restart_file():
+    // collective over the PP ranks, rank 0 writes (to a temporary name, then renamed over the old file).
+    void read_restart_file();
+    void apply_restart_dynamics_state();
+    void write_restart_file(int step);
+    bool should_write_restart_step(int step) const;
     void write_xyz_trajectory(int step, const SerialTrajectoryFrame& frame);
     void write_lammps_dump(int step, const SerialTrajectoryFrame& frame);
     void write_dcd_frame(int step, const SerialTrajectoryFrame& frame);

@@ -14,9 +14,10 @@ from).
 
 The script and data file become the dsMD_input package (OUT_DIR/manifest.yaml, ...), and
 the script's run settings (timestep, run, minimize, velocity, fixes, thermo, dump, cutoff,
-kspace) become OUT_DIR/input_dsmd.yaml. A setting DeepScaleMD cannot reproduce is an error
-unless --allow-lossy is given (which also lets improper_style harmonic impropers be
-dropped). dsMD reads `input_system` relative to the directory it is started in, so the
+kspace) become OUT_DIR/input_dsmd.yaml. fix shake / rattle becomes the topology's [constraints].
+A setting DeepScaleMD cannot reproduce (for example the pressure part of fix npt) is an error
+unless --allow-lossy is given (which also converts an improper_style harmonic with chi0 other
+than 0 or 180 as written). dsMD reads `input_system` relative to the directory it is started in, so the
 default `manifest.yaml` is meant for
     cd OUT_DIR && dsMD input_dsmd.yaml
 """
@@ -47,8 +48,9 @@ def main(argv=None) -> int:
     parser.add_argument("--ff-name", default="unknown",
                          help="Recorded as forcefield_variant in manifest.yaml")
     parser.add_argument("--allow-lossy", action="store_true",
-                         help="Drop improper_style harmonic impropers and turn run settings "
-                              "DeepScaleMD cannot reproduce into warnings instead of an error")
+                         help="Turn run settings DeepScaleMD cannot reproduce into warnings instead of "
+                              "an error (and convert an improper_style harmonic with chi0 other "
+                              "than 0 or 180 as written)")
     dsmd_input.add_yaml_arguments(parser)
     args = parser.parse_args(argv)
 
@@ -57,7 +59,9 @@ def main(argv=None) -> int:
         system = convert(args.input_script, args.data_file,
                           forcefield_variant=args.ff_name, allow_lossy=args.allow_lossy)
         stage("run settings")
-        settings = lammps_run_settings(args.input_script, system.box, "lammps")
+        settings = lammps_run_settings(args.input_script, system.box, "lammps", shake_in_package=True)
+        settings.atom_count = len(system.atoms)
+        settings.charge_sq_sum = sum(a.charge * a.charge for a in system.atoms)
         warnings = dsmd_input.check(settings, args.allow_lossy)
         sources = [args.input_script] + ([args.data_file] if args.data_file else [])
         write_package(system, args.out_dir, source_engine="lammps", source_files=sources)
@@ -74,7 +78,7 @@ def main(argv=None) -> int:
           f"({len(system.atoms)} atoms, {len(system.bonds)} bonds, "
           f"{len(system.angles)} angles, {len(system.torsions)} dihedrals, "
           f"{len(system.impropers)} impropers, {len(system.special_pairs)} special pairs, "
-          f"mie({system.mie_n},{system.mie_m}))")
+          f"{len(system.constraints)} constraints, mie({system.mie_n},{system.mie_m}))")
     return 0
 
 

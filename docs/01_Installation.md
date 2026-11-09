@@ -52,9 +52,10 @@ Optional:
 |------------------------------------------------|------------------------------------------|--------------------------------------------------------------------------------------------------------------|
 | FFTW OpenMP library (`libfftw3_omp`)           | Found automatically when installed       | Multi-threaded PME FFTs on CPU. Without it the FFTs are single-threaded no matter what `OMP_NUM_THREADS` is. |
 | FFTW MPI library (`libfftw3_mpi`)              | Found automatically when installed       | `force_calculation.pme_ranks` larger than 1.                                                                 |
+| cuFFTMp and NVSHMEM (NVIDIA HPC SDK)           | `-DDSMD_ENABLE_CUFFTMP=ON`, CUDA builds only, not with LibTorch | `force_calculation.pme_ranks: 2`: the PME FFT is solved across all GPUs ([Technical note](08_Technical_Note.md) 9.3). |
 | ADIOS2 built with MPI                          | `-DENABLE_ADIOS2=ON`                     | `trajectory_format: bp`                                                                                      |
 | Parallel HDF5 (built with `--enable-parallel`) | `-DENABLE_HDF5=ON`                       | `trajectory_format: h5md`                                                                                    |
-| LibTorch, taken from a Python `torch` package  | `-DENABLE_LIBTORCH=ON`, CUDA builds only | `mlip_backend: libtorch` (see [MLIP](06_MLIP.md))                                                            |
+| LibTorch, taken from a Python `torch` package  | `-DENABLE_LIBTORCH=ON`, CUDA builds only | `mlip_backend: libtorch` or `pytorch` (see [MLIP](06_MLIP.md))                                               |
 
 
 ## Step 1. Build and install dsDecompX
@@ -137,8 +138,8 @@ The configure step stops with a message if the dsDecompX package does not match 
 | `BACKEND`                                    | `CPU`, `CUDA`, `SYCL`                        | `CPU`               | Execution backend. `SYCL` is under development; use `CPU` or `CUDA`.                                                                  |
 | `DSDECOMPX_DIR`                              | path                                         | empty               | Where the matching dsDecompX package is.                                                                                              |
 | `CMAKE_CUDA_ARCHITECTURES`                   | e.g. `80`, `90`, `80;90`                     | `80;86;89;90`       | GPU architectures to compile for. Set it to your GPU: 80 for A100, 86 for RTX 30xx and A6000, 89 for RTX 40xx, 90 for H100 and GH200. |
-| `ENABLE_PYTHON`                              | `ON`, `OFF`                                  | `ON`                | Embedded Python, needed for `mlip_backend: python`.                                                                                   |
-| `ENABLE_LIBTORCH`                            | `ON`, `OFF`                                  | `OFF`               | LibTorch MLIP backend. Requires `BACKEND=CUDA`.                                                                                       |
+| `ENABLE_PYTHON`                              | `ON`, `OFF`                                  | `ON`                | Embedded Python, needed for `mlip_backend: ase` and `pytorch`.                                                                        |
+| `ENABLE_LIBTORCH`                            | `ON`, `OFF`                                  | `OFF`               | LibTorch and PyTorch modes of the MLIP. Requires `BACKEND=CUDA`.                                                                      |
 | `LIBTORCH_PYTHON`                            | path to a Python                             | `python3` on `PATH` | The Python whose `torch` package supplies LibTorch. Ignored when `Torch_DIR` is set.                                                  |
 | `Torch_DIR`                                  | path                                         | empty               | Use a LibTorch at `<LibTorch>/share/cmake/Torch` instead.                                                                       |
 | `ENABLE_ADIOS2`                              | `ON`, `OFF`                                  | `OFF`               | ADIOS2 BP trajectory writer.                                                                                                          |
@@ -147,6 +148,9 @@ The configure step stops with a message if the dsDecompX package does not match 
 | `DEEPSCALEMD_TARGET_ARCH`                    | e.g. `skylake-avx512`, `znver3`, `x86-64-v3` | `native`            | `-march` value when the build node and the compute node differ.                                                                       |
 | `ENABLE_LTO`                                 | `ON`, `OFF`                                  | `OFF`               | Link-time optimization for Release builds.                                                                                            |
 | `DSMD_ENABLE_NCCL`                           | `ON`, `OFF`                                  | `ON`                | In a CUDA build with an NCCL-enabled dsDecompX, sum the multi-GPU PME grid with NCCL.                                                 |
+| `DSMD_ENABLE_CUFFTMP`                        | `ON`, `OFF`                                  | `OFF`               | CUDA builds: distributed PME with cuFFTMp, selected at run time by `force_calculation.pme_ranks: 2`. libcufftMp replaces libcufft in the link, so it cannot be combined with `ENABLE_LIBTORCH`. |
+| `CUFFTMP_ROOT`                               | path                                         | found from the environment | The `math_libs/<cuda version>` directory of the HPC SDK: `include/cufftmp/cufftMp.h` and `lib64/libcufftMp.so`. |
+| `CUFFTMP_NVSHMEM_ROOT`                       | path                                         | `NVSHMEM_HOME`      | NVSHMEM prefix with `lib/libnvshmem_host.so`. |
 | `FFTW3_INCLUDE_DIR`, `FFTW3_LIBRARY`         | paths                                        | found automatically | Point CMake at a FFTW3 that is not on the default search path.                                                                        |
 | `FFTW3_OMP_LIBRARY`                          | path                                         | found automatically | `libfftw3_omp`.                                                                                                                       |
 | `FFTW3_MPI_INCLUDE_DIR`, `FFTW3_MPI_LIBRARY` | paths                                        | found automatically | `libfftw3_mpi`.                                                                                                                       |
@@ -160,7 +164,10 @@ DeepScaleMD: found libfftw3_omp ...       (or "NOT found")
 DeepScaleMD: found libfftw3_mpi ...       (or "NOT found")  
 DeepScaleMD: NCCL PME grid sum enabled    (or "not built")  
 dsDecompX NCCL support: ...
+DeepScaleMD: cuFFTMp distributed PME enabled (...)    (only with DSMD_ENABLE_CUFFTMP=ON)
 ```
+
+A cuFFTMp build starts NVSHMEM inside cuFFTMp when the first PME step runs. At run time set `NVSHMEM_BOOTSTRAP=MPI`, and across nodes on a Slingshot network also `NVSHMEM_REMOTE_TRANSPORT=libfabric` and `NVSHMEM_LIBFABRIC_PROVIDER=cxi` (a single node does not use libfabric). On the Hangang cluster, `bash build_hangang.sh cuda-cufftmp` configures this build.
 
 ### Make wrapper
 
@@ -178,7 +185,7 @@ cmake -S . -B build/deepscalemd-cuda ... \
 
 ADIOS2 must be built with `-DADIOS2_USE_MPI=ON`, and HDF5 with `--enable-parallel`. A serial HDF5is rejected at configure time. Both options work with either backend. If you ask for `bp` or`h5md` in the input file without having built the writer, `dsMD` stops at start-up and says which CMake option is missing.
 
-### LibTorch MLIP backend
+### LibTorch and PyTorch modes of the MLIP
 
 Activate the Python environment whose `torch` you want to use, then:
 

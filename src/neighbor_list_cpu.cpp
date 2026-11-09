@@ -108,6 +108,10 @@ void SpatialVerletList::prune_active(const ParticleData& particles,
         Real dz = particles.z[i] - particles.z[static_cast<size_t>(j)];
         if (!mpi_box || static_cast<size_t>(j) < local_n) {
             box.apply_minimum_image(dx, dy, dz);
+        } else {
+            // a ghost atom: already image-shifted along a split axis, but a periodic axis this rank does not
+            // split has no ghosts, so a neighbor through that boundary has to be wrapped here
+            box.apply_minimum_image_unsplit(dx, dy, dz);
         }
         return dx * dx + dy * dy + dz * dz < cutoff_sq;
     };
@@ -310,11 +314,21 @@ void SpatialVerletList::build(const ParticleData& particles, const SimulationBox
     const int stencil_size = static_cast<int>(sdx.size());
 
     if (build_tile_graph_) {
+        // Owned atoms and ghost atoms of a cell go into SEPARATE tiles. The tile kernels take the owned lanes of a
+        // tile against every slot of the other tile, so a tile that held both kinds would never evaluate the pairs
+        // (ghost lane, owned slot) of a tile pair that is emitted in this orientation only: owned atoms next to a
+        // subdomain face lost those pairs (energy and force). With pure tiles a (local, ghost) tile pair is
+        // emitted with the local tile first (see the swap below) and a (ghost, ghost) pair is skipped.
+        // The atoms of a cell are in index order, so the owned ones (index < local_N) come first.
+        std::vector<int> cell_local_count(static_cast<size_t>(total_cells), 0);
+        for (size_t i = 0; i < local_N && i < total_N; ++i) ++cell_local_count[static_cast<size_t>(cell_of_[i])];
         std::vector<int> tile_count_of_cell(static_cast<size_t>(total_cells));
         std::vector<int> tile_offset_of_cell(static_cast<size_t>(total_cells) + 1, 0);
         for (int c = 0; c < total_cells; ++c) {
+            const int n_owned = cell_local_count[static_cast<size_t>(c)];
+            const int n_ghost = cell_count[static_cast<size_t>(c)] - n_owned;
             tile_count_of_cell[static_cast<size_t>(c)] =
-                (cell_count[static_cast<size_t>(c)] + kCpuTileSize - 1) / kCpuTileSize;
+                (n_owned + kCpuTileSize - 1) / kCpuTileSize + (n_ghost + kCpuTileSize - 1) / kCpuTileSize;
         }
         for (int c = 0; c < total_cells; ++c) {
             tile_offset_of_cell[static_cast<size_t>(c) + 1] =
@@ -341,13 +355,17 @@ void SpatialVerletList::build(const ParticleData& particles, const SimulationBox
                     cell_atoms[static_cast<size_t>(start + k)];
             }
 
-            kd_split_atoms(scratch_tl.data(), 0, cnt,
-                           px_tile, py_tile, pz_tile);
+            const int n_owned = cell_local_count[static_cast<size_t>(c)];
+            const int owned_tiles = (n_owned + kCpuTileSize - 1) / kCpuTileSize;
+            kd_split_atoms(scratch_tl.data(), 0, n_owned, px_tile, py_tile, pz_tile);        // owned atoms
+            kd_split_atoms(scratch_tl.data(), n_owned, cnt, px_tile, py_tile, pz_tile);      // ghost atoms
 
             for (int k = 0; k < cnt; ++k) {
                 const int atom = scratch_tl[static_cast<size_t>(k)];
-                int tile_idx = base_tile + k / kCpuTileSize;
-                int slot = k % kCpuTileSize;
+                const bool owned = k < n_owned;
+                const int within = owned ? k : (k - n_owned);
+                const int tile_idx = base_tile + (owned ? 0 : owned_tiles) + within / kCpuTileSize;
+                const int slot = within % kCpuTileSize;
                 tile_atoms_[static_cast<size_t>(tile_idx) * kCpuTileSize + static_cast<size_t>(slot)] = atom;
             }
         }
@@ -744,8 +762,14 @@ void SpatialVerletList::build(const ParticleData& particles, const SimulationBox
                 if (apply_index_tiebreak && j < local_n_int && j < i_int) continue;
                 Real ddx = xi - px[j], ddy = yi - py[j], ddz = zi - pz[j];
                 const bool j_is_local = (j < local_n_int);
-                if (can_apply_minimum_image && (!is_mpi_subdomain || j_is_local)) {
-                    box.apply_minimum_image(ddx, ddy, ddz);
+                if (can_apply_minimum_image) {
+                    if (!is_mpi_subdomain || j_is_local) {
+                        box.apply_minimum_image(ddx, ddy, ddz);
+                    } else {
+                        // ghost atom: wrap only the periodic axes this rank does not split (the candidate loop
+                        // above found it through the wrapped cell, and its distance has to follow)
+                        box.apply_minimum_image_unsplit(ddx, ddy, ddz);
+                    }
                 }
                 if (ddx * ddx + ddy * ddy + ddz * ddz < rcut2) {
                     fn(j);

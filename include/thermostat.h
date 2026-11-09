@@ -3,8 +3,10 @@
 
 #include "md_types.h"
 
+#include <mpi.h>
 #include <random>
 #include <stdexcept>
+#include <vector>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -42,6 +44,18 @@ enum class ThermostatType {
 class Thermostat {
 protected:
     Real target_temperature;
+    // Degrees of freedom per particle over 3: (3N - constraints) / (3N) for a system with SHAKE/RATTLE constraints,
+    // 1 otherwise. The Nose-Hoover thermostat holds the kinetic energy at dof/2 kT, so it counts 3 * particles *
+    // dof_fraction_ degrees of freedom (a rank sees its own particles; the fraction is the system's).
+    Real dof_fraction_ = 1.0;
+    // The ranks that share the system (MPI_COMM_SELF: this rank holds all of it). The Nose-Hoover friction xi is one
+    // variable of the whole system, so it is driven by the kinetic energy and the atom count summed over these ranks;
+    // every rank then holds the same xi.
+    MPI_Comm comm_ = MPI_COMM_SELF;
+    int comm_size_ = 1;
+    // Sums the kinetic energy and the particle count over comm_ (collective: every rank of comm_ must call it, also
+    // one with no particles). Does nothing on a single rank.
+    void sum_over_ranks(Real& kinetic_energy, size_t& particle_count) const;
 
 public:
     explicit Thermostat(Real temp) : target_temperature(temp) {}
@@ -49,6 +63,13 @@ public:
 
     virtual void apply(ParticleData& particles, Real dt, size_t local_particles) = 0;
     virtual void set_temperature(Real temp) { target_temperature = temp; }
+    void set_dof_fraction(Real fraction) { dof_fraction_ = fraction; }
+    void set_communicator(MPI_Comm comm);
+    // The internal variables a restart file keeps (Nose-Hoover: the friction xi). Empty for a thermostat that has none
+    // (Langevin and Andersen only draw random numbers, which are not continued). set_restart_state() ignores a vector
+    // of the wrong length.
+    virtual std::vector<Real> restart_state() const { return {}; }
+    virtual void set_restart_state(const std::vector<Real>& state) { (void)state; }
 
 #ifdef USE_CUDA
     virtual void apply_device(Real* d_vx, Real* d_vy, Real* d_vz,
@@ -68,6 +89,8 @@ private:
 
 public:
     NoseHooverThermostat(Real temp, Real mass);
+    std::vector<Real> restart_state() const override { return {xi}; }
+    void set_restart_state(const std::vector<Real>& state) override { if (state.size() == 1) xi = state[0]; }
     void apply(ParticleData& particles, Real dt, size_t local_particles) override;
 };
 
@@ -108,6 +131,8 @@ private:
 
 public:
     NoseHooverThermostatCUDA(Real temp, Real mass);
+    std::vector<Real> restart_state() const override { return {xi}; }
+    void set_restart_state(const std::vector<Real>& state) override { if (state.size() == 1) xi = state[0]; }
     ~NoseHooverThermostatCUDA();
     void apply(ParticleData& particles, Real dt, size_t local_particles) override;
     void apply_device(Real* d_vx, Real* d_vy, Real* d_vz,
@@ -179,6 +204,8 @@ private:
 
 public:
     NoseHooverThermostatSYCL(Real temp, Real mass);
+    std::vector<Real> restart_state() const override { return {xi}; }
+    void set_restart_state(const std::vector<Real>& state) override { if (state.size() == 1) xi = state[0]; }
     void apply(ParticleData& particles, Real dt, size_t local_particles) override;
 };
 

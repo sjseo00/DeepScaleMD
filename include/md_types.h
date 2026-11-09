@@ -69,6 +69,24 @@ struct SimulationBox {
         }
     }
 
+    // Minimum image on the axes this rank does NOT split only. A ghost atom is already image-shifted along a split
+    // axis (dsDecompX sends it that way), but an unsplit periodic axis gets no ghost atoms at all: an owned atom and a
+    // ghost atom that are neighbors through the periodic boundary of that axis differ by about a box length there.
+    inline void apply_minimum_image_unsplit(Real& dx, Real& dy, Real& dz) const {
+        if (periodic_x && !is_split_x()) {
+            if (dx > 0.5 * lx) dx -= lx;
+            else if (dx < -0.5 * lx) dx += lx;
+        }
+        if (periodic_y && !is_split_y()) {
+            if (dy > 0.5 * ly) dy -= ly;
+            else if (dy < -0.5 * ly) dy += ly;
+        }
+        if (periodic_z && !is_split_z()) {
+            if (dz > 0.5 * lz) dz -= lz;
+            else if (dz < -0.5 * lz) dz += lz;
+        }
+    }
+
     inline bool is_split_x() const { return (xhi > xlo) && ((xhi - xlo) < lx - 1e-6); }
     inline bool is_split_y() const { return (yhi > ylo) && ((yhi - ylo) < ly - 1e-6); }
     inline bool is_split_z() const { return (zhi > zlo) && ((zhi - zlo) < lz - 1e-6); }

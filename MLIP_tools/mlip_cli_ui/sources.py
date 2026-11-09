@@ -208,11 +208,12 @@ def collect(mlip: MLIP, python: str, token: Optional[str], gh_token: Optional[st
             if not source.path:
                 found.append(Candidate("use the weights inside the package (no file)", source.label, bundled=True))
             elif not offline:
-                files = list_package_files(python, mlip.package, source.path, mlip)
+                package = source.ref or mlip.package
+                files = list_package_files(python, package, source.path, mlip)
                 if files:
                     found.extend(files)
                 else:
-                    report(f"  ({mlip.package} is not installed in {python}: its bundled checkpoints are not listed)")
+                    report(f"  ({package} is not installed in {python}: its bundled checkpoints are not listed)")
             continue
         if offline:
             continue

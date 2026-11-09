@@ -13,6 +13,7 @@
 - [Force calculation (`force_calculation:`)](#force-calculation-force_calculation)
 - [Machine-learned potentials](#machine-learned-potentials)
 - [Output](#output)
+- [Restart](#restart)
 - [Advanced (`advanced:`)](#advanced-advanced)
 - [Complete examples](#complete-examples)
 - [Limitations](#limitations)
@@ -102,12 +103,14 @@ With a barostat the box changes during the run.
 |---|---|---|---|---|
 | `timestep` | number | required | fs | Integration step. |
 | `total_steps` | integer | required | | Number of MD steps. Must be positive. |
-| `target_temperature` | number | required | K | Target temperature. Also used for the initial velocities, and for the minimizer's velocity reset. Must not be negative. |
+| `target_temperature` | number | required | K | Target temperature. Also used for the initial velocities (Maxwell–Boltzmann: each component Gaussian with variance `kT/m`, centre-of-mass motion removed, scaled to `3N - 3` degrees of freedom), and for the minimizer's velocity reset. With constraints one RATTLE projects the velocities onto the constraints before step 0, so the printed `T` (which divides by `3N - constraints`) is the target from step 0 on. Must not be negative. |
 | `integrator` | `velocity_verlet`, `leap_frog` (`leapfrog`) | `velocity_verlet` | | `verlet`, and any unknown name, falls back to `velocity_verlet`. `r_respa` is rejected. SHAKE/RATTLE constraints need `velocity_verlet`. |
 | `thermostat` | `none`, `langevin`, `nose_hoover`, `andersen` | `none` | | Thermostat. Any other value (including `berendsen`) gives no thermostat, without an error. |
 | `tau_t` (alias `thermostat_damping`) | number | `100.0` | fs | Thermostat time constant. Langevin friction is `1/tau_t`, Andersen collision rate is `1/tau_t`, and Nosé–Hoover uses `tau_t` as its relaxation time. Must be positive when a thermostat is on. A warning is printed (and lost in the start-up block) if it is below 10 timesteps. |
-| `barostat` | `none`, `berendsen`, `parrinello_rahman`, `andersen` | `none` | | Barostat. `parrinello_rahman` is the isotropic Langevin piston. Any other value gives no barostat. |
-| `target_pressure` | number | `1.0` | bar | Target pressure. |
+| `barostat` | `none`, `berendsen`, `parrinello_rahman`, `andersen` | `none` | | Barostat. `parrinello_rahman` is the Langevin piston. Any other value gives no barostat. |
+| `barostat_coupling` | `isotropic`, `anisotropic`, `semiisotropic` | `isotropic` | | `isotropic` scales all three box lengths by one factor from the pressure (trace of the pressure tensor). `anisotropic` scales each axis of `barostat_axes` on its own from its own pressure `P_aa`; the other axes keep their length. `semiisotropic` (lipid membranes) scales the two in-plane axes named in `barostat_axes` together from `(P_xx + P_yy) / 2` and the normal axis on its own from `P_zz`. Both need the diagonal of the virial tensor: the CUDA and CPU force calculators give it, and an MLIP with `mlip_backend: libtorch` or `pytorch` (a model with edge shifts must be converted with the diagonal, metadata `virial_diagonal`; older folders stop with that message). Not with `mlip_backend: ase` or SYCL. |
+| `barostat_axes` | any of `x`, `y`, `z` (`z`, `x y`, `xyz`) | `xyz` | | Anisotropic: the axes the barostat scales, for example `z` for a membrane normal to z. Semi-isotropic: the two in-plane axes (`x y` for a membrane normal to z; the default `xyz` means `x y`); all three are scaled. Each scaled axis must be periodic. Other than `xyz` it needs `barostat_coupling: anisotropic` or `semiisotropic`. |
+| `target_pressure` | number | `1.0` | bar | Target pressure, the same for every coupled axis. |
 | `tau_p` (alias `barostat_damping`) | number | `1000.0` | fs | Barostat time constant (piston period for `parrinello_rahman`). For `parrinello_rahman` it must be at least 10 timesteps. |
 | `tau_p_decay` (alias `langevin_piston_decay`) | number | `tau_p / 2` | fs | `parrinello_rahman` only: piston friction time. Must be at least 10 timesteps. |
 | `langevin_piston_temp` | number | `target_temperature` | K | `parrinello_rahman` only: temperature of the piston noise. |
@@ -152,15 +155,15 @@ again at `target_temperature`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `mode` (long form `force_calculation_mode`) | `builtin`, `python`, or a comma list such as `builtin, python` | `builtin` | `builtin` is the classical force field. `python` turns the machine-learned potential on, and a built-in force field only stays on when `builtin` is also listed. The MLIP implementation is chosen by `mlip_backend`. `libtorch` is not a valid mode; use `mode: python` with `mlip_backend: libtorch`. |
-| `type` (long form `force_calculation_type`) | comma list of `bonds`, `angles`, `dihedrals`, `lj`, `coulomb` | all terms | Which built-in terms to compute. `bond`, `angle`, `dihedral`, `lennard_jones`, `LJ`, `PME`, and `electrostatic` are accepted as alternate spellings. When `type` is given, every term not listed is off. Impropers and special (1-4) pairs follow the `dihedrals` and `lj`/`coulomb` terms respectively. In Python MLIP mode, with no `mlip_config.model_type`, `type` is used as the model type. |
+| `mode` (long form `force_calculation_mode`) | `builtin`, `mlip`, or a comma list such as `builtin, mlip` | `builtin` | `builtin` is the classical force field. `mlip` turns the machine-learned potential on, and a built-in force field only stays on when `builtin` is also listed. The way the model runs is chosen by `mlip_backend`. `ase`, `libtorch` and `pytorch` are not valid modes; use `mode: mlip` with `mlip_backend: libtorch` (for example). |
+| `type` (long form `force_calculation_type`) | comma list of `bonds`, `angles`, `dihedrals`, `lj`, `coulomb` | all terms | Which built-in terms to compute. `bond`, `angle`, `dihedral`, `lennard_jones`, `LJ`, `PME`, and `electrostatic` are accepted as alternate spellings. When `type` is given, every term not listed is off. Impropers and special (1-4) pairs follow the `dihedrals` and `lj`/`coulomb` terms respectively. In ASE mode, with no `mlip_config.model_type`, `type` is used as the model type. |
 | `enable_bonds`, `enable_angles`, `enable_dihedrals`, `enable_lennard_jones`, `enable_coulomb` | `true`/`false` | `true` | Per-term switches. Used only when `type` is not given. |
 | `precision` | `double`, `mixed` | `double` | `mixed` does the Lennard-Jones and real-space Ewald pair math in single precision and accumulates forces, energy, and virial in double. It is faster; check energy conservation for your system before production runs. |
 | `nonbonded_kernel` | `tiled`, `graph`, `list` | `tiled` | Pair-force kernel layout. `list` is the fastest on GPU but needs `precision: mixed`, built-in Lennard-Jones/PME, and a 12-6 potential; when it cannot be used `dsMD` falls back to `tiled`. On CPU, `list` runs as `tiled`. |
 | `electrostatics_solver` | `pme`, `fmm` | `pme` | `fmm` is a placeholder and stops with an error. |
 | `pme_grid_spacing` | number (Å) | automatic | Target PME mesh spacing. `0` or unset means automatic: the smaller of 1.2 Å and `0.4 / alpha`, where `alpha` is chosen from the cutoff for a 1e-5 relative error. The grid size is rounded up to an FFT-friendly size. |
 | `pme_cluster_spread` | `true`/`false` | `false` | GPU only: use a thread-block-cluster charge-spreading kernel. Takes effect only on compute capability 9.0 or higher, and is unverified on real Hopper hardware. |
-| `pme_ranks` | integer | `0` | Number of MPI ranks dedicated to the reciprocal-space PME work (a PP/PME rank split). `0` means every rank does both. Must be smaller than the total rank count. Values above 1 need an FFTW build with `libfftw3_mpi` (a PME group of exactly one rank runs on the GPU in CUDA builds, larger groups on the CPU). |
+| `pme_ranks` | integer | `0` | Number of MPI ranks dedicated to the reciprocal-space PME work (a PP/PME rank split). `0` means every rank does both. Must be smaller than the total rank count. Values above 1 need an FFTW build with `libfftw3_mpi` (a PME group of exactly one rank runs on the GPU in CUDA builds, larger groups on the CPU). **Exception:** in a CUDA build configured with `-DDSMD_ENABLE_CUFFTMP=ON`, `pme_ranks: 2` selects the distributed GPU solve instead: no rank is reserved, every rank spreads its own charges, the grid is cut into slabs and solved with a cuFFTMp FFT over all ranks (needs `precision: mixed`, CUDA-aware MPI and at least as many x and y grid planes as ranks; otherwise the usual replicated solve runs and rank 0 says why). It is meant for several nodes; a single node keeps using `0`. See [Technical note](08_Technical_Note.md) 9.3. |
 
 The PME interpolation order is 4 and is not configurable. The force-field functional forms and
 what each term does are in [Classical MD](05_Classical_MD.md).
@@ -172,18 +175,22 @@ completeness.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `mlip_backend` | `python`, `libtorch` | `python` | `python` calls a Python adapter in an embedded interpreter (CPU or CUDA). `libtorch` runs a converted model from C++ and needs a CUDA build configured with `-DENABLE_LIBTORCH=ON`. |
-| `mlip_model` | path | none | `libtorch` only (required): the converted model folder. |
-| `python_mlip_path` | path | `mlip_python` | `python` only: the folder with `ml_forces.py`. Relative to the directory you start `dsMD` in. |
+| `mlip_backend` | `ase`, `libtorch`, `pytorch` | `ase` | `ase` calls the model package's ASE calculator through an adapter in an embedded interpreter (CPU or CUDA). `libtorch` runs a converted TorchScript or AOTI model from C++ and needs a CUDA build configured with `-DENABLE_LIBTORCH=ON`. `pytorch` runs a model folder converted with `--backend pytorch` as Python in the embedded interpreter and needs the same CUDA build with `-DENABLE_PYTHON=ON`. |
+| `mlip_model` | path | none | `libtorch` and `pytorch` only (required): the converted model folder. It has to be one for the chosen `mlip_backend`. |
+| `mlip_kspace` | `none`, `pme` | `none` | `pme` for a model converted with `--kspace pme` (SO3LR): dsMD computes the reciprocal (k-space) sums of the model's charges with smooth PME. Required for such a folder and refused for any other (dsMD stops at start-up when the input and the folder's `metadata.json` "kspace" disagree). Needs a box periodic along x, y and z and `mlip_backend: libtorch` or `pytorch`. |
+| `mlip_kspace_grid_spacing` | Å | the folder's (`metadata.json` "kspace", 2.0) | Largest spacing of the electrostatic PME grid (the grid size per axis is the smallest product of 2, 3, 5, 7 at least box / spacing and 2 x order). Smaller is more accurate and slower. |
+| `mlip_kspace_dispersion_grid_spacing` | Å | the folder's (3.0) | The same for the dispersion grid. |
+| `mlip_kspace_order` | `4`, `6` | the folder's (4) | B-spline order of the PME interpolation. |
+| `python_mlip_path` | path | `mlip_python` | `ase` only: the folder with `ml_forces.py`. Relative to the directory you start `dsMD` in. |
 | `mlip_elements:` (section) | `type name: element` lines | automatic | Names the chemical element of each atom type when `dsMD` cannot tell. See [MLIP](06_MLIP.md#which-element-is-each-atom-type). `mlip_type_to_z` is no longer accepted and stops the run. |
-| `mlip_config:` (section; alias `mace_config`) | | | Settings for `mlip_backend: python`. Keys below. |
+| `mlip_config:` (section; alias `mace_config`) | | | Settings for `mlip_backend: ase`. Keys below. |
 | `mlip_config.model_path` | path | none | Model file for the adapter. |
 | `mlip_config.model_type` | text | `force_calculation.type` | Adapter name, such as `mace_mp`. |
 | `mlip_config.model_size` | text | `small` | Size variant, for adapters that have one. |
 | `mlip_config.device` | `cpu`, `cuda` | `cpu` | Device the model runs on. In a CUDA build any value other than `cpu` means `cuda`. |
 | `mlip_config.dtype` | text | `float32` | Model precision. |
 | `mlip_config.<other>` | text | | Any other key under `mlip_config` is passed to the adapter as a keyword argument. |
-| `advanced.tf32` | boolean | `false` | `libtorch` only: allow TF32 matrix products in the model. Ignored with a message for `python`. |
+| `advanced.tf32` | boolean | `false` | `libtorch` and `pytorch` only: allow TF32 matrix products in the model. Ignored with a message for `ase`. |
 
 ## Output
 
@@ -191,11 +198,49 @@ completeness.
 |---|---|---|---|
 | `output_prefix` | text | `md_output` | Start of every trajectory file name. May contain a folder path (the folder must exist). |
 | `output_freq` | integer | `10` | Steps between status lines on screen. `0` turns them off. |
-| `output_info` | comma list | `STEP, T, KE` | Fields of each status line, in order: `STEP`, `T`, `KE`, `PE`, `ETOTAL`, `P` (or `PRESS`), `MAX_SPEED`, `AVG_SPEED`, `FMAX`. An unknown token is ignored with a warning on stderr; with no valid token, `STEP, T, KE` is used. `FMAX`, `MAX_SPEED`, and `AVG_SPEED` need a pass over all atoms and slow the steps they are printed on. |
+| `output_info` | comma list | `STEP, T, KE` | Fields of each status line, in order: `STEP`, `T`, `KE`, `PE`, `ETOTAL`, `P` (or `PRESS`), `PXX`, `PYY`, `PZZ` (the diagonal of the pressure tensor, in bar; they switch on the virial tensor, so they are not available with an MLIP or SYCL), `BOX` (the box lengths in A), `MAX_SPEED`, `AVG_SPEED`, `FMAX`. An unknown token is ignored with a warning on stderr; with no valid token, `STEP, T, KE` is used. `FMAX`, `MAX_SPEED`, and `AVG_SPEED` need a pass over all atoms and slow the steps they are printed on. |
 | `trajectory_output_freq` | integer | `100` | Steps between trajectory frames. `0` turns trajectory output off. Step 0 is written when the step number is a multiple of this. |
 | `trajectory_format` | comma list of `xyz`, `dump`, `dcd`, `bp`, `h5md` | `xyz` | Trajectory formats, one or more. `both` is the old name for `xyz, dump`. `bp` and `h5md` need the matching CMake option at build time. |
 | `trajectory_include_velocities` | `true`/`false` | `false` | Write velocities (`xyz`, `dump`, `bp`, `h5md`). |
 | `trajectory_include_forces` | `true`/`false` | `false` | Write forces (`xyz`, `dump`, `bp`, `h5md`). |
+
+## Restart
+
+A run can write a restart file and a later run can start from it.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `restart_output_freq` | integer | `0` | Steps between restart files. The last step of the run is written as well. `0` writes no restart file. |
+| `restart_output` | path | `<output_prefix>.restart` | Restart file to write. Each write replaces the previous one. The file is first written under a temporary name and then renamed, so a job killed during the write leaves the old file intact. |
+| `restart_file` | path | none | Start from this restart file. |
+
+A restart file holds the step number, the box lengths, the positions and velocities of all atoms,
+and the internal state of the Nosé–Hoover thermostat and the Parrinello–Rahman barostat. It does
+not depend on the number of MPI ranks or GPUs, so the next run may use a different number.
+
+With `restart_file` set:
+
+- The positions and velocities come from the restart file. No new velocities are drawn and
+  `minimize:` is skipped.
+- The box comes from the restart file. The YAML `box_x`, `box_y`, `box_z` are not used, so an NPT
+  run continues with the box it reached.
+- The step count continues. `total_steps` is the number of steps to run now: a restart at step
+  10000 with `total_steps: 5000` runs steps 10001 to 15000.
+- `coordinate_file` (or `input_system`) is still required. It gives the atom order and the
+  element names, and must have the same number of atoms as the restart file.
+- The topology, force field and all other settings come from the YAML file as usual. The
+  thermostat or barostat state is used only when the same type is selected again.
+- Random numbers (Langevin, Andersen, piston noise) start a new sequence. A stochastic run
+  continues correctly but not bit for bit.
+
+Trajectory files whose name has no step number in it (`dcd`, `bp`, `h5md`) are written again
+from the start. Give the restarted run a different `output_prefix` to keep the old ones.
+
+```yaml
+restart_file: run1.restart
+output_prefix: run2
+restart_output_freq: 10000
+```
 
 ## Advanced (`advanced:`)
 
@@ -303,7 +348,8 @@ MLIP examples are in [MLIP](06_MLIP.md).
 - `builtin_forcefield:` sections in old inputs are ignored.
 - Thermostat `berendsen` and the integrators `verlet` (as a distinct method) and `r_respa` are not
   available; see the table above for what happens with each.
-- Barostat support is isotropic only. There is no anisotropic or semi-isotropic coupling.
+- Barostat coupling is isotropic, anisotropic (each axis of `barostat_axes` scaled on its own) or semi-isotropic (two
+  in-plane axes together, the normal on its own). There is no per-axis target pressure (no surface tension) and no shear.
 - The box is orthorhombic. There are no tilted cells.
 - `force_calculation.pme_ranks` greater than 0 is an advanced mode. Check one-rank against
   many-rank energies on your own system before relying on it.

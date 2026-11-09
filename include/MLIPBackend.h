@@ -1,9 +1,10 @@
 #ifndef MLIP_BACKEND_H
 #define MLIP_BACKEND_H
 
-// No LibTorch headers here: MD code and PythonBackend must build without LibTorch.
+// No LibTorch headers here: MD code and AseBackend must build without LibTorch.
 
 #include "MLIPHaloTransport.h"
+#include "MLIPKspace.h"
 #include "MLIPRankComm.h"
 
 #include <cstdint>
@@ -34,9 +35,10 @@ struct MLIPInputs {
     int64_t n_edges = 0;
     cudaStream_t stream = nullptr;            // ForceCalculatorCUDA force_stream
     bool host_memory = false;                 // d_* pointers (and MLIPOutputs) are host memory: CPU calculator
-    double cell[3] = {0.0, 0.0, 0.0};         // orthorhombic box lengths (A); used by PythonBackend
-    bool pbc[3] = {false, false, false};      // periodic flags; used by PythonBackend
+    double cell[3] = {0.0, 0.0, 0.0};         // orthorhombic box lengths (A); used by AseBackend
+    bool pbc[3] = {false, false, false};      // periodic flags; used by AseBackend
     MLIPHaloTransport* halo = nullptr;        // how a layer-exchange model (exchanges_layers()) moves node features between the ranks
+    MLIPKspaceContext* kspace = nullptr;      // box, grid and grid sum of the k-space sums of a model with kspace_settings()
                                               // (the MD's halo exchange); nullptr = no ghost atoms to exchange with (one rank, or the
                                               // replicated step)
 };
@@ -51,10 +53,12 @@ struct MLIPOutputs {
     double  energy = 0.0;                     // owned-atom energy sum, valid if need_energy
     double  virial = 0.0;                     // sum of r.F over the atoms the model saw plus the edge-shift term (kcal/mol); only
     bool    has_virial = false;               // set (with need_energy) by a backend that returns it, i.e. one with edge shifts
+    double  virial_diag[3] = {0.0, 0.0, 0.0}; // its diagonal W_xx, W_yy, W_zz (they sum to virial); only
+    bool    has_virial_diag = false;          // set by a model with edge shifts that returns it (metadata virial_diagonal)
 };
 
-// The former mlip_config section keys (docs/04): everything the Python MLIP path takes.
-struct PythonMLIPConfig {
+// The former mlip_config section keys (docs/04): everything the ASE mode (mlip_backend: ase) takes.
+struct AseMLIPConfig {
     std::string module_path = "MLIP_tools/mlip_python";  // python_mlip_path: the directory with ml_forces.py (relative to the working directory, or absolute)
     std::string model_path;                   // mlip_config.model_path
     std::string model_type;                   // mlip_config.model_type, or force_calculation.type if empty
@@ -65,37 +69,50 @@ struct PythonMLIPConfig {
 };
 
 struct MLIPConfig {
-    std::string backend;                      // "python" | "libtorch"
-    std::string model_path;                   // converted model folder (libtorch)
+    std::string backend;                      // "ase" | "libtorch" | "pytorch"
+    std::string model_path;                   // converted model folder (libtorch, pytorch)
     std::vector<int> type_to_z;               // MD type id -> atomic number
     bool verbose = false;                     // print progress messages (MPI rank 0 only)
     bool allow_tf32 = false;                  // libtorch: float32 matrix products on the TF32 tensor cores (advanced.tf32); faster, ~10 bits
                                               // of mantissa in the products; needs an Ampere or newer GPU
-    PythonMLIPConfig python;                  // used when backend == "python"
-    MLIPRankComm* comm = nullptr;             // the other MPI ranks (not owned); nullptr = a single process. PythonBackend uses it
-                                              // on several ranks: every rank then computes all atoms (see PythonBackend.h)
+    AseMLIPConfig ase;                        // used when backend == "ase"
+    MLIPRankComm* comm = nullptr;             // the other MPI ranks (not owned); nullptr = a single process. AseBackend uses it
+                                              // on several ranks: every rank then computes all atoms (see AseBackend.h)
 };
 
 class MLIPBackend {
 public:
     virtual ~MLIPBackend() = default;
     virtual void compute(const MLIPInputs& in, MLIPOutputs& out) = 0;
-    virtual double cutoff() const = 0;        // neighbor-list cutoff (A); 0 = not applicable (PythonBackend)
+    virtual double cutoff() const = 0;        // neighbor-list cutoff (A); 0 = not applicable (AseBackend)
     virtual double ghost_cutoff() const = 0;  // ghost depth without skin (A); 0 = keep MD's own halo width
     // True: the model takes periodic images as edge shifts (MLIPInputs::d_edge_shift) and gives the virial, so the MD side
     // does not copy atoms across the periodic boundary for it.
     virtual bool uses_edge_shifts() const { return false; }
+    // True: a model with edge shifts returns the diagonal of the virial tensor (metadata virial_diagonal), which anisotropic and
+    // semi-isotropic barostats need. A model without edge shifts needs nothing for it: the MD sums r_a F_a over the atoms itself.
+    virtual bool gives_virial_diagonal() const { return false; }
     // 0 or 1: the row of the edge list that the model sums its messages onto, so the MD can leave out the edges that cannot change
     // the energy of the owned atoms (EdgeBuilder::Prune); -1 = not known, every edge is kept.
     virtual int edge_receiver_row() const { return -1; }
     // True: the model exchanges node features between its layers (metadata layer_exchange). The MD then gives it ghost atoms only
     // one cutoff deep, builds edges onto owned atoms only (MLIPStepGeometry::owned_receivers_only), and sets MLIPInputs::halo.
     virtual bool exchanges_layers() const { return false; }
+    // True: the model's energy is not a sum of local terms, it reads the whole system at once (metadata whole_system: ORB's energy
+    // head averages the node features of all atoms). With several ranks the MD then always runs it replicated (MDSystem::mlip_replicated):
+    // every rank computes all atoms.
+    virtual bool needs_whole_system() const { return false; }
+    // The model's k-space terms (metadata "kspace", so3lr --kspace pme): nullptr or disabled for every other model. The MD then sets
+    // MLIPInputs::kspace for every call (MLIPKspaceHost).
+    virtual const MLIPKspaceSettings* kspace_settings() const { return nullptr; }
 };
 
-// Defined in MLIPBackendFactory.cpp. An empty cfg.backend means "python".
-// validate_mlip_config() throws std::runtime_error for an unknown backend, for 'libtorch' in a build without
-// LibTorch (CPU/SYCL builds, or CUDA builds without ENABLE_LIBTORCH), and for incomplete libtorch settings.
+// Defined in MLIPBackendFactory.cpp. The way the model is run (mlip_backend):
+//   ase      the ASE calculator of the model's package, called from the embedded Python (AseBackend; no conversion)
+//   libtorch a converted TorchScript or AOTI file, run by LibTorch in C++ (LibTorchBackend)
+//   pytorch  a model folder converted with --backend pytorch, run as Python by the embedded interpreter (LibTorchBackend)
+// An empty cfg.backend means "ase". validate_mlip_config() throws std::runtime_error for an unknown backend, for 'libtorch' and
+// 'pytorch' in a build without LibTorch (CPU/SYCL builds, or CUDA builds without ENABLE_LIBTORCH), and for incomplete settings.
 // create_mlip_backend() validates first, then constructs the backend.
 void validate_mlip_config(const MLIPConfig& cfg);
 std::unique_ptr<MLIPBackend> create_mlip_backend(const MLIPConfig& cfg);

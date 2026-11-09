@@ -1,4 +1,4 @@
-"""NequIP and Allegro (a compiled .nequip.pt2 / .pth file): an adapter of the Python MLIP mode (registered in adapters/__init__.py)."""
+"""NequIP and Allegro (a compiled .nequip.pt2 / .pth file): an adapter of the ASE mode (registered in adapters/__init__.py)."""
 from __future__ import annotations
 
 import os

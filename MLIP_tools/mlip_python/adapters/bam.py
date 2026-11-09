@@ -1,4 +1,4 @@
-"""BAM (bam_torch, RACE): an adapter of the Python MLIP mode (registered in adapters/__init__.py)."""
+"""BAM (bam_torch, RACE): an adapter of the ASE mode (registered in adapters/__init__.py)."""
 from __future__ import annotations
 
 import os

@@ -8,6 +8,32 @@
 #include <cstdlib>
 #include <mpi.h>
 #include <omp.h>
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+#ifdef USE_CUDA
+// A GPU-aware MPI (Cray MPICH GTL) starts its GPU transport on the CURRENT device inside MPI_Init. The ranks pick their
+// GPU only later, so every rank started on device 0 and the library printed "not using the same device it did during
+// gtl_init ... IPC is disabled" once a rank moved to its own GPU: the intra-node transfers then lost the IPC path.
+// Choose the GPU first from the node-local rank the launcher provides (the same rule the force calculator applies
+// afterwards: local rank modulo the number of visible GPUs).
+static void select_gpu_before_mpi_init() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
+        (void)cudaGetLastError();
+        return;
+    }
+    const char* names[] = {"SLURM_LOCALID", "PMI_LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "MV2_COMM_WORLD_LOCAL_RANK"};
+    for (const char* name : names) {
+        const char* value = std::getenv(name);
+        if (value && *value) {
+            (void)cudaSetDevice(std::atoi(value) % count);
+            return;
+        }
+    }
+}
+#endif
 
 void parse_arguments(int argc, char* argv[], std::string& config_file) {
     config_file = "input.yaml";  // Default config file
@@ -30,6 +56,9 @@ int main(int argc, char* argv[]) {
     parse_arguments(argc, argv, config_file);
     
     int provided;
+#ifdef USE_CUDA
+    select_gpu_before_mpi_init();
+#endif
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     
     initialize_mpi_utils();

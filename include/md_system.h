@@ -21,17 +21,17 @@ public:
     // string copy nor a map lookup per term is needed on a rebuild.
     struct LocalBond {
         size_t atom1, atom2;
-        const std::string* type;
+        int type;   // id of the parameter name in the Topology
         Real k, r0;
     };
     struct LocalAngle {
         size_t atom1, atom2, atom3;
-        const std::string* type;
+        int type;   // id of the parameter name in the Topology
         Real k, theta0;
     };
     struct LocalDihedral {
         size_t atom1, atom2, atom3, atom4;
-        const std::string* type;
+        int type;   // id of the parameter name in the Topology
         Real k, phi0;
         int n;
     };
@@ -58,6 +58,7 @@ private:
     Real verlet_skin_ = 2.0;
     Real mlip_ghost_depth_ = 0.0;   // set when an MLIP that needs real ghost atoms (libtorch) is selected
     bool mlip_replicated_ = false;  // a subdomain is narrower than the MLIP's ghost layer: every rank computes all atoms
+    bool mlip_whole_system_ = false;   // the MLIP reads the whole system at once (MLIPBackend::needs_whole_system): always replicated
     bool builtin_forces_enabled_ = true;   // force_calculation.mode has "builtin" (the classical short-range kernels run)
     bool mlip_replicated_reported_ = false;
 
@@ -105,6 +106,16 @@ private:
     std::vector<char> bond_ok_all_, angle_ok_all_, dihedral_ok_all_, improper_ok_all_;
     std::vector<int> bonded_slot_scratch_;   // global id -> local slot, reused between rebuilds
     void ensure_bonded_parameter_cache();
+    // Constraint clusters: the connected components of the constraint graph (a water molecule, a CH3 group with
+    // its three C-H constraints, ...), the unit SHAKE and RATTLE solve together. A rank holds every constraint of
+    // every cluster that has an atom it owns (the cluster's other atoms are its ghosts), so that two ranks that share
+    // a cluster each solve all of it and agree on the owned atoms; see refresh_local_bonded_topology().
+    // constraint_cluster_of_atom_[global id] = cluster id or -1; constraint_cluster_of_term_[term] = cluster id.
+    bool constraint_clusters_ready_ = false;
+    size_t constraint_cluster_count_ = 0;
+    std::vector<int> constraint_cluster_of_atom_;
+    std::vector<int> constraint_cluster_of_term_;
+    void ensure_constraint_clusters();
     friend class ForceCalculatorCUDA;  // builds the local bonded lists on the GPU from the caches above
     // true (CUDA): the local lists hold every term that touches an owned atom, because the
     // kernels apply forces to owned atoms only. false: only terms owned by the lower-id
@@ -176,7 +187,7 @@ public:
     Real get_physical_cutoff() const { return physical_cutoff; }
     void set_physical_cutoff(Real cutoff) { physical_cutoff = cutoff; }
     void set_verlet_skin(Real skin) { verlet_skin_ = skin; }
-    // False for an MLIP-only run (mode: python): no classical short-range kernel runs, so the warning about ghost images that
+    // False for an MLIP-only run (mode: mlip): no classical short-range kernel runs, so the warning about ghost images that
     // are received twice (warn_if_domain_narrower_than_two_halos) does not apply: the MLIP edge search uses the real positions
     // of the atoms and images, no minimum-image convention, and the two copies of an atom are different periodic images.
     void set_builtin_forces_enabled(bool enabled) { builtin_forces_enabled_ = enabled; }
@@ -185,6 +196,9 @@ public:
     // the force cutoff. Re-applies the halo width right away. 0 (the default) leaves the halo to the force cutoff, so
     // runs without such an MLIP are unchanged.
     void set_mlip_ghost_depth(Real depth);
+    // An MLIP whose energy reads the whole system at once (MLIPBackend::needs_whole_system) is never split: with several ranks it
+    // always runs replicated. Takes effect at the next decomposition update (set it before the first one).
+    void set_mlip_whole_system(bool whole) { mlip_whole_system_ = whole; }
     // Halo width in A: the larger of the force cutoff and the MLIP depth, plus the Verlet skin and a margin. When the MLIP's
     // ghost layer does not fit into the subdomains (mlip_replicated()) the MLIP takes no ghosts from the halo, so the depth
     // does not count.
@@ -221,6 +235,9 @@ public:
     }
 
     void sync_decomposition_domain();
+    // NPT between halo plan rebuilds: the decomposition takes the current box but keeps its halo plan, so the next
+    // halo refresh puts the ghosts of a periodic face at the image shift of this box (not of the last rebuild's box).
+    void rescale_decomposition_domain();
     void warn_if_domain_narrower_than_two_halos(Real halo_width);
     void invalidate_halo_cache();
     void refresh_local_bonded_topology();
@@ -243,8 +260,10 @@ public:
     void redistribute_particles_after_scale();
 
 #ifdef USE_CUDA
+    // positions_only (a reused plan only): send just the ghost positions; false also refreshes the ghosts'
+    // velocities (the constraint solver needs them before RATTLE). The same value on every rank.
     bool exchange_halo_on_device(class ForceCalculatorCUDA& calculator,
-                                 bool rebuild_halo);
+                                 bool rebuild_halo, bool positions_only = true);
     // Whether the last device halo exchange refreshed its plan in place. Same
     // value on every rank, so callers may use it to skip a collective.
     bool last_device_halo_plan_reused() const { return last_device_halo_plan_reused_; }

@@ -1,8 +1,9 @@
 """The menu flow:  MLIP -> what to do -> model file -> options -> output folder -> run.
 
 What to do is either
-  convert  run  python -m mlip_convert <arch> ...  (model.pt / model.pt2 + metadata.json + reference.json, for mlip_backend: libtorch)
-  python   get the model file and write the mlip_config block for  mlip_backend: python
+  convert  run  python -m mlip_convert <arch> ...  (model.pt / model.pt2 + metadata.json + reference.json, for mlip_backend: libtorch; --backend pytorch: no model file,
+           for mlip_backend: pytorch)
+  ase      get the model file and write the mlip_config block for  mlip_backend: ase
 The conversion itself is mlip_convert, unchanged: this program only asks the questions and types the command.
 """
 import argparse
@@ -21,7 +22,9 @@ from .catalog import MLIP, MLIPS
 from .sources import (Candidate, SourceError, collect, fetch, human_size, list_hf, search_hf)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKENDS = {"torchscript": "TorchScript (model.pt, the default)", "aoti": "AOTInductor (model.pt2, compiled for one GPU)"}
+BACKENDS = {"torchscript": "TorchScript (model.pt, the default; run with mlip_backend: libtorch)",
+            "aoti": "AOTInductor (model.pt2, compiled for one GPU; run with mlip_backend: libtorch)",
+            "pytorch": "PyTorch (no model file: dsMD's embedded Python runs the model as it is, without TorchScript; run with mlip_backend: pytorch)"}
 HF_ID = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
 
 
@@ -67,7 +70,8 @@ def package_installed(python: str, module: str) -> bool:
 def step_mlip(st: State, cfg: Settings) -> bool:
     items = []
     for m in MLIPS.values():
-        modes = ("LibTorch + Python" if m.convert_arch and m.python_type else "LibTorch only" if m.convert_arch else "Python MLIP only")
+        modes = " + ".join(_modes(m))
+        modes = modes if modes != "ASE" else "ASE mode only"
         if m.layer_exchange:
             modes += ", layer exchange for several GPUs"
         items.append((m.title, modes))
@@ -77,16 +81,28 @@ def step_mlip(st: State, cfg: Settings) -> bool:
     return True
 
 
+def _modes(m: MLIP) -> List[str]:
+    """The dsMD modes the MLIP can run in: LibTorch (a TorchScript or AOTI folder), PyTorch, ASE."""
+    modes = []
+    if m.convert_arch and ({"torchscript", "aoti"} & set(m.backends)):
+        modes.append("LibTorch")
+    if m.convert_arch and "pytorch" in m.backends:
+        modes.append("PyTorch")
+    if m.python_type:
+        modes.append("ASE")
+    return modes
+
+
 def step_action(st: State, cfg: Settings) -> Optional[bool]:
     m = st.mlip
     if m.convert_arch and m.python_type:
         pick = ui.choose("What do you want to do?", [
-            ("Convert to a LibTorch model folder", "model.pt + metadata.json + reference.json   (mlip_backend: libtorch)"),
-            ("Get the model file for the Python MLIP mode", "download + write the mlip_config block   (mlip_backend: python)")], default=0)
-        st.action = ("convert", "python")[pick]
+            ("Convert to a model folder", "model.pt + metadata.json + reference.json   (mlip_backend: libtorch, or pytorch)"),
+            ("Get the model file for the ASE mode", "download + write the mlip_config block   (mlip_backend: ase)")], default=0)
+        st.action = ("convert", "ase")[pick]
         return True
-    st.action = "convert" if m.convert_arch else "python"
-    print(ui.dim(f"  only possible here: {'convert to LibTorch' if m.convert_arch else 'Python MLIP mode'}"))
+    st.action = "convert" if m.convert_arch else "ase"
+    print(ui.dim(f"  only possible here: {'convert to a model folder' if m.convert_arch else 'ASE mode'}"))
     return None
 
 
@@ -210,6 +226,14 @@ def _elements_ok(text: str) -> Optional[str]:
     return None if values and all(1 <= v <= 118 for v in values) else "atomic numbers between 1 and 118"
 
 
+def _composition_ok(text: str) -> Optional[str]:
+    return None if re.fullmatch(r"\s*([A-Z][a-z]?\d*)+\s*", text) else "a formula with counts, e.g. H2000O1000"
+
+
+def _integer_ok(text: str) -> Optional[str]:
+    return None if not text.strip() or re.fullmatch(r"\s*-?\d+\s*", text) else "a whole number"
+
+
 def _extra_ok(layered: bool) -> Callable[[str], Optional[str]]:
     def check(text: str) -> Optional[str]:
         if layered and "--no-edge-shifts" in text:
@@ -218,12 +242,20 @@ def _extra_ok(layered: bool) -> Callable[[str], Optional[str]]:
     return check
 
 
+def _accel_note(accel: str) -> str:
+    if accel == "e3nn":
+        return "no extra package"
+    if accel == "so3lr_fused":
+        return "built from src/ with the CUDA toolkit (nvcc, ninja) when converting; needs a GPU"
+    return "needs its package and a GPU"
+
+
 def step_options(st: State, cfg: Settings) -> Optional[bool]:
     m = st.mlip
     o = st.options
     o.clear()
     if st.action != "convert":
-        pick = ui.choose("Device the Python MLIP runs on", [("cuda", ""), ("cpu", "")], default=0)
+        pick = ui.choose("Device the ASE mode runs on", [("cuda", ""), ("cpu", "")], default=0)
         o["device"] = ("cuda", "cpu")[pick]
         pick = ui.choose("Precision", [("float32", "faster"), ("float64", "")], default=0)
         o["dtype"] = ("float32", "float64")[pick]
@@ -232,19 +264,22 @@ def step_options(st: State, cfg: Settings) -> Optional[bool]:
             o["accel"] = accels[ui.choose("Tensor product kernels", [(a, "") for a in accels], default=0)]
         return True
     ui.heading("Conversion options (Enter = default)")
-    pick = ui.choose("Backend", [(k, v) for k, v in BACKENDS.items()], default=0)
-    o["backend"] = list(BACKENDS)[pick]
+    backends = [k for k in BACKENDS if k in m.backends]
+    if len(backends) == 1:
+        o["backend"] = backends[0]
+        print(ui.dim(f"  backend: {backends[0]} (the only one this model can be converted with)"))
+    else:
+        o["backend"] = backends[ui.choose("Backend", [(k, BACKENDS[k]) for k in backends], default=0)]
     if not m.fixed_dtype:
         o["dtype"] = ("float32", "float64")[ui.choose("Precision of the converted model", [
             ("float32", "faster, what the examples use"), ("float64", "the converter's own default")], default=0)]
     else:
         print(ui.dim("  precision: the model carries its own (no --dtype)"))
     if len(m.accels) > 1:
-        o["accel"] = m.accels[ui.choose("Tensor product kernels", [(a, "needs its package and a GPU" if a != "e3nn" else "no extra package")
-                                                                  for a in m.accels], default=0)]
+        o["accel"] = m.accels[ui.choose("Tensor product kernels", [(a, _accel_note(a)) for a in m.accels], default=0)]
         if o["accel"] != "e3nn":      # an e3nn file runs on any device, the other kernels are built for the GPU
             print(ui.dim(f"  device: cuda (--accel {o['accel']} is converted and checked on the GPU; CPU is not supported)"))
-    if m.layer_exchange and o["backend"] == "torchscript":
+    if m.layer_exchange and o["backend"] in ("torchscript", "pytorch"):
         if m.layer_exchange_local:
             pick = ui.choose("Several GPUs (MPI ranks): do the ranks compute the atoms around their part of the box too?", [
                 ("ordinary", "every rank computes its ghost atoms as well as its own; fine for one GPU"),
@@ -252,19 +287,41 @@ def step_options(st: State, cfg: Settings) -> Optional[bool]:
                                      "this model is local)")], default=0)
         else:
             pick = ui.choose("Several GPUs (MPI ranks): how do the ranks get the atoms around their part of the box?", [
-                ("ordinary", "ghost atoms layers x cutoff deep (12 A for MACE), every rank computes its ghost atoms itself; fine for one GPU"),
+                ("ordinary", m.ordinary_ranks or "ghost atoms layers x cutoff deep (12 A for MACE), every rank computes its ghost atoms "
+                                                 "itself; fine for one GPU"),
                 ("layer exchange", "ghost atoms one cutoff deep, the ranks send node features between the layers, no edge is computed twice")],
                 default=0)
         o["layer_exchange"] = pick == 1
         if o["layer_exchange"]:
             print(ui.dim("  --layer-exchange: needs edge shifts (the default)" + ("" if m.layer_exchange_local else
                          ", and a dsMD built with the dsDecompX that has forward_exchange")))
-            if o.get("accel", "e3nn") != "e3nn":
-                print(ui.yellow(f"  layer exchange has been tried with the e3nn kernels only, not with {o['accel']}"))
+            if o.get("accel", "e3nn") not in m.layer_exchange_accels:
+                print(ui.yellow(f"  layer exchange has been tried with the {', '.join(m.layer_exchange_accels)} kernels only, "
+                                f"not with {o['accel']}"))
     elif m.layer_exchange:
-        print(ui.dim("  layer exchange: not available with the AOTInductor backend (TorchScript only)"))
-    if m.has_heads:
+        print(ui.dim("  layer exchange: not available with the AOTInductor backend (TorchScript or PyTorch only)"))
+    if m.has_heads and m.key == "uma":
+        o["head"] = ui.ask("Task of the model (omat, omol, oc20, odac, omc)", "omat")
+    elif m.has_heads:
         o["head"] = ui.ask("Head / modal to fix (Enter = ask after the model is downloaded, if it has several)", "", allow_empty=True)
+    if "composition" in m.system_options and m.key == "esen":
+        o["composition"] = ui.ask("Formula of the whole MD system with its atom counts (Enter = none: needed only if the converter "
+                                  "asks for it)", "", allow_empty=True, validate=lambda text: _composition_ok(text) if text.strip() else None)
+    elif "composition" in m.system_options:
+        o["composition"] = ui.ask("Formula of the whole MD system with its atom counts, e.g. H2000O1000", validate=_composition_ok)
+    if "charge" in m.system_options:
+        o["charge"] = ui.ask("Total charge of the system (Enter = none: only models with a charge input take it)", "", allow_empty=True,
+                             validate=_integer_ok)
+        o["spin"] = ui.ask("Spin multiplicity of the system (Enter = none)", "", allow_empty=True, validate=_integer_ok)
+    if m.kspace:
+        pick = ui.choose("Long-range electrostatics and dispersion", [
+            ("cutoff", "pair terms switched off at the long-range cutoff (--cutoff, default 12 A); nothing else needed"),
+            ("PME (k-space)", "--kspace pme: real-space part on the edges, reciprocal sums by dsMD; needs 'mlip_kspace: pme' in the dsMD "
+                              "input and a periodic box (as the SO3LR Tauri paper ran its liquids and biomolecules)")], default=0)
+        o["kspace"] = "pme" if pick == 1 else ""
+        if o["kspace"]:
+            print(ui.dim("  --kspace pme: smearings 4.0 / 2.0 A (electrostatics / dispersion); grid spacing 2.0 / 3.0 A by default, "
+                         "set in the dsMD input with mlip_kspace_grid_spacing / mlip_kspace_dispersion_grid_spacing"))
     if m.needs_elements:
         o["elements"] = ui.ask("Atomic numbers the model was trained on, e.g. 1,6,7,8", validate=_elements_ok)
     o["extra"] = ui.ask("Extra mlip_convert arguments, e.g. --cutoff 5.0 --no-edge-shifts (Enter = none)", "", allow_empty=True,
@@ -309,6 +366,9 @@ def build_convert_command(st: State, cfg: Settings, model: Optional[str]) -> Lis
         cmd += ["--head", o["head"]]
     if o.get("elements"):
         cmd += ["--elements", o["elements"].replace(" ", "")]
+    for key in ("composition", "charge", "spin", "kspace"):
+        if str(o.get(key) or "").strip():
+            cmd += ["--" + key, str(o[key]).strip()]
     if o.get("extra"):
         cmd += shlex.split(o["extra"])
     return cmd
@@ -355,8 +415,8 @@ def step_run(st: State, cfg: Settings) -> bool:
             print(ui.red(f"\n  download failed: {error}"))
             return True
     # 2. the work
-    if st.action == "python":
-        return _write_python_config(st, path)
+    if st.action == "ase":
+        return _write_ase_config(st, path)
     return _run_convert(st, cfg, path)
 
 
@@ -415,7 +475,11 @@ def _run_convert(st: State, cfg: Settings, model: Optional[str]) -> bool:
         except (OSError, ValueError):
             pass
     print("\nUse it in the dsMD input file:\n")
-    print(f"  mlip_backend: libtorch\n  mlip_model:   {st.output.as_posix()}")
+    pytorch = st.options.get("backend") == "pytorch"
+    print(f"  mlip_backend: {'pytorch' if pytorch else 'libtorch'}\n  mlip_model:   {st.output.as_posix()}")
+    if pytorch:
+        print("\n  The folder holds no model file: dsMD reads the model file again when it starts, from the path the converter wrote")
+        print("  into metadata.json. Keep that file where it is.")
     if st.options.get("layer_exchange"):
         print()
         if st.mlip.layer_exchange_local:
@@ -428,9 +492,9 @@ def _run_convert(st: State, cfg: Settings, model: Optional[str]) -> bool:
     return True
 
 
-def _write_python_config(st: State, path: Optional[str]) -> bool:
+def _write_ase_config(st: State, path: Optional[str]) -> bool:
     m, o = st.mlip, st.options
-    lines = ["mlip_backend: python", "", "mlip_config:", f"  model_type: {m.python_type}"]
+    lines = ["mlip_backend: ase", "", "mlip_config:", f"  model_type: {m.python_type}"]
     if path:
         if m.key in ("nequip", "allegro") and not path.endswith((".pt2", ".pth")):
             compiled = (st.output / f"{m.key}.nequip.pt2").as_posix()
@@ -450,7 +514,7 @@ def _write_python_config(st: State, path: Optional[str]) -> bool:
     print(ui.green(f"\nDone. Written: {st.output / 'mlip_config.yaml'}\n"))
     print(text)
     if m.key in ("nequip", "allegro") and path and not path.endswith((".pt2", ".pth")):
-        print("The Python MLIP mode reads a compiled NequIP/Allegro file. Compile it (needs the nequip package):")
+        print("The ASE mode reads a compiled NequIP/Allegro file. Compile it (needs the nequip package):")
         print(f"  nequip-compile {path} {(st.output / (m.key + '.nequip.pt2')).as_posix()} --mode aotinductor --device cuda --target ase")
     if m.key == "orb" or (m.optional_model and not path):
         print("No model file is used: the package loads its own weights.")
@@ -478,8 +542,7 @@ def run_flow(cfg: Settings) -> None:
 
 def list_catalog() -> None:
     for m in MLIPS.values():
-        modes = "libtorch" if m.convert_arch else ""
-        modes += (" + " if modes and m.python_type else "") + ("python" if m.python_type else "")
+        modes = " + ".join(mode.lower() for mode in _modes(m))
         modes += " + layer-exchange" if m.layer_exchange else ""
         print(f"{m.key:<10} {m.title}   [{modes}]")
         for s in m.sources:
@@ -492,7 +555,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m mlip_cli_ui",
         description="Menu to pick an MLIP and its model file (Hugging Face, GitHub, installed package, local), then convert it "
-                    "with mlip_convert or write the Python MLIP config.")
+                    "with mlip_convert or write the ASE mode config.")
     parser.add_argument("--python", default=sys.executable,
                         help="python that runs mlip_convert: the environment where the model's package is installed (default: this one)")
     parser.add_argument("--download-dir", default="models/downloads", help="where model files are downloaded for a conversion")

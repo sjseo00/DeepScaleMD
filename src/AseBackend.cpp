@@ -1,4 +1,4 @@
-#include "PythonBackend.h"
+#include "AseBackend.h"
 
 #include "PythonModules.h"
 
@@ -20,7 +20,7 @@ namespace {
 #ifdef USE_CUDA
 void cuda_check(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("PythonBackend: ") + what + ": " + cudaGetErrorString(err));
+        throw std::runtime_error(std::string("AseBackend: ") + what + ": " + cudaGetErrorString(err));
     }
 }
 #endif
@@ -49,47 +49,47 @@ struct PyRef {
 // Prints the pending Python error (if any) and stops the run: a failed MLIP call must never be answered with "no force".
 [[noreturn]] void python_failure(const std::string& what) {
     if (PyErr_Occurred()) PyErr_Print();
-    throw std::runtime_error("PythonBackend: " + what);
+    throw std::runtime_error("AseBackend: " + what);
 }
 
 #endif
 
 }  // namespace
 
-PythonBackend::PythonBackend(const MLIPConfig& cfg) : comm_(cfg.comm) {
+AseBackend::AseBackend(const MLIPConfig& cfg) : comm_(cfg.comm) {
 #ifndef ENABLE_PYTHON_INTERFACE
     throw std::runtime_error(
-        "mlip_backend 'python' needs a build with the embedded Python interface (configure with -DENABLE_PYTHON=ON; "
+        "mlip_backend 'ase' needs a build with the embedded Python interface (configure with -DENABLE_PYTHON=ON; "
         "Python 3 development files and NumPy are needed), and this build has none. Use mlip_backend: libtorch, or rebuild.");
 #endif
-    const PythonMLIPConfig& py = cfg.python;
+    const AseMLIPConfig& py = cfg.ase;
 
     if (py.model_type.empty()) {
         throw std::runtime_error(
-            "mlip_backend 'python' needs the model: set mlip_config: model_type (mace, nequip, sevennet, ...) and model_path");
+            "mlip_backend 'ase' needs the model: set mlip_config: model_type (mace, nequip, sevennet, ...) and model_path");
     }
     initialize_python(py.module_path);
     if (cfg.verbose) {
-        std::cout << "Python MLIP interface initialized" << std::endl;
-        std::cout << "Initializing Python MLIP (type=" << py.model_type << ")..." << std::endl;
+        std::cout << "ASE MLIP interface initialized" << std::endl;
+        std::cout << "Initializing ASE MLIP (type=" << py.model_type << ")..." << std::endl;
         std::cout << "  model_path: " << py.model_path << std::endl;
         std::cout << "  model_type: " << py.model_type << std::endl;
         std::cout << "  model_size: " << py.model_size << std::endl;
         std::cout << "  device:     " << py.device << std::endl;
         std::cout << "  dtype:      " << py.dtype << std::endl;
         if (comm_ && comm_->size() > 1) {
-            std::cout << "  " << comm_->size() << " MPI ranks: every rank computes all atoms of the system with this Python MLIP "
-                      << "(correct, but no speed-up; mlip_backend: libtorch is the multi-GPU path)" << std::endl;
+            std::cout << "  " << comm_->size() << " MPI ranks: every rank computes all atoms of the system with this ASE MLIP "
+                      << "(correct, but no speed-up; mlip_backend: libtorch or pytorch is the multi-GPU path)" << std::endl;
         }
     }
     initialize_ml_model(py, cfg.type_to_z);
 }
 
-PythonBackend::~PythonBackend() {
+AseBackend::~AseBackend() {
     finalize_python();
 }
 
-void PythonBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
+void AseBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
     const size_t n = static_cast<size_t>(in.n_all);
 
 #ifdef USE_CUDA
@@ -129,7 +129,7 @@ void PythonBackend::compute(const MLIPInputs& in, MLIPOutputs& out) {
     out.energy = last_energy_;
 }
 
-void PythonBackend::run_on_host(const double* x, const double* y, const double* z, const int* type, size_t n, size_t n_owned,
+void AseBackend::run_on_host(const double* x, const double* y, const double* z, const int* type, size_t n, size_t n_owned,
                                 double* fx, double* fy, double* fz, const double* cell, const bool* pbc) {
     if (!comm_ || comm_->size() <= 1) {
         call_python(x, y, z, type, n, fx, fy, fz, cell, pbc);
@@ -155,13 +155,13 @@ void PythonBackend::run_on_host(const double* x, const double* y, const double* 
 
 #ifdef ENABLE_PYTHON_INTERFACE
 
-void PythonBackend::initialize_python(const std::string& module_path) {
+void AseBackend::initialize_python(const std::string& module_path) {
     python_mlip_path_ = module_path;
 
     if (!Py_IsInitialized()) {
         Py_Initialize();
         if (!Py_IsInitialized()) {
-            throw std::runtime_error("PythonBackend: failed to initialize the Python interpreter");
+            throw std::runtime_error("AseBackend: failed to initialize the Python interpreter");
         }
         add_active_python_environment();   // before NumPy is imported: the activated environment's packages come first
         if (_import_array() < 0) {   // NumPy's C API
@@ -183,10 +183,10 @@ void PythonBackend::initialize_python(const std::string& module_path) {
     PyRun_SimpleString("sys.path.append(os.path.join(os.path.dirname(os.getcwd()), 'MLIP_tools', 'mlip_python'))");
 
     std::cout << "Python interpreter initialized for the MLIP" << std::endl;
-    std::cout << "Python MLIP module path: " << (ec ? module_path : configured.string()) << std::endl;
+    std::cout << "ASE mode module path: " << (ec ? module_path : configured.string()) << std::endl;
 }
 
-void PythonBackend::initialize_ml_model(const PythonMLIPConfig& py, const std::vector<int>& type_to_z) {
+void AseBackend::initialize_ml_model(const AseMLIPConfig& py, const std::vector<int>& type_to_z) {
     std::cout << "[ML] Initializing ML model: type=" << py.model_type
               << " device=" << py.device << std::endl;
 
@@ -224,13 +224,13 @@ void PythonBackend::initialize_ml_model(const PythonMLIPConfig& py, const std::v
 
     if (PyRun_SimpleString(cmd.c_str()) != 0) {      // Python has printed the traceback
         throw std::runtime_error(
-            "PythonBackend: initializing the MLIP '" + py.model_type + "' failed (see the messages above; ml_forces.py is "
+            "AseBackend: initializing the MLIP '" + py.model_type + "' failed (see the messages above; ml_forces.py is "
             "looked for in '" + python_mlip_path_ + "', the packages of the model must be importable by the embedded Python)");
     }
     std::cout << "[ML] ML model initialized successfully (" << py.model_type << ")" << std::endl;
 }
 
-void PythonBackend::finalize_python() {
+void AseBackend::finalize_python() {
     if (Py_IsInitialized()) {
         if (py_ml_compute_func_)    { Py_DECREF((PyObject*)py_ml_compute_func_);    py_ml_compute_func_    = nullptr; }
         if (py_ml_get_energy_func_) { Py_DECREF((PyObject*)py_ml_get_energy_func_); py_ml_get_energy_func_ = nullptr; }
@@ -241,10 +241,10 @@ void PythonBackend::finalize_python() {
     }
 }
 
-void PythonBackend::call_python(const double* x, const double* y, const double* z, const int* type,
+void AseBackend::call_python(const double* x, const double* y, const double* z, const int* type,
                                 size_t n_particles, double* fx, double* fy, double* fz,
                                 const double* cell, const bool* pbc) {
-    if (!Py_IsInitialized()) throw std::runtime_error("PythonBackend: Python is not initialized");
+    if (!Py_IsInitialized()) throw std::runtime_error("AseBackend: Python is not initialized");
 
     if (!py_ml_module_) {
         py_ml_module_ = (void*)PyImport_ImportModule("ml_forces");
@@ -312,7 +312,7 @@ void PythonBackend::call_python(const double* x, const double* y, const double* 
     if (PyArray_NDIM(forces_array) != 2 || PyArray_DIMS(forces_array)[0] != (npy_intp)n_particles ||
         PyArray_DIMS(forces_array)[1] != 3 || PyArray_TYPE(forces_array) != NPY_DOUBLE ||
         !PyArray_IS_C_CONTIGUOUS(forces_array)) {
-        throw std::runtime_error("PythonBackend: ml_forces.compute_force must return a C-contiguous float64 array of shape [" +
+        throw std::runtime_error("AseBackend: ml_forces.compute_force must return a C-contiguous float64 array of shape [" +
                                  std::to_string(n_particles) + ", 3]");
     }
     memcpy(frc_buf_.data(), PyArray_DATA(forces_array), n_particles * 3 * sizeof(double));
@@ -345,15 +345,15 @@ void PythonBackend::call_python(const double* x, const double* y, const double* 
 #else  // !ENABLE_PYTHON_INTERFACE
 
 // The constructor refuses to run without Python, so none of these is reached.
-void PythonBackend::initialize_python(const std::string&) {}
+void AseBackend::initialize_python(const std::string&) {}
 
-void PythonBackend::initialize_ml_model(const PythonMLIPConfig&, const std::vector<int>&) {}
+void AseBackend::initialize_ml_model(const AseMLIPConfig&, const std::vector<int>&) {}
 
-void PythonBackend::finalize_python() {}
+void AseBackend::finalize_python() {}
 
-void PythonBackend::call_python(const double*, const double*, const double*, const int*, size_t,
+void AseBackend::call_python(const double*, const double*, const double*, const int*, size_t,
                                 double*, double*, double*, const double*, const bool*) {
-    throw std::runtime_error("PythonBackend: this build has no embedded Python (-DENABLE_PYTHON=ON)");
+    throw std::runtime_error("AseBackend: this build has no embedded Python (-DENABLE_PYTHON=ON)");
 }
 
 #endif  // ENABLE_PYTHON_INTERFACE
